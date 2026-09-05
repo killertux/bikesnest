@@ -54,6 +54,89 @@ body {
   text-rendering: optimizeLegibility;
 }
 
+/* Landing page: a light editorial hero and a compact path to discovery.
+   Scoped here so search, account and moderation retain their own density. */
+.home-hero {
+  display: grid;
+  gap: 2.5rem;
+  max-width: var(--spacing-shell);
+  margin-inline: auto;
+  padding: 3.5rem 2rem 4rem;
+  align-items: center;
+}
+.home-hero-content { min-width: 0; }
+.home-eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  margin-bottom: 1.5rem;
+  color: var(--color-accent-strong);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+.home-eyebrow > span {
+  width: 0.5rem;
+  height: 0.5rem;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--color-accent-strong);
+}
+.home-headline {
+  font-size: clamp(2.75rem, 4.5vw, 4.25rem);
+  font-weight: 700;
+  line-height: 1.06;
+  letter-spacing: -0.05em;
+  text-wrap: balance;
+}
+.home-search { box-shadow: 0 8px 24px oklch(20% 0.02 240 / 0.05); }
+.home-search button { flex-shrink: 0; }
+.home-hero-photo {
+  position: relative;
+  order: 2;
+  height: 32rem;
+  overflow: hidden;
+  border-radius: 1.5rem;
+  background: var(--color-border);
+}
+.home-hero-photo > img { object-position: 52% center; }
+.home-photo-link {
+  position: absolute;
+  inset: auto 1.25rem 1.25rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1rem 1.25rem;
+  border-radius: 0.75rem;
+  background: var(--color-surface);
+  color: var(--color-accent-strong);
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+.home-photo-link:hover { background: var(--color-bg); }
+.home-photo-link svg { flex-shrink: 0; }
+.home-how { border-top: 1px solid var(--color-border); scroll-margin-top: 5rem; }
+.home-step { padding: 0 1.5rem 0 0; }
+.landing-page h2 { text-wrap: balance; }
+@media (min-width: 1024px) {
+  .home-hero { grid-template-columns: 1.2fr 1fr; gap: 3rem; }
+}
+@media (min-width: 768px) {
+  .home-step + .home-step { border-left: 1px solid var(--color-border); padding-left: 1.5rem; }
+}
+@media (max-width: 1023px) {
+  .home-hero-photo { height: 22rem; }
+  .home-hero-content { max-width: 42rem; }
+}
+@media (max-width: 639px) {
+  .home-hero { padding: 2.5rem 1.5rem; gap: 2rem; }
+  .home-hero-photo { height: 17rem; }
+  .home-eyebrow { font-size: 0.6875rem; letter-spacing: 0.04em; }
+  .home-step { padding-bottom: 1.5rem; border-bottom: 1px solid var(--color-border); }
+}
+
 /* Focus — never remove, never dim (design-system/colors_and_type.css,
    ported verbatim). Plain CSS outside any `@layer`, so it always wins over
    a Tailwind utility on the same element regardless of source order or

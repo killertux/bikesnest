@@ -246,16 +246,16 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
             "Bicicletários feitos pela comunidade",
         ),
         "home.hero.title" => (
-            "From destination to parked bike",
-            "Do destino à bike estacionada",
+            "A place to park. More room to explore.",
+            "Um lugar para a bike. Mais cidade para você.",
         ),
         "home.hero.subtitle" => (
             "Search any address in Curitiba and see nearby bicycle parking — with cost, security and how recently each spot was checked.",
             "Busque qualquer endereço em Curitiba e veja bicicletários por perto — com custo, segurança e há quanto tempo cada vaga foi conferida.",
         ),
         "home.search.placeholder" => (
-            "Where are you going? e.g. Rua XV de Novembro",
-            "Para onde você vai? ex.: Rua XV de Novembro",
+            "Where are you going?",
+            "Para onde você vai?",
         ),
         "home.search.button" => ("Search parking", "Buscar vagas"),
         "home.search.locate" => ("Use my location", "Usar minha localização"),
@@ -268,6 +268,10 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
             "Usada uma vez, só para esta busca.",
         ),
         "home.how.title" => ("How it works", "Como funciona"),
+        "home.how.heading" => (
+            "From destination to parked bike",
+            "Do destino à bike estacionada",
+        ),
         "home.how.s1.title" => ("Search a destination", "Busque um destino"),
         "home.how.s1.body" => (
             "Type where you are headed. We find bicycle parking within walking distance.",

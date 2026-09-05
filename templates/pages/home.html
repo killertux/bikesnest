@@ -1,40 +1,30 @@
 {% extends "layouts/base.html" %}
 {% block content %}
 
-<!-- ======== Hero: photo + gradient, headline, search card (P1) ======== -->
-<section class="relative isolate overflow-hidden">
-  <img
-    src="{{ layout.asset("img/hero-bike-parking-2000.jpg") }}"
-    srcset="{{ layout.asset("img/hero-bike-parking-640.jpg") }} 640w, {{ layout.asset("img/hero-bike-parking-1024.jpg") }} 1024w, {{ layout.asset("img/hero-bike-parking-2000.jpg") }} 2000w"
-    sizes="100vw"
-    alt="Rows of bicycles parked in a multi-tier parking facility"
-    width="2000" height="1125"
-    fetchpriority="high"
-    class="absolute inset-0 h-full w-full object-cover"
-  />
-  <div class="absolute inset-0 bg-gradient-to-b from-[oklch(18%_0.015_240_/_0.72)] via-[oklch(18%_0.015_240_/_0.56)] to-[oklch(18%_0.015_240_/_0.84)]" aria-hidden="true"></div>
-
-  <div class="relative mx-auto max-w-shell px-4 py-24 sm:py-32">
+<div class="landing-page">
+<!-- Destination search leads; photography gives it a sense of place. -->
+<section class="home-hero">
+  <div class="home-hero-content">
     <div class="max-w-2xl">
-      <p class="mb-4 font-mono text-xs uppercase tracking-[0.14em] text-white/80">{{ tr.t("home.eyebrow") }}</p>
-      <h1 class="font-display text-4xl font-bold leading-[1.08] tracking-tight text-white sm:text-5xl lg:text-6xl">
+      <p class="home-eyebrow"><span aria-hidden="true"></span>{{ tr.t("home.eyebrow") }}</p>
+      <h1 class="home-headline font-display">
         {{ tr.t("home.hero.title") }}
       </h1>
-      <p class="mt-5 max-w-xl text-lg leading-relaxed text-white/85">
+      <p class="mt-6 max-w-xl text-lg leading-relaxed text-muted">
         {{ tr.t("home.hero.subtitle") }}
       </p>
     </div>
 
     <!-- Search card -->
     <div class="mt-10 max-w-2xl" x-data="homeHero">
-      <form action="/search" method="get" role="search" class="flex flex-col gap-2 rounded-2xl bg-surface p-2 shadow-pop sm:flex-row sm:items-center">
-        <div class="flex flex-1 items-center gap-3 px-3 py-1.5">
+      <form action="/search" method="get" role="search" class="home-search flex flex-col gap-2 rounded-2xl border border-border bg-surface p-2 sm:flex-row sm:items-center">
+        <div class="flex min-w-0 flex-1 items-center gap-3 px-3 py-1.5">
           <svg aria-hidden="true" class="h-5 w-5 shrink-0 text-muted" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 10c0 4.993-5.539 10.193-7.399 11.799a1 1 0 0 1-1.202 0C9.539 20.193 4 14.993 4 10a8 8 0 0 1 16 0" /><circle cx="12" cy="10" r="3" /></svg>
           <label for="q" class="sr-only">{{ tr.t("home.search.placeholder") }}</label>
           <input
             id="q" name="q" type="text" autocomplete="off"
             placeholder="{{ tr.t("home.search.placeholder") }}"
-            class="w-full bg-transparent py-2 text-base"
+            class="min-w-0 w-full bg-transparent py-2 text-base"
           />
         </div>
         <button type="submit" class="inline-flex items-center justify-center gap-2 rounded-xl bg-accent-strong px-6 py-3.5 text-base font-medium text-white transition-colors hover:bg-accent-dark">
@@ -46,42 +36,57 @@
         <button
           type="button"
           @click="locate"
-          class="inline-flex items-center gap-2 rounded-full border border-white/30 bg-white/10 px-4 py-2 text-sm font-medium text-white backdrop-blur transition-colors hover:bg-white/20"
+          class="inline-flex items-center gap-2 rounded-full py-2 text-sm font-medium text-accent-strong hover:underline"
         >
           <svg aria-hidden="true" class="h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 10c0 6-8 12-8 12S4 16 4 10a8 8 0 0 1 16 0" /><circle cx="12" cy="10" r="3" /></svg>
           {{ tr.t("home.search.locate") }}
-          <span x-show="locating" class="text-white/70">…</span>
+          <span x-show="locating">…</span>
         </button>
-        <span class="text-xs text-white/70">{{ tr.t("home.search.locate_hint") }}</span>
+        <span class="text-xs text-muted">{{ tr.t("home.search.locate_hint") }}</span>
       </div>
       {# `homeHero` has always set `denied` on a refused/failed geolocation;
          until now nothing rendered it, so tapping the button and denying the
          prompt looked like the button was broken. #}
       <p x-show="denied" role="status"
-         class="mt-3 rounded-lg bg-white/10 px-3 py-2 text-sm text-white backdrop-blur">
+         class="mt-3 rounded-lg bg-accent-soft px-3 py-2 text-sm text-accent-strong">
         {{ tr.t("home.locate_denied") }}
       </p>
     </div>
   </div>
+  <div class="home-hero-photo">
+    <img
+      src="{{ layout.asset("img/hero-bike-parking-2000.jpg") }}"
+      srcset="{{ layout.asset("img/hero-bike-parking-640.jpg") }} 640w, {{ layout.asset("img/hero-bike-parking-1024.jpg") }} 1024w, {{ layout.asset("img/hero-bike-parking-2000.jpg") }} 2000w"
+      sizes="(min-width: 1024px) 42vw, 100vw"
+      alt=""
+      width="2000" height="1125"
+      fetchpriority="high"
+      class="h-full w-full object-cover"
+    />
+    <a href="/search?bbox={{ layout.browse_bbox() }}" class="home-photo-link">
+      <span>{{ tr.t("home.explore_center") }}</span>
+      <svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14m-6-6 6 6-6 6" /></svg>
+    </a>
+  </div>
 </section>
 
 <!-- ======== How it works (P1) ======== -->
-<section id="how-it-works" class="mx-auto max-w-shell px-4 py-20 lg:py-28">
+<section id="how-it-works" class="home-how mx-auto max-w-shell px-6 py-12 lg:px-8 lg:py-16">
   <p class="mb-3 font-mono text-xs uppercase tracking-[0.14em] text-accent-strong">{{ tr.t("home.how.title") }}</p>
-  <h2 class="font-display text-3xl font-bold tracking-tight sm:text-4xl">{{ tr.t("home.hero.title") }}</h2>
+  <h2 class="font-display text-3xl font-bold tracking-tight sm:text-4xl">{{ tr.t("home.how.heading") }}</h2>
 
   <div class="mt-10 grid gap-6 md:grid-cols-3">
-    <div class="rounded-2xl border border-border bg-surface p-6">
+    <div class="home-step">
       <span class="inline-flex items-center rounded-full bg-accent/10 px-2.5 py-1 font-mono text-xs font-semibold text-accent-strong">01</span>
       <h3 class="font-display mt-4 text-xl font-semibold">{{ tr.t("home.how.s1.title") }}</h3>
       <p class="mt-2 text-[15px] leading-relaxed text-muted">{{ tr.t("home.how.s1.body") }}</p>
     </div>
-    <div class="rounded-2xl border border-border bg-surface p-6">
+    <div class="home-step">
       <span class="inline-flex items-center rounded-full bg-accent/10 px-2.5 py-1 font-mono text-xs font-semibold text-accent-strong">02</span>
       <h3 class="font-display mt-4 text-xl font-semibold">{{ tr.t("home.how.s2.title") }}</h3>
       <p class="mt-2 text-[15px] leading-relaxed text-muted">{{ tr.t("home.how.s2.body") }}</p>
     </div>
-    <div class="rounded-2xl border border-border bg-surface p-6">
+    <div class="home-step">
       <span class="inline-flex items-center rounded-full bg-accent/10 px-2.5 py-1 font-mono text-xs font-semibold text-accent-strong">03</span>
       <h3 class="font-display mt-4 text-xl font-semibold">{{ tr.t("home.how.s3.title") }}</h3>
       <p class="mt-2 text-[15px] leading-relaxed text-muted">{{ tr.t("home.how.s3.body") }}</p>
@@ -92,7 +97,7 @@
 <!-- ======== Featured parking with real photos (P1) ======== -->
 {% if !featured.is_empty() %}
 <section class="border-t border-border bg-surface">
-  <div class="mx-auto max-w-shell px-4 py-20 lg:py-28">
+  <div class="mx-auto max-w-shell px-6 py-16 lg:px-8 lg:py-20">
     <div class="flex flex-wrap items-end justify-between gap-4">
       <h2 class="font-display text-3xl font-bold tracking-tight sm:text-4xl">{{ tr.t("home.featured.title") }}</h2>
       <a href="/search?bbox={{ layout.browse_bbox() }}" class="inline-flex items-center gap-2 text-[15px] font-medium text-accent-strong hover:text-accent-dark">
@@ -106,9 +111,9 @@
       <a href="{{ item.url }}" class="group flex flex-col overflow-hidden rounded-2xl border border-border bg-surface shadow-card transition-shadow hover:shadow-pop">
         <div class="relative aspect-[4/3] overflow-hidden">
           {% if let Some(url) = item.photo_url %}
-          <img src="{{ url }}" alt="{{ item.name }}" class="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.02]" />
+          <img src="{{ url }}" alt="{{ item.name }}" loading="lazy" class="h-full w-full object-cover" />
           {% else %}
-          <img src="{{ item.image }}" alt="{{ item.image_alt }}" class="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.02]" />
+          <img src="{{ item.image }}" alt="{{ item.image_alt }}" loading="lazy" class="h-full w-full object-cover" />
           {% endif %}
           <span class="absolute left-4 top-4 inline-flex items-center gap-1.5 rounded-full bg-[oklch(100%_0_0_/_0.95)] px-2.5 py-1 font-mono text-[11px] uppercase tracking-wide text-fg shadow-sm">
             {{ item.type_label }}
@@ -156,14 +161,14 @@
 
 <!-- ======== Community: the map is kept honest by riders (P1) ======== -->
 <section class="border-t border-border">
-  <div class="mx-auto grid max-w-shell items-center gap-10 px-4 py-20 lg:grid-cols-2 lg:py-28">
+  <div class="mx-auto grid max-w-shell items-center gap-10 px-6 py-16 lg:grid-cols-2 lg:gap-16 lg:px-8 lg:py-20">
     <div class="overflow-hidden rounded-2xl border border-border shadow-card">
       <img
         src="{{ layout.asset("img/mtb-pair-rack-800.jpg") }}"
         srcset="{{ layout.asset("img/mtb-pair-rack-640.jpg") }} 640w, {{ layout.asset("img/mtb-pair-rack-800.jpg") }} 800w"
         sizes="(min-width: 1024px) 50vw, 100vw"
         loading="lazy"
-        alt="Two bicycles resting on a metal rack" class="aspect-[4/3] w-full object-cover"
+        alt="" class="aspect-[4/3] w-full object-cover"
       />
     </div>
     <div>
@@ -199,11 +204,11 @@
     srcset="{{ layout.asset("img/cyclist-foggy-avenue-640.jpg") }} 640w, {{ layout.asset("img/cyclist-foggy-avenue-1024.jpg") }} 1024w, {{ layout.asset("img/cyclist-foggy-avenue-1600.jpg") }} 1600w"
     sizes="100vw"
     loading="lazy"
-    alt="Cyclist riding down a tree-lined avenue in the morning mist"
+    alt=""
     width="1600" height="1069"
     class="absolute inset-0 h-full w-full object-cover"
   />
-  <div class="absolute inset-0 bg-gradient-to-b from-[oklch(18%_0.015_240_/_0.80)] via-[oklch(18%_0.015_240_/_0.88)] to-[oklch(18%_0.015_240_/_0.93)]" aria-hidden="true"></div>
+  <div class="absolute inset-0 bg-scrim/85" aria-hidden="true"></div>
   <div class="relative mx-auto max-w-2xl px-4 py-24 text-center lg:py-28">
     <h2 class="font-display text-3xl font-bold tracking-tight text-white sm:text-4xl">{{ tr.t("home.cta.title") }}</h2>
     <p class="mx-auto mt-4 max-w-lg text-lg text-white/85">{{ tr.t("home.cta.body") }}</p>
@@ -214,4 +219,5 @@
   </div>
 </section>
 
+</div>
 {% endblock %}
