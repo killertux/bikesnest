@@ -11,7 +11,7 @@
 //! styles (attribution/controls/markers); we add no inline styles of our own, so
 //! that surface is MapLibre's alone. The tile/geocode/media origins are templated
 //! from configuration so the same binary works against any hosted provider (dev
-//! defaults to the `demotiles.maplibre.org` demo style for tiles).
+//! defaults to the `tiles.openfreemap.org` street style for tiles).
 
 use axum::body::Body;
 use axum::extract::State;
@@ -219,13 +219,13 @@ mod tests {
     }
 
     #[test]
-    fn dev_defaults_to_demo_tiles() {
+    fn dev_allows_default_street_tiles() {
         let cfg = bikesnest_infrastructure::Config::for_tests("postgres://localhost/x");
         let h = SecurityHeaders::new(&cfg.security, cfg.tls_on);
         assert!(
             h.tile_hosts
                 .iter()
-                .any(|h| h == "https://demotiles.maplibre.org")
+                .any(|h| h == bikesnest_infrastructure::config::DEFAULT_TILE_HOST)
         );
         assert!(h.geocode_hosts.is_empty());
         assert!(!h.tls_on, "plaintext dev never emits HSTS");

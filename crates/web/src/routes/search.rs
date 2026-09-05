@@ -306,6 +306,7 @@ pub(crate) fn render_search(
         let vm = SearchResultsVm {
             tr,
             results,
+            form: params.0.clone(),
             oob: true,
             is_authenticated: auth.authenticated(),
             can_contribute,

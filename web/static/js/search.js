@@ -27,10 +27,10 @@
   "use strict";
 
   /* The style URL and (Mapbox) access token come from the server via
-   * <body data-map-style-url / data-map-access-token>. Default: MapLibre demo tiles
+   * <body data-map-style-url / data-map-access-token>. Default: OpenFreeMap streets
    * so the map still renders before MAP_STYLE_URL is configured. */
   var bodyCfg = document.body ? document.body.dataset : {};
-  var STYLE_URL = bodyCfg.mapStyleUrl || "https://demotiles.maplibre.org/style.json";
+  var STYLE_URL = bodyCfg.mapStyleUrl || "https://tiles.openfreemap.org/styles/liberty";
   var ACCESS_TOKEN = bodyCfg.mapAccessToken || "";
   var CENTER_FALLBACK = [-49.2733, -25.4284]; // Curitiba [lon, lat]
 
@@ -319,7 +319,7 @@
       if (card) select(Number(card.dataset.parkingId));
     });
     // Re-render markers after an HTMX results-fragment swap (htmx 4 event).
-    document.body.addEventListener("htmx:after:swap", function () {
+    document.addEventListener("htmx:after:swap", function () {
       setTimeout(init, 0);
     });
     /* The panel was shown or hidden. `x-show` flips `display` as part of the

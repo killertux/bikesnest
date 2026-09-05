@@ -253,10 +253,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
             "Search any address in Curitiba and see nearby bicycle parking — with cost, security and how recently each spot was checked.",
             "Busque qualquer endereço em Curitiba e veja bicicletários por perto — com custo, segurança e há quanto tempo cada vaga foi conferida.",
         ),
-        "home.search.placeholder" => (
-            "Where are you going?",
-            "Para onde você vai?",
-        ),
+        "home.search.placeholder" => ("Where are you going?", "Para onde você vai?"),
         "home.search.button" => ("Search parking", "Buscar vagas"),
         "home.search.locate" => ("Use my location", "Usar minha localização"),
         "home.locate_denied" => (
@@ -327,6 +324,11 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
 
         // --- search (P2) ---------------------------------------------------
         "search.title" => ("Search — BikesNest", "Busca — BikesNest"),
+        "search.eyebrow" => ("Find your next stop", "Encontre sua próxima parada"),
+        "search.subtitle" => (
+            "Find a spot near your destination. Compare the details and choose where to park.",
+            "Encontre uma vaga perto do seu destino. Compare os detalhes e escolha onde parar.",
+        ),
         "search.heading.near" => ("Parking near", "Vagas perto de"),
         "search.heading.generic" => ("Nearby parking", "Vagas por perto"),
         "search.count.one" => ("1 parking spot", "1 vaga"),

@@ -12,7 +12,7 @@
 (function () {
   "use strict";
   var bodyCfg = document.body ? document.body.dataset : {};
-  var STYLE_URL = bodyCfg.mapStyleUrl || "https://demotiles.maplibre.org/style.json";
+  var STYLE_URL = bodyCfg.mapStyleUrl || "https://tiles.openfreemap.org/styles/liberty";
   var ACCESS_TOKEN = bodyCfg.mapAccessToken || "";
 
   function addMarker(map, lon, lat, className, label) {

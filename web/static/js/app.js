@@ -161,6 +161,11 @@ document.addEventListener('alpine:init', function () {
       moved: false,
       init: function () {
         var self = this;
+        // Keep applied filters visible on arrival; otherwise lead with results.
+        var params = new URLSearchParams(window.location.search);
+        this.filtersOpen = ['type', 'cost', 'security', 'open_now', 'radius'].some(function (key) {
+          return !!params.get(key);
+        });
         /* Whether the map panel is open is a per-viewer preference, not a
          * breakpoint: the width only decides the first time (a phone opens on
          * the list, a desktop on both). */

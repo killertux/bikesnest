@@ -316,6 +316,7 @@ impl SearchPageVm {
 pub struct SearchResultsVm {
     pub tr: Translator,
     pub results: view::ResultsData,
+    pub form: routes::search::SearchParams,
     /// Always `true`: the destination heading and result count live outside
     /// `#results` in `search.html`, so this fragment updates them via
     /// `hx-swap-oob` alongside the swapped results list.

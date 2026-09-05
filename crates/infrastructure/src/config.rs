@@ -221,10 +221,10 @@ pub struct SecurityConfig {
     pub media_hosts: Vec<String>,
 }
 
-/// Client-side map configuration. The style URL defaults to MapLibre's public
-/// demo tiles; a Mapbox style also needs its public access token embedded
+/// Client-side map configuration. The style URL defaults to OpenFreeMap's
+/// street tiles; a Mapbox style also needs its public access token embedded
 /// client-side (only when the style is Mapbox-based).
-pub const DEFAULT_MAP_STYLE_URL: &str = "https://demotiles.maplibre.org/style.json";
+pub const DEFAULT_MAP_STYLE_URL: &str = "https://tiles.openfreemap.org/styles/liberty";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapConfig {
@@ -736,7 +736,7 @@ impl ConfigError {
 // ---------------------------------------------------------------------------
 
 /// Default MapLibre tile origin, also the CSP default for `CSP_TILE_HOSTS`.
-pub const DEFAULT_TILE_HOST: &str = "https://demotiles.maplibre.org";
+pub const DEFAULT_TILE_HOST: &str = "https://tiles.openfreemap.org";
 
 /// `STATIC_ROOT`, else `web/static` relative to the working directory, else the
 /// path the binary was compiled from (so `cargo run` works from the repo).
@@ -901,7 +901,7 @@ fn resolve_map_config(
     let access_token = if is_mapbox_style(&style_url) {
         map_token.or(fallback_token).unwrap_or_default()
     } else {
-        // Non-Mapbox style (e.g. demo tiles) needs no token; keep it off the page.
+        // Non-Mapbox style (e.g. OpenFreeMap) needs no token; keep it off the page.
         String::new()
     };
     MapConfig {
@@ -910,7 +910,7 @@ fn resolve_map_config(
     }
 }
 
-/// `MAP_STYLE_URL` (default demo tiles), plus the Mapbox access token
+/// `MAP_STYLE_URL` (default OpenFreeMap streets), plus the Mapbox access token
 /// (`MAPBOX_MAP_ACCESS_TOKEN`, or the geocoder's `MAPBOX_ACCESS_TOKEN` as a
 /// fallback) when the style is Mapbox-based.
 fn map_config(env: &EnvSource<'_>) -> MapConfig {
@@ -1459,10 +1459,12 @@ mod tests {
     // --- map style ----------------------------------------------------------
 
     #[test]
-    fn map_style_defaults_to_demo_tiles() {
+    fn map_style_defaults_to_streets_with_matching_csp_origin() {
         let c = resolve_map_config(None, None, None);
         assert_eq!(c.style_url, DEFAULT_MAP_STYLE_URL);
         assert_eq!(c.access_token, "");
+        assert!(c.style_url.starts_with(&format!("{DEFAULT_TILE_HOST}/")));
+        assert_eq!(c.style_url, "https://tiles.openfreemap.org/styles/liberty");
     }
 
     #[test]
@@ -1485,7 +1487,7 @@ mod tests {
 
     #[test]
     fn non_mapbox_style_never_leaks_token() {
-        // A non-Mapbox style (e.g. demo tiles / a self-hosted style) must not
+        // A non-Mapbox style (e.g. OpenFreeMap / a self-hosted style) must not
         // embed a Mapbox token even when one is configured for geocoding.
         let c = resolve_map_config(
             Some("https://tiles.example/style.json".to_string()),

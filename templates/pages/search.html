@@ -1,11 +1,12 @@
 {% extends "layouts/base.html" %}
 {% import "components/search_state_inputs.html" as state %}
 {% block content %}
-<div x-data="searchFilters">
+<div class="search-page" x-data="searchFilters">
 
 <!-- ======== Search strip (P2 — pre-filled, editable) ======== -->
-<section class="border-b border-border bg-surface">
-  <div class="mx-auto max-w-shell px-4 pb-6 pt-8 lg:px-8">
+<section class="search-intro border-b border-border">
+  <div class="search-shell pb-6 pt-10">
+    <p class="mb-3 text-xs font-semibold uppercase tracking-wide text-accent-strong">{{ tr.t("search.eyebrow") }}</p>
     <h1 id="search-heading" class="font-display text-2xl font-bold tracking-tight sm:text-3xl">
       {% if results.browse %}
         {{ tr.t("search.browse.heading") }}
@@ -15,50 +16,52 @@
         {{ tr.t("search.heading.generic") }}
       {% endif %}
     </h1>
+    <p class="mt-3 text-muted">{{ tr.t("search.subtitle") }}</p>
 
     <form
       id="search-form"
       action="/search" method="get"
       hx-get="/search" hx-target="#results" hx-swap="innerHTML"
       hx-push-url="true" hx-indicator="#results-indicator"
-      class="mt-5 flex flex-col gap-3 sm:flex-row sm:items-center"
+      role="search"
+      class="search-query mt-6"
     >
-      {% call state::hidden(form, true, false, false, true) %}
-      <div class="relative flex-1">
+      <span id="search-query-state" hidden>{% call state::hidden(form, true, false, false, true) %}</span>
+      <div class="relative min-w-0 flex-1">
         <svg aria-hidden="true" class="pointer-events-none absolute left-3.5 top-1/2 h-5 w-5 -translate-y-1/2 text-muted" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 10c0 4.993-5.539 10.193-7.399 11.799a1 1 0 0 1-1.202 0C9.539 20.193 4 14.993 4 10a8 8 0 0 1 16 0" /><circle cx="12" cy="10" r="3" /></svg>
         <label for="q" class="sr-only">{{ tr.t("home.search.placeholder") }}</label>
         <input
           id="q" name="q" type="search" value="{{ form.q }}"
           placeholder="{{ tr.t("home.search.placeholder") }}"
-          class="h-12 w-full rounded-xl border border-border bg-bg pl-11 pr-4 text-[15px] text-fg placeholder:text-muted focus:border-accent"
+          class="h-12 w-full rounded-xl bg-surface pl-11 pr-4 text-base text-fg placeholder:text-muted"
         />
       </div>
-      <div class="flex gap-3">
+      <div class="search-query-actions flex gap-2">
         <button type="submit" class="inline-flex h-12 flex-1 items-center justify-center gap-2 rounded-xl bg-accent-strong px-5 text-[15px] font-medium text-white transition-colors hover:bg-accent-dark sm:flex-none">
           <svg aria-hidden="true" class="h-5 w-5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21 21-4.34-4.34" /><circle cx="11" cy="11" r="8" /></svg>
           {{ tr.t("home.search.button") }}
         </button>
         <button
           type="button" @click="locate"
-          class="inline-flex h-12 flex-1 items-center justify-center gap-2 rounded-xl border border-border bg-surface px-4 text-[15px] font-medium text-fg transition-colors hover:border-fg sm:flex-none"
+          class="inline-flex h-12 flex-1 items-center justify-center gap-2 rounded-xl px-4 text-sm font-medium text-accent-strong transition-colors hover:bg-bg sm:flex-none"
         >
           <svg aria-hidden="true" class="h-5 w-5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 10c0 6-8 12-8 12S4 16 4 10a8 8 0 0 1 16 0" /><circle cx="12" cy="10" r="3" /></svg>
-          <span class="whitespace-nowrap">{{ tr.t("home.search.locate") }}<span x-show="locating">…</span></span>
+          <span>{{ tr.t("home.search.locate") }}<span x-show="locating">…</span></span>
         </button>
       </div>
     </form>
-    <p class="mt-3 font-mono text-xs text-muted">{{ tr.t("home.search.locate_hint") }}</p>
+    <p class="mt-3 text-xs text-muted">{{ tr.t("home.search.locate_hint") }}</p>
   </div>
 </section>
 
 <!-- ======== Toolbar: count + map toggle (mobile) + sort + filters ======== -->
 <section class="border-b border-border bg-bg">
-  <div class="mx-auto max-w-shell px-4 py-4 lg:px-8">
+  <div class="search-shell py-4">
     <div class="flex flex-wrap items-center justify-between gap-3">
       <p id="result-count" aria-live="polite" class="text-sm text-muted">
         {% if results.error.is_some() %}{% else %}{{ results.total_label }}{% endif %}
       </p>
-      <div class="flex items-center gap-2.5">
+      <div class="search-tools flex flex-wrap items-center gap-2.5">
         {% if can_contribute %}
           <a href="/parking/new" class="inline-flex items-center gap-1.5 rounded-lg bg-accent-strong px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-accent-dark">
             <svg aria-hidden="true" class="h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14" /><path d="M12 5v14" /></svg>
@@ -69,12 +72,12 @@
         {% else %}
           <a href="/register" class="inline-flex items-center gap-1.5 rounded-lg border border-border bg-surface px-3 py-2 text-sm font-medium text-fg hover:border-fg">{{ tr.t("nav.signup_to_add") }}</a>
         {% endif %}
-        <button @click="toggleMap" :aria-expanded="mapOpen" class="inline-flex items-center gap-1.5 rounded-lg border border-border bg-surface px-3 py-2 text-sm font-medium text-fg">
+        <button @click="toggleMap" :aria-expanded="mapOpen" aria-controls="search-map-panel" class="search-toggle inline-flex items-center gap-1.5 rounded-lg border border-border bg-surface px-3 py-2 text-sm font-medium text-fg">
           <svg aria-hidden="true" class="h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.1 5.5 9.9 3.8 4 6v15l5.9-2.2 4.2 1.7 5.9-2.3V3.7Z" /><path d="M9.9 3.8v15" /><path d="M14.1 5.5v15" /></svg>
           <span x-text="mapOpen ? '{{ tr.t("search.map.hide") }}' : '{{ tr.t("search.map.show") }}'">{{ tr.t("search.map.show") }}</span>
         </button>
         <form action="/search" method="get" hx-get="/search" hx-target="#results" hx-swap="innerHTML" hx-push-url="true" hx-indicator="#results-indicator" class="flex items-center gap-2.5">
-          {% call state::hidden(form, false, true, false, false) %}
+          <span id="search-sort-state" hidden>{% call state::hidden(form, false, true, false, false) %}</span>
           <label class="flex items-center gap-2 text-sm text-muted">
             {{ tr.t("search.sort.label") }}
             <select
@@ -90,7 +93,7 @@
           </label>
           <noscript><button type="submit" class="rounded-lg border border-border bg-surface px-3 py-2 text-sm font-medium text-fg">{{ tr.t("search.filters.apply") }}</button></noscript>
         </form>
-        <button @click="toggleFilters" :aria-expanded="filtersOpen" class="inline-flex items-center gap-1.5 rounded-lg border border-border bg-surface px-3 py-2 text-sm font-medium text-fg">
+        <button @click="toggleFilters" :aria-expanded="filtersOpen" aria-controls="search-filter-panel" class="search-toggle inline-flex items-center gap-1.5 rounded-lg border border-border bg-surface px-3 py-2 text-sm font-medium text-fg">
           <svg aria-hidden="true" class="h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18" /><path d="M7 12h10" /><path d="M10 18h4" /></svg>
           {{ tr.t("search.filters.button") }}
         </button>
@@ -98,7 +101,7 @@
     </div>
 
     <!-- Filter panel -->
-    <div x-show="filtersOpen" class="mt-4 rounded-2xl border border-border bg-surface p-5 shadow-card">
+    <div id="search-filter-panel" x-show="filtersOpen" class="search-filter-panel mt-4 rounded-2xl border border-border bg-surface p-6">
       <div class="flex items-center justify-between">
         <h2 class="font-display text-sm font-semibold uppercase tracking-wide text-muted">{{ tr.t("search.filters.results") }}</h2>
         <a href="/search{% if q_set() %}?q={{ form.q|urlencode }}{% endif %}" class="text-sm font-medium text-accent-strong hover:text-accent-dark">{{ tr.t("search.filters.clear") }}</a>
@@ -108,9 +111,9 @@
         hx-get="/search" hx-target="#results" hx-swap="innerHTML"
         hx-trigger="change from:input[type='checkbox'], change from:input[type='radio'], change from:select"
         hx-push-url="true" hx-indicator="#results-indicator"
-        class="mt-4 grid gap-6 md:grid-cols-3"
+        class="mt-5 grid gap-6 sm:grid-cols-2 xl:grid-cols-4"
       >
-        {% call state::hidden(form, false, false, true, false) %}
+        <span id="search-filter-state" hidden>{% call state::hidden(form, false, false, true, false) %}</span>
 
         <fieldset>
           <legend class="mb-2.5 text-sm font-semibold text-fg">{{ tr.t("search.filters.type") }}</legend>
@@ -150,7 +153,7 @@
         <fieldset class="md:col-span-1">
           <legend class="mb-2.5 text-sm font-semibold text-fg">{{ tr.t("search.filters.radius") }}</legend>
           <select name="radius" class="h-10 w-full rounded-lg border border-border bg-bg px-2.5 text-sm font-medium text-fg focus:border-accent">
-            <option value="" {% if radius_none() %}selected{% endif %}>1 km · {{ tr.t("search.radius.default") }}</option>
+            <option value="1000" {% if radius_none() %}selected{% endif %}>1 km · {{ tr.t("search.radius.default") }}</option>
             <option value="250" {% if radius_is(250) %}selected{% endif %}>250 m</option>
             <option value="500" {% if radius_is(500) %}selected{% endif %}>500 m</option>
             <option value="1000" {% if radius_is(1000) %}selected{% endif %}>1 km</option>
@@ -167,12 +170,12 @@
 
 <!-- ======== Results area: map (lg: left) + accessible list ======== -->
 <section class="bg-bg">
-  <div class="mx-auto max-w-shell px-4 py-6 lg:px-8 lg:py-8">
-    <div class="grid gap-6 lg:grid-cols-12">
+  <div class="search-shell py-6 lg:py-8">
+    <div class="search-workspace grid gap-6 lg:grid-cols-12">
       <!-- Map panel -->
-      <div x-show="mapOpen" x-cloak class="lg:col-span-5">
+      <div id="search-map-panel" x-show="mapOpen" x-cloak class="min-w-0 lg:col-span-5">
         <div class="lg:sticky lg:top-20">
-          <div class="overflow-hidden rounded-2xl border border-border bg-surface shadow-card">
+          <div class="overflow-hidden rounded-2xl border border-border bg-surface">
             <div class="flex items-center justify-between border-b border-border px-4 py-3">
               <h2 class="font-display text-sm font-semibold text-fg">{{ tr.t("search.map.title") }}</h2>
               <button id="recenter" class="ml-1 inline-flex h-8 items-center gap-1.5 rounded-lg border border-border px-2.5 text-xs font-medium text-fg hover:bg-[oklch(20%_0.02_240_/_0.05)]">
@@ -180,7 +183,7 @@
                 {{ tr.t("search.map.recenter") }}
               </button>
             </div>
-            <div class="relative aspect-[5/4] overflow-hidden">
+            <div class="search-map-frame relative overflow-hidden">
               <div
                 id="map" class="absolute inset-0"
                 data-label-destination="{{ tr.t("map.destination") }}"
@@ -200,7 +203,7 @@
                 hx-push-url="true" hx-indicator="#results-indicator"
                 class="absolute inset-x-0 bottom-3 flex justify-center"
               >
-                {% call state::browse(form) %}
+                <span id="search-browse-state" hidden>{% call state::browse(form) %}</span>
                 <button type="submit" class="inline-flex items-center gap-1.5 rounded-full bg-accent-strong px-4 py-2 text-sm font-medium text-white shadow-pop transition-colors hover:bg-accent-dark">
                   <svg aria-hidden="true" class="h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21 21-4.34-4.34" /><circle cx="11" cy="11" r="8" /></svg>
                   {{ tr.t("search.browse.here") }}

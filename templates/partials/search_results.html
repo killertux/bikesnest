@@ -1,4 +1,11 @@
+{% import "components/search_state_inputs.html" as state %}
 {% if oob %}
+{# The controls survive a results swap. Refresh their hidden mirrors too,
+   so the next form submits the current search rather than the initial one. #}
+<span id="search-query-state" hidden hx-swap-oob="true">{% call state::hidden(form, true, false, false, true) %}</span>
+<span id="search-sort-state" hidden hx-swap-oob="true">{% call state::hidden(form, false, true, false, false) %}</span>
+<span id="search-filter-state" hidden hx-swap-oob="true">{% call state::hidden(form, false, false, true, false) %}</span>
+<span id="search-browse-state" hidden hx-swap-oob="true">{% call state::browse(form) %}</span>
 <h1 id="search-heading" hx-swap-oob="true" class="font-display text-2xl font-bold tracking-tight sm:text-3xl">
   {% if results.browse %}
     {{ tr.t("search.browse.heading") }}
@@ -20,8 +27,11 @@
 {% endif %}
 
 {% if let Some(err) = results.error %}
-  <div class="rounded-2xl border border-border bg-surface p-8 text-center text-muted">
-    <p>{{ err }}</p>
+  <div class="search-notice rounded-2xl border border-border bg-surface p-8 text-center text-muted">
+    <span class="mx-auto mb-5 grid h-14 w-14 place-items-center rounded-2xl bg-accent-soft text-accent-strong">
+      <svg aria-hidden="true" class="h-7 w-7" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 10c0 6-8 12-8 12S4 16 4 10a8 8 0 0 1 16 0"/><circle cx="12" cy="10" r="3"/></svg>
+    </span>
+    <p class="mx-auto max-w-sm text-base leading-relaxed">{{ err }}</p>
     <!-- The way out of every notice that has no results behind it: browse the
          city centre's map instead of guessing at a destination. -->
     <a
@@ -37,7 +47,7 @@
     {% if let Some(hint) = results.refine_hint %}
     <!-- Browse mode, area too full to list: the map is showing grid counts,
          so the list's job is to say why and ask for a smaller area. -->
-    <div class="rounded-2xl border border-dashed border-border bg-surface px-6 py-14 text-center">
+    <div class="search-notice rounded-2xl border border-border bg-surface px-6 py-14 text-center">
       <span class="mx-auto grid h-12 w-12 place-items-center rounded-2xl bg-accent/10 text-accent-strong">
         <svg aria-hidden="true" class="h-6 w-6" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8" /><path d="M8 11h6" /><path d="m21 21-4.34-4.34" /></svg>
       </span>
@@ -46,7 +56,7 @@
     </div>
     {% else %}
     <!-- Empty state (P2) -->
-    <div class="rounded-2xl border border-dashed border-border bg-surface px-6 py-14 text-center">
+    <div class="search-notice rounded-2xl border border-border bg-surface px-6 py-14 text-center">
       <span class="mx-auto grid h-12 w-12 place-items-center rounded-2xl bg-accent/10 text-accent-strong">
         <svg aria-hidden="true" class="h-6 w-6" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21 21-4.34-4.34" /><circle cx="11" cy="11" r="8" /></svg>
       </span>
