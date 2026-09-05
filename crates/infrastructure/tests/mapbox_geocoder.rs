@@ -1,4 +1,4 @@
-//! Live integration test for the Mapbox geocoder (****).
+//! Live integration tests for the Mapbox geocoder.
 //!
 //! The network-dependent test is **gated on `MAPBOX_TEST_TOKEN`**: when it is
 //! unset the test is skipped (logged, still passes), so the default `cargo test`
@@ -44,4 +44,23 @@ async fn geocodes_a_real_place() {
         hit.point
     );
     assert!(!hit.label.is_empty(), "label should be populated");
+}
+
+#[tokio::test]
+async fn suggests_multiple_curitiba_addresses() {
+    let Some(token) = token() else {
+        eprintln!("MAPBOX_TEST_TOKEN not set; skipping live Mapbox test");
+        return;
+    };
+    let geo = MapboxGeocoder::new(token);
+    let hits = geo
+        .suggest("Rua XV de", 10, None, "pt-BR")
+        .await
+        .expect("suggestions should succeed");
+    assert!(hits.len() > 1, "expected more than one suggestion");
+    assert!(hits.len() <= 10, "provider limit must be respected");
+    assert!(
+        hits.iter().all(|hit| !hit.label.is_empty()),
+        "every suggestion needs a visible label"
+    );
 }

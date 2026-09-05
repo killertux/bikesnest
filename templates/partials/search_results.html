@@ -2,9 +2,9 @@
 {% if oob %}
 {# The controls survive a results swap. Refresh their hidden mirrors too,
    so the next form submits the current search rather than the initial one. #}
-<span id="search-query-state" hidden hx-swap-oob="true">{% call state::hidden(form, true, false, false, true) %}</span>
-<span id="search-sort-state" hidden hx-swap-oob="true">{% call state::hidden(form, false, true, false, false) %}</span>
-<span id="search-filter-state" hidden hx-swap-oob="true">{% call state::hidden(form, false, false, true, false) %}</span>
+<span id="search-query-state" hidden hx-swap-oob="true">{% call state::hidden(form, true, false, false, true, true) %}</span>
+<span id="search-sort-state" hidden hx-swap-oob="true">{% call state::hidden(form, false, true, false, false, false) %}</span>
+<span id="search-filter-state" hidden hx-swap-oob="true">{% call state::hidden(form, false, false, true, false, false) %}</span>
 <span id="search-browse-state" hidden hx-swap-oob="true">{% call state::browse(form) %}</span>
 <h1 id="search-heading" hx-swap-oob="true" class="font-display text-[clamp(1.875rem,3vw,2.75rem)] leading-[1.15] font-bold tracking-[-0.04em] wrap-anywhere">
   {% if results.browse %}
@@ -19,7 +19,7 @@
   {% if results.error.is_some() %}{% else %}{{ results.total_label }}{% endif %}
 </p>
 {# `#search-data` itself lives outside `#results` (search.html renders the
-   primary copy as a sibling, WP21 a11y pass: `role="list"` must contain only
+   primary copy as a sibling: `role="list"` must contain only
    `role="listitem"` children) — this fragment only re-renders it here,
    out-of-band, so a re-search's `hx-target="#results" hx-swap="innerHTML"`
    never leaves a second copy sitting inside the list. #}
@@ -55,7 +55,7 @@
       <p class="mx-auto mt-2 max-w-sm text-[15px] text-muted">{{ hint }}</p>
     </div>
     {% else %}
-    <!-- Empty state (P2) -->
+    <!-- Empty search state. -->
     <div class="search-notice rounded-2xl border border-border bg-surface px-6 py-16 text-center">
       <span class="mx-auto grid h-12 w-12 place-items-center rounded-2xl bg-accent/10 text-accent-strong">
         <svg aria-hidden="true" class="h-6 w-6" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21 21-4.34-4.34" /><circle cx="11" cy="11" r="8" /></svg>
@@ -79,7 +79,7 @@
     {# No wrapper here: `#results` (search.html) is `role="list"` and already
        carries `space-y-4` itself, so each card — `role="listitem"` in
        components/parking_card.html — is a direct child of the list, not
-       nested inside an extra div (WP21 a11y pass). #}
+       nested inside an extra div. #}
     {% for item in results.items %}
       {% include "components/parking_card.html" %}
     {% endfor %}

@@ -324,6 +324,9 @@
   .z-10 {
     z-index: 10;
   }
+  .z-30 {
+    z-index: 30;
+  }
   .z-40 {
     z-index: 40;
   }
@@ -489,6 +492,9 @@
   .h-1\.5 {
     height: calc(var(--spacing) * 1.5);
   }
+  .h-2 {
+    height: calc(var(--spacing) * 2);
+  }
   .h-3 {
     height: calc(var(--spacing) * 3);
   }
@@ -546,6 +552,9 @@
   .h-full {
     height: 100%;
   }
+  .max-h-80 {
+    max-height: calc(var(--spacing) * 80);
+  }
   .max-h-\[90vh\] {
     max-height: 90vh;
   }
@@ -566,6 +575,9 @@
   }
   .w-1\.5 {
     width: calc(var(--spacing) * 1.5);
+  }
+  .w-2 {
+    width: calc(var(--spacing) * 2);
   }
   .w-3 {
     width: calc(var(--spacing) * 3);
@@ -833,6 +845,9 @@
   }
   .overflow-x-auto {
     overflow-x: auto;
+  }
+  .overflow-y-auto {
+    overflow-y: auto;
   }
   .rounded {
     border-radius: 0.25rem;
@@ -1354,9 +1369,6 @@
     --tw-tracking: var(--tracking-wide);
     letter-spacing: var(--tracking-wide);
   }
-  .\[text-wrap\:balance\] {
-    text-wrap: balance;
-  }
   .text-balance {
     text-wrap: balance;
   }
@@ -1573,6 +1585,9 @@
     }
     .hover\:bg-accent-dark:hover {
       background-color: var(--color-accent-dark);
+    }
+    .hover\:bg-accent-soft:hover {
+      background-color: var(--color-accent-soft);
     }
     .hover\:bg-bg:hover {
       background-color: var(--color-bg);
@@ -1910,9 +1925,6 @@
   }
   .\[\&_fieldset\]\:min-w-0 fieldset {
     min-width: 0px;
-  }
-  .\[\&_h2\]\:\[text-wrap\:balance\] h2 {
-    text-wrap: balance;
   }
   .\[\&_h2\]\:text-balance h2 {
     text-wrap: balance;

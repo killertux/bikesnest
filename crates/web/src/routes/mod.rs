@@ -38,7 +38,7 @@ use admin::{
     admin_audit, admin_privacy_request_fulfill, admin_privacy_requests, admin_role_post,
     admin_user_contributions, admin_user_restore, admin_user_suspend, admin_users,
 };
-use api::geocode_api;
+use api::{address_suggestions_api, geocode_api, resolve_address_suggestion_api};
 use auth::{
     account, account_email, account_email_post, account_password, account_password_post,
     account_public_name_post, auth_google, auth_google_callback, auth_google_fake_consent,
@@ -82,6 +82,11 @@ pub(crate) fn routes(state: &AppState) -> Router<AppState> {
     let mut router = Router::new()
         .route("/", get(home))
         .route("/search", get(search))
+        .route("/api/address-suggestions", get(address_suggestions_api))
+        .route(
+            "/api/address-suggestions/resolve",
+            get(resolve_address_suggestion_api),
+        )
         // Address → coordinates for the add/edit map picker. Signed-in and
         // verified only, and metered on the same per-IP geocode budget as
         // `/search`, because it reaches the same billable provider.
@@ -93,7 +98,7 @@ pub(crate) fn routes(state: &AppState) -> Router<AppState> {
         .route("/lang/{code}", get(set_lang))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
-        // --- Accounts & authentication (M2) ---
+        // --- Accounts and authentication ---
         .route("/register", get(register_page).post(register_post))
         .route("/login", get(login_page).post(login_post))
         .route("/logout", post(logout))
@@ -126,7 +131,7 @@ pub(crate) fn routes(state: &AppState) -> Router<AppState> {
             "/account/email",
             get(account_email).post(account_email_post),
         )
-        // --- M6 privacy & account lifecycle ---
+        // --- Privacy and account lifecycle ---
         .route("/privacy", get(privacy_page))
         .route("/terms", get(terms_page))
         .route("/cookies", get(cookies_page))
@@ -153,7 +158,7 @@ pub(crate) fn routes(state: &AppState) -> Router<AppState> {
             "/admin/privacy-requests/{id}/fulfill",
             post(admin_privacy_request_fulfill),
         )
-        // --- M3 community contributions ---
+        // --- Community contributions ---
         .route("/parking/new", get(parking_new_page).post(parking_new_post))
         .route(
             "/parking/{id}/edit",
@@ -172,7 +177,7 @@ pub(crate) fn routes(state: &AppState) -> Router<AppState> {
         .route("/account/contributions", get(account_contributions))
         .route("/admin/users", get(admin_users))
         .route("/admin/users/{id}/role", post(admin_role_post))
-        // --- M4 photos (upload → moderate → publish) ---
+        // --- Photos (upload → moderate → publish) ---
         .route(
             "/parking/{id}/photo",
             post(upload_photo).layer(DefaultBodyLimit::max(
@@ -196,7 +201,7 @@ pub(crate) fn routes(state: &AppState) -> Router<AppState> {
             "/moderation/photos/{kind}/{id}/restore",
             post(moderation_photo_restore),
         )
-        // --- M5 reports + moderation actions + audit viewer ---
+        // --- Reports, moderation actions and audit viewer ---
         .route("/reports", post(report_submit))
         .route("/moderation", get(moderation_dashboard))
         .route("/moderation/reports", get(moderation_reports))
@@ -244,7 +249,7 @@ pub(crate) fn routes(state: &AppState) -> Router<AppState> {
             get(admin_user_contributions),
         )
         .route("/admin/audit", get(admin_audit))
-        // Content-hashed assets (WP14): a more specific static segment
+        // Content-hashed assets: a more specific static segment
         // ("h") than the `/static/{*rest}` the `nest_service` below expands
         // to, so this route wins the match for any hashed URL. Validates the
         // hash against `state.assets` and answers with a long, immutable

@@ -1,4 +1,4 @@
-//! Authentication middleware + extractors (M2). Resolves the session cookie
+//! Authentication middleware and extractors. Resolves the session cookie
 //! into a principal, enforces CSRF on state-changing authenticated requests,
 //! and hands handlers an [`Auth`] principal.
 
@@ -65,10 +65,7 @@ impl Default for Auth {
             next: "/".to_string(),
             fragment: false,
             tr: Translator::new(Locale::PtBr),
-            map: MapConfig {
-                style_url: String::new(),
-                access_token: String::new(),
-            },
+            map: MapConfig::open_free_map(),
         }
     }
 }
@@ -150,7 +147,7 @@ impl Auth {
     }
 
     /// Returns the authenticated principal iff they are a moderator **or** an
-    /// admin (the M4 moderation queue grants both).
+    /// admin (the moderation queue grants both).
     #[allow(clippy::result_large_err)]
     pub fn require_moderator(&self) -> Result<&AuthenticatedUser, Response> {
         let user = self.require_user()?;

@@ -13,23 +13,19 @@
  * navigation that swaps in a fresh #pin-map leaves no stale handler holding a
  * map that is no longer on the page.
  *
- * CSP-safe: no inline script, no eval; the style URL/token arrive on <body>
- * data attributes exactly as search.js and details-map.js read them. */
+ * CSP-safe: no inline script or dynamic markup. */
 (function () {
   "use strict";
-
-  var bodyCfg = document.body ? document.body.dataset : {};
-  var STYLE_URL = bodyCfg.mapStyleUrl || "https://tiles.openfreemap.org/styles/liberty";
-  var ACCESS_TOKEN = bodyCfg.mapAccessToken || "";
 
   function num(value) {
     var n = parseFloat(value);
     return isFinite(n) ? n : null;
   }
 
-  function init() {
+  function initReady() {
     var el = document.getElementById("pin-map");
-    if (!el || !window.maplibregl || el.dataset.initialized) return;
+    var provider = window.BikesNestMapProvider;
+    if (!el || !provider || el.dataset.initialized) return;
     el.dataset.initialized = "1";
 
     var latInput = document.getElementById(el.dataset.latInput || "lat");
@@ -54,20 +50,20 @@
       centerLon = -49.2733;
     }
 
-    if (ACCESS_TOKEN) maplibregl.accessToken = ACCESS_TOKEN;
-    var map = new maplibregl.Map({
-      container: el,
-      style: STYLE_URL,
-      center: [centerLon, centerLat],
+    var map = provider.createMap(el, {
+      center: { lon: centerLon, lat: centerLat },
       zoom: picked ? 17 : 14,
+      navigation: true,
     });
-    map.addControl(new maplibregl.NavigationControl());
 
     var markerEl = document.createElement("div");
     markerEl.className = "marker marker-pin";
-    var marker = new maplibregl.Marker({ element: markerEl, draggable: true })
-      .setLngLat([centerLon, centerLat])
-      .addTo(map);
+    var marker = map.addMarker({
+      element: markerEl,
+      position: { lon: centerLon, lat: centerLat },
+      draggable: true,
+      onDragEnd: function (at) { publish(at.lat, at.lon); },
+    });
 
     function publish(lat, lon) {
       if (latInput) latInput.value = lat.toFixed(6);
@@ -80,13 +76,9 @@
       );
     }
 
-    marker.on("dragend", function () {
-      var at = marker.getLngLat();
-      publish(at.lat, at.lng);
-    });
-    map.on("click", function (e) {
-      marker.setLngLat(e.lngLat);
-      publish(e.lngLat.lat, e.lngLat.lng);
+    map.onClick(function (at) {
+      marker.setPosition(at);
+      publish(at.lat, at.lon);
     });
 
     el.addEventListener("bikesnest:pin-set", function (e) {
@@ -94,8 +86,16 @@
       var toLat = num(detail.lat);
       var toLon = num(detail.lon);
       if (toLat === null || toLon === null) return;
-      marker.setLngLat([toLon, toLat]);
-      map.jumpTo({ center: [toLon, toLat], zoom: 17 });
+      marker.setPosition({ lon: toLon, lat: toLat });
+      map.jumpTo({ center: { lon: toLon, lat: toLat }, zoom: 17 });
+    });
+  }
+
+  function init() {
+    var provider = window.BikesNestMapProvider;
+    if (!provider) return;
+    provider.ready().then(initReady).catch(function () {
+      /* Manual latitude/longitude fields remain available. */
     });
   }
 

@@ -1,4 +1,4 @@
-//! Real-PostgreSQL integration tests for the M3 community repositories.
+//! Real-PostgreSQL integration tests for the community repositories.
 //!
 //! The write repos create their own transactions on pool connections (they
 //! commit to the shared DB), so these tests use the **committed-fixture**
@@ -63,6 +63,16 @@ async fn cleanup_user(email: &str) {
         .execute(&pool().await)
         .await
         .unwrap();
+}
+
+async fn verify_user(user: UserId) {
+    sqlx::query(
+        "UPDATE users SET account_state = 'ACTIVE', email_verified_at = now() WHERE id = $1",
+    )
+    .bind(user.0)
+    .execute(&pool().await)
+    .await
+    .unwrap();
 }
 
 fn new_location() -> NewParkingLocation {
@@ -426,6 +436,7 @@ async fn edit_revision_snapshot_holds_the_row_after_state(tx: &mut bikesnest_tes
 async fn proposal_is_pending_with_no_live_change(tx: &mut bikesnest_test_support::TestTx) {
     let email = "c-proposal@test.dev";
     let user = fresh_user(tx, email).await;
+    verify_user(user).await;
     let repo = SqlxParkingContributionRepository::new(db().await);
     let id = repo
         .create(&new_location(), user, chrono::Utc::now())

@@ -1,6 +1,6 @@
-/* P2: map rendering + card↔marker sync (plain JS over the server-rendered
- * results). The server stays the source of truth: results arrive as HTML; this
- * file only mirrors them into markers (P2).
+/* Search map rendering + card↔marker sync over the server-rendered
+ * results. The server stays the source of truth: results arrive as HTML; this
+ * file only mirrors them into markers.
  *
  * Written to be idempotent because it runs again after every swap: whole-body
  * swaps (base.html sets `hx-boost:inherited` on <body>, so links and forms are
@@ -26,18 +26,19 @@
 (function () {
   "use strict";
 
-  /* The style URL and (Mapbox) access token come from the server via
-   * <body data-map-style-url / data-map-access-token>. Default: OpenFreeMap streets
-   * so the map still renders before MAP_STYLE_URL is configured. */
-  var bodyCfg = document.body ? document.body.dataset : {};
-  var STYLE_URL = bodyCfg.mapStyleUrl || "https://tiles.openfreemap.org/styles/liberty";
-  var ACCESS_TOKEN = bodyCfg.mapAccessToken || "";
-  var CENTER_FALLBACK = [-49.2733, -25.4284]; // Curitiba [lon, lat]
+  var CENTER_FALLBACK = { lon: -49.2733, lat: -25.4284 };
 
   // Per-page-view state, keyed off the #map element so a fresh map (after a
   // boosted navigation swaps in a new #map) starts clean.
   function state(mapEl) {
-    if (!mapEl._bn) mapEl._bn = { map: null, markers: {}, clusters: [], dest: null, ignoreMove: 0 };
+    if (!mapEl._bn) mapEl._bn = {
+      map: null,
+      markers: {},
+      clusters: [],
+      dest: null,
+      ignoreMove: 0,
+      initializing: false,
+    };
     return mapEl._bn;
   }
 
@@ -165,16 +166,20 @@
       var destEl = document.createElement("div");
       destEl.className = "marker marker-destination";
       destEl.title = data.origin.label || labels.destination;
-      st.dest = new maplibregl.Marker(destEl)
-        .setLngLat([data.origin.lon, data.origin.lat])
-        .addTo(map);
+      st.dest = map.addMarker({
+        element: destEl,
+        position: { lon: data.origin.lon, lat: data.origin.lat },
+      });
     }
     (data.items || []).forEach(function (item) {
       var el = resultMarkerEl(item, labels);
-      var marker = new maplibregl.Marker({ element: el })
-        .setLngLat([item.lon, item.lat])
-        .setPopup(new maplibregl.Popup({ offset: 16, closeButton: true }).setDOMContent(popupContent(item, labels)))
-        .addTo(map);
+      var marker = map.addMarker({
+        element: el,
+        position: { lon: item.lon, lat: item.lat },
+        // The adapters pass this DOM node to setDOMContent, preserving the
+        // text-only construction above across every map provider.
+        popup: popupContent(item, labels),
+      });
       el.addEventListener("click", function () {
         select(item.id);
       });
@@ -188,11 +193,15 @@
     });
     (data.clusters || []).forEach(function (cluster) {
       var el = clusterMarkerEl(cluster, labels);
-      var marker = new maplibregl.Marker({ element: el })
-        .setLngLat([cluster.lon, cluster.lat])
-        .addTo(map);
+      var marker = map.addMarker({
+        element: el,
+        position: { lon: cluster.lon, lat: cluster.lat },
+      });
       function zoomIn() {
-        map.easeTo({ center: [cluster.lon, cluster.lat], zoom: map.getZoom() + 2 });
+        map.easeTo({
+          center: { lon: cluster.lon, lat: cluster.lat },
+          zoom: map.getZoom() + 2,
+        });
       }
       el.addEventListener("click", zoomIn);
       el.addEventListener("keydown", function (e) {
@@ -208,22 +217,24 @@
    * "search this area" button and the browse form's hidden `bbox`. */
   function publishBounds(mapEl, map) {
     var b = map.getBounds();
+    if (!b) return;
     var bbox = [
-      b.getWest().toFixed(5),
-      b.getSouth().toFixed(5),
-      b.getEast().toFixed(5),
-      b.getNorth().toFixed(5),
+      b.west.toFixed(5),
+      b.south.toFixed(5),
+      b.east.toFixed(5),
+      b.north.toFixed(5),
     ].join(",");
     mapEl.dispatchEvent(
       new CustomEvent("bikesnest:map-moved", { bubbles: true, detail: { bbox: bbox } })
     );
   }
 
-  function init() {
+  function initReady() {
     var data = readData();
     if (!data) return;
     var mapEl = document.getElementById("map");
-    if (!mapEl || !window.maplibregl) return;
+    var provider = window.BikesNestMapProvider;
+    if (!mapEl || !provider) return;
 
     var st = state(mapEl);
     var labels = readLabels(mapEl);
@@ -236,20 +247,17 @@
     var center = CENTER_FALLBACK;
     var zoom = 13;
     if (data.origin && data.origin.lat != null) {
-      center = [data.origin.lon, data.origin.lat];
+      center = { lon: data.origin.lon, lat: data.origin.lat };
       zoom = 14;
     } else if (data.items && data.items.length) {
-      center = [data.items[0].lon, data.items[0].lat];
+      center = { lon: data.items[0].lon, lat: data.items[0].lat };
     }
     // Browse mode: the box the server answered for is the view, whatever is
     // inside it.
     var bbox = data.bbox && data.bbox.length === 4 ? data.bbox : null;
 
     if (!st.map) {
-      if (ACCESS_TOKEN) maplibregl.accessToken = ACCESS_TOKEN;
-      st.map = new maplibregl.Map({ container: mapEl, style: STYLE_URL, center: center, zoom: zoom });
-      st.map.addControl(new maplibregl.NavigationControl());
-      st.map.addControl(new maplibregl.GeolocateControl());
+      st.map = provider.createMap(mapEl, { center: center, zoom: zoom, navigation: true });
       var recenter = document.getElementById("recenter");
       if (recenter) {
         recenter.addEventListener("click", function () {
@@ -260,24 +268,24 @@
       // Only *the viewer's* moves offer a new area to search: the camera moves
       // this file makes itself (framing a fresh result set, recentring) are
       // swallowed, or the button would appear on every page load.
-      st.map.on("moveend", function () {
+      st.map.onMoveEnd(function () {
         if (st.ignoreMove > 0) {
           st.ignoreMove--;
           return;
         }
         publishBounds(mapEl, st.map);
       });
-      st.map.on("load", function () {
+      st.map.onLoad(function () {
         renderMarkers(st.map, st, readData() || data, labels);
+        if (bbox) {
+          st.ignoreMove++;
+          st.map.fitBounds(bbox, { animate: false, padding: 24 });
+        }
       });
-      if (bbox) {
-        st.ignoreMove++;
-        st.map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { animate: false, padding: 24 });
-      }
     } else {
       st.ignoreMove++;
       if (bbox) {
-        st.map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { animate: false, padding: 24 });
+        st.map.fitBounds(bbox, { animate: false, padding: 24 });
       } else {
         st.map.jumpTo({ center: center, zoom: zoom });
       }
@@ -290,6 +298,27 @@
       var n = data.total != null ? data.total : (data.items || []).length;
       countEl.textContent = labels.onMap.replace("{n}", n);
     }
+  }
+
+  function init() {
+    var mapEl = document.getElementById("map");
+    var provider = window.BikesNestMapProvider;
+    if (!mapEl || !provider) return;
+    var st = state(mapEl);
+    observe(mapEl);
+    if (!isVisible(mapEl)) return;
+    if (st.map) {
+      initReady();
+      return;
+    }
+    if (st.initializing) return;
+    st.initializing = true;
+    provider.ready().then(function () {
+      st.initializing = false;
+      initReady();
+    }).catch(function () {
+      st.initializing = false;
+    });
   }
 
   /* Belt and braces for the reveal: a container that gains a size either has a

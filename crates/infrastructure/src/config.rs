@@ -149,11 +149,13 @@ pub enum EmailConfig {
     },
 }
 
-/// Geocoding backend. `Mapbox` cannot exist without its token.
+/// Server-side address search backend. Real providers cannot exist without
+/// their server credential.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GeocoderConfig {
     Fake,
     Mapbox { token: String },
+    Google { api_key: String },
 }
 
 /// Rate-limiter store. `InMemory` is per-process and therefore development-only.
@@ -221,16 +223,39 @@ pub struct SecurityConfig {
     pub media_hosts: Vec<String>,
 }
 
-/// Client-side map configuration. The style URL defaults to OpenFreeMap's
-/// street tiles; a Mapbox style also needs its public access token embedded
-/// client-side (only when the style is Mapbox-based).
+/// Client-side map configuration for the development MapLibre basemap,
+/// Mapbox GL JS, or Google Maps JavaScript API.
 pub const DEFAULT_MAP_STYLE_URL: &str = "https://tiles.openfreemap.org/styles/liberty";
+pub const DEFAULT_MAPBOX_STYLE_URL: &str = "mapbox://styles/mapbox/streets-v12";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MapConfig {
-    pub style_url: String,
-    /// Public Mapbox token for the style/tiles; empty for a non-Mapbox style.
-    pub access_token: String,
+pub enum MapConfig {
+    MapLibre {
+        style_url: String,
+        /// Public Mapbox token for the style/tiles; empty for OpenFreeMap.
+        access_token: String,
+    },
+    Mapbox {
+        style_url: String,
+        /// Browser-visible public token restricted to the site's origins.
+        access_token: String,
+    },
+    Google {
+        /// Browser-visible key, restricted to the site's HTTP referrers and
+        /// the Maps JavaScript API in Google Cloud.
+        browser_api_key: String,
+        /// Required by Google's AdvancedMarkerElement.
+        map_id: String,
+    },
+}
+
+impl MapConfig {
+    pub fn open_free_map() -> Self {
+        Self::MapLibre {
+            style_url: DEFAULT_MAP_STYLE_URL.to_string(),
+            access_token: String::new(),
+        }
+    }
 }
 
 /// Deterministic dev identity for the Google sign-in stub.
@@ -487,7 +512,7 @@ impl Config {
             geocode: geocode_limits(&env),
             storage: s3_config(&env, dev),
             security: security_config(&env),
-            map: map_config(&env),
+            map: map_config(&env)?,
             fake_oauth: FakeOAuthConfig {
                 email: env
                     .string("FAKE_OAUTH_EMAIL")
@@ -593,11 +618,22 @@ impl Config {
         // Geocoding: the fake fabricates coordinates for unknown queries.
         match &self.geocoder {
             GeocoderConfig::Mapbox { token } if token.is_empty() => {
-                errs.push("MAPBOX_ACCESS_TOKEN must be set when GEOCODER=mapbox".to_string());
+                errs.push(
+                    "MAPBOX_GEOCODING_ACCESS_TOKEN must be set for Mapbox location search"
+                        .to_string(),
+                );
             }
             GeocoderConfig::Mapbox { .. } => {}
+            GeocoderConfig::Google { api_key } if api_key.is_empty() => {
+                errs.push(
+                    "GOOGLE_MAPS_SERVER_API_KEY must be set for Google location search"
+                        .to_string(),
+                );
+            }
+            GeocoderConfig::Google { .. } => {}
             GeocoderConfig::Fake => errs.push(
-                "GEOCODER must be mapbox (the fake geocoder fabricates coordinates)".to_string(),
+                "LOCATION_PROVIDER must be mapbox or google (the fake geocoder fabricates coordinates)"
+                    .to_string(),
             ),
         }
 
@@ -684,10 +720,7 @@ impl Config {
                 geocode_hosts: Vec::new(),
                 media_hosts: vec![TEST_MEDIA_ORIGIN.to_string()],
             },
-            map: MapConfig {
-                style_url: DEFAULT_MAP_STYLE_URL.to_string(),
-                access_token: String::new(),
-            },
+            map: MapConfig::open_free_map(),
             fake_oauth: FakeOAuthConfig::default(),
             export_ttl_hours: 24,
             inactive_account_anonymize_after_days: 0,
@@ -769,7 +802,7 @@ fn email_config(env: &EnvSource<'_>, dev: bool) -> Result<EmailConfig, ConfigErr
             // Only development writes the readable outbox to disk. `MEDIA_ROOT`
             // is now *only* this directory: media itself lives in object
             // storage, and the retention sweep lists the bucket rather than a
-            // local tree (WP16).
+            // local tree.
             outbox_root: dev.then(|| {
                 env.string("MEDIA_ROOT")
                     .map(PathBuf::from)
@@ -795,22 +828,35 @@ fn email_config(env: &EnvSource<'_>, dev: bool) -> Result<EmailConfig, ConfigErr
     }
 }
 
-/// `GEOCODER` (`mapbox` | `fake`; unset = `fake`). `mapbox` without a token is
-/// an error rather than a fake that invents coordinates.
+/// The coherent `LOCATION_PROVIDER` profile wins over the legacy `GEOCODER`
+/// selector. Keeping the legacy variable readable avoids breaking existing
+/// deployments while new deployments can switch geocoding and maps together.
 fn geocoder_config(env: &EnvSource<'_>) -> Result<GeocoderConfig, ConfigError> {
-    match env
-        .string("GEOCODER")
+    let from_profile = env.string("LOCATION_PROVIDER");
+    let key = if from_profile.is_some() {
+        "LOCATION_PROVIDER"
+    } else {
+        "GEOCODER"
+    };
+    match from_profile
+        .or_else(|| env.string("GEOCODER"))
         .unwrap_or_else(|| "fake".to_string())
         .to_ascii_lowercase()
         .as_str()
     {
         "fake" => Ok(GeocoderConfig::Fake),
         "mapbox" => Ok(GeocoderConfig::Mapbox {
-            token: env.require("MAPBOX_ACCESS_TOKEN")?,
+            token: env
+                .string("MAPBOX_GEOCODING_ACCESS_TOKEN")
+                .or_else(|| env.string("MAPBOX_ACCESS_TOKEN"))
+                .ok_or(ConfigError::MissingEnv("MAPBOX_GEOCODING_ACCESS_TOKEN"))?,
+        }),
+        "google" => Ok(GeocoderConfig::Google {
+            api_key: env.require("GOOGLE_MAPS_SERVER_API_KEY")?,
         }),
         other => Err(ConfigError::invalid(
-            "GEOCODER",
-            format!("unknown provider {other:?}; expected mapbox or fake"),
+            key,
+            format!("unknown provider {other:?}; expected fake, mapbox or google"),
         )),
     }
 }
@@ -904,21 +950,41 @@ fn resolve_map_config(
         // Non-Mapbox style (e.g. OpenFreeMap) needs no token; keep it off the page.
         String::new()
     };
-    MapConfig {
+    MapConfig::MapLibre {
         style_url,
         access_token,
     }
 }
 
-/// `MAP_STYLE_URL` (default OpenFreeMap streets), plus the Mapbox access token
-/// (`MAPBOX_MAP_ACCESS_TOKEN`, or the geocoder's `MAPBOX_ACCESS_TOKEN` as a
-/// fallback) when the style is Mapbox-based.
-fn map_config(env: &EnvSource<'_>) -> MapConfig {
-    resolve_map_config(
-        env.string("MAP_STYLE_URL"),
-        env.string("MAPBOX_MAP_ACCESS_TOKEN"),
-        env.string("MAPBOX_ACCESS_TOKEN"),
-    )
+/// Map half of the location-provider profile. Without `LOCATION_PROVIDER`,
+/// preserve the existing `MAP_STYLE_URL`/MapLibre behavior.
+fn map_config(env: &EnvSource<'_>) -> Result<MapConfig, ConfigError> {
+    match env
+        .string("LOCATION_PROVIDER")
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("google") => Ok(MapConfig::Google {
+            browser_api_key: env.require("GOOGLE_MAPS_BROWSER_API_KEY")?,
+            map_id: env.require("GOOGLE_MAP_ID")?,
+        }),
+        Some("mapbox") => Ok(MapConfig::Mapbox {
+            style_url: env
+                .string("MAPBOX_STYLE_URL")
+                .unwrap_or_else(|| DEFAULT_MAPBOX_STYLE_URL.to_string()),
+            access_token: env.require("MAPBOX_MAP_ACCESS_TOKEN")?,
+        }),
+        Some("fake") => Ok(MapConfig::open_free_map()),
+        Some(other) => Err(ConfigError::invalid(
+            "LOCATION_PROVIDER",
+            format!("unknown provider {other:?}; expected fake, mapbox or google"),
+        )),
+        None => Ok(resolve_map_config(
+            env.string("MAP_STYLE_URL"),
+            env.string("MAPBOX_MAP_ACCESS_TOKEN"),
+            env.string("MAPBOX_ACCESS_TOKEN"),
+        )),
+    }
 }
 
 /// Per-IP geocode budget, from env with the defaults above.
@@ -933,7 +999,7 @@ fn geocode_limits(env: &EnvSource<'_>) -> GeocodeLimits {
     }
 }
 
-/// Recommendation weights, from env with the M1 defaults.
+/// Recommendation weights from environment configuration.
 fn recommendation_config(env: &EnvSource<'_>) -> RecommendationConfig {
     let rec = DEFAULT_RECOMMENDATION_CONFIG;
     RecommendationConfig {
@@ -947,7 +1013,7 @@ fn recommendation_config(env: &EnvSource<'_>) -> RecommendationConfig {
     }
 }
 
-/// Freshness thresholds, from env with the M1 defaults.
+/// Freshness thresholds from environment configuration.
 fn freshness_config(env: &EnvSource<'_>) -> FreshnessConfig {
     let d = bikesnest_domain::DEFAULT_THRESHOLDS;
     FreshnessConfig {
@@ -960,7 +1026,7 @@ fn freshness_config(env: &EnvSource<'_>) -> FreshnessConfig {
     }
 }
 
-/// Photo pipeline limits, from env with the M4 defaults.
+/// Photo pipeline limits from environment configuration.
 fn photo_config(env: &EnvSource<'_>) -> PhotoConfig {
     PhotoConfig {
         max_bytes: env
@@ -1160,7 +1226,7 @@ mod tests {
             "S3_ACCESS_KEY_ID",
             "S3_SECRET_ACCESS_KEY",
             "EMAIL_PROVIDER",
-            "GEOCODER",
+            "LOCATION_PROVIDER",
             "VALKEY_URL",
             "TLS_ON",
             "CSP_MEDIA_HOSTS",
@@ -1277,7 +1343,95 @@ mod tests {
             .expect_err("mapbox without a token must not fall back to the fake");
         assert!(matches!(
             err,
-            ConfigError::MissingEnv("MAPBOX_ACCESS_TOKEN")
+            ConfigError::MissingEnv("MAPBOX_GEOCODING_ACCESS_TOKEN")
+        ));
+    }
+
+    #[test]
+    fn google_profile_requires_server_and_browser_credentials() {
+        let err = Config::from_lookup(&lookup(&[DB, ("LOCATION_PROVIDER", "google")]))
+            .expect_err("Google needs its server key");
+        assert!(matches!(
+            err,
+            ConfigError::MissingEnv("GOOGLE_MAPS_SERVER_API_KEY")
+        ));
+
+        let err = Config::from_lookup(&lookup(&[
+            DB,
+            ("LOCATION_PROVIDER", "google"),
+            ("GOOGLE_MAPS_SERVER_API_KEY", "server-key"),
+        ]))
+        .expect_err("Google needs its browser key");
+        assert!(matches!(
+            err,
+            ConfigError::MissingEnv("GOOGLE_MAPS_BROWSER_API_KEY")
+        ));
+
+        let err = Config::from_lookup(&lookup(&[
+            DB,
+            ("LOCATION_PROVIDER", "google"),
+            ("GOOGLE_MAPS_SERVER_API_KEY", "server-key"),
+            ("GOOGLE_MAPS_BROWSER_API_KEY", "browser-key"),
+        ]))
+        .expect_err("Google advanced markers need a map ID");
+        assert!(matches!(err, ConfigError::MissingEnv("GOOGLE_MAP_ID")));
+    }
+
+    #[test]
+    fn google_profile_selects_both_provider_halves() {
+        let cfg = config(&[
+            DB,
+            ("LOCATION_PROVIDER", "google"),
+            ("GOOGLE_MAPS_SERVER_API_KEY", "server-key"),
+            ("GOOGLE_MAPS_BROWSER_API_KEY", "browser-key"),
+            ("GOOGLE_MAP_ID", "map-id"),
+        ]);
+        assert_eq!(
+            cfg.geocoder,
+            GeocoderConfig::Google {
+                api_key: "server-key".to_string()
+            }
+        );
+        assert_eq!(
+            cfg.map,
+            MapConfig::Google {
+                browser_api_key: "browser-key".to_string(),
+                map_id: "map-id".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn mapbox_profile_selects_geocoder_and_map_style() {
+        let cfg = config(&[
+            DB,
+            ("LOCATION_PROVIDER", "mapbox"),
+            ("MAPBOX_GEOCODING_ACCESS_TOKEN", "geo-key"),
+            ("MAPBOX_MAP_ACCESS_TOKEN", "map-key"),
+            ("MAPBOX_STYLE_URL", "mapbox://styles/example/streets"),
+        ]);
+        assert!(matches!(
+            cfg.geocoder,
+            GeocoderConfig::Mapbox { token } if token == "geo-key"
+        ));
+        assert!(matches!(
+            cfg.map,
+            MapConfig::Mapbox { style_url, access_token }
+                if style_url == "mapbox://styles/example/streets" && access_token == "map-key"
+        ));
+    }
+
+    #[test]
+    fn mapbox_profile_requires_a_separate_browser_token() {
+        let err = Config::from_lookup(&lookup(&[
+            DB,
+            ("LOCATION_PROVIDER", "mapbox"),
+            ("MAPBOX_GEOCODING_ACCESS_TOKEN", "geo-key"),
+        ]))
+        .expect_err("Mapbox GL needs a public browser token");
+        assert!(matches!(
+            err,
+            ConfigError::MissingEnv("MAPBOX_MAP_ACCESS_TOKEN")
         ));
     }
 
@@ -1357,7 +1511,7 @@ mod tests {
     // --- tuning knobs (defaults must not drift) -----------------------------
 
     #[test]
-    fn recommendation_defaults_match_m1() {
+    fn recommendation_defaults_match_expected_values() {
         let got = config(&[DB]).recommendation;
         let exp = DEFAULT_RECOMMENDATION_CONFIG;
         assert_eq!(got.w_distance, exp.w_distance);
@@ -1368,7 +1522,7 @@ mod tests {
     }
 
     #[test]
-    fn freshness_defaults_match_m1() {
+    fn freshness_defaults_match_expected_values() {
         assert_eq!(
             config(&[DB]).freshness.thresholds,
             bikesnest_domain::DEFAULT_THRESHOLDS
@@ -1376,7 +1530,7 @@ mod tests {
     }
 
     #[test]
-    fn photo_defaults_match_m4() {
+    fn photo_defaults_match_expected_values() {
         let got = config(&[DB]).photo;
         assert_eq!(got.max_bytes, bikesnest_domain::MAX_PHOTO_BYTES);
         assert_eq!(got.max_megapixels, bikesnest_domain::MAX_PHOTO_MEGAPIXELS);
@@ -1461,10 +1615,16 @@ mod tests {
     #[test]
     fn map_style_defaults_to_streets_with_matching_csp_origin() {
         let c = resolve_map_config(None, None, None);
-        assert_eq!(c.style_url, DEFAULT_MAP_STYLE_URL);
-        assert_eq!(c.access_token, "");
-        assert!(c.style_url.starts_with(&format!("{DEFAULT_TILE_HOST}/")));
-        assert_eq!(c.style_url, "https://tiles.openfreemap.org/styles/liberty");
+        let MapConfig::MapLibre {
+            style_url,
+            access_token,
+        } = c
+        else {
+            panic!("default map must use MapLibre");
+        };
+        assert_eq!(style_url, DEFAULT_MAP_STYLE_URL);
+        assert_eq!(access_token, "");
+        assert!(style_url.starts_with(&format!("{DEFAULT_TILE_HOST}/")));
     }
 
     #[test]
@@ -1475,14 +1635,20 @@ mod tests {
             Some("geo-tok".to_string()),
         );
         // The dedicated map token wins; the geocoder token is only a fallback.
-        assert_eq!(c.access_token, "public-map-tok");
+        assert!(matches!(
+            c,
+            MapConfig::MapLibre { access_token, .. } if access_token == "public-map-tok"
+        ));
 
         let fallback = resolve_map_config(
             Some("https://api.mapbox.com/styles/v1/u/s".to_string()),
             None,
             Some("geo-tok".to_string()),
         );
-        assert_eq!(fallback.access_token, "geo-tok");
+        assert!(matches!(
+            fallback,
+            MapConfig::MapLibre { access_token, .. } if access_token == "geo-tok"
+        ));
     }
 
     #[test]
@@ -1494,7 +1660,10 @@ mod tests {
             None,
             Some("geo-tok".to_string()),
         );
-        assert_eq!(c.access_token, "");
+        assert!(matches!(
+            c,
+            MapConfig::MapLibre { access_token, .. } if access_token.is_empty()
+        ));
         assert!(!is_mapbox_style("https://tiles.example/style.json"));
         assert!(is_mapbox_style("mapbox://styles/u/s"));
         assert!(is_mapbox_style("https://api.mapbox.com/styles/v1/u/s"));

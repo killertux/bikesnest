@@ -50,15 +50,16 @@ All knobs are documented in `.env.example`; production sets them as real secrets
 | `JOBS_POLL_INTERVAL_MS` / `JOBS_BATCH_SIZE` / `JOBS_LEASE_TTL_MS` | queue poll cadence, batch size, and lease length (defaults 5000 / 4 / 600000) |
 | `JOBS_MAX_ATTEMPTS` / `JOBS_BACKOFF_BASE_MS` | retry budget (default 5) and exponential-backoff base (default 2000) before dead-letter |
 | `JOBS_HISTORY_RETENTION_DAYS` | `jobs.gc` deletes `succeeded`/`failed` rows older than this (default 7) |
-| `CSP_TILE_HOSTS` / `CSP_GEOCODE_HOSTS` | origins allowed by the strict CSP for map tiles / geocoding |
+| `CSP_TILE_HOSTS` / `CSP_GEOCODE_HOSTS` | extra origins allowed by the strict CSP for MapLibre tiles / browser geocoding. Required Mapbox and Google Maps origins are added automatically for their profiles |
 | `CSP_MEDIA_HOSTS` | object-storage origin(s) allowed in the CSP `img-src` that parking photos are served from as direct pre-signed URLs (dev: `http://localhost:9000`; AWS: `https://<bucket>.s3.<region>.amazonaws.com`) |
 | `APP_ENV` | `production` → JSON structured logs (machine-parseable, forward to a log aggregator) **and the startup validation described below** |
 | `STATIC_ROOT` | directory `/static` is served from; the image sets `/app/web/static`. Unset falls back to `web/static` beside the working directory, then to the compile-time path |
-| `GEOCODER` | **Geocoder:** `mapbox` \| `fake` (default `fake`). `mapbox` sends the query to Mapbox server-side |
-| `MAPBOX_ACCESS_TOKEN` | Mapbox token; required when `GEOCODER=mapbox` (a missing token is a startup error, never a fallback to `fake`) |
-| `RATE_GEOCODE_PER_IP` / `RATE_GEOCODE_WINDOW_SECS` | per-IP budget for **billable** geocodes on `/search` (default 60 per 15 min). Only cache **misses** count; over the budget `/search` answers 429 with a notice instead of calling the provider |
-| `MAP_STYLE_URL` | **Basemap:** style URL; default MapLibre demo tiles |
-| `MAPBOX_MAP_ACCESS_TOKEN` | **Basemap** public Mapbox token (client-side); falls back to `MAPBOX_ACCESS_TOKEN` if unset; only loaded when the style is Mapbox-based |
+| `LOCATION_PROVIDER` | **Location stack:** `google` \| `mapbox` \| `fake` (default `fake`). One value selects direct geocoding, autocomplete, suggestion resolution, and map rendering |
+| `MAPBOX_GEOCODING_ACCESS_TOKEN` | server-side Mapbox geocoding token; required by the Mapbox profile |
+| `MAPBOX_MAP_ACCESS_TOKEN` / `MAPBOX_STYLE_URL` | URL-restricted browser token and Mapbox GL style for the Mapbox profile |
+| `GOOGLE_MAPS_SERVER_API_KEY` | server key for Geocoding API and Places API (New); required by the Google profile |
+| `GOOGLE_MAPS_BROWSER_API_KEY` / `GOOGLE_MAP_ID` | HTTP-referrer-restricted Maps JavaScript API key and cloud map ID; required by the Google profile |
+| `RATE_GEOCODE_PER_IP` / `RATE_GEOCODE_WINDOW_SECS` | shared per-IP budget for provider-backed direct searches, autocomplete, and place resolution (default 60 per 15 min); over budget the endpoint answers 429 before calling the provider |
 | `EMAIL_PROVIDER` | `smtp` or `resend` in production (not `fake`) |
 | `SMTP_*` / `RESEND_API_KEY` / `RESEND_FROM` | the chosen email backend |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` | `seed-admin` bootstrap (run once) |
@@ -83,8 +84,8 @@ problem on stderr) unless all of the following hold:
   (`minioadmin`).
 - `EMAIL_PROVIDER` is `smtp` or `resend`, with its credentials present. The
   `fake` provider discards every message, so production never runs on it.
-- `GEOCODER=mapbox` with `MAPBOX_ACCESS_TOKEN`. The fake geocoder fabricates
-  coordinates for unknown queries.
+- `LOCATION_PROVIDER=mapbox` or `google`, with that profile's credentials. The
+  fake geocoder fabricates coordinates for unknown queries.
 - `VALKEY_URL` or `VALKEY_CLUSTER_URLS` is set. The in-memory limiter is
   per-process, so N replicas would multiply every rate limit by N.
 - `TLS_ON=true`, so `Strict-Transport-Security` is emitted.
@@ -198,40 +199,33 @@ letting the later transactional migration collide with it.
 
 ## 5. Providers
 
-The map/tile, geocoder, email, OAuth and object-storage integrations
-are selected at wiring time from environment variables; the dev fakes that
-remain (Google OAuth) are documented below and must be replaced before launch.
+The map, geocoder, email, OAuth, and object-storage integrations are selected at
+wiring time from environment variables. The Google OAuth development fake is
+documented below and must be replaced before enabling sign-in in production.
 
-**Geocoder.** Selectable at wiring time with `GEOCODER`
-(`mapbox` | `fake`, default `fake`):
+**Location stack.** `LOCATION_PROVIDER` selects all address and map behavior:
 
-- `fake` — deterministic dev geocoder (landmark table + hashed jitter).
-- `mapbox` — real `MapboxGeocoder` calling the Mapbox Geocoding API
-  (hosted, OSM-derived). Requires `MAPBOX_ACCESS_TOKEN`; without it the
-  process refuses to start rather than falling back to `fake`.
+- `fake` — deterministic development geocoder plus MapLibre/OpenFreeMap.
+- `mapbox` — `MapboxGeocoder` provides direct search and up to ten ranked
+  autocomplete results. Mapbox GL JS renders `MAPBOX_STYLE_URL`; use separate
+  least-privilege keys for server geocoding and browser rendering.
+- `google` — `GoogleGeocoder` uses Geocoding API, Places Autocomplete (New),
+  and Place Details. The browser uses Maps JavaScript API with advanced markers.
+  Autocomplete predictions and the selected Place Details request share a
+  random session token. Google requires a browser key, a server key, and a map
+  ID; absence of any one is a startup error.
 
-  **Privacy boundary:** the query is sent **server-side** with only the free-text
-  destination — no account identity, cookie, or client IP crosses to Mapbox
-  (see `docs/provider-transfer-inventory.md`). A Mapbox error is **graceful**: the
-  search page shows a "location service unavailable" message rather than a 500.
+The hosted geocoder sees the typed address and, for Google autocomplete, the
+random session token. It receives no BikesNest account identity, cookie, or
+direct connection from the browser. The Google map renderer receives normal
+browser request metadata and the viewed map area. See
+`docs/provider-transfer-inventory.md` before selecting either hosted profile.
 
-  **Cost control.** Two things bound what a hosted geocoder can be billed for.
-  Resolved destinations are cached in-process for 24 h (bounded at ~10k
-  queries), which covers the common case of the same handful of destinations
-  being searched repeatedly — including the home page, which now passes fixed
-  coordinates for its featured strip instead of geocoding a constant string on
-  every render. Searches that *miss* that cache are metered per client IP
-  (`RATE_GEOCODE_PER_IP` / `RATE_GEOCODE_WINDOW_SECS`, default 60 per 15 min);
-  over the budget `/search` answers 429 with a "try again in a few minutes"
-  notice and calls nobody. Cache hits and searches that carry coordinates are
-  never metered, because they cost nothing. The cache is per instance: a shared
-  ValKey tier (the rate limiter already talks to one) would let replicas share
-  the savings and survive restarts — a worthwhile follow-up, not a
-  correctness gap.
-  Terms of service, attribution, rate limits and the **provider contract / DPA /
-  international-transfer review** apply —
-  Mapbox is a paid hosted SaaS (free tier ≈100k geocode/mo); self-hosted Photon
-  (OSM) is the no-cost, no-external-transfer alternative if preferred.
+Hosted results are kept out of the generic in-process cache so provider storage
+terms are respected. `RATE_GEOCODE_PER_IP` and `RATE_GEOCODE_WINDOW_SECS` bound
+direct searches, autocomplete, and selection resolution before an external call.
+Coordinates already submitted by the browser skip direct geocoding. Provider
+errors render the localized location-service unavailable state.
 
 **Object storage.** Media is stored in an S3-compatible bucket
 (MinIO in dev, AWS/S3/R2/B2 in prod; `S3_*` env) and served via **direct S3
@@ -248,17 +242,9 @@ production set `EMAIL_PROVIDER=resend` + `RESEND_API_KEY`/`RESEND_FROM`, or
 `smtp` + `SMTP_*`. Only the production relay/ESP credentials remain (ops).
 Delivery itself goes through the background job queue described below.
 
-**Other providers (tiles, Google OAuth) still use dev impls —**
-**tiles are now configurable**:
-
-- **Tiles / basemap.** `MAP_STYLE_URL` (default MapLibre demo tiles) reaches the
-  browser via `<body data-*>` (CSP-safe — no inline script) and is read by
-  `search.js` / `details-map.js`. For production set a real basemap: a Mapbox
-  style (`mapbox://styles/<user>/<style>` + a public `MAPBOX_MAP_ACCESS_TOKEN`,
-  or the HTTPS styles URL), or a self-hosted vector style (Protomaps PMTiles /
-  OpenFreeMap — free, no per-request cost, no external transfer). Attribution is
-  rendered by MapLibre's attribution control; a hosted provider's ToS /
-  attribution, usage limits, and DPA requirements still apply.
+**Google OAuth still uses a development implementation.** It remains disabled
+in production independently of Google Maps Platform; the two use separate
+configuration and credentials.
 
 
 ## 5b. Rate limiter (ValKey)
@@ -293,7 +279,7 @@ all slots — portable on Docker Desktop for Mac; see the file header for a
 multi-node variant).
 
 
-## 5c. Background jobs (M9)
+## 5c. Background jobs
 
 The app ships a **pure-PostgreSQL job queue** — no broker. A `background_job`
 table stores durable one-shot + recurring work; an **in-process worker task**

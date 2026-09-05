@@ -14,7 +14,7 @@ We do not use local storage (*localStorage*) or other tracking technologies.
 
 ## Third-party cookies
 
-We do not let third parties set cookies on BikesNest. When the map is displayed, your browser loads map tiles directly from the map provider; that request carries your IP address to the provider, but it does not set cookies through our site. See "Who we share data with" in the [Privacy Policy](/privacy).
+BikesNest does not use third-party cookies for advertising or tracking. When the map is displayed, your browser contacts the selected map provider directly; that request carries your IP address, and the provider handles its own storage or cookies under its privacy policy. See "Who we share data with" in the [Privacy Policy](/privacy).
 
 ## How to control cookies
 

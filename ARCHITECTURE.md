@@ -6,8 +6,9 @@ How BikesNest is put together. Written for both humans and coding agents — the
 ## Overview
 
 BikesNest is a server-rendered Rust web application: axum serves HTML rendered
-from Askama templates, with htmx swapping fragments and Alpine/MapLibre
-handling client-side behavior. All business logic lives in a framework-free
+from Askama templates, with htmx swapping fragments and Alpine plus a selected
+Google Maps or MapLibre adapter handling client-side behavior. All business
+logic lives in a framework-free
 core (`domain` + `application`); PostgreSQL/PostGIS is the source of truth.
 Everything external (geocoding, email, object storage, OAuth, rate limiting) is
 hidden behind a port so it can be replaced by a different implementation
@@ -19,7 +20,7 @@ browser ──> reverse proxy / TLS ──> axum (web) ──> application servi
                                           v                                  v
                                     Askama templates                infrastructure impls
                                                                    (sqlx, S3, SMTP, ValKey,
-                                                                    Mapbox, image processor)
+                                                                    Google/Mapbox, image processor)
                                                                              │
                                                                              v
                                                                   PostgreSQL/PostGIS + object storage
@@ -47,7 +48,7 @@ browser ──> reverse proxy / TLS ──> axum (web) ──> application servi
 |---|---|---|
 | `bikesnest-domain` (`crates/domain`) | pure business concepts: value objects, enums, rules (hours, freshness, confidence, cost, security), the typed proposal payload | nothing framework-level (chrono, thiserror, serde_json for the proposal payload) |
 | `bikesnest-application` (`crates/application`) | use cases (services) + ports (`trait`s). Orchestrates domain objects; no I/O of its own | `domain` |
-| `bikesnest-infrastructure` (`crates/infrastructure`) | SQLx repositories, config loading, providers (S3, SMTP, Mapbox, ValKey, image, timezone), seeders, job worker | `domain`, `application` |
+| `bikesnest-infrastructure` (`crates/infrastructure`) | SQLx repositories, config loading, providers (S3, SMTP, Google/Mapbox, ValKey, image, timezone), seeders, job worker | `domain`, `application` |
 | `bikesnest-i18n` (`crates/i18n`) | the en + pt-BR string catalog (`Locale`, `Translator`); the axum request extractor sits behind the `axum` feature so infrastructure can render emails without it | nothing framework-level (axum only with the feature) |
 | `bikesnest-web` (`crates/web`) | axum router, handlers, middleware, view models, Askama templates; re-exports the i18n catalog. **The binary** (`bikesnest-web`) | `domain`, `application`, `infrastructure`, `i18n` |
 | `bikesnest-test-support` (`crates/test-support`) | shared `#[db_test]` harness, pool fixture, domain-rich builders, fast test doubles | `domain`, `application`, `infrastructure`, `test-macros` |
@@ -137,7 +138,7 @@ directly. Examples: `SearchParking`, `ContributionService`, `AuthService`,
 ### Infrastructure (`crates/infrastructure`)
 
 The adapters: `Sqlx*` repositories for every persistence port, `Config::from_env`
-(reads `.env`), `MapboxGeocoder`/`FakeGeocoder`, `S3ObjectStorage`,
+(reads `.env`), `GoogleGeocoder`/`MapboxGeocoder`/`FakeGeocoder`, `S3ObjectStorage`,
 `LocalImageProcessor`, `FakeOAuthProvider`, email impls
 (`fake`/`smtp`/`resend`), `ValKeyRateLimiter`/`InMemoryRateLimiter`,
 `OfflineTimezoneResolver`, `SystemClock`, `OsRngTokenGenerator`,
@@ -167,10 +168,10 @@ The router is split three ways:
 - **`routes/`** — one module per slice, each owning its handlers, its
   form/query structs, its form → domain mapping and its error → response
   mapping: `public` (home, about, robots/sitemap, language, health), `search`,
-  `details`, `auth` (M2 accounts), `community` (add/edit/propose),
+  `details`, `auth` (accounts), `community` (add/edit/propose),
   `reviews` (review/verify/parked-here/favorite + the account activity lists),
-  `photo` (M4 upload + photo queue), `moderation` (M5 reports and queues),
-  `admin` (users, audit, privacy requests), `privacy` (M6 export/delete),
+  `photo` (upload and photo queue), `moderation` (reports and queues),
+  `admin` (users, audit, privacy requests), `privacy` (export/delete),
   `legal` (policy pages), plus `common` (shared render/fragment helpers) and
   `errors` (the styled 404/500 family). `routes/mod.rs` holds the URL → handler
   table. Two tests guard the shape: no file over 1200 lines, and nothing under
@@ -191,9 +192,9 @@ votes, moderation and version history are page-local mock state; see
   `rust:1.95` in Docker.
 - **HTTP:** axum 0.8 + tower/tower-http.
 - **Templates:** Askama 0.14 (compiled at build time, embedded in the binary).
-- **Frontend:** htmx 4 (`hx-boost` + `hx-alpine-compat`), Alpine.js **CSP build**
-  (no inline `x-data`, no `unsafe-eval`), MapLibre GL JS — all vendored locally,
-  no CDN.
+- **Frontend:** htmx 4 (`hx-boost` + `hx-alpine-compat`), Alpine.js **CSP build**,
+  and a provider-neutral map adapter. The MapLibre runtime is vendored; the
+  Google profile loads Google's Maps JavaScript API from its required origin.
 - **CSS:** Tailwind CSS 4.3, design tokens from `design-system/colors_and_type.css`.
 - **Data:** PostgreSQL 17 + PostGIS, SQLx 0.8 (runtime-checked queries,
   forward-only migrations applied on startup).
@@ -204,8 +205,10 @@ votes, moderation and version history are page-local mock state; see
   to browsers.
 - **Crypto:** argon2id (passwords), HMAC signing, SHA-256-hashed sessions at rest.
 - **Email:** lettre (SMTP) or the Resend API.
-- **Maps/geocoding:** Mapbox Geocoding API (or a deterministic fake), MapLibre
-  for the browser map.
+- **Maps/geocoding:** `LOCATION_PROVIDER` selects Google Maps Platform,
+  Mapbox geocoding with Mapbox GL JS, or the deterministic development
+  fake with OpenFreeMap. The same profile controls direct geocoding,
+  autocomplete, suggestion resolution, and map rendering.
 
 ## Data model
 
@@ -223,7 +226,7 @@ Versioned, forward-only migrations in `migrations/`:
 | `0008_community.sql` | `review`, `review_revision`, `verification`, `favorite` |
 | `0009_photos.sql` | photo moderation pipeline (`parking_photo` moderation fields) |
 | `0010_moderation.sql` | `report` (polymorphic target), moderation CHECK widening |
-| `0011_review_photos.sql` | `review_photo` (D3 review photo attach) |
+| `0011_review_photos.sql` | `review_photo` (review photo attachments) |
 | `0012_privacy.sql` | privacy requests, exports, anonymization |
 | `0013_policies.sql` + `0014_policy_locale.sql` | versioned legal pages |
 | `0015_background_jobs.sql` | `background_job` queue |

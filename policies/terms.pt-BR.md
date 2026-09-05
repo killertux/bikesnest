@@ -55,7 +55,7 @@ Você não pode:
 
 ## 6. Propriedade intelectual
 
-O software, a marca, o nome e o desenho do BikesNest pertencem a nós ou a nossos licenciantes. O mapa-base e a geocodificação são fornecidos por terceiros sob suas próprias licenças e exigências de atribuição, exibidas no próprio mapa. O Conteúdo dos usuários é regido pela seção 3.
+O software, a marca, o nome e o desenho do BikesNest pertencem a nós ou a nossos licenciantes. O mapa-base, a geocodificação e o preenchimento automático são fornecidos por terceiros sob suas próprias licenças e exigências de atribuição, exibidas na interface correspondente do mapa ou da busca de endereços. O Conteúdo dos usuários é regido pela seção 3.
 
 ## 7. Isenção de garantias
 

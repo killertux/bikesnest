@@ -6,9 +6,9 @@
 //! `RowNotFound`, the code table) are unit-tested inside `db_error.rs`.
 
 use bikesnest_application::{ContributionError, ReviewRepository};
-use bikesnest_domain::{ReviewBody, StarRating, UserId};
-use bikesnest_infrastructure::{Db, DbFailure, SqlxReviewRepository, classify};
-use bikesnest_test_support::{ParkingBuilder, UserBuilder, db_test, pool};
+use bikesnest_domain::{ReviewBody, StarRating};
+use bikesnest_infrastructure::{DbFailure, SqlxReviewRepository, classify};
+use bikesnest_test_support::{ParkingBuilder, UserBuilder, db_test};
 
 /// Runs `sql` inside the test transaction and returns the failure it produced.
 async fn failure_of(conn: &mut sqlx::PgConnection, sql: &str) -> DbFailure {
@@ -98,17 +98,24 @@ async fn statement_timeout_is_unavailable(tx: &mut bikesnest_test_support::TestT
 /// End-to-end through a repository: the mapper turns an FK rejection into the
 /// feature's own error instead of an opaque `Internal`.
 ///
-/// The write repos run on pool connections, so this uses a location id that
-/// cannot exist — nothing is written and there is nothing to clean up.
 #[db_test]
-async fn repository_maps_a_rejected_write_off_internal(_tx: &mut bikesnest_test_support::TestTx) {
-    let repo = SqlxReviewRepository::new(Db::from_pool(pool().await));
+async fn repository_maps_a_rejected_write_off_internal(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
+    let mut conn = db.acquire().await.expect("test transaction connection");
+    let author = UserBuilder::new()
+        .with_email("db-error-repository@example.com")
+        .create(&mut *conn)
+        .await
+        .expect("fixture author");
+    drop(conn);
+
+    let repo = SqlxReviewRepository::new(db);
     let body = ReviewBody::new("Plenty of racks, always free.").expect("valid body");
 
     let err = repo
         .upsert_review(
             -1,
-            UserId(-1),
+            author.id,
             StarRating::new(4).expect("valid rating"),
             &body,
         )

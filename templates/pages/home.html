@@ -18,14 +18,46 @@
     <!-- Search card -->
     <div class="mt-10 max-w-2xl" x-data="homeHero">
       <form action="/search" method="get" role="search" class="home-search flex flex-col gap-2 rounded-2xl border border-border bg-surface p-2 shadow-[0_8px_24px_oklch(20%_0.02_240/0.05)] sm:flex-row sm:items-center">
-        <div class="flex min-w-0 flex-1 items-center gap-3 px-3 py-1.5">
+        <div class="relative flex min-w-0 flex-1 items-center gap-3 px-3 py-1.5"
+             x-data="addressAutocomplete"
+             data-searching="{{ tr.t("address.autocomplete.searching") }}"
+             data-no-results="{{ tr.t("address.autocomplete.no_results") }}"
+             data-failed="{{ tr.t("address.autocomplete.failed") }}">
           <svg aria-hidden="true" class="h-5 w-5 shrink-0 text-muted" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 10c0 4.993-5.539 10.193-7.399 11.799a1 1 0 0 1-1.202 0C9.539 20.193 4 14.993 4 10a8 8 0 0 1 16 0" /><circle cx="12" cy="10" r="3" /></svg>
           <label for="q" class="sr-only">{{ tr.t("home.search.placeholder") }}</label>
           <input
             id="q" name="q" type="text" autocomplete="off"
+            data-address-query role="combobox" aria-autocomplete="list"
+            aria-controls="home-address-suggestions" :aria-expanded="open"
+            :aria-activedescendant="activeDescendant"
+            @input="queue" @focus="show"
+            @keydown.arrow-down.prevent="next" @keydown.arrow-up.prevent="previous"
+            @keydown.enter="enter" @keydown.escape="close"
             placeholder="{{ tr.t("home.search.placeholder") }}"
             class="min-w-0 w-full bg-transparent py-2 text-base"
           />
+          <div x-show="panelOpen" x-cloak @click.outside="close"
+               class="absolute inset-x-0 top-full z-30 mt-2 overflow-hidden rounded-xl border border-border bg-surface shadow-pop">
+            <p x-show="message" x-text="message" role="status" class="px-4 py-3 text-sm text-muted"></p>
+            <div x-show="open" id="home-address-suggestions" role="listbox"
+                 aria-label="{{ tr.t("address.autocomplete.suggestions") }}" class="max-h-80 overflow-y-auto py-1">
+              <template x-for="(suggestion, index) in suggestions" :key="index">
+                <button type="button" role="option" tabindex="-1" :id="optionId(index)"
+                        :data-index="index" :aria-selected="index === activeIndex"
+                        @mousedown.prevent="choose"
+                        :class="index === activeIndex ? 'bg-accent-soft' : ''"
+                        class="block w-full px-4 py-3 text-left text-sm text-fg hover:bg-accent-soft">
+                  <span x-text="suggestion.label"></span>
+                </button>
+              </template>
+            </div>
+            {% if layout.uses_google_maps() %}
+            <div x-show="open" class="flex justify-end border-t border-border px-3 py-1.5">
+              <img src="{{ layout.asset("img/powered_by_google_on_white.png") }}"
+                   width="59" height="18" alt="{{ tr.t("address.autocomplete.google_attribution") }}">
+            </div>
+            {% endif %}
+          </div>
         </div>
         <button type="submit" class="inline-flex shrink-0 items-center justify-center gap-2 rounded-xl bg-accent-strong px-6 py-3.5 text-base font-medium text-white transition-colors hover:bg-accent-dark">
           <svg aria-hidden="true" class="h-5 w-5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21 21-4.34-4.34" /><circle cx="11" cy="11" r="8" /></svg>
@@ -70,7 +102,7 @@
   </div>
 </section>
 
-<!-- ======== How it works (P1) ======== -->
+<!-- How it works. -->
 <section id="how-it-works" class="home-how mx-auto max-w-shell scroll-mt-20 border-t border-border px-6 py-12 lg:px-8 lg:py-16">
   <p class="mb-3 font-mono text-xs uppercase tracking-[0.14em] text-accent-strong">{{ tr.t("home.how.title") }}</p>
   <h2 class="font-display text-3xl font-bold tracking-tight sm:text-4xl">{{ tr.t("home.how.heading") }}</h2>
@@ -94,7 +126,7 @@
   </div>
 </section>
 
-<!-- ======== Featured parking with real photos (P1) ======== -->
+<!-- Featured parking with real photos. -->
 {% if !featured.is_empty() %}
 <section class="border-t border-border bg-surface">
   <div class="mx-auto max-w-shell px-6 py-16 lg:px-8 lg:py-20">
@@ -159,7 +191,7 @@
 </section>
 {% endif %}
 
-<!-- ======== Community: the map is kept honest by riders (P1) ======== -->
+<!-- Community: the map is kept honest by riders. -->
 <section class="border-t border-border">
   <div class="mx-auto grid max-w-shell items-center gap-10 px-6 py-16 lg:grid-cols-2 lg:gap-16 lg:px-8 lg:py-20">
     <div class="overflow-hidden rounded-2xl border border-border shadow-card">
@@ -197,7 +229,7 @@
   </div>
 </section>
 
-<!-- ======== CTA strip (closing, P1) ======== -->
+<!-- Closing call to action. -->
 <section class="relative isolate overflow-hidden">
   <img
     src="{{ layout.asset("img/cyclist-foggy-avenue-1600.jpg") }}"

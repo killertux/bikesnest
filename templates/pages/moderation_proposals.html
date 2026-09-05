@@ -133,18 +133,33 @@
 </section>
 {% endblock %}
 {% block head %}
-<!-- MapLibre base styles (map clipping, canvas layout, control/attribution
+<!-- Map renderer base styles (map clipping, canvas layout, control/attribution
      positioning). Must load before map.css so the page's map overrides win. -->
+{% if layout.uses_maplibre() %}
 <link rel="stylesheet" href="{{ layout.asset("vendor/maplibre-gl.css") }}">
+{% else if layout.uses_mapbox() %}
+<link rel="stylesheet" href="{{ layout.asset("vendor/mapbox-gl.css") }}">
+{% endif %}
 <link rel="stylesheet" href="{{ layout.asset("css/map.css") }}">
 {% if !layout.map_style_url.is_empty() %}
 <link rel="preconnect" href="{{ layout.tile_origin() }}" crossorigin>
+{% else if layout.uses_google_maps() %}
+<link rel="preconnect" href="https://maps.googleapis.com">
+<link rel="preconnect" href="https://maps.gstatic.com" crossorigin>
 {% endif %}
 {% endblock %}
 
 {% block scripts %}
 {# The same renderer the details page uses; it draws the optional second
    marker when the container carries `data-current-lat`/`data-current-lon`. #}
+{% if layout.uses_maplibre() %}
 <script src="{{ layout.asset("vendor/maplibre-gl.js") }}"></script>
+<script src="{{ layout.asset("js/map-provider-maplibre.js") }}"></script>
+{% else if layout.uses_mapbox() %}
+<script src="{{ layout.asset("vendor/mapbox-gl.js") }}"></script>
+<script src="{{ layout.asset("js/map-provider-mapbox.js") }}"></script>
+{% else if layout.uses_google_maps() %}
+<script src="{{ layout.asset("js/map-provider-google.js") }}"></script>
+{% endif %}
 <script src="{{ layout.asset("js/details-map.js") }}"></script>
 {% endblock %}

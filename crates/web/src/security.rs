@@ -5,20 +5,16 @@
 //! on), `Content-Security-Policy`, `X-Content-Type-Options`, `Referrer-Policy`,
 //! `Permissions-Policy` and `X-Frame-Options`.
 //!
-//! The CSP is deliberately strict: `script-src 'self'` with **no `'unsafe-eval'`**
-//! — this is the whole point of the Alpine CSP build.
-//! `style-src 'unsafe-inline'` is retained only because MapLibre injects inline
-//! styles (attribution/controls/markers); we add no inline styles of our own, so
-//! that surface is MapLibre's alone. The tile/geocode/media origins are templated
-//! from configuration so the same binary works against any hosted provider (dev
-//! defaults to the `tiles.openfreemap.org` street style for tiles).
+//! The CSP is strict for the MapLibre profile. The Google Maps JavaScript API
+//! needs its documented remote origins and runtime evaluation allowance; those
+//! are added only when that provider is selected.
 
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderValue, Request, header};
 use axum::middleware::Next;
 use axum::response::Response;
-use bikesnest_infrastructure::SecurityConfig;
+use bikesnest_infrastructure::{MapConfig, SecurityConfig};
 
 use crate::htmx;
 
@@ -37,37 +33,71 @@ pub struct SecurityHeaders {
     /// (pre-signed) URLs, e.g. `http://localhost:9000` in dev or
     /// `https://<bucket>.s3.<region>.amazonaws.com` in production.
     media_hosts: Vec<String>,
+    google_maps: bool,
+    mapbox_maps: bool,
 }
 
 impl SecurityHeaders {
     /// Built once at startup from the parsed CSP origins plus whether TLS
     /// terminates here (which gates HSTS).
-    pub fn new(config: &SecurityConfig, tls_on: bool) -> Self {
+    pub fn new(config: &SecurityConfig, map: &MapConfig, tls_on: bool) -> Self {
         Self {
             tls_on,
             tile_hosts: config.tile_hosts.clone(),
             geocode_hosts: config.geocode_hosts.clone(),
             media_hosts: config.media_hosts.clone(),
+            google_maps: matches!(map, MapConfig::Google { .. }),
+            mapbox_maps: matches!(map, MapConfig::Mapbox { .. }),
         }
     }
 
-    /// The `Content-Security-Policy` value. Hosts templated from config; no `'unsafe-eval'`.
+    /// The `Content-Security-Policy` value, with hosts selected from config.
     pub fn csp(&self) -> String {
         let tile = self.join_hosts(&self.tile_hosts);
         let geocode = self.join_hosts(&self.geocode_hosts);
         let media = self.join_hosts(&self.media_hosts);
+        let google_script = if self.google_maps {
+            " 'unsafe-inline' 'unsafe-eval' https://*.googleapis.com https://*.gstatic.com https://*.google.com https://*.ggpht.com https://*.googleusercontent.com blob:"
+        } else {
+            ""
+        };
+        let google_style = if self.google_maps {
+            " https://fonts.googleapis.com"
+        } else {
+            ""
+        };
+        let google_content = if self.google_maps {
+            " https://*.googleapis.com https://*.gstatic.com https://*.google.com https://*.ggpht.com https://*.googleusercontent.com"
+        } else {
+            ""
+        };
+        let google_font = if self.google_maps {
+            " https://fonts.gstatic.com"
+        } else {
+            ""
+        };
+        let frame = if self.google_maps {
+            "; frame-src https://*.google.com"
+        } else {
+            ""
+        };
+        let mapbox_content = if self.mapbox_maps {
+            " https://api.mapbox.com https://events.mapbox.com"
+        } else {
+            ""
+        };
         format!(
             "default-src 'self'; \
-             script-src 'self'; \
-             style-src 'self' 'unsafe-inline'; \
-             img-src 'self' data: blob:{tile}{media}; \
-             font-src 'self'{tile}; \
-             connect-src 'self'{tile}{geocode}; \
+             script-src 'self'{google_script}; \
+             style-src 'self' 'unsafe-inline'{google_style}; \
+             img-src 'self' data: blob:{tile}{media}{google_content}{mapbox_content}; \
+             font-src 'self'{tile}{google_font}; \
+             connect-src 'self'{tile}{geocode}{google_content}{mapbox_content}; \
              worker-src 'self' blob:; \
              object-src 'none'; \
              base-uri 'self'; \
              frame-ancestors 'none'; \
-             form-action 'self'"
+             form-action 'self'{frame}"
         )
     }
 
@@ -182,6 +212,8 @@ mod tests {
             tile_hosts: tile_hosts.iter().map(|s| s.to_string()).collect(),
             geocode_hosts: geocode_hosts.iter().map(|s| s.to_string()).collect(),
             media_hosts: media_hosts.iter().map(|s| s.to_string()).collect(),
+            google_maps: false,
+            mapbox_maps: false,
         }
     }
 
@@ -219,9 +251,36 @@ mod tests {
     }
 
     #[test]
+    fn google_map_origins_are_enabled_only_for_google_profile() {
+        let map = MapConfig::Google {
+            browser_api_key: "browser-key".to_string(),
+            map_id: "map-id".to_string(),
+        };
+        let csp = SecurityHeaders::new(&SecurityConfig::default(), &map, false).csp();
+        assert!(csp.contains("script-src 'self' 'unsafe-inline' 'unsafe-eval'"));
+        assert!(csp.contains("https://*.googleapis.com"));
+        assert!(csp.contains("https://fonts.googleapis.com"));
+        assert!(csp.contains("https://fonts.gstatic.com"));
+        assert!(csp.contains("frame-src https://*.google.com"));
+    }
+
+    #[test]
+    fn mapbox_map_origins_are_enabled_for_mapbox_profile() {
+        let map = MapConfig::Mapbox {
+            style_url: "mapbox://styles/mapbox/streets-v12".to_string(),
+            access_token: "public-token".to_string(),
+        };
+        let csp = SecurityHeaders::new(&SecurityConfig::default(), &map, false).csp();
+        assert!(
+            csp.contains("connect-src 'self' https://api.mapbox.com https://events.mapbox.com")
+        );
+        assert!(!csp.contains("unsafe-eval"));
+    }
+
+    #[test]
     fn dev_allows_default_street_tiles() {
         let cfg = bikesnest_infrastructure::Config::for_tests("postgres://localhost/x");
-        let h = SecurityHeaders::new(&cfg.security, cfg.tls_on);
+        let h = SecurityHeaders::new(&cfg.security, &cfg.map, cfg.tls_on);
         assert!(
             h.tile_hosts
                 .iter()

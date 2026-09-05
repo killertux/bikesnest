@@ -47,8 +47,8 @@ Não vendemos dados pessoais e não os compartilhamos com redes de publicidade o
 - **Hospedagem e banco de dados** – executam a aplicação e armazenam todos os dados descritos acima.
 - **Armazenamento de arquivos** – guarda as versões redimensionadas das fotos, sob identificadores opacos, sem qualquer dado de conta.
 - **Envio de e-mail** – recebe apenas seu endereço de e-mail e o conteúdo da mensagem transacional (verificação, redefinição de senha).
-- **Geocodificação** – recebe apenas o texto do endereço que você digita na busca, sem identificação da sua conta, cookie ou endereço IP.
-- **Mapa** – ao exibir o mapa, seu navegador solicita os "tiles" diretamente ao provedor de mapas, que recebe seu endereço IP e a região do mapa exibida. Não enviamos a ele nenhum dado da sua conta.
+- **Geocodificação** – recebe o texto do endereço que você digita e pode receber um identificador aleatório da sessão de preenchimento automático. As requisições partem do servidor do BikesNest, sem identificação da sua conta, cookie ou conexão direta com o endereço IP do seu navegador.
+- **Mapa** – ao exibir o mapa, seu navegador solicita o código e os dados diretamente ao provedor de mapas selecionado, que recebe seu endereço IP e a região exibida. Não enviamos a ele nenhum dado da sua conta. Quando o Google Maps Platform estiver selecionado, o uso também será regido pelos [Termos do Google Maps Platform](https://cloud.google.com/maps-platform/terms) e pela [Política de Privacidade do Google](https://policies.google.com/privacy).
 
 Podemos ainda compartilhar dados quando exigido por lei, ordem judicial ou autoridade competente, ou para proteger nossos direitos, a segurança do serviço e de seus usuários.
 

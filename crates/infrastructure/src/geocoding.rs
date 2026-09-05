@@ -1,26 +1,23 @@
-//! Geocoders: the deterministic dev `FakeGeocoder` and a real
-//! `MapboxGeocoder` (hosted OSM-derived provider). Selected at wiring time
-//! by the parsed `GEOCODER` setting (`fake` | `mapbox`) — swapping providers is
-//! a config change, never a domain/app change.
+//! Geocoders: deterministic development data plus Mapbox and Google Maps
+//! Platform adapters. `LOCATION_PROVIDER` selects one at wiring time, so
+//! swapping providers is a configuration change rather than a domain change.
 //!
-//! ** (third-party boundary):** the geocoder is called **server-side** with
-//! only the free-text destination query. No account identity, cookie, or client
-//! IP is sent to the provider; the query string is the complete payload.
+//! The geocoder is called server-side with the free-text destination query and,
+//! for Google autocomplete, a random billing-session token. No account
+//! identity, cookie, or direct browser IP is sent to the provider.
 //!
-//! ** — what is documented:** Mapbox Geocoding API (`mapbox.places` forward).
-//! Usage is rate/billing-limited by the Mapbox account (`MAPBOX_ACCESS_TOKEN`;
-//! the free tier is ~100k requests/month). Terms of service + attribution apply
-//! (see docs/provider-transfer-inventory.md —
-//! provider contract / DPA / international-transfer review).
+//! Hosted usage is rate/billing-limited by the selected provider account.
+//! Terms of service and attribution apply; see
+//! `docs/provider-transfer-inventory.md` for the provider review.
 //!
-//! **Failure mode:** a geocoder error is surfaced to the web layer, which
+//! A geocoder error is surfaced to the web layer, which
 //! renders a friendly "couldn't reach the geocoder" message (the search handler
 //! maps it to a no-results page, never a 500).
 
 use crate::config::GeocoderConfig;
 
 use async_trait::async_trait;
-use bikesnest_application::{GeoHit, GeocodeError, Geocoder};
+use bikesnest_application::{AddressSuggestion, GeoHit, GeocodeError, Geocoder};
 use bikesnest_domain::GeoPoint;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -167,11 +164,11 @@ struct MapboxFeature {
     text: Option<String>,
 }
 
-/// Parse a Mapbox geocoding response into the best [`GeoHit`]. Empty/featureless
-/// responses → `Ok(None)` (a genuinely unresolvable destination).
-fn parse_mapbox_response(bytes: &[u8]) -> Result<Option<GeoHit>, GeocodeError> {
+/// Parse provider-ranked Mapbox features into valid geocoding hits.
+fn parse_mapbox_response(bytes: &[u8]) -> Result<Vec<GeoHit>, GeocodeError> {
     let resp: MapboxResponse = serde_json::from_slice(bytes)
         .map_err(|e| GeocodeError::Unexpected(format!("bad Mapbox response: {e}")))?;
+    let mut hits = Vec::with_capacity(resp.features.len());
     for f in resp.features {
         if let Some([lon, lat]) = f.center
             && let Ok(point) = GeoPoint::new(lat, lon)
@@ -181,10 +178,10 @@ fn parse_mapbox_response(bytes: &[u8]) -> Result<Option<GeoHit>, GeocodeError> {
                 .clone()
                 .or_else(|| f.text.clone())
                 .unwrap_or_else(|| format!("{lat}, {lon}"));
-            return Ok(Some(GeoHit { label, point }));
+            hits.push(GeoHit { label, point });
         }
     }
-    Ok(None)
+    Ok(hits)
 }
 
 /// Real Mapbox geocoder. Caller holds the access token; the query is the only
@@ -209,20 +206,20 @@ impl MapboxGeocoder {
             endpoint: MAPBOX_ENDPOINT.to_string(),
         }
     }
-}
 
-#[async_trait]
-impl Geocoder for MapboxGeocoder {
-    async fn geocode(&self, query: &str) -> Result<Option<GeoHit>, GeocodeError> {
-        let q = query.trim();
-        if q.is_empty() {
-            return Ok(None);
-        }
-        let url = mapbox_url(&self.endpoint, q, 1);
+    async fn forward(&self, query: &str, limit: usize) -> Result<Vec<GeoHit>, GeocodeError> {
+        let url = mapbox_url(&self.endpoint, query, limit.min(10) as u32);
         let bytes = self
             .client
             .get(&url)
-            .query(&[("access_token", &self.token)])
+            // BikesNest currently serves Curitiba. Country filtering prevents
+            // same-named streets abroad from displacing local results, while
+            // proximity keeps nearby addresses at the top of the dropdown.
+            .query(&[
+                ("access_token", self.token.as_str()),
+                ("country", "br"),
+                ("proximity", "-49.2733,-25.4284"),
+            ])
             .send()
             .await
             .map_err(|e| {
@@ -245,9 +242,307 @@ impl Geocoder for MapboxGeocoder {
     }
 }
 
+#[async_trait]
+impl Geocoder for MapboxGeocoder {
+    async fn geocode(&self, query: &str) -> Result<Option<GeoHit>, GeocodeError> {
+        let q = query.trim();
+        if q.is_empty() {
+            return Ok(None);
+        }
+        Ok(self.forward(q, 1).await?.into_iter().next())
+    }
+
+    async fn suggest(
+        &self,
+        query: &str,
+        limit: usize,
+        _session_token: Option<&str>,
+        _language_code: &str,
+    ) -> Result<Vec<AddressSuggestion>, GeocodeError> {
+        let q = query.trim();
+        if q.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .forward(q, limit)
+            .await?
+            .into_iter()
+            .map(|hit| AddressSuggestion {
+                label: hit.label,
+                reference: None,
+                point: Some(hit.point),
+            })
+            .collect())
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Selection
+// GoogleGeocoder (production)
 // ---------------------------------------------------------------------------
+
+const GOOGLE_GEOCODING_ENDPOINT: &str = "https://maps.googleapis.com/maps/api/geocode/json";
+const GOOGLE_AUTOCOMPLETE_ENDPOINT: &str = "https://places.googleapis.com/v1/places:autocomplete";
+const GOOGLE_PLACES_ENDPOINT: &str = "https://places.googleapis.com/v1/places";
+
+#[derive(serde::Deserialize)]
+struct GoogleGeocodeResponse {
+    status: String,
+    #[serde(default)]
+    results: Vec<GoogleGeocodeResult>,
+}
+
+#[derive(serde::Deserialize)]
+struct GoogleGeocodeResult {
+    formatted_address: String,
+    geometry: GoogleGeometry,
+}
+
+#[derive(serde::Deserialize)]
+struct GoogleGeometry {
+    location: GoogleLatLng,
+}
+
+#[derive(serde::Deserialize)]
+struct GoogleLatLng {
+    lat: f64,
+    lng: f64,
+}
+
+#[derive(serde::Deserialize)]
+struct GoogleAutocompleteResponse {
+    #[serde(default)]
+    suggestions: Vec<GoogleSuggestion>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleSuggestion {
+    place_prediction: Option<GooglePlacePrediction>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GooglePlacePrediction {
+    place_id: String,
+    text: GooglePredictionText,
+}
+
+#[derive(serde::Deserialize)]
+struct GooglePredictionText {
+    text: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GooglePlaceDetails {
+    formatted_address: Option<String>,
+    location: Option<GooglePlaceLocation>,
+}
+
+#[derive(serde::Deserialize)]
+struct GooglePlaceLocation {
+    latitude: f64,
+    longitude: f64,
+}
+
+fn parse_google_geocode_response(bytes: &[u8]) -> Result<Option<GeoHit>, GeocodeError> {
+    let response: GoogleGeocodeResponse = serde_json::from_slice(bytes)
+        .map_err(|e| GeocodeError::Unexpected(format!("bad Google geocoding response: {e}")))?;
+    if response.status == "ZERO_RESULTS" {
+        return Ok(None);
+    }
+    if response.status != "OK" {
+        return Err(GeocodeError::Unexpected(format!(
+            "Google geocoding status: {}",
+            response.status
+        )));
+    }
+    for result in response.results {
+        if let Ok(point) = GeoPoint::new(result.geometry.location.lat, result.geometry.location.lng)
+        {
+            return Ok(Some(GeoHit {
+                label: result.formatted_address,
+                point,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+fn parse_google_suggestions(
+    bytes: &[u8],
+    limit: usize,
+) -> Result<Vec<AddressSuggestion>, GeocodeError> {
+    let response: GoogleAutocompleteResponse = serde_json::from_slice(bytes)
+        .map_err(|e| GeocodeError::Unexpected(format!("bad Google Places response: {e}")))?;
+    Ok(response
+        .suggestions
+        .into_iter()
+        .filter_map(|suggestion| suggestion.place_prediction)
+        .filter(|prediction| !prediction.place_id.is_empty() && !prediction.text.text.is_empty())
+        .take(limit.min(10))
+        .map(|prediction| AddressSuggestion {
+            label: prediction.text.text,
+            reference: Some(prediction.place_id),
+            point: None,
+        })
+        .collect())
+}
+
+fn parse_google_place_details(bytes: &[u8]) -> Result<Option<GeoHit>, GeocodeError> {
+    let details: GooglePlaceDetails = serde_json::from_slice(bytes)
+        .map_err(|e| GeocodeError::Unexpected(format!("bad Google place response: {e}")))?;
+    let Some(location) = details.location else {
+        return Ok(None);
+    };
+    let Ok(point) = GeoPoint::new(location.latitude, location.longitude) else {
+        return Ok(None);
+    };
+    Ok(Some(GeoHit {
+        label: details
+            .formatted_address
+            .unwrap_or_else(|| format!("{}, {}", location.latitude, location.longitude)),
+        point,
+    }))
+}
+
+/// Google Maps Platform adapter. Free-text submissions use Geocoding API;
+/// autocomplete uses Places API (New) and resolves only the selected Place ID.
+pub struct GoogleGeocoder {
+    client: reqwest::Client,
+    api_key: String,
+    geocoding_endpoint: String,
+    autocomplete_endpoint: String,
+    places_endpoint: String,
+}
+
+impl GoogleGeocoder {
+    pub fn new(api_key: impl Into<String>) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("reqwest client");
+        Self {
+            client,
+            api_key: api_key.into(),
+            geocoding_endpoint: GOOGLE_GEOCODING_ENDPOINT.to_string(),
+            autocomplete_endpoint: GOOGLE_AUTOCOMPLETE_ENDPOINT.to_string(),
+            places_endpoint: GOOGLE_PLACES_ENDPOINT.to_string(),
+        }
+    }
+
+    async fn response_bytes(
+        response: Result<reqwest::Response, reqwest::Error>,
+        operation: &'static str,
+    ) -> Result<Vec<u8>, GeocodeError> {
+        let bytes = response
+            .map_err(|e| {
+                tracing::warn!(google_operation = operation, google_error = %describe_reqwest_error(&e), "Google Maps request failed");
+                GeocodeError::Unavailable
+            })?
+            .error_for_status()
+            .map_err(|e| {
+                let desc = describe_reqwest_error(&e);
+                tracing::warn!(google_operation = operation, google_error = %desc, "Google Maps returned a non-success status");
+                GeocodeError::Unexpected(format!("Google Maps status: {desc}"))
+            })?
+            .bytes()
+            .await
+            .map_err(|e| {
+                tracing::warn!(google_operation = operation, google_error = %describe_reqwest_error(&e), "Google Maps body read failed");
+                GeocodeError::Unavailable
+            })?;
+        Ok(bytes.to_vec())
+    }
+}
+
+#[async_trait]
+impl Geocoder for GoogleGeocoder {
+    async fn geocode(&self, query: &str) -> Result<Option<GeoHit>, GeocodeError> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(None);
+        }
+        let response = self
+            .client
+            .get(&self.geocoding_endpoint)
+            .query(&[
+                ("address", query),
+                ("key", self.api_key.as_str()),
+                ("region", "br"),
+            ])
+            .send()
+            .await;
+        let bytes = Self::response_bytes(response, "geocode").await?;
+        parse_google_geocode_response(&bytes)
+    }
+
+    async fn suggest(
+        &self,
+        query: &str,
+        limit: usize,
+        session_token: Option<&str>,
+        language_code: &str,
+    ) -> Result<Vec<AddressSuggestion>, GeocodeError> {
+        let query = query.trim();
+        if query.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut body = serde_json::json!({
+            "input": query,
+            "includedRegionCodes": ["br"],
+            "languageCode": if language_code.eq_ignore_ascii_case("en") { "en" } else { "pt-BR" },
+            "locationBias": {
+                "circle": {
+                    "center": { "latitude": CENTROID.0, "longitude": CENTROID.1 },
+                    "radius": 50_000.0
+                }
+            }
+        });
+        if let Some(token) = session_token.filter(|token| !token.is_empty()) {
+            body["sessionToken"] = serde_json::Value::String(token.to_string());
+        }
+        let response = self
+            .client
+            .post(&self.autocomplete_endpoint)
+            .header("X-Goog-Api-Key", &self.api_key)
+            .header(
+                "X-Goog-FieldMask",
+                "suggestions.placePrediction.placeId,suggestions.placePrediction.text.text",
+            )
+            .json(&body)
+            .send()
+            .await;
+        let bytes = Self::response_bytes(response, "autocomplete").await?;
+        parse_google_suggestions(&bytes, limit)
+    }
+
+    async fn resolve_suggestion(
+        &self,
+        reference: &str,
+        session_token: Option<&str>,
+    ) -> Result<Option<GeoHit>, GeocodeError> {
+        let reference = reference.trim();
+        if reference.is_empty() || reference.chars().count() > 256 {
+            return Ok(None);
+        }
+        let url = format!(
+            "{}/{}",
+            self.places_endpoint,
+            encode_path_segment(reference)
+        );
+        let mut request = self
+            .client
+            .get(url)
+            .header("X-Goog-Api-Key", &self.api_key)
+            .header("X-Goog-FieldMask", "formattedAddress,location");
+        if let Some(token) = session_token.filter(|token| !token.is_empty()) {
+            request = request.query(&[("sessionToken", token)]);
+        }
+        let bytes = Self::response_bytes(request.send().await, "place-details").await?;
+        parse_google_place_details(&bytes)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // CachingGeocoder
@@ -262,19 +557,10 @@ pub const GEOCODE_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// ~10k entries of (query, label, point) is well under a megabyte.
 pub const GEOCODE_CACHE_CAPACITY: usize = 10_000;
 
-/// In-process cache in front of a real geocoder.
+/// In-process cache wrapper around a geocoder.
 ///
-/// Every geocode is a billable third-party call, and the search box
-/// resolves the same few dozen destinations over and over: "the city centre",
-/// a shared link making the rounds, one person paging through results. Without
-/// this, each of those is a fresh call to the provider.
-///
-/// Deliberately in-process, and therefore per-instance: it needs no store, no
-/// eviction daemon and no failure mode of its own. A shared ValKey tier (the
-/// rate limiter already talks to one) would let several instances share the
-/// savings and survive a restart — the obvious follow-up, and the reason
-/// [`Self::peek`] exists as a lookup rather than the cache being hidden inside
-/// [`Geocoder::geocode`].
+/// The development fake may retain repeated resolutions. Hosted provider
+/// adapters use [`Self::uncached`] because their result-storage terms differ.
 ///
 /// Only *resolved* queries are remembered. A query the provider could not
 /// resolve is not cached: those are typos and junk, they must not pin a
@@ -298,6 +584,12 @@ impl CachingGeocoder {
         Self::with_limits(inner, GEOCODE_CACHE_TTL, GEOCODE_CACHE_CAPACITY)
     }
 
+    /// Build a pass-through instance when provider terms do not permit the
+    /// generic cache to retain the complete result.
+    pub fn uncached(inner: Box<dyn Geocoder>) -> Self {
+        Self::with_limits(inner, Duration::ZERO, 0)
+    }
+
     fn with_limits(inner: Box<dyn Geocoder>, ttl: Duration, capacity: usize) -> Self {
         Self {
             inner,
@@ -317,6 +609,9 @@ impl CachingGeocoder {
     /// geocode budget: a query this cache can already answer costs the
     /// provider nothing, so it must not cost the caller anything either.
     pub fn peek(&self, query: &str) -> Option<GeoHit> {
+        if self.capacity == 0 {
+            return None;
+        }
         let key = normalize(query);
         let state = self.state.lock().expect("geocode cache mutex");
         let (hit, at) = state.hits.get(&key)?;
@@ -324,6 +619,9 @@ impl CachingGeocoder {
     }
 
     fn remember(&self, query: &str, hit: &GeoHit) {
+        if self.capacity == 0 {
+            return;
+        }
         let key = normalize(query);
         let mut state = self.state.lock().expect("geocode cache mutex");
         if state
@@ -353,6 +651,28 @@ impl Geocoder for CachingGeocoder {
         }
         Ok(resolved)
     }
+
+    async fn suggest(
+        &self,
+        query: &str,
+        limit: usize,
+        session_token: Option<&str>,
+        language_code: &str,
+    ) -> Result<Vec<AddressSuggestion>, GeocodeError> {
+        self.inner
+            .suggest(query, limit, session_token, language_code)
+            .await
+    }
+
+    async fn resolve_suggestion(
+        &self,
+        reference: &str,
+        session_token: Option<&str>,
+    ) -> Result<Option<GeoHit>, GeocodeError> {
+        self.inner
+            .resolve_suggestion(reference, session_token)
+            .await
+    }
 }
 
 /// One [`CachingGeocoder`] behind the [`Geocoder`] port, so the use case and
@@ -371,6 +691,26 @@ impl Geocoder for SharedGeocoder {
     async fn geocode(&self, query: &str) -> Result<Option<GeoHit>, GeocodeError> {
         self.0.geocode(query).await
     }
+
+    async fn suggest(
+        &self,
+        query: &str,
+        limit: usize,
+        session_token: Option<&str>,
+        language_code: &str,
+    ) -> Result<Vec<AddressSuggestion>, GeocodeError> {
+        self.0
+            .suggest(query, limit, session_token, language_code)
+            .await
+    }
+
+    async fn resolve_suggestion(
+        &self,
+        reference: &str,
+        session_token: Option<&str>,
+    ) -> Result<Option<GeoHit>, GeocodeError> {
+        self.0.resolve_suggestion(reference, session_token).await
+    }
 }
 
 /// Build the geocoder the parsed configuration selected. `Mapbox` carries its
@@ -380,6 +720,20 @@ pub fn geocoder_from_config(config: &GeocoderConfig) -> Box<dyn Geocoder> {
     match config {
         GeocoderConfig::Fake => Box::new(FakeGeocoder),
         GeocoderConfig::Mapbox { token } => Box::new(MapboxGeocoder::new(token.clone())),
+        GeocoderConfig::Google { api_key } => Box::new(GoogleGeocoder::new(api_key.clone())),
+    }
+}
+
+/// The deterministic fake may use the bounded cache. Hosted provider results
+/// stay uncached here because the generic cache retains labels as well as
+/// coordinates and cannot satisfy each provider's storage terms.
+pub fn caching_geocoder_from_config(config: &GeocoderConfig) -> CachingGeocoder {
+    let geocoder = geocoder_from_config(config);
+    match config {
+        GeocoderConfig::Fake => CachingGeocoder::new(geocoder),
+        GeocoderConfig::Mapbox { .. } | GeocoderConfig::Google { .. } => {
+            CachingGeocoder::uncached(geocoder)
+        }
     }
 }
 
@@ -432,7 +786,9 @@ mod tests {
             { "center": [-49.2700, -25.4200], "place_name": "other, Brazil", "text": "other" }
           ]
         }"#;
-        let hit = parse_mapbox_response(body).unwrap().unwrap();
+        let hits = parse_mapbox_response(body).unwrap();
+        assert_eq!(hits.len(), 2, "all provider suggestions are retained");
+        let hit = &hits[0];
         assert_eq!(hit.label, "Rua XV de Novembro, Curitiba, PR, Brazil");
         assert!((hit.point.lat() - -25.4284).abs() < 1e-9);
         assert!((hit.point.lon() - -49.2733).abs() < 1e-9);
@@ -443,12 +799,12 @@ mod tests {
         assert!(
             parse_mapbox_response(br#"{"features":[]}"#)
                 .unwrap()
-                .is_none()
+                .is_empty()
         );
         assert!(
             parse_mapbox_response(br#"{"query":["x"]}"#)
                 .unwrap()
-                .is_none()
+                .is_empty()
         );
     }
 
@@ -456,14 +812,70 @@ mod tests {
     fn falls_back_to_text_when_no_place_name() {
         let body =
             br#"{ "features": [ { "center": [-49.2733, -25.4284], "text": "Only text" } ] }"#;
-        let hit = parse_mapbox_response(body).unwrap().unwrap();
+        let hits = parse_mapbox_response(body).unwrap();
+        let hit = &hits[0];
         assert_eq!(hit.label, "Only text");
     }
 
     #[test]
     fn ignores_features_without_center() {
         let body = br#"{ "features": [ { "place_name": "no coords" } ] }"#;
-        assert!(parse_mapbox_response(body).unwrap().is_none());
+        assert!(parse_mapbox_response(body).unwrap().is_empty());
+    }
+
+    // --- Google parsing ---------------------------------------------------
+
+    #[test]
+    fn parses_google_geocode_result() {
+        let body = br#"{
+          "status": "OK",
+          "results": [{
+            "formatted_address": "Rua XV de Novembro, Curitiba - PR, Brasil",
+            "geometry": { "location": { "lat": -25.4297, "lng": -49.2705 } }
+          }]
+        }"#;
+        let hit = parse_google_geocode_response(body).unwrap().unwrap();
+        assert_eq!(hit.label, "Rua XV de Novembro, Curitiba - PR, Brasil");
+        assert!((hit.point.lat() - -25.4297).abs() < 1e-9);
+        assert!((hit.point.lon() - -49.2705).abs() < 1e-9);
+    }
+
+    #[test]
+    fn google_zero_results_is_not_an_error() {
+        assert!(
+            parse_google_geocode_response(br#"{"status":"ZERO_RESULTS","results":[]}"#)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parses_google_predictions_without_resolving_them() {
+        let body = br#"{
+          "suggestions": [{
+            "placePrediction": {
+              "placeId": "ChIJ-example",
+              "text": { "text": "Rua XV de Novembro, Curitiba" }
+            }
+          }]
+        }"#;
+        let suggestions = parse_google_suggestions(body, 10).unwrap();
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].reference.as_deref(), Some("ChIJ-example"));
+        assert!(suggestions[0].point.is_none());
+    }
+
+    #[test]
+    fn parses_selected_google_place_coordinates() {
+        let body = r#"{
+          "formattedAddress": "Praça Tiradentes, Curitiba - PR, Brasil",
+          "location": { "latitude": -25.4290, "longitude": -49.2710 }
+        }"#;
+        let hit = parse_google_place_details(body.as_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.label, "Praça Tiradentes, Curitiba - PR, Brasil");
+        assert!((hit.point.lat() - -25.4290).abs() < 1e-9);
     }
 
     // --- URL / encoding ----------------------------------------------------
@@ -613,6 +1025,16 @@ mod tests {
         assert!(geo.peek("asdfghjkl").is_none(), "no failure is pinned");
         assert!(geo.geocode("asdfghjkl").await.unwrap().is_none());
         assert_eq!(calls.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn uncached_geocoder_never_retains_provider_results() {
+        let (inner, calls) = counting(true);
+        let geo = CachingGeocoder::uncached(inner);
+        geo.geocode("Rua XV").await.unwrap();
+        geo.geocode("Rua XV").await.unwrap();
+        assert_eq!(calls.get(), 2);
+        assert!(geo.peek("Rua XV").is_none());
     }
 
     #[tokio::test]

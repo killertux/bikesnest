@@ -18,11 +18,61 @@ pub enum GeocodeError {
     Unexpected(String),
 }
 
+/// One provider-ranked address prediction.
+///
+/// Some providers include coordinates with their predictions. Others, such as
+/// Google Places, return an opaque reference that must be resolved after the
+/// user chooses the prediction. The web API exposes the same shape for both.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AddressSuggestion {
+    pub label: String,
+    pub reference: Option<String>,
+    pub point: Option<GeoPoint>,
+}
+
 /// Port: resolve a destination string to coordinates.
 #[async_trait]
 pub trait Geocoder: Send + Sync {
     /// `Ok(None)` when nothing matches the query.
     async fn geocode(&self, query: &str) -> Result<Option<GeoHit>, GeocodeError>;
+
+    /// Ordered suggestions for an incomplete destination query.
+    ///
+    /// Providers that only support a single result still get useful default
+    /// behavior. Autocomplete-capable adapters override this to return up to
+    /// `limit` candidates in provider-ranked order.
+    async fn suggest(
+        &self,
+        query: &str,
+        limit: usize,
+        _session_token: Option<&str>,
+        _language_code: &str,
+    ) -> Result<Vec<AddressSuggestion>, GeocodeError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .geocode(query)
+            .await?
+            .into_iter()
+            .map(|hit| AddressSuggestion {
+                label: hit.label,
+                reference: None,
+                point: Some(hit.point),
+            })
+            .collect())
+    }
+
+    /// Resolve the opaque reference returned by [`Self::suggest`].
+    /// Providers whose suggestions already contain coordinates use the
+    /// default no-result implementation.
+    async fn resolve_suggestion(
+        &self,
+        _reference: &str,
+        _session_token: Option<&str>,
+    ) -> Result<Option<GeoHit>, GeocodeError> {
+        Ok(None)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -264,7 +314,7 @@ impl SearchRequest {
     }
 }
 
-/// One row of search results — everything a P2 card needs.
+/// One row of search results — everything a search card needs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParkingSummary {
     pub id: i64,
@@ -484,8 +534,8 @@ pub trait ParkingDetailsReader: Send + Sync {
 
 /// A stored photo reference: an opaque object-storage key plus its content type
 /// and accessible description. The web layer turns the key into a presigned URL.
-/// When a processed thumbnail exists (M4 uploads), [`Self::thumbnail_key`] is
-/// present and the gallery prefers it; seeded M1 photos fall back to [`Self::key`].
+/// When a processed thumbnail exists, [`Self::thumbnail_key`] is present and
+/// the gallery prefers it; seeded photos fall back to [`Self::key`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredPhoto {
     pub key: String,
@@ -494,7 +544,7 @@ pub struct StoredPhoto {
     pub alt: Option<String>,
 }
 
-/// Port: approved photos for a location, in display order (P3 gallery / P2
+/// Port: approved photos for a location, in display order (gallery and search
 /// card). Kept separate from [`ParkingDetailsReader`] so the details aggregate
 /// and its use case stay unchanged (photos are a read-side, presentation
 /// concern joined at the web boundary).

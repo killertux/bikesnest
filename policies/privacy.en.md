@@ -47,8 +47,8 @@ We do not sell personal data and we do not share it with advertising networks or
 - **Hosting and database** – run the application and store all the data described above.
 - **File storage** – holds the resized photo versions under opaque identifiers, with no account data.
 - **E-mail delivery** – receives only your e-mail address and the transactional message (verification, password reset).
-- **Geocoding** – receives only the address text you type into the search, with no account identity, cookie or IP address.
-- **Maps** – when the map is displayed, your browser requests map tiles directly from the map provider, which receives your IP address and the map area shown. We send it no account data.
+- **Geocoding** – receives the address text you type and may receive a random autocomplete-session identifier. Requests come from the BikesNest server, so they include no account identity, cookie or direct browser IP address.
+- **Maps** – when the map is displayed, your browser requests map code and data directly from the selected map provider, which receives your IP address and the map area shown. We send it no account data. When Google Maps Platform is selected, its use is also governed by the [Google Maps Platform Terms](https://cloud.google.com/maps-platform/terms) and [Google Privacy Policy](https://policies.google.com/privacy).
 
 We may also disclose data where required by law, court order or a competent authority, or to protect our rights and the safety of the service and its users.
 

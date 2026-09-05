@@ -1,4 +1,4 @@
-/* MapLibre overrides + map page layout (kept out of the Tailwind entry, §12). */
+/* Provider map overrides and map page layout, kept out of the Tailwind entry. */
 
 .search-layout {
   display: grid;

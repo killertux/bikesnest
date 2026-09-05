@@ -49,10 +49,10 @@ pub use photo::{
     UploadedPhoto,
 };
 pub use ports::{
-    BROWSE_LIST_CAP, BROWSE_MARKER_CAP, BoundsPage, BoundsQuery, Cluster, CostFilter, Cursor,
-    Filters, FreshnessConfig, GeoHit, GeocodeError, Geocoder, ParkingDetailsReader,
-    ParkingPhotoReader, ParkingSearchReader, ParkingSummary, ReaderError, ReviewPhotosReader,
-    SearchInput, SearchPage, SearchRequest, SitemapReader, Sort, StoredPhoto,
+    AddressSuggestion, BROWSE_LIST_CAP, BROWSE_MARKER_CAP, BoundsPage, BoundsQuery, Cluster,
+    CostFilter, Cursor, Filters, FreshnessConfig, GeoHit, GeocodeError, Geocoder,
+    ParkingDetailsReader, ParkingPhotoReader, ParkingSearchReader, ParkingSummary, ReaderError,
+    ReviewPhotosReader, SearchInput, SearchPage, SearchRequest, SitemapReader, Sort, StoredPhoto,
 };
 pub use privacy::{
     AnonymizationReport, AnonymizationRepository, Export, ExportAccount, ExportDownload,

@@ -19,17 +19,16 @@ use bikesnest_application::{
 };
 use bikesnest_infrastructure::probe::SqlxDatabaseProbe;
 use bikesnest_infrastructure::{
-    Argon2PasswordHasher, CachingGeocoder, Config, ConfigError, Db, FakeOAuthProvider,
-    InlineEmailQueue, JobEmailQueue, LocalImageProcessor, OfflineTimezoneResolver,
-    RealTokenGenerator, S3ObjectStorage, SharedGeocoder, SharedObjectStorage, SharedRateLimiter,
-    SqlxAccountRepository, SqlxAnonymizationRepository, SqlxAuditLog, SqlxAuditLogReader,
-    SqlxContributionHistoryReader, SqlxExportRepository, SqlxFavoriteRepository,
-    SqlxModerationRepository, SqlxParkingContributionRepository, SqlxParkingDetailsReader,
-    SqlxParkingPhotoReader, SqlxParkingSearchReader, SqlxPhotoRepository, SqlxPolicyReader,
-    SqlxPrivacyRequestRepository, SqlxReportRepository, SqlxReviewPhotosReader,
-    SqlxReviewRepository, SqlxSessionStore, SqlxSitemapReader, SqlxTokenStore,
-    SqlxVerificationRepository, SystemClock, email_from_config, geocoder_from_config,
-    rate_limiter_from_config,
+    Argon2PasswordHasher, Config, ConfigError, Db, FakeOAuthProvider, InlineEmailQueue,
+    JobEmailQueue, LocalImageProcessor, OfflineTimezoneResolver, RealTokenGenerator,
+    S3ObjectStorage, SharedGeocoder, SharedObjectStorage, SharedRateLimiter, SqlxAccountRepository,
+    SqlxAnonymizationRepository, SqlxAuditLog, SqlxAuditLogReader, SqlxContributionHistoryReader,
+    SqlxExportRepository, SqlxFavoriteRepository, SqlxModerationRepository,
+    SqlxParkingContributionRepository, SqlxParkingDetailsReader, SqlxParkingPhotoReader,
+    SqlxParkingSearchReader, SqlxPhotoRepository, SqlxPolicyReader, SqlxPrivacyRequestRepository,
+    SqlxReportRepository, SqlxReviewPhotosReader, SqlxReviewRepository, SqlxSessionStore,
+    SqlxSitemapReader, SqlxTokenStore, SqlxVerificationRepository, SystemClock,
+    caching_geocoder_from_config, email_from_config, rate_limiter_from_config,
 };
 use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 
@@ -99,7 +98,7 @@ pub fn app_router_with<H: PasswordHasher + Clone + 'static>(
     // One geocoder instance, wrapped in the in-process cache, shared by the
     // use case and the handler: `/search` asks the cache whether a query is
     // already resolved before it spends any of the caller's geocode budget.
-    let geocoder = Arc::new(CachingGeocoder::new(geocoder_from_config(&config.geocoder)));
+    let geocoder = Arc::new(caching_geocoder_from_config(&config.geocoder));
     let search_uc = SearchParking::new(
         Box::new(SharedGeocoder::new(geocoder.clone())),
         Box::new(SqlxParkingSearchReader::new(
@@ -201,7 +200,7 @@ pub fn app_router_with<H: PasswordHasher + Clone + 'static>(
         moderation: Arc::new(moderation_service),
         privacy: Arc::new(privacy_service),
         policy: policy_reader,
-        security: SecurityHeaders::new(&config.security, config.tls_on),
+        security: SecurityHeaders::new(&config.security, &config.map, config.tls_on),
         map: config.map.clone(),
         base_url: config.base_url.clone(),
         google_oauth_enabled,

@@ -38,12 +38,17 @@ pub struct PageLayout {
     pub description: String,
     /// OpenGraph type: "website" (default) or "article".
     pub og_type: &'static str,
+    /// Browser map implementation selected at startup.
+    pub map_provider: &'static str,
     /// Map style URL; rendered onto `<body>` data attributes so the map JS
     /// (search.js / details-map.js) reads it, CSP-safe (no inline script).
     pub map_style_url: String,
-    /// Public Mapbox access token for the style/tiles; empty for a non-Mapbox
-    /// style (e.g. demo tiles) so the token never lands on the page.
+    /// Public Mapbox access token for the Mapbox renderer; empty otherwise.
     pub map_access_token: String,
+    /// Browser-restricted Google Maps JavaScript key; empty for non-Google maps.
+    pub google_maps_api_key: String,
+    /// Google cloud map id used by Advanced Markers; empty for non-Google maps.
+    pub google_map_id: String,
     /// Whether this request carries a resolved session (signed in). Drives the
     /// header: an account menu vs. Entrar/Criar conta. An anonymous page that
     /// still mints a double-submit CSRF token (login/register/reset/verify)
@@ -63,6 +68,39 @@ impl PageLayout {
     /// style/token come from the configuration parsed at startup and held in
     /// `AppState`, never from the process environment at render time.
     pub fn new(map: &MapConfig, title: String, current: &str) -> Self {
+        let (map_provider, map_style_url, map_access_token, google_maps_api_key, google_map_id) =
+            match map {
+                MapConfig::MapLibre {
+                    style_url,
+                    access_token,
+                } => (
+                    "maplibre",
+                    style_url.clone(),
+                    access_token.clone(),
+                    String::new(),
+                    String::new(),
+                ),
+                MapConfig::Mapbox {
+                    style_url,
+                    access_token,
+                } => (
+                    "mapbox",
+                    style_url.clone(),
+                    access_token.clone(),
+                    String::new(),
+                    String::new(),
+                ),
+                MapConfig::Google {
+                    browser_api_key,
+                    map_id,
+                } => (
+                    "google",
+                    String::new(),
+                    String::new(),
+                    browser_api_key.clone(),
+                    map_id.clone(),
+                ),
+            };
         Self {
             title,
             current: current.to_string(),
@@ -70,8 +108,11 @@ impl PageLayout {
             canonical: String::new(),
             description: String::new(),
             og_type: "website",
-            map_style_url: map.style_url.clone(),
-            map_access_token: map.access_token.clone(),
+            map_provider,
+            map_style_url,
+            map_access_token,
+            google_maps_api_key,
+            google_map_id,
             is_authenticated: false,
             is_moderator: false,
             is_admin: false,
@@ -138,7 +179,7 @@ impl PageLayout {
 
     /// Resolves `path` (relative to `static_root`, forward-slash separated —
     /// e.g. `"css/app.css"`, `"vendor/maplibre-gl.js"`) to its content-hashed
-    /// `/static/h/<hash>/<path>` URL (WP14). Falls back to the plain
+    /// `/static/h/<hash>/<path>` URL. Falls back to the plain
     /// `/static/<path>` when the asset manifest hasn't been built yet or the
     /// path isn't in it, so a template call here never produces a broken
     /// link — just one without the long-lived cache header. Askama calls
@@ -152,6 +193,9 @@ impl PageLayout {
     /// with a map — computed here so the template never parses a URL.
     pub fn tile_origin(&self) -> String {
         let url = &self.map_style_url;
+        if url.starts_with("mapbox://") {
+            return "https://api.mapbox.com".to_string();
+        }
         let Some(scheme_end) = url.find("://") else {
             return String::new();
         };
@@ -160,6 +204,18 @@ impl PageLayout {
             .find(['/', '?', '#'])
             .unwrap_or(after_scheme.len());
         format!("{}{}", &url[..scheme_end + 3], &after_scheme[..host_end])
+    }
+
+    pub fn uses_maplibre(&self) -> bool {
+        self.map_provider == "maplibre"
+    }
+
+    pub fn uses_mapbox(&self) -> bool {
+        self.map_provider == "mapbox"
+    }
+
+    pub fn uses_google_maps(&self) -> bool {
+        self.map_provider == "google"
     }
 
     /// The `west,south,east,north` box behind every "browse the map" link in
@@ -244,7 +300,7 @@ pub fn error_response(
     resp
 }
 
-/// P1 — home / landing.
+/// Home / landing page.
 #[derive(Template)]
 #[template(path = "pages/home.html")]
 pub struct HomePage {
@@ -253,7 +309,7 @@ pub struct HomePage {
     pub featured: Vec<view::CardVm>,
 }
 
-/// P2 — search results, full page.
+/// Search results, full page.
 #[derive(Template)]
 #[template(path = "pages/search.html")]
 pub struct SearchPageVm {
@@ -335,7 +391,7 @@ impl SearchResultsVm {
     }
 }
 
-/// P3 — parking details.
+/// Parking details.
 #[derive(Template)]
 #[template(path = "pages/parking_details.html")]
 pub struct DetailsPage {
@@ -361,10 +417,9 @@ pub struct DetailsPage {
     pub google_url: String,
     pub lat: f64,
     pub lon: f64,
-    /// Approved location photos (presigned URLs), empty when none yet (P3
-    /// gallery / M4 pipeline).
+    /// Approved location photos (presigned URLs), empty when none yet.
     pub gallery: Vec<PhotoVm>,
-    // --- M3 community additions ---
+    // Community additions.
     pub reviews: Vec<view::ReviewVm>,
     pub confidence_code: &'static str,
     pub confidence_label: String,
@@ -384,7 +439,7 @@ pub struct DetailsPage {
     pub moderation_state: &'static str,
     /// Whether the viewer is a moderator/admin (sees the hidden/invalid banner).
     pub is_moderator: bool,
-    /// The report-reason options for the P3 report modal.
+    /// The report-reason options for the details-page report modal.
     pub reason_options: Vec<view::OptionVm>,
     /// Public-safe persisted proposals; no voter identities or photo keys.
     pub collaboration_proposals: Vec<CollaborationProposalVm>,
@@ -491,7 +546,7 @@ impl DetailsPage {
         }
     }
 
-    /// Build the P3 page with the M3 community view (reviews, confidence,
+    /// Build the details page with the community view (reviews, confidence,
     /// verification panel, favorite, recommendation explanation) overlaid on
     /// the base detail view. `auth`'s verified/authenticated/moderator status
     /// gates the contributor actions; anonymous viewers get a public-only page.
@@ -591,7 +646,7 @@ pub struct SecVm {
     pub state: &'static str,
 }
 
-/// P7 — about / how it works.
+/// About / how it works.
 #[derive(Template)]
 #[template(path = "pages/about.html")]
 pub struct AboutPage {
@@ -600,7 +655,7 @@ pub struct AboutPage {
 }
 
 // ---------------------------------------------------------------------------
-// Authentication & account pages (M2)
+// Authentication and account pages.
 // ---------------------------------------------------------------------------
 
 /// A1 — register.
@@ -612,7 +667,7 @@ pub struct RegisterPage {
     pub email: String,
     pub display_name: String,
     pub error: Option<String>,
-    /// Which input(s) a rejected submission belongs to (WP21 a11y pass).
+    /// Which input(s) a rejected submission belongs to.
     pub field_errors: view::FieldErrors,
 }
 
@@ -625,7 +680,7 @@ pub struct LoginPage {
     pub email: String,
     pub notice: Option<String>,
     pub error: Option<String>,
-    /// Which input(s) a rejected submission belongs to (WP21 a11y pass). A
+    /// Which input(s) a rejected submission belongs to. A
     /// bad login never says which of email/password was wrong, so a failure
     /// flags both rather than disclosing one over the other.
     pub field_errors: view::FieldErrors,
@@ -705,7 +760,7 @@ pub struct AccountEmailPage {
     pub notice: Option<String>,
 }
 
-/// M5 — user management (role assignment).
+/// User management (role assignment).
 #[derive(Template)]
 #[template(path = "pages/admin_users.html")]
 pub struct AdminUsersPage {
@@ -720,7 +775,7 @@ pub struct AdminUsersPage {
     pub error: Option<String>,
 }
 
-/// M6 — a versioned legal page (P4/P5/P6): current version + effective date.
+/// A versioned legal page: current version and effective date.
 #[derive(Template)]
 #[template(path = "pages/policy.html")]
 pub struct PolicyPage {
@@ -737,7 +792,7 @@ pub struct PolicyPage {
     pub content: String,
 }
 
-/// M6 — the version history for a legal page ( determinability).
+/// The version history for a legal page.
 #[derive(Template)]
 #[template(path = "pages/policy_versions.html")]
 pub struct PolicyVersionsPage {
@@ -748,7 +803,7 @@ pub struct PolicyVersionsPage {
     pub items: Vec<view::PolicyVersionVm>,
 }
 
-/// M6 — C6 privacy & data hub.
+/// Privacy and data hub.
 #[derive(Template)]
 #[template(path = "pages/account_privacy.html")]
 pub struct AccountPrivacyPage {
@@ -759,7 +814,7 @@ pub struct AccountPrivacyPage {
     pub notice: Option<String>,
 }
 
-/// M6 — C7 export status.
+/// Data export status.
 #[derive(Template)]
 #[template(path = "pages/account_export.html")]
 pub struct AccountExportPage {
@@ -769,7 +824,7 @@ pub struct AccountExportPage {
     pub notice: Option<String>,
 }
 
-/// M6 — account deletion confirmation.
+/// Account deletion confirmation.
 #[derive(Template)]
 #[template(path = "pages/account_delete.html")]
 pub struct AccountDeletePage {
@@ -778,7 +833,7 @@ pub struct AccountDeletePage {
     pub error: Option<String>,
 }
 
-/// M6 — admin privacy-request queue.
+/// Admin privacy-request queue.
 #[derive(Template)]
 #[template(path = "pages/admin_privacy_requests.html")]
 pub struct AdminPrivacyRequestsPage {
@@ -789,10 +844,10 @@ pub struct AdminPrivacyRequestsPage {
 }
 
 // ---------------------------------------------------------------------------
-// M3 community pages
+// Community pages.
 // ---------------------------------------------------------------------------
 
-/// D1 — add a parking location.
+/// Add a parking location.
 #[derive(Template)]
 #[template(path = "pages/parking_new.html")]
 pub struct ParkingNewPage {
@@ -816,7 +871,7 @@ pub struct ParkingNewPage {
     pub security_states: Vec<ContributionTriStateVm>,
     pub type_options: Vec<view::OptionVm>,
     pub error: Option<String>,
-    /// Which input(s) a rejected submission belongs to (WP21 a11y pass).
+    /// Which input(s) a rejected submission belongs to.
     pub field_errors: view::FieldErrors,
     pub duplicates: Vec<view::DuplicateVm>,
     /// Set when the add succeeded but similar listings turned up anyway — the
@@ -824,7 +879,7 @@ pub struct ParkingNewPage {
     pub added_id: Option<i64>,
 }
 
-/// D1 — the duplicate interstitial, rendered *before* anything is created.
+/// The duplicate interstitial, rendered *before* anything is created.
 #[derive(Template)]
 #[template(path = "pages/parking_new_confirm.html")]
 pub struct ParkingNewConfirmPage {
@@ -835,7 +890,7 @@ pub struct ParkingNewConfirmPage {
     pub fields: Vec<ContributionHiddenField>,
 }
 
-/// D2 — edit a location (reversible fields).
+/// Edit a location (reversible fields).
 #[derive(Template)]
 #[template(path = "pages/parking_edit.html")]
 pub struct ParkingEditPage {
@@ -859,12 +914,12 @@ pub struct ParkingEditPage {
     pub lat: f64,
     pub lon: f64,
     pub error: Option<String>,
-    /// Which input(s) a rejected submission belongs to (WP21 a11y pass).
+    /// Which input(s) a rejected submission belongs to.
     pub field_errors: view::FieldErrors,
     pub notice: Option<String>,
 }
 
-/// D3 — write / edit a review.
+/// Write or edit a review.
 #[derive(Template)]
 #[template(path = "pages/review_form.html")]
 pub struct ReviewFormPage {
@@ -874,7 +929,7 @@ pub struct ReviewFormPage {
     pub rating: u8,
     pub body: String,
     pub error: Option<String>,
-    /// Which input(s) a rejected submission belongs to (WP21 a11y pass).
+    /// Which input(s) a rejected submission belongs to.
     pub field_errors: view::FieldErrors,
 }
 
@@ -929,7 +984,7 @@ pub struct FragmentErrorVm {
     pub message: String,
 }
 
-/// M2 photo moderation queue page (PLAN M4).
+/// Photo moderation queue page.
 #[derive(Template)]
 #[template(path = "pages/moderation_photos.html")]
 pub struct ModerationPhotosPage {
@@ -940,7 +995,7 @@ pub struct ModerationPhotosPage {
     pub next_url: Option<String>,
 }
 
-/// HTMX fragment: the P3 photo upload result (success or error).
+/// HTMX fragment for a photo upload result (success or error).
 #[derive(Template)]
 #[template(path = "partials/photo_upload_result.html")]
 pub struct PhotoUploadResultVm {
@@ -951,10 +1006,10 @@ pub struct PhotoUploadResultVm {
 }
 
 // ---------------------------------------------------------------------------
-// M5 moderation & reporting pages
+// Moderation and reporting pages.
 // ---------------------------------------------------------------------------
 
-/// M1 — moderation dashboard (counts + links to the queues).
+/// Moderation dashboard (counts and links to the queues).
 #[derive(Template)]
 #[template(path = "pages/moderation_dashboard.html")]
 pub struct ModerationDashboardPage {
@@ -967,7 +1022,7 @@ pub struct ModerationDashboardPage {
     pub is_admin: bool,
 }
 
-/// M3 — reports queue.
+/// Reports queue.
 #[derive(Template)]
 #[template(path = "pages/moderation_reports.html")]
 pub struct ModerationReportsPage {
@@ -982,7 +1037,7 @@ pub struct ModerationReportsPage {
     pub next_url: Option<String>,
 }
 
-/// M4 — proposal review queue.
+/// Proposal review queue.
 #[derive(Template)]
 #[template(path = "pages/moderation_proposals.html")]
 pub struct ModerationProposalsPage {
@@ -993,7 +1048,7 @@ pub struct ModerationProposalsPage {
     pub next_url: Option<String>,
 }
 
-/// M6 — admin audit-log viewer.
+/// Admin audit-log viewer.
 #[derive(Template)]
 #[template(path = "pages/admin_audit.html")]
 pub struct AdminAuditPage {
@@ -1041,88 +1096,4 @@ pub struct ModerationActionResultVm {
 pub use wiring::{RouterDeps, app_router, app_router_with};
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::http::{HeaderMap, HeaderValue, StatusCode};
-    use bikesnest_infrastructure::MapConfig;
-    use i18n::Locale;
-
-    fn map() -> MapConfig {
-        MapConfig {
-            style_url: String::new(),
-            access_token: String::new(),
-        }
-    }
-
-    async fn body_of(resp: axum::response::Response) -> String {
-        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
-            .await
-            .unwrap();
-        String::from_utf8_lossy(&bytes).to_string()
-    }
-
-    /// The 500 branch `search` / `parking_details` take when the read side
-    /// fails: a fragment request must not receive a whole document.
-    #[tokio::test]
-    async fn error_response_renders_a_fragment_for_a_fragment_request() {
-        let mut headers = HeaderMap::new();
-        headers.insert(htmx::HX_REQUEST, HeaderValue::from_static("true"));
-        let tr = i18n::Translator::new(Locale::En);
-        let resp = error_response(
-            &headers,
-            &map(),
-            &Auth::default(),
-            tr,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            tr.t("error.500.body").to_string(),
-        );
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(
-            resp.headers()
-                .get_all(axum::http::header::VARY)
-                .iter()
-                .count(),
-            1
-        );
-        let body = body_of(resp).await;
-        assert!(body.contains(r#"role="alert""#), "{body}");
-        assert!(!body.contains("<html"), "not a document: {body}");
-    }
-
-    #[tokio::test]
-    async fn error_response_renders_the_page_for_a_document_request() {
-        let tr = i18n::Translator::new(Locale::En);
-        let resp = error_response(
-            &HeaderMap::new(),
-            &map(),
-            &Auth::default(),
-            tr,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            tr.t("error.500.body").to_string(),
-        );
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let body = body_of(resp).await;
-        assert!(body.contains("<!DOCTYPE"), "a whole document: {body}");
-        assert!(body.contains("500"), "the status is on the page");
-        assert!(body.contains("Something went wrong"), "the 500 title/body");
-    }
-
-    /// A boosted navigation carries `HX-Request` but swaps `<body>`.
-    #[tokio::test]
-    async fn error_response_gives_a_boosted_request_the_page() {
-        let mut headers = HeaderMap::new();
-        headers.insert(htmx::HX_REQUEST, HeaderValue::from_static("true"));
-        headers.insert(htmx::HX_BOOSTED, HeaderValue::from_static("true"));
-        let tr = i18n::Translator::new(Locale::En);
-        let resp = error_response(
-            &headers,
-            &map(),
-            &Auth::default(),
-            tr,
-            StatusCode::NOT_FOUND,
-            tr.t("error.404.body").to_string(),
-        );
-        let body = body_of(resp).await;
-        assert!(body.contains("<!DOCTYPE"), "a whole document: {body}");
-    }
-}
+mod lib_tests;

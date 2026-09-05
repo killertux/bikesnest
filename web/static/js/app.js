@@ -13,7 +13,7 @@
 document.addEventListener('alpine:init', function () {
   var Alpine = window.Alpine;
 
-  /* ---- Shared focus trap (WP21 accessibility pass) ------------------------------
+  /* ---- Shared focus trap ---------------------------------------------------------
    * Both dialogs below (the report modal, the photo lightbox) call this from
    * their own open/close methods — it is plain JS, never a template
    * expression, so the CSP build's evaluator never has to parse it.
@@ -136,6 +136,226 @@ document.addEventListener('alpine:init', function () {
           },
           function () { self.locating = false; self.denied = true; }
         );
+      },
+    };
+  });
+
+  /* ---- Shared address autocomplete -------------------------------------------- */
+  Alpine.data('addressAutocomplete', function () {
+    return {
+      suggestions: [],
+      open: false,
+      loading: false,
+      message: '',
+      activeIndex: -1,
+      timer: null,
+      request: null,
+      session: '',
+      searchingLabel: '',
+      noResultsLabel: '',
+      failedLabel: '',
+      init: function () {
+        var ds = this.$el.dataset;
+        this.searchingLabel = ds.searching || '';
+        this.noResultsLabel = ds.noResults || '';
+        this.failedLabel = ds.failed || '';
+        this.session = this.newSession();
+      },
+      newSession: function () {
+        if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+          return window.crypto.randomUUID();
+        }
+        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (char) {
+          var n = Math.floor(Math.random() * 16);
+          return (char === 'x' ? n : (n & 3) | 8).toString(16);
+        });
+      },
+      get panelOpen() { return this.open || !!this.message; },
+      get activeDescendant() {
+        return this.open && this.activeIndex >= 0 ? this.optionId(this.activeIndex) : null;
+      },
+      input: function () { return this.$root.querySelector('[data-address-query]'); },
+      optionId: function (index) {
+        var input = this.input();
+        var listId = input ? input.getAttribute('aria-controls') : '';
+        return listId + '-option-' + index;
+      },
+      form: function () {
+        var input = this.input();
+        return input ? input.closest('form') : null;
+      },
+      cancelRequest: function () {
+        if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+        if (this.request) { this.request.abort(); this.request = null; }
+        this.loading = false;
+      },
+      clearCoordinates: function () {
+        var form = this.form();
+        if (!form) return;
+        ['lat', 'lon'].forEach(function (name) {
+          var field = form.querySelector('[name="' + name + '"]');
+          if (!field) return;
+          if (field.type === 'hidden') field.remove();
+          else field.value = '';
+        });
+        this.$root.dispatchEvent(new CustomEvent('bikesnest:address-cleared', { bubbles: true }));
+      },
+      queue: function () {
+        var self = this;
+        this.cancelRequest();
+        this.clearCoordinates();
+        this.suggestions = [];
+        this.open = false;
+        this.activeIndex = -1;
+        this.message = '';
+        var input = this.input();
+        var query = input ? input.value.trim() : '';
+        if (query.length < 3) return;
+        this.timer = setTimeout(function () {
+          self.timer = null;
+          self.fetchSuggestions(query);
+        }, 800);
+      },
+      fetchSuggestions: function (query) {
+        var self = this;
+        this.loading = true;
+        this.message = this.searchingLabel;
+        this.request = typeof AbortController === 'function' ? new AbortController() : null;
+        var options = { credentials: 'same-origin' };
+        if (this.request) options.signal = this.request.signal;
+        fetch(
+          '/api/address-suggestions?q=' + encodeURIComponent(query) +
+          '&session=' + encodeURIComponent(this.session),
+          options
+        )
+          .then(function (res) {
+            if (!res.ok) throw new Error(String(res.status));
+            return res.json();
+          })
+          .then(function (items) {
+            var input = self.input();
+            if (!input || input.value.trim() !== query) return;
+            self.loading = false;
+            self.request = null;
+            self.suggestions = Array.isArray(items) ? items.slice(0, 10) : [];
+            self.open = self.suggestions.length > 0;
+            self.activeIndex = self.open ? 0 : -1;
+            self.message = self.open ? '' : self.noResultsLabel;
+          })
+          .catch(function (err) {
+            if (err && err.name === 'AbortError') return;
+            self.loading = false;
+            self.request = null;
+            self.suggestions = [];
+            self.open = false;
+            self.activeIndex = -1;
+            self.message = self.failedLabel;
+          });
+      },
+      setCoordinate: function (name, value) {
+        var form = this.form();
+        if (!form) return;
+        var field = form.querySelector('[name="' + name + '"]');
+        if (!field) {
+          field = document.createElement('input');
+          field.type = 'hidden';
+          field.name = name;
+          form.appendChild(field);
+        }
+        field.value = Number(value).toFixed(6);
+      },
+      hasCoordinates: function (suggestion) {
+        return suggestion && typeof suggestion.lat === 'number' &&
+          typeof suggestion.lon === 'number' &&
+          isFinite(suggestion.lat) && isFinite(suggestion.lon);
+      },
+      applySuggestion: function (suggestion) {
+        if (!this.hasCoordinates(suggestion)) return;
+        var input = this.input();
+        if (input) input.value = suggestion.label;
+        this.setCoordinate('lat', suggestion.lat);
+        this.setCoordinate('lon', suggestion.lon);
+        this.message = '';
+        this.open = false;
+        this.activeIndex = -1;
+        this.$root.dispatchEvent(new CustomEvent('bikesnest:address-selected', {
+          bubbles: true,
+          detail: suggestion,
+        }));
+        if (input) input.dispatchEvent(new Event('change', { bubbles: true }));
+        this.session = this.newSession();
+      },
+      select: function (index) {
+        var suggestion = this.suggestions[index];
+        if (!suggestion) return;
+        var input = this.input();
+        if (input) input.value = suggestion.label;
+        this.open = false;
+        this.activeIndex = -1;
+        if (this.hasCoordinates(suggestion)) {
+          this.applySuggestion(suggestion);
+          return;
+        }
+        if (!suggestion.reference) return;
+        this.resolveSuggestion(suggestion);
+      },
+      resolveSuggestion: function (suggestion) {
+        var self = this;
+        this.cancelRequest();
+        this.loading = true;
+        this.message = this.searchingLabel;
+        this.request = typeof AbortController === 'function' ? new AbortController() : null;
+        var options = { credentials: 'same-origin' };
+        if (this.request) options.signal = this.request.signal;
+        fetch(
+          '/api/address-suggestions/resolve?id=' + encodeURIComponent(suggestion.reference) +
+          '&session=' + encodeURIComponent(this.session),
+          options
+        )
+          .then(function (res) {
+            if (!res.ok) throw new Error(String(res.status));
+            return res.json();
+          })
+          .then(function (resolved) {
+            self.loading = false;
+            self.request = null;
+            self.applySuggestion({
+              label: resolved.label || suggestion.label,
+              lat: resolved.lat,
+              lon: resolved.lon,
+            });
+          })
+          .catch(function (err) {
+            if (err && err.name === 'AbortError') return;
+            self.loading = false;
+            self.request = null;
+            self.message = self.failedLabel;
+          });
+      },
+      choose: function (e) {
+        this.select(parseInt(e.currentTarget.dataset.index, 10));
+      },
+      next: function () {
+        if (!this.open || !this.suggestions.length) return;
+        this.activeIndex = (this.activeIndex + 1) % this.suggestions.length;
+      },
+      previous: function () {
+        if (!this.open || !this.suggestions.length) return;
+        this.activeIndex = (this.activeIndex - 1 + this.suggestions.length) % this.suggestions.length;
+      },
+      enter: function (e) {
+        if (!this.open || !this.suggestions.length) return;
+        e.preventDefault();
+        this.select(this.activeIndex < 0 ? 0 : this.activeIndex);
+      },
+      show: function () {
+        if (this.suggestions.length) this.open = true;
+      },
+      close: function () {
+        this.cancelRequest();
+        this.open = false;
+        this.message = '';
+        this.activeIndex = -1;
       },
     };
   });
@@ -342,6 +562,19 @@ document.addEventListener('alpine:init', function () {
           }));
         }
       },
+      selectAddress: function (e) {
+        var d = (e && e.detail) || {};
+        if (!isFinite(d.lat) || !isFinite(d.lon)) return;
+        this.setPosition(Number(d.lat), Number(d.lon));
+      },
+      clearAddress: function () {
+        var fields = this.inputs();
+        if (fields.lat) fields.lat.value = '';
+        if (fields.lon) fields.lon.value = '';
+        this.lat = null;
+        this.lon = null;
+        this.message = '';
+      },
       useLocation: function () {
         var self = this;
         if (!navigator.geolocation) { self.message = self.locateFailed; return; }
@@ -482,7 +715,7 @@ document.addEventListener('alpine:init', function () {
   });
 });
 
-/* ---- parking_details.html: move focus after a verification swap (WP21) ------
+/* ---- parking_details.html: move focus after a verification swap ------------
  * `#verification-panel`'s own forms (verify.still_exists / no_longer_exists /
  * info_changed / parked_here) all target `hx-target="#verification-panel"
  * hx-swap="innerHTML"`, so the form that fired the request is *inside* the

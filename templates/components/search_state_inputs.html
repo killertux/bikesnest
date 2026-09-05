@@ -3,12 +3,14 @@
    state the other two own. Each caller skips the field(s) it renders as a
    visible control, so no form ever submits a field twice.
 
-   `skip_bbox` is what the main search box sets: typing a destination leaves
-   browse mode, so that form must not carry the map area forward, while the
-   sort and filter forms must (changing a filter re-queries the same area). #}
-{% macro hidden(form, skip_q, skip_sort, skip_filters, skip_bbox) %}
+   `skip_bbox` and `skip_origin` are what the main search box sets: typing a
+   destination leaves browse mode and replaces any geolocated origin. Sort and
+   filter forms keep both because they re-query the current search. #}
+{% macro hidden(form, skip_q, skip_sort, skip_filters, skip_bbox, skip_origin) %}
+{% if !skip_origin %}
 {% if let Some(lat) = form.lat %}<input type="hidden" name="lat" value="{{ lat }}" />{% endif %}
 {% if let Some(lon) = form.lon %}<input type="hidden" name="lon" value="{{ lon }}" />{% endif %}
+{% endif %}
 {% if !skip_q %}{% if !form.q.is_empty() %}<input type="hidden" name="q" value="{{ form.q }}" />{% endif %}{% endif %}
 {% if !skip_sort %}{% if !form.sort.is_empty() %}<input type="hidden" name="sort" value="{{ form.sort }}" />{% endif %}{% endif %}
 {% if !skip_bbox %}{% if !form.bbox.is_empty() %}<input type="hidden" name="bbox" value="{{ form.bbox }}" />{% endif %}{% endif %}

@@ -32,7 +32,7 @@ browsers, in **English** and **Brazilian Portuguese**.
 A Rust web server (axum) renders server-side pages (Askama templates) and
 serves small interactive fragments via [htmx](https://htmx.org), with
 [Alpine.js](https://alpinejs.dev) for client-side behavior and
-[MapLibre](https://maplibre.org) for the map. Business rules live in a clean,
+a selectable Google Maps, Mapbox GL, or MapLibre renderer. Business rules live in a clean,
 framework-free core; PostgreSQL + PostGIS does the geospatial search and stores
 the data. Everything external — geocoding, email, object storage, OAuth, rate
 limiting — sits behind a small interface (a "port") so it can be swapped
@@ -122,8 +122,9 @@ docker run --rm -p 8080:8080 \
   -e S3_ENDPOINT= -e S3_REGION=us-east-1 -e S3_BUCKET=bikesnest \
   -e S3_ACCESS_KEY_ID=... -e S3_SECRET_ACCESS_KEY=... \
   -e VALKEY_URL=valkey://valkey:6379 \
-  -e GEOCODER=mapbox -e MAPBOX_ACCESS_TOKEN=... \
-  -e MAP_STYLE_URL=https://... \
+  -e LOCATION_PROVIDER=mapbox \
+  -e MAPBOX_GEOCODING_ACCESS_TOKEN=... \
+  -e MAPBOX_MAP_ACCESS_TOKEN=... \
   bikesnest
 ```
 
@@ -170,10 +171,11 @@ source of truth). The ones you'll most often touch:
 | `S3_ENDPOINT/REGION/BUCKET/ACCESS_KEY_ID/SECRET_ACCESS_KEY` | object storage (empty endpoint = AWS) | MinIO defaults |
 | `VALKEY_URL` / `VALKEY_CLUSTER_URLS` | shared rate limiter (unset = in-memory) | unset |
 | `RATE_LIMIT_FAIL_OPEN` | allow (true) or 429 (false) if ValKey is down | `true` |
-| `GEOCODER` | `mapbox` \| `fake` (address → coordinates) | `fake` |
-| `MAPBOX_ACCESS_TOKEN` | Mapbox geocoding token (when `GEOCODER=mapbox`) | — |
-| `MAP_STYLE_URL` | basemap style for the map | MapLibre demo tiles |
-| `MAPBOX_MAP_ACCESS_TOKEN` | public token for a Mapbox basemap | — |
+| `LOCATION_PROVIDER` | `google` \| `mapbox` \| `fake`; selects geocoding, autocomplete, and maps | `fake` |
+| `MAPBOX_GEOCODING_ACCESS_TOKEN` / `MAPBOX_MAP_ACCESS_TOKEN` | Mapbox server and browser tokens | — |
+| `MAPBOX_STYLE_URL` | Mapbox map style | Mapbox Streets v12 |
+| `GOOGLE_MAPS_SERVER_API_KEY` | Google Geocoding and Places server key | — |
+| `GOOGLE_MAPS_BROWSER_API_KEY` / `GOOGLE_MAP_ID` | Google Maps browser key and map ID | — |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` | `seed-admin` bootstrap | — |
 | `JOBS_ENABLED` / `JOBS_*` | background job worker (Postgres-backed) | enabled |
 | `POLICY_OPERATOR_*` / `POLICY_CONTACT_EMAIL` / `POLICY_VERSION` / `POLICY_EFFECTIVE_AT` | legal pages seeding | — |

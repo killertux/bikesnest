@@ -55,7 +55,7 @@ You may not:
 
 ## 6. Intellectual property
 
-The BikesNest software, brand, name and design belong to us or our licensors. The base map and geocoding are provided by third parties under their own licences and attribution requirements, shown on the map itself. User Content is governed by section 3.
+The BikesNest software, brand, name and design belong to us or our licensors. The base map, geocoding and autocomplete are provided by third parties under their own licences and attribution requirements, shown in the relevant map or address-search interface. User Content is governed by section 3.
 
 ## 7. Disclaimer of warranties
 

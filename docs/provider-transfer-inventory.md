@@ -4,7 +4,7 @@
 > **outside Brazil** (EU and/or US). Every row is therefore an international
 > transfer under LGPD art. 33 for Brazilian users, and — for EEA users — a
 > Chapter V transfer whenever the provider is outside the EEA. The privacy
-> policy (§6) says exactly this.
+> policy's international-transfer section says exactly this.
 >
 > **Mechanisms we rely on** (state them in each DPA):
 > - **LGPD:** the ANPD standard contractual clauses (Resolução CD/ANPD nº
@@ -22,41 +22,46 @@
 | Provider (chosen) | Purpose | Data transferred | Region | Role | GDPR mechanism | LGPD mechanism | Status |
 |---|---|---|---|---|---|---|---|
 | Hosting (app + PostgreSQL) — _name TBD_ | run app, store DB | full app + DB (all personal data) | ☐ EU / US — record it | processor | ☐ EU-hosted → none needed; US → DPF or EU SCC | ☐ ANPD SCC in DPA (else art. 33 IX) | ☐ DPA accepted ☐ region recorded ☐ backups same region |
-| Object storage (S3-compatible: AWS S3 / Cloudflare R2 / Backblaze B2) — _TBD_ | photo binaries | derivative bytes under opaque keys (§77: no user metadata) | ☐ | processor | ☐ | ☐ | ☐ DPA ☐ region ☐ bucket private, presigned GET only |
+| Object storage (S3-compatible: AWS S3 / Cloudflare R2 / Backblaze B2) — _TBD_ | photo binaries | derivative bytes under opaque keys, with no user metadata | ☐ | processor | ☐ | ☐ | ☐ DPA ☐ region ☐ bucket private, presigned GET only |
 | Email (Resend **or** SMTP relay) — _TBD_ | verification / reset mail | email address + token link | ☐ (Resend: US) | processor | ☐ | ☐ | ☐ DPA ☐ region |
-| **Mapbox** (`GEOCODER=mapbox`) | address → coordinates | query string only (§77: no identity, cookie or client IP) | US | processor | ☐ Mapbox DPA (EU SCC / DPF) | ☐ ANPD SCC if offered, else art. 33 IX | ☐ DPA accepted ☐ token URL-restricted |
-| Map tiles (Mapbox style **or** other via `MAP_STYLE_URL`) — _TBD_ | render basemap | tile requests **from the user's browser**: client IP + viewed area; no account identity | ☐ | processor (receives IP directly) | ☐ | ☐ | ☐ DPA ☐ attribution shown ☐ `CSP_TILE_HOSTS` set |
-| Automated content screening (LLM/classifier) — _future_ | moderation assist | the photo/text being screened only; **never** account identity | ☐ | processor | ☐ | ☐ | not wired yet — add here + policy §5 already discloses it |
+| **Mapbox** (`LOCATION_PROVIDER=mapbox`) | address search and autocomplete | query string; server-to-provider request metadata; no BikesNest identity or cookie | US | processor | ☐ Mapbox DPA (EU SCC / DPF) | ☐ ANPD SCC if offered, else art. 33 IX | ☐ DPA accepted ☐ server token API-scoped |
+| **Google Maps Platform** (`LOCATION_PROVIDER=google`) | address search, autocomplete, place resolution, and map rendering | typed query + random session token from the server; browser IP + viewed area for map assets; no BikesNest account identity or cookie | ☐ record contracted region/terms | processor / independent controller as contract states | ☐ Google Maps Platform terms + DPA/SCC/DPF reviewed | ☐ ANPD SCC if offered, else art. 33 IX | ☐ terms/DPA accepted ☐ keys API/referer/network restricted ☐ Places/Geocoding/Maps JS enabled |
+| OpenFreeMap tiles | render the MapLibre development basemap for the fake profile | requests **from the user's browser**: client IP + viewed area; no account identity | ☐ | processor (receives IP directly) | ☐ | ☐ | development only |
+| Automated content screening (LLM/classifier) — _future_ | moderation assist | the photo/text being screened only; **never** account identity | ☐ | processor | ☐ | ☐ | not wired yet; add it here before launch |
 | Observability / error tracking — _none planned_ | logs/metrics | logs (headers never logged; PII minimized) | ☐ | processor | ☐ | ☐ | if added: DPA + region |
-| Google (OAuth) | login | `sub`, email, `email_verified` | US | independent controller (their side) | n/a | n/a | **deferred — not in production**; add to policy §2/§4 when shipped |
+| Google (OAuth) | login | `sub`, email, `email_verified` | US | independent controller (their side) | n/a | n/a | **deferred — not in production**; update the policy when shipped |
 
-## §77 minimization confirmations (already true from M1–M8)
+## Data-minimization confirmations
 
 - **Map renderer** receives no authenticated identity — tiles are public.
-- **Geocoder** receives only the query string.
+- **Geocoder** receives the typed query and, for Google autocomplete, a random
+  per-selection session token. It receives no BikesNest account identity,
+  cookie, or direct browser connection.
 - **Object store** receives only derivative bytes under opaque keys (no email or
   provider `sub` in keys).
 - **Email provider** receives only the address + the verification/reset link.
 
-These boundaries are asserted by M6 tests (the export payload never contains a
-credential hash / token hash; the map/geocode/object-key calls carry no account
-identity).
+Tests assert that the export payload never contains a credential or token hash;
+the map, geocoder, and object-key calls carry no account identity.
 
-## Geocoder (§83) — selectable backend
+## Selectable location provider
 
-`crates/infrastructure/src/geocoding.rs` (`GEOCODER`, default `fake`):
+`LOCATION_PROVIDER` selects one coherent profile. It defaults to `fake` in
+development, and production accepts only `mapbox` or `google`.
 
 - **fake** — deterministic dev geocoder (no external request).
-- **mapbox** — `MapboxGeocoder` → `GET api.mapbox.com/geocoding/v5/mapbox.places/{query}.json`
-  with `limit=1`. **Sent to Mapbox:** only the percent-encoded query string
-  (§77). **Not sent:** account identity, cookies, client IP. Response
-  `features[0]` (`center` as `[lon, lat]`) → `GeoHit`. Empty features → no match.
+- **mapbox** — `MapboxGeocoder` calls the Mapbox forward-geocoding endpoint.
+  The response's provider-ranked features supply up to ten dropdown options.
+  Their coordinates are ready as soon as the user selects one. Mapbox GL JS
+  renders the configured Mapbox style.
+- **google** — `GoogleGeocoder` calls Geocoding API for direct searches, Places
+  Autocomplete (New) for dropdown predictions, and Place Details for the chosen
+  prediction. One random session token ties autocomplete to selection. The
+  browser loads Maps JavaScript API and renders Google results on Google Maps.
 
-  **§83 documentation:** usage limit = Mapbox account plan/billing (free tier
-  ~100k requests/month); ToS + attribution apply; caching is request-scoped (no
-  client-side cache of results); terms-of-service and privacy are Mapbox's. A
-  geocode error is rendered as a friendly "location service unavailable" page
-  (not a 500).
+Hosted geocoding responses are not stored in BikesNest's in-process cache. The
+per-IP rate limit bounds provider traffic. Errors render the localized location
+service unavailable state rather than an internal-server-error page.
 
 ## Pre-launch procedure (ops)
 
@@ -67,4 +72,5 @@ identity).
    GDPR transfer question for EEA users entirely.
 4. If any provider lacks ANPD clauses, note "art. 33 IX" in this table and flag
    it in `docs/legal-review.md` for counsel.
-5. Set `CSP_TILE_HOSTS` / `CSP_GEOCODE_HOSTS` to exactly the chosen hosts.
+5. For MapLibre, set `CSP_TILE_HOSTS` to the chosen style/tile hosts. Google
+   Maps origins are enabled automatically by the selected profile.

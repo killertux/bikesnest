@@ -227,16 +227,13 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "footer.privacy" => ("Privacy policy", "Política de privacidade"),
         "footer.terms" => ("Terms of service", "Termos de uso"),
         "footer.cookies" => ("Cookie policy", "Política de cookies"),
-        "footer.coming" => (
-            "Coming in a later milestone",
-            "Em breve, em uma próxima etapa",
-        ),
+        "footer.coming" => ("Coming soon", "Em breve"),
         "footer.subtitle" => (
             "Community-maintained bicycle parking",
             "Bicicletários mantidos pela comunidade",
         ),
 
-        // --- home (P1) -----------------------------------------------------
+        // --- home ----------------------------------------------------------
         "home.title" => (
             "BikesNest — find bicycle parking you can trust",
             "BikesNest — encontre bicicletários confiáveis",
@@ -322,7 +319,18 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         ),
         "home.cta.button" => ("Search parking", "Buscar vagas"),
 
-        // --- search (P2) ---------------------------------------------------
+        // --- search --------------------------------------------------------
+        "address.autocomplete.searching" => ("Searching addresses…", "Buscando endereços…"),
+        "address.autocomplete.no_results" => (
+            "No matching addresses found.",
+            "Nenhum endereço correspondente foi encontrado.",
+        ),
+        "address.autocomplete.failed" => (
+            "Address search is unavailable right now.",
+            "A busca de endereços está indisponível no momento.",
+        ),
+        "address.autocomplete.suggestions" => ("Address suggestions", "Sugestões de endereço"),
+        "address.autocomplete.google_attribution" => ("Powered by Google", "Powered by Google"),
         // Frontend-only listing collaboration concept.
         "collab.preview" => ("Interactive preview", "Prévia interativa"),
         "collab.preview_body" => (
@@ -717,7 +725,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "verified.days_ago" => ("Last verified {n} days ago", "Verificado há {n} dias"),
         "verified.never" => ("Never verified", "Nunca verificado"),
 
-        // --- details (P3) --------------------------------------------------
+        // --- details -------------------------------------------------------
         "details.breadcrumb.home" => ("Home", "Início"),
         "details.breadcrumb.search" => ("Parking", "Vagas"),
         "details.badge.community" => ("Community verified", "Verificado pela comunidade"),
@@ -743,7 +751,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
             "Be the first to add a photo",
             "Seja o primeiro a enviar uma foto",
         ),
-        // A fixed name on the button itself (WP21 a11y pass): an uploaded
+        // A fixed name on the button itself: an uploaded
         // photo's own caption is optional, so the thumbnail's accessible name
         // cannot rely on it alone.
         "gallery.view_photo" => ("View photo", "Ver foto"),
@@ -765,7 +773,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
             "Favoritar, verificar e propor mudanças chegam com as contas da comunidade.",
         ),
 
-        // --- about (P7) ----------------------------------------------------
+        // --- about ---------------------------------------------------------
         "about.title" => ("About — BikesNest", "Sobre — BikesNest"),
         "about.hero.eyebrow" => ("The community model", "O modelo da comunidade"),
         "about.hero.title" => (
@@ -1060,7 +1068,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "account.state.deleted" => ("Deleted", "Excluída"),
         "account.unverified" => ("Unverified", "Não verificado"),
 
-        // --- admin user management (M5) ------------------------------------
+        // --- admin user management -----------------------------------------
         "admin.users_title" => ("Users", "Usuários"),
         "admin.user" => ("User", "Usuário"),
         "admin.state" => ("State", "Estado"),
@@ -1077,7 +1085,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "admin.grant_admin" => ("+ Admin", "+ Admin"),
         "admin.revoke_admin" => ("− Admin", "− Admin"),
 
-        // --- M3 contributions: add (D1) ---------------------------------
+        // --- contributions: add ------------------------------------------
         "new.title" => ("Add a parking spot", "Adicionar uma vaga"),
         "new.subtitle" => (
             "Mark where bicycle parking exists — type, cost, hours, security.",
@@ -1161,7 +1169,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         ),
         "new.confirm.back" => ("Go back and edit", "Voltar e corrigir"),
 
-        // --- M3 contributions: edit (D2) --------------------------------
+        // --- contributions: edit -----------------------------------------
         "edit.title" => ("Edit parking spot", "Editar vaga"),
         "edit.subtitle" => (
             "Update the details of this spot. Moving the pin or removal are separate actions below.",
@@ -1180,7 +1188,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "edit.remove.submit" => ("Propose change", "Propor mudança"),
         "edit.reason" => ("Reason", "Motivo"),
 
-        // --- M3 reviews (D3) -------------------------------------------
+        // --- reviews ------------------------------------------------------
         "review.title" => ("Write a review", "Escrever uma avaliação"),
         "review.subtitle" => ("How was it to park here?", "Como foi estacionar aqui?"),
         "review.rating" => ("Rating", "Avaliação"),
@@ -1206,7 +1214,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
             "Não foi possível salvar sua avaliação.",
         ),
 
-        // --- M3 favorites (C4) -----------------------------------------
+        // --- favorites ----------------------------------------------------
         "favorites.title" => ("Your favorites", "Seus favoritos"),
         "favorites.subtitle" => ("Spots you saved for later.", "Vagas que você salvou."),
         "favorites.save" => ("Save to favorites", "Salvar nos favoritos"),
@@ -1217,7 +1225,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
             "Toque no coração em uma vaga para mantê-la aqui.",
         ),
 
-        // --- M3 contributions history (C5) ------------------------------
+        // --- contributions history ---------------------------------------
         "contrib.title" => ("Your contributions", "Suas contribuições"),
         "contrib.subtitle" => (
             "Everything you have added, verified or reviewed.",
@@ -1275,7 +1283,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
             "Anotado. Isso ajuda a ver o uso.",
         ),
 
-        // --- P3 post-action notices --------------------------------------
+        // --- post-action notices -----------------------------------------
         "details.notice.proposed" => (
             "Your change has been submitted and will be reviewed by a moderator before it appears.",
             "Sua mudança foi enviada e será revisada por um moderador antes de aparecer.",
@@ -1291,7 +1299,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
             "Sua vaga está no ar. A comunidade vai conferi-la com o tempo; você pode editá-la quando quiser.",
         ),
 
-        // --- P3 recommended because -----------------------------------
+        // --- recommended because -----------------------------------------
         "details.recommend.title" => ("Recommended because", "Recomendado porque"),
         "reason.distance" => ("Close to your destination", "Perto do seu destino"),
         "reason.security" => ("Security attributes", "Itens de segurança"),
@@ -1358,7 +1366,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "attr.location" => ("Location", "Localização"),
         "attr.unknown" => ("Details", "Detalhes"),
 
-        // --- photos (M4, /) -----------------------------------------
+        // --- photos -------------------------------------------------------
         "photo.upload.title" => ("Add a photo", "Adicionar foto"),
         "photo.upload.hint" => (
             "A photo helps riders recognize a spot. Upload only photos you took of the parking itself and avoid people's faces and licence plates. You are responsible for what you upload; photos are reviewed by moderators and automated tools before they appear.",
@@ -1470,7 +1478,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "moderation.refresh" => ("Refresh queue", "Atualizar fila"),
         "moderation.uploaded" => ("Uploaded", "Enviado"),
 
-        // --- M5 reports + moderation (moderation.rs) -------------------
+        // --- reports and moderation --------------------------------------
         "report.title" => ("Report this content", "Denunciar este conteúdo"),
         "report.action" => ("Report", "Denunciar"),
         "report.reason" => ("Reason", "Motivo"),
@@ -1716,7 +1724,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "audit.result.success" => ("Success", "Sucesso"),
         "audit.result.failure" => ("Failure", "Falha"),
 
-        // --- M6 privacy & account lifecycle ---
+        // --- privacy and account lifecycle -------------------------------
         "nav.privacy" => ("Privacy policy", "Política de privacidade"),
         "nav.terms" => ("Terms of service", "Termos de serviço"),
         "nav.cookies" => ("Cookie policy", "Política de cookies"),

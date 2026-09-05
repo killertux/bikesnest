@@ -68,7 +68,7 @@
   <div id="listing-overview" role="tabpanel" aria-labelledby="tab-overview" class="parking-overview grid gap-8 lg:grid-cols-[1fr_320px]" data-listing-pane="overview">
     <div>
 
-      <!-- Photo gallery (P3) -->
+      <!-- Photo gallery -->
       <section class="parking-gallery">
         {% if gallery.is_empty() %}
           <div class="rounded-2xl border border-dashed border-border bg-surface px-6 py-12 text-center">
@@ -213,7 +213,7 @@
         </section>
       {% endif %}
 
-      <!-- Reviews (M3) -->
+      <!-- Reviews -->
       <section class="mt-8">
         <h2 class="font-display text-lg font-semibold">{{ tr.t("details.reviews.title") }}</h2>
         {% if can_contribute %}
@@ -276,7 +276,7 @@
         </div>
       </div>
 
-      <!-- Add a nearby spot (WP12): the map above only ever shows this one
+      <!-- Add a nearby spot: the map above only ever shows this one
            listing, so this is the entry point to add whatever it doesn't cover. -->
       <div class="rounded-2xl border border-dashed border-border bg-surface p-4 text-sm">
         <p class="text-muted">{{ tr.t("details.add_nearby") }}</p>
@@ -417,16 +417,31 @@
 {% endblock %}
 
 {% block head %}
-<!-- MapLibre base styles (map clipping, canvas layout, control/attribution
+<!-- Map renderer base styles (map clipping, canvas layout, control/attribution
      positioning). Must load before map.css so the page's map overrides win. -->
+{% if layout.uses_maplibre() %}
 <link rel="stylesheet" href="{{ layout.asset("vendor/maplibre-gl.css") }}">
+{% else if layout.uses_mapbox() %}
+<link rel="stylesheet" href="{{ layout.asset("vendor/mapbox-gl.css") }}">
+{% endif %}
 <link rel="stylesheet" href="{{ layout.asset("css/map.css") }}">
 {% if !layout.map_style_url.is_empty() %}
 <link rel="preconnect" href="{{ layout.tile_origin() }}" crossorigin>
+{% else if layout.uses_google_maps() %}
+<link rel="preconnect" href="https://maps.googleapis.com">
+<link rel="preconnect" href="https://maps.gstatic.com" crossorigin>
 {% endif %}
 {% endblock %}
 
 {% block scripts %}
+{% if layout.uses_maplibre() %}
 <script src="{{ layout.asset("vendor/maplibre-gl.js") }}"></script>
+<script src="{{ layout.asset("js/map-provider-maplibre.js") }}"></script>
+{% else if layout.uses_mapbox() %}
+<script src="{{ layout.asset("vendor/mapbox-gl.js") }}"></script>
+<script src="{{ layout.asset("js/map-provider-mapbox.js") }}"></script>
+{% else if layout.uses_google_maps() %}
+<script src="{{ layout.asset("js/map-provider-google.js") }}"></script>
+{% endif %}
 <script src="{{ layout.asset("js/details-map.js") }}"></script>
 {% endblock %}

@@ -30,7 +30,7 @@
   <link rel="stylesheet" href="{{ layout.asset("css/app.css") }}">
   <!-- The map library's CSS/JS load only on pages that actually render a map
        — search.html, parking_details.html, moderation_proposals.html — via
-       their own head/scripts blocks (WP14), not unconditionally here. -->
+       their own head/scripts blocks, not unconditionally here. -->
   {% block head %}{% endblock %}
 </head>
 {# htmx 4 has `config.implicitInheritance = false`, so a plain `hx-boost` on
@@ -39,8 +39,11 @@
    (`closest('[hx-boost\:inherited]')`), so this is the attribute that actually
    boosts the document's links and forms. #}
 <body class="bg-bg font-body text-fg" hx-boost:inherited="true"
+      data-map-provider="{{ layout.map_provider }}"
       data-map-style-url="{{ layout.map_style_url }}"
-      data-map-access-token="{{ layout.map_access_token }}">
+      data-map-access-token="{{ layout.map_access_token }}"
+      data-google-maps-api-key="{{ layout.google_maps_api_key }}"
+      data-google-map-id="{{ layout.google_map_id }}">
   <a href="#content" class="sr-only focus:not-sr-only focus:absolute focus:left-4 focus:top-4 focus:z-50 focus:rounded-lg focus:bg-surface focus:px-4 focus:py-2 focus:text-fg">{{ tr.t("a11y.skip") }}</a>
   <header id="top" class="sticky top-0 z-40 border-b border-border bg-[oklch(98%_0.004_240_/_0.9)] backdrop-blur" x-data="mobileMenu">
     <div class="mx-auto flex h-16 max-w-shell items-center justify-between gap-6 px-4 lg:px-8">

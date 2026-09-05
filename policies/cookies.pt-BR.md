@@ -14,7 +14,7 @@ Não usamos armazenamento local (*localStorage*) nem outras tecnologias de rastr
 
 ## Cookies de terceiros
 
-Não permitimos que terceiros gravem cookies no BikesNest. Ao exibir o mapa, seu navegador carrega os "tiles" diretamente do provedor de mapas; essa requisição leva seu endereço IP ao provedor, mas ele não grava cookies pelo nosso site. Veja a seção "Com quem compartilhamos" da [Política de Privacidade](/privacy).
+O BikesNest não usa cookies de terceiros para publicidade ou rastreamento. Ao exibir o mapa, seu navegador contata diretamente o provedor selecionado; essa requisição leva seu endereço IP, e o provedor trata o armazenamento ou os cookies próprios conforme sua política de privacidade. Veja a seção "Com quem compartilhamos" da [Política de Privacidade](/privacy).
 
 ## Como controlar
 

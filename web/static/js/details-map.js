@@ -1,8 +1,8 @@
 /* Single-location maps rendered from `data-*` attributes.
  *
  * Two shapes share this file:
- *   - `#map-single` (P3 details): one marker at data-lat/data-lon.
- *   - `.proposal-map` (M4 proposal queue): the same, plus an optional "before"
+ *   - `#map-single` on details pages: one marker at data-lat/data-lon.
+ *   - `.proposal-map` in the proposal queue: the same, plus an optional "before"
  *     marker at data-current-lat/data-current-lon so a move proposal shows
  *     where the pin is now and where it would go. When both are present the
  *     view is fitted to contain them.
@@ -11,17 +11,11 @@
  */
 (function () {
   "use strict";
-  var bodyCfg = document.body ? document.body.dataset : {};
-  var STYLE_URL = bodyCfg.mapStyleUrl || "https://tiles.openfreemap.org/styles/liberty";
-  var ACCESS_TOKEN = bodyCfg.mapAccessToken || "";
-
   function addMarker(map, lon, lat, className, label) {
     var el = document.createElement("div");
     el.className = className;
     if (label) el.title = label;
-    var marker = new maplibregl.Marker(el).setLngLat([lon, lat]);
-    marker.addTo(map);
-    return marker;
+    return map.addMarker({ element: el, position: { lon: lon, lat: lat } });
   }
 
   function num(value) {
@@ -30,7 +24,8 @@
   }
 
   function initOne(el) {
-    if (!el || !window.maplibregl || el.dataset.initialized) return;
+    var provider = window.BikesNestMapProvider;
+    if (!el || !provider || el.dataset.initialized) return;
     var lat = num(el.dataset.lat);
     var lon = num(el.dataset.lon);
     if (lat === null || lon === null) return;
@@ -42,15 +37,12 @@
     var fromLon = num(el.dataset.currentLon);
     var hasFrom = fromLat !== null && fromLon !== null;
 
-    if (ACCESS_TOKEN) maplibregl.accessToken = ACCESS_TOKEN;
-    var map = new maplibregl.Map({
-      container: el,
-      style: STYLE_URL,
-      center: [lon, lat],
+    var map = provider.createMap(el, {
+      center: { lon: lon, lat: lat },
       zoom: 17,
+      navigation: true,
     });
-    map.addControl(new maplibregl.NavigationControl());
-    map.on("load", function () {
+    map.onLoad(function () {
       if (hasFrom) {
         addMarker(map, fromLon, fromLat, "marker marker-before", el.dataset.currentLabel);
       }
@@ -58,8 +50,10 @@
       if (hasFrom && (fromLat !== lat || fromLon !== lon)) {
         map.fitBounds(
           [
-            [Math.min(fromLon, lon), Math.min(fromLat, lat)],
-            [Math.max(fromLon, lon), Math.max(fromLat, lat)],
+            Math.min(fromLon, lon),
+            Math.min(fromLat, lat),
+            Math.max(fromLon, lon),
+            Math.max(fromLat, lat),
           ],
           { padding: 48, maxZoom: 17, duration: 0 }
         );
@@ -68,9 +62,13 @@
   }
 
   function init() {
-    initOne(document.getElementById("map-single"));
-    var pairs = document.querySelectorAll(".proposal-map");
-    for (var i = 0; i < pairs.length; i++) initOne(pairs[i]);
+    var provider = window.BikesNestMapProvider;
+    if (!provider) return;
+    provider.ready().then(function () {
+      initOne(document.getElementById("map-single"));
+      var pairs = document.querySelectorAll(".proposal-map");
+      for (var i = 0; i < pairs.length; i++) initOne(pairs[i]);
+    }).catch(function () { /* The rest of the page remains usable. */ });
   }
 
   if (document.readyState === "loading") {
