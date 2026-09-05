@@ -25,6 +25,8 @@
   {% if !layout.canonical.is_empty() %}
   <meta property="og:url" content="{{ layout.canonical }}">
   {% endif %}
+  <link rel="icon" type="image/png" sizes="32x32" href="{{ layout.asset("img/bikesnest-favicon-32.png") }}">
+  <link rel="apple-touch-icon" sizes="180x180" href="{{ layout.asset("img/apple-touch-icon.png") }}">
   <link rel="stylesheet" href="{{ layout.asset("css/app.css") }}">
   <!-- The map library's CSS/JS load only on pages that actually render a map
        — search.html, parking_details.html, moderation_proposals.html — via
@@ -43,10 +45,7 @@
   <header id="top" class="sticky top-0 z-40 border-b border-border bg-[oklch(98%_0.004_240_/_0.9)] backdrop-blur" x-data="mobileMenu">
     <div class="mx-auto flex h-16 max-w-shell items-center justify-between gap-6 px-4 lg:px-8">
       <a href="/" class="flex items-center gap-2.5" aria-label="{{ tr.t("brand.home_aria") }}">
-        <span class="grid h-9 w-9 place-items-center rounded-xl bg-accent text-white">
-          <svg aria-hidden="true" class="h-5 w-5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18.5" cy="17.5" r="3.5" /><circle cx="5.5" cy="17.5" r="3.5" /><circle cx="15" cy="5" r="1" /><path d="M12 17.5V14l-3-3 4-3 2 3h2" /></svg>
-        </span>
-        <span class="font-display text-lg font-bold tracking-tight">BikesNest</span>
+        <img src="{{ layout.asset("img/bikesnest-logo.png") }}" width="640" height="213" alt="" class="w-40">
       </a>
       <nav class="hidden items-center gap-7 md:flex" aria-label="{{ tr.t("a11y.primary_nav") }}">
         <a href="/#how-it-works" class="text-sm text-muted hover:text-fg">{{ tr.t("nav.how") }}</a>
@@ -183,10 +182,7 @@
       <div class="flex flex-col gap-10 md:flex-row md:items-start md:justify-between">
         <div class="max-w-xs">
           <a href="/" class="flex items-center gap-2.5" aria-label="{{ tr.t("brand.home_aria") }}">
-            <span class="grid h-8 w-8 place-items-center rounded-lg bg-accent text-white">
-              <svg aria-hidden="true" class="h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18.5" cy="17.5" r="3.5" /><circle cx="5.5" cy="17.5" r="3.5" /><circle cx="15" cy="5" r="1" /><path d="M12 17.5V14l-3-3 4-3 2 3h2" /></svg>
-            </span>
-            <span class="font-display text-base font-bold tracking-tight">BikesNest</span>
+            <img src="{{ layout.asset("img/bikesnest-logo.png") }}" width="640" height="213" alt="" loading="lazy" class="w-40">
           </a>
           <p class="mt-3 text-sm leading-relaxed text-muted">{{ tr.t("footer.tagline") }}</p>
         </div>

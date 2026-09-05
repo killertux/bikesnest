@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#f6f9fb">
+<title>BikesNest — Logo assets</title>
+<link rel="icon" type="image/png" href="assets/bikesnest-icon.png">
+<style>
+/* OD-LAYOUT-PRIMITIVES v1 — structure only: display, flex/grid, overflow, wrapping, ratio.
+   Put this @layer first; product CSS outside the layer always wins. */
+@layer od-layout {
+  :where(.od-stack,.od-row,.od-row-top,.od-cluster,.od-grid,.od-field,.od-stat,.od-cell,.od-tile) > :where(*) { min-width: 0; }
+
+  /* containers */
+  .od-stack   { display: flex; flex-direction: column; gap: var(--od-gap, 8px); }
+  .od-row     { display: flex; align-items: center; gap: var(--od-gap, 8px); }
+  .od-row-top { display: flex; align-items: flex-start; gap: var(--od-gap, 8px); }
+  .od-cluster { display: flex; flex-wrap: wrap; align-items: center; gap: var(--od-gap, 8px); }
+  .od-fill    { flex: 1 1 0; min-width: 0; }
+  .od-fixed   { flex: none; }
+  .od-grid    { display: grid; gap: var(--od-gap, 12px); grid-template-columns: repeat(var(--od-cols, 3), minmax(0, 1fr)); }
+
+  /* stacked information: each piece is its own line — never sibling inline spans */
+  .od-stat, .od-field, .od-cell { display: grid; gap: var(--od-gap, 2px); }
+  :where(.od-stat,.od-field,.od-cell) > :where(*) { display: block; }
+  .od-tile { display: grid; grid-template-rows: auto 1fr; }
+  :where(.od-tile) > :where(*) { display: block; }
+
+  /* media keeps its intrinsic ratio by default; never a distorted or cropped
+     cover by accident. height:auto lets the ratio win over an <img height="…">
+     attribute. Cropping to a uniform box is an explicit opt-in: set --od-ratio
+     AND add .od-media-cover together (per the core rule, only where a crop is
+     deliberate — tile thumbs, decorative fills — never on full-frame content). */
+  .od-media { display: block; width: 100%; height: auto; aspect-ratio: var(--od-ratio, auto); }
+  .od-media-cover { object-fit: cover; }
+
+  /* data text only — authored copy is rewritten to its budget instead */
+  .od-truncate { display: block; max-width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .od-clamp-2, .od-clamp-3 { display: -webkit-box; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+  .od-clamp-2 { -webkit-line-clamp: 2; }
+  .od-clamp-3 { -webkit-line-clamp: 3; }
+  .od-lines-2 { min-height: calc(2 * 1.4em); }   /* block-level reservation for a shared baseline */
+  .od-nowrap  { white-space: nowrap; }           /* 数字+单位 · 价格+起 · 日期+星期 */
+  .od-keep    { word-break: keep-all; overflow-wrap: anywhere; } /* CJK labels break at spaces / <wbr> first */
+
+  /* screen skeleton (optional): bars take their own space, the middle scrolls — no padding guessed for chrome */
+  .od-screen { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; height: 100%; }
+  .od-scroll { overflow-y: auto; overscroll-behavior: contain; min-height: 0; }
+
+  /* horizontal rail: the next item peeks at the edge; trailing room survives overflow */
+  .od-rail { display: flex; gap: var(--od-gap, 8px); overflow-x: auto; scroll-snap-type: x proximity; scrollbar-width: none;
+             padding-inline: var(--od-rail-pad, 16px); scroll-padding-inline: var(--od-rail-pad, 16px); }
+  .od-rail::-webkit-scrollbar { display: none; }
+  :where(.od-rail) > :where(*) { flex: none; scroll-snap-align: start; }
+  :where(.od-rail) > :where(:last-child) { margin-inline-end: var(--od-rail-pad, 16px); }
+
+  .od-spacer { flex: none; visibility: hidden; pointer-events: none; }
+  .od-touch  { min-width: 44px; min-height: 44px; }
+}
+/* /OD-LAYOUT-PRIMITIVES v1 */
+
+:root {
+ --bg:oklch(98% 0.004 240); --surface:#fff; --fg:oklch(20% 0.02 240);
+ --muted:oklch(45% 0.018 240); --line:oklch(90% 0.006 240);
+ --accent:oklch(56% 0.12 170); --strong:oklch(45% 0.11 170); --dark:oklch(40% 0.10 170);
+ --soft:oklch(56% 0.12 170 / .06); --hover:oklch(20% 0.02 240 / .05);
+ --font-display:"Avenir Next",-apple-system,BlinkMacSystemFont,system-ui,sans-serif;
+ --font-body:-apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,sans-serif;
+ --s1:4px; --s2:8px; --s3:16px; --s4:24px; --s5:32px; --s6:48px; --s7:64px;
+ --radius:8px; --body:16px; --small:16px; --section:24px; --title:clamp(32px,4vw,48px);
+ --shell:1152px; --control:48px;
+}
+* { box-sizing:border-box; }
+html { color-scheme:light; -webkit-text-size-adjust:100%; }
+body { margin:0; background:var(--bg); color:var(--fg); font:var(--body)/1.6 var(--font-body); }
+h1,h2,h3,p,figure { margin:0; }
+h1,h2,h3 { font-family:var(--font-display); text-wrap:balance; }
+h1 { font-size:var(--title); line-height:1.15; letter-spacing:-.035em; font-weight:700; }
+h2 { font-size:var(--section); line-height:1.3; letter-spacing:-.02em; }
+p { text-wrap:pretty; }
+a { color:var(--strong); text-underline-offset:4px; cursor:pointer; }
+:focus-visible { outline:3px solid var(--strong); outline-offset:4px; }
+.wrap { max-width:var(--shell); margin-inline:auto; padding-inline:var(--s4); }
+.topbar { border-bottom:1px solid var(--line); }
+.topbar-inner { min-height:88px; display:flex; align-items:center; justify-content:space-between; gap:var(--s4); }
+.brand { font-family:var(--font-display); font-weight:700; font-size:var(--section); letter-spacing:-.03em; }
+.top-label,.muted { color:var(--muted); }
+main { padding-block:var(--s6); }
+.intro { --od-gap:var(--s3); margin-bottom:var(--s5); max-width:760px; }
+.eyebrow { font-size:var(--small); font-weight:600; color:var(--strong); }
+.intro p { color:var(--muted); max-width:65ch; }
+.asset { background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); }
+.logo-stage { padding:var(--s5); display:grid; place-items:center; }
+.logo-stage img { max-width:960px; }
+.asset-footer { padding:var(--s4) var(--s5); border-top:1px solid var(--line); --od-gap:var(--s4); }
+.asset-footer p { color:var(--muted); margin-top:var(--s1); }
+.download { display:inline-flex; align-items:center; justify-content:center; min-height:var(--control); padding:var(--s2) var(--s4); border-radius:var(--radius); color:var(--surface); background:var(--strong); text-decoration:none; font-weight:600; white-space:nowrap; }
+.download.secondary { color:var(--fg); background:var(--surface); border:1px solid var(--line); }
+.lower { display:grid; grid-template-columns:minmax(0,1fr); gap:var(--s5); margin-top:var(--s5); }
+.icon-stage { background:var(--soft); display:grid; place-items:center; padding:var(--s5); border-radius:var(--radius) var(--radius) 0 0; }
+.icon-stage img { max-width:224px; }
+.icon-footer { --od-gap:var(--s3); padding:var(--s4); }
+.icon-footer p { color:var(--muted); }
+.guide { --od-gap:var(--s4); padding-block:var(--s2); }
+.guide p { color:var(--muted); max-width:60ch; }
+.guide-list { margin:0; padding:0; display:grid; gap:var(--s3); }
+.guide-list div { display:grid; grid-template-columns:112px minmax(0,1fr); gap:var(--s3); padding-bottom:var(--s3); border-bottom:1px solid var(--line); }
+dt { font-weight:600; }
+dd { margin:0; color:var(--muted); overflow-wrap:anywhere; }
+.notes { display:inline-flex; align-items:center; min-height:var(--control); align-self:flex-start; font-weight:600; }
+footer.page-footer { padding-block:var(--s4); border-top:1px solid var(--line); color:var(--muted); }
+footer.page-footer .od-cluster { justify-content:space-between; --od-gap:var(--s3); }
+@media (hover:hover) { .download:hover { background:var(--dark); } .download.secondary:hover { background:var(--hover); } .notes:hover { text-decoration-thickness:2px; } }
+@media (min-width:768px) { .wrap { padding-inline:var(--s5); } .lower { grid-template-columns:minmax(0, .9fr) minmax(0,1.2fr); gap:var(--s6); } }
+@media (min-width:1024px) { main { padding-block:var(--s7); } .logo-stage { padding:var(--s6); } .lower { grid-template-columns:minmax(0, .85fr) minmax(0,1.15fr); gap:var(--s7); } }
+@media (min-width:1440px) { .wrap { padding-inline:0; } }
+@media (max-width:767px) { .asset-footer { flex-direction:column; align-items:stretch; padding:var(--s4); } .asset-footer .od-fill { flex:auto; } .logo-stage { padding:var(--s3); } .topbar-inner { min-height:80px; } .top-label { font-size:var(--small); } .download { width:100%; } }
+@media (prefers-reduced-motion:reduce) { *,*::before,*::after { animation:none!important; transition:none!important; scroll-behavior:auto!important; } }
+</style>
+</head>
+<body>
+<header class="topbar"><div class="wrap topbar-inner"><span class="brand">BikesNest</span><span class="top-label">Brand assets</span></div></header>
+<main class="wrap">
+ <div class="intro od-stack"><span class="eyebrow">The BikesNest identity</span><h1>A welcoming place to park.</h1><p>A bicycle, a simple nest, and a familiar name. A fresh mark for the community that keeps bike parking on the map.</p></div>
+ <section class="asset" aria-labelledby="logo-title">
+  <figure class="logo-stage"><img class="od-media" src="assets/bikesnest-logo.png" width="2172" height="724" alt="BikesNest logo: a green-teal bicycle cradled by an open curved nest beside the BikesNest wordmark."></figure>
+  <div class="asset-footer od-row"><div class="od-field od-fill"><h2 id="logo-title">Primary logo</h2><p>Transparent PNG · <span class="od-nowrap">2172 × 724 px</span></p></div><a class="download od-fixed" href="assets/bikesnest-logo.png" download="bikesnest-logo.png">Download logo</a></div>
+ </section>
+ <div class="lower">
+  <section class="asset" aria-labelledby="icon-title"><figure class="icon-stage"><img class="od-media" src="assets/bikesnest-icon.png" width="1254" height="1254" alt="Square BikesNest companion icon with a green bicycle and a curved nest."></figure><div class="icon-footer od-stack"><div class="od-field"><h2 id="icon-title">Companion icon</h2><p>Transparent PNG · <span class="od-nowrap">1254 × 1254 px</span></p></div><a class="download secondary" href="assets/bikesnest-icon.png" download="bikesnest-icon.png">Download icon</a></div></section>
+  <section class="guide od-stack" aria-labelledby="use-title"><h2 id="use-title">Made to feel at home.</h2><p>The green-teal color continues BikesNest’s existing identity. The open arc adds a sense of shelter, with a bold bicycle at its heart.</p><dl class="guide-list"><div><dt>Logo</dt><dd>For website headers and emails, on a light background.</dd></div><div><dt>Icon</dt><dd>For compact brand placements. A simplified companion with slight differences in geometry.</dd></div><div><dt>Clear space</dt><dd>Keep the full frame and give the mark room to breathe. Preserve its proportions.</dd></div><div><dt>Format</dt><dd>Raster PNG artwork with transparency. No vector master is included.</dd></div></dl><a class="notes" href="brand/logo-notes.md" download="bikesnest-logo-notes.md">Download usage notes</a></section>
+ </div>
+</main>
+<footer class="page-footer"><div class="wrap od-cluster"><span>BikesNest · Community bicycle parking</span><span>Logo concept · September 2026</span></div></footer>
+</body>
+</html>

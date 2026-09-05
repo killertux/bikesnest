@@ -1270,6 +1270,10 @@
   .opacity-60 {
     opacity: 60%;
   }
+  .shadow {
+    --tw-shadow: 0 1px 3px 0 var(--tw-shadow-color, rgb(0 0 0 / 0.1)), 0 1px 2px -1px var(--tw-shadow-color, rgb(0 0 0 / 0.1));
+    box-shadow: var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow);
+  }
   .shadow-card {
     --tw-shadow: 0 1px 2px var(--tw-shadow-color, oklch(20% 0.02 240 / 0.06)), 0 8px 24px var(--tw-shadow-color, oklch(20% 0.02 240 / 0.08));
     box-shadow: var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow);
