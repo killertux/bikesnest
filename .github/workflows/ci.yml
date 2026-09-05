@@ -1,48 +1,67 @@
 name: CI
 
-# NOTE (WP22): this workflow has never been run — GitHub Actions cannot be
-# executed locally. It was validated by `python3 -c "import yaml; yaml.safe_load(...)"`
-# (syntax only) and a careful read against the Dockerfile/.env.example/
-# docker-compose.yml this repo already has. Treat a first real run as the
-# actual test of it.
-
 on:
   push:
     branches: [main]
   pull_request:
 
-env:
-  # Test binaries read TEST_DATABASE_URL (falling back to DATABASE_URL) via
-  # crates/test-support — see database_url() in crates/test-support/src/lib.rs.
-  DATABASE_URL: postgres://bikesnest:bikesnest@localhost:5432/bikesnest
-  # bikesnest_test_support::test_config() (what every #[db_test] builds its
-  # router from) hardcodes the dev fakes/MinIO origin itself — it does not
-  # read these — but Config::from_env() (the production docker job below)
-  # does, so they are set here too for consistency with .env.example.
-  S3_ENDPOINT: http://localhost:9000
-  S3_REGION: us-east-1
-  S3_BUCKET: bikesnest
-  S3_ACCESS_KEY_ID: minioadmin
-  S3_SECRET_ACCESS_KEY: minioadmin
-  VALKEY_URL: valkey://localhost:6379
-  CSP_MEDIA_HOSTS: http://localhost:9000
-  # The two integration tests that talk to a *real* MinIO/ValKey read their
-  # own env names (crates/infrastructure/tests/s3_object_storage.rs,
-  # valkey_rate_limit.rs) and silently skip when unset — set them so CI
-  # actually exercises those adapters instead of quietly passing on nothing.
-  S3_TEST_ENDPOINT: http://localhost:9000
-  S3_TEST_REGION: us-east-1
-  S3_TEST_BUCKET: bikesnest
-  S3_TEST_ACCESS_KEY_ID: minioadmin
-  S3_TEST_SECRET_ACCESS_KEY: minioadmin
-  VALKEY_TEST_URL: valkey://localhost:6379
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  test:
+  format:
+    name: Format
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DATABASE_URL: postgres://bikesnest:bikesnest@localhost:5432/bikesnest
+      S3_ENDPOINT: http://localhost:9000
+      S3_REGION: us-east-1
+      S3_BUCKET: bikesnest
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin
+      VALKEY_URL: valkey://localhost:6379
+      CSP_MEDIA_HOSTS: http://localhost:9000
+      S3_TEST_ENDPOINT: http://localhost:9000
+      S3_TEST_REGION: us-east-1
+      S3_TEST_BUCKET: bikesnest
+      S3_TEST_ACCESS_KEY_ID: minioadmin
+      S3_TEST_SECRET_ACCESS_KEY: minioadmin
+      VALKEY_TEST_URL: valkey://localhost:6379
     services:
-      # postgis/postgis's entrypoint is the stock postgres one: POSTGRES_*
-      # env is enough to boot it, no command override needed.
       postgres:
         image: postgis/postgis:17-3.5
         env:
@@ -56,9 +75,6 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
-      # valkey-server is this image's default CMD, so — unlike MinIO below —
-      # a plain `services:` entry (no way to pass extra args in that schema)
-      # is enough for a single ephemeral dev-mode node.
       valkey:
         image: valkey/valkey:8
         ports:
@@ -68,102 +84,64 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
-
     steps:
       - uses: actions/checkout@v4
-
-      # `services:` has no field for overriding a container's command, and
-      # minio/minio's image requires `server /data` as an explicit CMD (its
-      # entrypoint does not default to serving) — so MinIO runs as a plain
-      # background container instead, mirroring docker-compose.yml's
-      # `minio`/`minio-init` pair.
       - name: Start MinIO
         run: |
           docker run -d --name minio -p 9000:9000 \
-            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
             minio/minio server /data
       - name: Wait for MinIO
         run: |
           for i in $(seq 1 30); do
             if curl -sf http://localhost:9000/minio/health/live >/dev/null; then
-              echo "MinIO is up"
               exit 0
             fi
             sleep 1
           done
           echo "::error::MinIO did not become healthy in time"
           exit 1
-      - name: Create the bikesnest bucket
+      - name: Create test bucket
         run: |
           docker run --rm --network host --entrypoint sh minio/mc -c \
             "mc alias set local http://localhost:9000 minioadmin minioadmin && mc mb --ignore-existing local/bikesnest"
-
-      - name: Wait for Postgres
-        run: |
-          for i in $(seq 1 30); do
-            if pg_isready -h localhost -p 5432 -U bikesnest -d bikesnest >/dev/null 2>&1; then
-              echo "Postgres is up"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "::error::Postgres did not become ready in time"
-          exit 1
-
-      # Pinned to the exact release the Dockerfile builds with (`FROM
-      # rust:1.95`), not `stable` — a workspace this close to its MSRV/edition
-      # boundary should not silently drift onto whatever "stable" happens to
-      # be on a given CI day while the release image stays on 1.95. `@master`
-      # (rather than `@stable`) is what lets this step take a `toolchain:`
-      # input at all; the `with:` below is the only place the version is
-      # pinned — no root `rust-toolchain.toml` was added, deliberately: that
-      # file would also repin every contributor's (and every other CI job's)
-      # local `cargo`/`rustup` the moment they run a cargo command in this
-      # repo, which is a bigger footprint than "make CI match the Docker
-      # image", and would force an installed-toolchain switch this action's
-      # explicit input already gets us without it.
-      - name: Install Rust (pinned to the Dockerfile's rust:1.95)
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"
-          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
 
-      - name: cargo fmt --check
-        run: cargo fmt --all --check
-
-      - name: cargo build (workspace, all targets)
-        run: cargo build --workspace --all-targets
-
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
+  frontend-assets:
+    name: Frontend assets
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: npm ci
+          cache: npm
+      - name: Install dependencies
         run: npm ci
-      - name: Rebuild app.css and diff against the committed file
+      - name: Rebuild generated assets
         run: |
+          npm run build:assets
           npm run build:css
-          git diff --exit-code web/static/css/app.css
-
-      - name: cargo test (workspace)
-        run: cargo test --workspace
+      - name: Check generated assets are committed
+        run: git diff --exit-code -- web/static/css/app.css web/static/vendor
 
   docker:
+    name: Docker image
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: docker build
+      - name: Build production image
         run: docker build -t bikesnest .
-      - name: Production startup validation refuses an incomplete environment
-        # APP_ENV=production with nothing else set (a bogus, unreachable
-        # DATABASE_URL, no S3/email/geocoder/TLS/CSP_MEDIA_HOSTS/ValKey config)
-        # must exit non-zero before the container ever tries to reach that
-        # database — see Config::validate_for_production() and its call site
-        # in crates/web/src/main.rs (runs for `None | Some("serve")`, i.e. the
-        # ENTRYPOINT's tini + bikesnest-web with the "serve" CMD arg below).
+      - name: Reject an incomplete production environment
         run: |
           set +e
           docker run --rm \
@@ -173,7 +151,6 @@ jobs:
           status=$?
           set -e
           if [ "$status" -eq 0 ]; then
-            echo "::error::the production image started (exit 0) with an incomplete environment; startup validation should have refused"
+            echo "::error::the production image accepted an incomplete environment"
             exit 1
           fi
-          echo "production validation correctly refused to start (exit code $status)"

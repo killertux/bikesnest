@@ -16,7 +16,7 @@ fn repository_commits_release_savepoints_and_outer_scope_rolls_back() {
             .create(&mut *conn)
             .await
             .unwrap();
-        let parking = ParkingBuilder::new().create(&mut *conn).await.unwrap();
+        let parking = ParkingBuilder::new().create(&mut conn).await.unwrap();
         drop(conn);
         let accounts = SqlxAccountRepository::new(db.clone());
         accounts

@@ -194,9 +194,9 @@ cargo test --workspace         # everything, incl. #[db_test] integration/HTTP t
 ```
 
 How tests are structured and how to write one: [`TESTING.md`](TESTING.md).
-CI (`.github/workflows/ci.yml`) runs fmt/build/clippy/CSS-drift/`cargo test
---workspace` on every push and PR, plus a job that builds the Docker image and
-checks the production image refuses to start with an incomplete environment.
+CI (`.github/workflows/ci.yml`) reports formatting, Clippy, workspace tests,
+generated frontend assets, and Docker image validation as independent checks
+on every PR and push to `main`.
 
 ## Repository layout
 

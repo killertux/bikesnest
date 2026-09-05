@@ -396,36 +396,19 @@ falls back to pt-BR).
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` runs on every push and pull request against `main`.
-Two jobs:
+`.github/workflows/ci.yml` runs on every pull request and every push to `main`.
+It exposes independent checks so a formatting or lint failure is visible
+without waiting for the integration suite:
 
-- **`test`**: `postgis/postgis:17-3.5` and `valkey/valkey:8` as GitHub Actions
-  `services:` (their default images boot straight from `POSTGRES_*` env / no
-  args at all); MinIO runs as a plain background `docker run ... minio/minio
-  server /data` step instead — the declarative `services:` schema has no field
-  for overriding a container's command, and MinIO's image needs `server /data`
-  as an explicit `CMD`. Steps: checkout; `pg_isready`/MinIO-health wait loops;
-  `dtolnay/rust-toolchain@master` pinned to `toolchain: "1.95.0"` (the exact
-  release the Dockerfile's `FROM rust:1.95` builds with — read off this
-  machine's own `rustc --version` while writing this, since Docker Hub's
-  `1.95` tag floats to "latest patch of 1.95.x" the same way rustup's own
-  channel resolution does) + `clippy`/`rustfmt` components — no root
-  `rust-toolchain.toml` (see the workflow comment above that step for why:
-  such a file would also repin every contributor's local `cargo`/`rustup`,
-  not just CI, for a fix that only needed to change CI); `Swatinem/rust-cache`;
-  `cargo fmt --all --check`; `cargo build --workspace
-  --all-targets`; `cargo clippy --workspace --all-targets -- -D warnings`;
-  Node 22 + `npm ci` + `npm run build:css` + `git diff --exit-code
-  web/static/css/app.css` (the committed CSS must be exactly the build
-  output); `cargo test --workspace`.
-- **`docker`**: `docker build -t bikesnest .`, then a step that runs the image
-  with `APP_ENV=production` and nothing else configured (a bogus
-  `DATABASE_URL`, no S3/email/geocoder/TLS/`CSP_MEDIA_HOSTS`/ValKey) and
-  asserts it exits non-zero — `Config::validate_for_production()`'s whole
-  reason to exist (see `crates/web/src/main.rs`).
+- **Format** runs `cargo fmt --all -- --check`.
+- **Clippy** runs `cargo clippy --workspace --all-targets --locked -- -D warnings`.
+- **Tests** runs `cargo test --workspace --locked` against PostgreSQL/PostGIS,
+  ValKey, and MinIO. The provider smoke tests remain opt-in and skip when their
+  external API keys are absent.
+- **Frontend assets** rebuilds the vendored JavaScript/CSS and Tailwind output,
+  then fails if the generated files differ from the committed copies.
+- **Docker image** builds the production image and checks that startup rejects
+  an incomplete production environment.
 
-This workflow has not been run (there is no way to run GitHub Actions
-locally); it was checked with `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml'))"`
-(syntax only) and a careful manual read against this repo's Dockerfile,
-`.env.example`, and `docker-compose.yml`. Treat its first real run as the
-actual test of it.
+All Rust jobs use Rust 1.95.0, matching the production Docker builder. Workflow
+concurrency cancels an older run when a PR receives another push.

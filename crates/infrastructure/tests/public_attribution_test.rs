@@ -21,9 +21,9 @@ async fn public_names_apply_only_to_new_reviews_and_revocation_is_permanent(tx: 
     .execute(&mut *conn)
     .await
     .unwrap();
-    let first = ParkingBuilder::new().create(&mut *conn).await.unwrap().id();
-    let second = ParkingBuilder::new().create(&mut *conn).await.unwrap().id();
-    let third = ParkingBuilder::new().create(&mut *conn).await.unwrap().id();
+    let first = ParkingBuilder::new().create(&mut conn).await.unwrap().id();
+    let second = ParkingBuilder::new().create(&mut conn).await.unwrap().id();
+    let third = ParkingBuilder::new().create(&mut conn).await.unwrap().id();
     drop(conn); // Release the lease before a repository acquires this connection.
     let accounts = SqlxAccountRepository::new(db.clone());
     let reviews = SqlxReviewRepository::new(db.clone());
