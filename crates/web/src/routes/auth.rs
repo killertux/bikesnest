@@ -574,6 +574,8 @@ pub(crate) struct AccountNotices {
     pw_changed: Option<String>,
     #[serde(default)]
     email_pending: Option<String>,
+    #[serde(default)]
+    attribution_saved: Option<String>,
 }
 
 pub(crate) async fn account(
@@ -591,6 +593,8 @@ pub(crate) async fn account(
         Some(tr.t("account.pw_changed").to_string())
     } else if q.email_pending.is_some() {
         Some(tr.t("account.email_pending").to_string())
+    } else if q.attribution_saved.is_some() {
+        Some(tr.t("account.attribution.saved").to_string())
     } else {
         None
     };
@@ -605,12 +609,46 @@ pub(crate) async fn account(
             tr,
             email: user.email.to_string(),
             display_name: user.display_name.clone(),
+            public_contribution_name: match state.auth.public_contribution_name(user.id).await {
+                Ok(enabled) => enabled,
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            },
             is_verified: user.is_verified,
             roles_label: format_roles(tr, user.roles.clone()),
             notice,
         },
         StatusCode::OK,
     )
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub(crate) struct PublicNameForm {
+    #[serde(default)]
+    enabled: Option<String>,
+}
+
+pub(crate) async fn account_public_name_post(
+    State(state): State<AppState>,
+    auth: Auth,
+    Form(form): Form<PublicNameForm>,
+) -> Response {
+    let user = match auth.require_user() {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
+    let enabled = match form.enabled.as_deref() {
+        None => false,
+        Some("true") => true,
+        _ => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    match state
+        .auth
+        .set_public_contribution_name(user.id, enabled)
+        .await
+    {
+        Ok(()) => axum::response::Redirect::to("/account?attribution_saved=1").into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
 }
 
 #[derive(Debug, Default, serde::Deserialize)]

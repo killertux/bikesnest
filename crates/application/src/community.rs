@@ -130,6 +130,50 @@ pub struct NewProposal {
     pub proposed: serde_json::Value,
 }
 
+/// A voter's one mutable position on a pending proposal.  It intentionally
+/// carries no identity in public read models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposalVote {
+    Approve,
+    Reject,
+}
+
+impl ProposalVote {
+    pub fn as_code(self) -> &'static str {
+        match self {
+            Self::Approve => "APPROVE",
+            Self::Reject => "REJECT",
+        }
+    }
+    pub fn from_code(value: &str) -> Option<Self> {
+        match value {
+            "approve" | "APPROVE" => Some(Self::Approve),
+            "reject" | "REJECT" => Some(Self::Reject),
+            _ => None,
+        }
+    }
+}
+
+/// Public-safe totals returned after a vote update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProposalVoteTotals {
+    pub approvals: i64,
+    pub rejections: i64,
+}
+
+/// Privacy-safe proposal card data for a listing. It deliberately omits voter
+/// ids, email, and any media key.
+#[derive(Debug, Clone)]
+pub struct ListingProposal {
+    pub id: i64,
+    pub kind: bikesnest_domain::ProposalKind,
+    pub reason: Option<String>,
+    pub status: bikesnest_domain::ProposalStatus,
+    pub approvals: i64,
+    pub rejections: i64,
+    pub created_at: DateTime<Utc>,
+}
+
 /// An advisory duplicate candidate. Non-blocking; ranked by
 /// name-similarity + address overlap.
 #[derive(Debug, Clone)]
@@ -148,6 +192,8 @@ pub struct Review {
     pub id: i64,
     pub location_id: i64,
     pub author: Option<UserId>,
+    /// Already privacy-filtered; never derive a public label from an account ID.
+    pub public_author_name: Option<String>,
     pub rating: StarRating,
     pub body: ReviewBody,
     pub created_at: DateTime<Utc>,
@@ -301,6 +347,23 @@ pub trait ParkingContributionRepository: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<i64, ContributionError>;
     async fn create_proposal(&self, p: &NewProposal) -> Result<i64, ContributionError>;
+    /// Upsert one vote and return only aggregate totals. Implementations must
+    /// reject self votes and ineligible/deactivated accounts atomically.
+    async fn vote_on_proposal(
+        &self,
+        _proposal_id: i64,
+        _voter: UserId,
+        _vote: ProposalVote,
+    ) -> Result<ProposalVoteTotals, ContributionError> {
+        Err(ContributionError::Unauthorized)
+    }
+    async fn listing_proposals(
+        &self,
+        _location_id: i64,
+        _limit: i64,
+    ) -> Result<Vec<ListingProposal>, ContributionError> {
+        Ok(Vec::new())
+    }
     /// Newest `limit` revisions (`version DESC`) — bounded, not the full
     /// history (a location edited often would otherwise return every version).
     async fn revision_history(
@@ -747,6 +810,52 @@ impl ContributionService {
         )
         .await?;
         Ok(proposal_id)
+    }
+
+    /// Switches (or withdraws by choosing the other position) a participant's
+    /// single vote. Eligibility is checked again by the transactional store so
+    /// a suspended/deleted account cannot race an old session.
+    pub async fn vote_on_proposal(
+        &self,
+        user: &crate::auth::AuthenticatedUser,
+        proposal_id: i64,
+        vote: ProposalVote,
+    ) -> Result<ProposalVoteTotals, ContributionError> {
+        self.require_verified(user)?;
+        let totals = self
+            .deps
+            .contributions
+            .vote_on_proposal(proposal_id, user.id, vote)
+            .await?;
+        self.audit(
+            Some(user.id),
+            "parking.proposal_voted",
+            "parking_proposal",
+            proposal_id.to_string(),
+            serde_json::json!({ "vote": vote.as_code() }),
+        )
+        .await?;
+        Ok(totals)
+    }
+
+    pub async fn listing_proposals(
+        &self,
+        location_id: i64,
+    ) -> Result<Vec<ListingProposal>, ContributionError> {
+        self.deps
+            .contributions
+            .listing_proposals(location_id, 50)
+            .await
+    }
+
+    pub async fn revision_history(
+        &self,
+        location_id: i64,
+    ) -> Result<Vec<RevisionSummary>, ContributionError> {
+        self.deps
+            .contributions
+            .revision_history(location_id, 50)
+            .await
     }
 
     // -----------------------------------------------------------------------

@@ -180,6 +180,11 @@ The router is split three ways:
 catalogs; `security.rs` the headers/CSP; `observability.rs` the JSON structured
 logging; `markdown.rs` the sanitizing renderer for the legal pages.
 
+The parking detail page includes a frontend-only collaboration prototype in
+`listing_collaboration.html` and `listing-prototype.js`/`.css`. Its proposals,
+votes, moderation and version history are page-local mock state; see
+[`docs/listing-collaboration-prototype.md`](docs/listing-collaboration-prototype.md).
+
 ## Tech stack
 
 - **Language:** Rust (edition 2024), Cargo workspace, toolchain pinned via
@@ -269,6 +274,13 @@ Key modeling notes:
    or an htmx fragment; media URLs are presigned by `ObjectStorage`.
 
 ## Cross-cutting concerns
+
+- **Repository test isolation:** `Db` can explicitly wrap a test-owned SQLx
+  transaction. `Db::acquire()` leases that connection, and nested SQLx
+  transactions become savepoints. Production still uses the ordinary pool.
+  Test-support awaits outer rollback (including after panic) and invalidates
+  surviving handles. This is not a substitute for multi-connection race tests;
+  see `TESTING.md` for the incremental adapter migration.
 
 - **Security:** strict CSP (nonce-free, Alpine CSP build), security headers,
   CSRF synchronizer token, HttpOnly/Secure/SameSite=Lax sessions hashed at

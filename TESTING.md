@@ -62,7 +62,57 @@ Rules:
   `let mut sp = tx.savepoint().await;` … `sp.commit().await;` (or
   `sp.rollback().await`).
 
-### When rollback isn't enough: the committed-fixture pattern
+### Repository tests: inject the outer transaction (preferred)
+
+Use `tx.db().await` **before any fixture queries**. It transfers ownership of the
+test transaction to a cloneable, transaction-backed `Db`. Build fixtures using
+`db.acquire()`, release the connection lease, then inject `db.clone()` into real
+repositories. Their SQLx transactions become savepoints: repository commit means
+`RELEASE SAVEPOINT`, not a commit visible outside the test.
+
+```rust
+#[db_test]
+async fn repository_behavior(tx: &mut TestTx) {
+    let db = tx.db().await;
+    let mut conn = db.acquire().await.unwrap();
+    let user = UserBuilder::new().create(&mut *conn).await.unwrap();
+    drop(conn); // do not hold a lease while invoking a repository
+
+    let accounts = SqlxAccountRepository::new(db.clone());
+    accounts.set_public_contribution_name(user.id, true).await.unwrap();
+    assert!(accounts.public_contribution_name(user.id).await.unwrap());
+    // No commit_fixture(), fixture tags or cleanup DELETE statements.
+}
+```
+
+The harness **awaits outer rollback on success and on panic**, then invalidates
+all surviving `Db` clones. A failed repository transaction rolls back its own
+savepoint without aborting the test's outer transaction. Scope tests run at
+REPEATABLE READ so snapshot-export transactions can use a savepoint too;
+PostgreSQL cannot change transaction isolation inside a savepoint.
+
+Adapters must use `Db::acquire()` for reads and acquire a connection before
+calling `conn.begin()` for writes. Do not call `Db::pool()` on an injected scope:
+it deliberately fails rather than accidentally committing outside the test.
+Account, review and export adapters support this now; migrate other adapters
+before injecting them into a transaction-scoped HTTP router. Do not mix
+`tx.executor()` / `tx.commit_fixture()` with `tx.db()` in one test.
+
+One scoped `Db` means **one connection**, with exclusive leases. This tests real
+SQL, constraints, rollback and repository commit behavior, but not independent
+concurrent transactions, snapshot visibility between connections, or lock races.
+Those tests need a dedicated isolated database and real connections; do not
+serialize them on a scoped `Db` and claim concurrency coverage.
+
+Regression examples: `infrastructure/tests/transaction_scope_test.rs` verifies
+repository commit isolation, failed-savepoint recovery, outer rollback after
+success/panic, and invalidation of surviving clones. `public_attribution_test.rs`
+tests the real account/review/export adapters without committing fixtures.
+
+### Legacy pooled tests: the committed-fixture pattern
+
+Existing tests below predate transaction injection. Prefer the scoped pattern
+above for new sequential repository tests and migrate these incrementally.
 
 Read-model tests query through *other* pool connections, which cannot see the
 uncommitted rows of the test transaction. For those, commit a **tagged**

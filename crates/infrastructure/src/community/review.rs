@@ -29,12 +29,23 @@ impl ReviewRepository for SqlxReviewRepository {
         rating: StarRating,
         body: &ReviewBody,
     ) -> Result<bool, ContributionError> {
-        let mut tx = self
+        let mut conn = self
             .db
-            .pool()
+            .acquire()
+            .await
+            .map_err(|e| db_err("review.upsert_review", e))?;
+        let mut tx = conn
             .begin()
             .await
             .map_err(|e| db_err("review.upsert_review", e))?;
+
+        let public_author: bool = sqlx::query_scalar(
+            "SELECT public_contribution_name FROM users WHERE id = $1 FOR UPDATE",
+        )
+        .bind(author.0)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| db_err("review.capture_attribution", e))?;
 
         // One statement, so two concurrent *first* reviews by the same author
         // cannot both take an insert branch: the loser upserts instead of
@@ -44,8 +55,8 @@ impl ReviewRepository for SqlxReviewRepository {
         // author editing a review a moderator hid must not un-hide it.
         let (review_id, was_update): (i64, bool) = sqlx::query_as(
             r#"
-            INSERT INTO review (location_id, author_id, rating, body)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO review (location_id, author_id, rating, body, public_author)
+            VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (location_id, author_id) DO UPDATE
                 SET rating = EXCLUDED.rating,
                     body = EXCLUDED.body,
@@ -57,6 +68,7 @@ impl ReviewRepository for SqlxReviewRepository {
         .bind(author.0)
         .bind(rating.as_i16())
         .bind(body.as_str())
+        .bind(public_author)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| db_err("review.upsert_review", e))?;
@@ -107,14 +119,15 @@ impl ReviewRepository for SqlxReviewRepository {
     ) -> Result<Option<Review>, ContributionError> {
         let row = sqlx::query_as::<_, ReviewRow>(
             r#"
-            SELECT id, location_id, author_id, rating, body, created_at, updated_at
+            SELECT id, location_id, author_id, rating, body, created_at, updated_at,
+                CASE WHEN public_author THEN (SELECT NULLIF(BTRIM(display_name), '') FROM users WHERE users.id = review.author_id AND public_contribution_name AND account_state = 'ACTIVE') END AS public_author_name
             FROM review
             WHERE location_id = $1 AND author_id = $2
             "#,
         )
         .bind(location_id)
         .bind(author.0)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *self.db.acquire().await.map_err(|e| db_err("review.acquire", e))?)
         .await
         .map_err(|e| db_err("review.find_own", e))?;
         row.map(review_from_row).transpose()
@@ -137,7 +150,8 @@ impl ReviewRepository for SqlxReviewRepository {
             Some(after) => {
                 sqlx::query_as::<_, ReviewRow>(
                     r#"
-                    SELECT id, location_id, author_id, rating, body, created_at, updated_at
+                    SELECT id, location_id, author_id, rating, body, created_at, updated_at,
+                        CASE WHEN public_author THEN (SELECT NULLIF(BTRIM(display_name), '') FROM users WHERE users.id = review.author_id AND public_contribution_name AND account_state = 'ACTIVE') END AS public_author_name
                     FROM review
                     WHERE location_id = $1 AND moderation_state = 'ACTIVE' AND id < $2
                     ORDER BY created_at DESC, id DESC
@@ -147,13 +161,14 @@ impl ReviewRepository for SqlxReviewRepository {
                 .bind(location_id)
                 .bind(after)
                 .bind(limit)
-                .fetch_all(self.db.pool())
+                .fetch_all(&mut *self.db.acquire().await.map_err(|e| db_err("review.acquire", e))?)
                 .await
             }
             None => {
                 sqlx::query_as::<_, ReviewRow>(
                     r#"
-                    SELECT id, location_id, author_id, rating, body, created_at, updated_at
+                    SELECT id, location_id, author_id, rating, body, created_at, updated_at,
+                        CASE WHEN public_author THEN (SELECT NULLIF(BTRIM(display_name), '') FROM users WHERE users.id = review.author_id AND public_contribution_name AND account_state = 'ACTIVE') END AS public_author_name
                     FROM review
                     WHERE location_id = $1 AND moderation_state = 'ACTIVE'
                     ORDER BY created_at DESC, id DESC
@@ -162,7 +177,7 @@ impl ReviewRepository for SqlxReviewRepository {
                 )
                 .bind(location_id)
                 .bind(limit)
-                .fetch_all(self.db.pool())
+                .fetch_all(&mut *self.db.acquire().await.map_err(|e| db_err("review.acquire", e))?)
                 .await
             }
         }
@@ -176,6 +191,7 @@ struct ReviewRow {
     id: i64,
     location_id: i64,
     author_id: Option<i64>,
+    public_author_name: Option<String>,
     rating: i16,
     body: String,
     created_at: chrono::DateTime<chrono::Utc>,
@@ -187,6 +203,7 @@ fn review_from_row(r: ReviewRow) -> Result<Review, ContributionError> {
         id: r.id,
         location_id: r.location_id,
         author: r.author_id.map(UserId),
+        public_author_name: r.public_author_name,
         rating: StarRating::from_smallint(r.rating)
             .map_err(|e| ContributionError::InvalidField(e.to_string()))?,
         body: ReviewBody::new(&r.body)

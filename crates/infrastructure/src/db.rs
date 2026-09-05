@@ -1,12 +1,76 @@
 use crate::config::DbConfig;
-use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Connection, Executor};
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
+use tokio::sync::{Mutex, OwnedMutexGuard};
+
+type SharedTransaction = Arc<Mutex<Option<Transaction<'static, Postgres>>>>;
+
+#[derive(Debug, Clone)]
+enum Source {
+    Pool(PgPool),
+    Transaction(SharedTransaction),
+}
 
 /// Real PostgreSQL connection + migration runner (SQLx, hand-written SQL).
 #[derive(Debug, Clone)]
 pub struct Db {
-    pool: PgPool,
+    source: Source,
+}
+
+/// A pooled connection in production, or an exclusive lease on a test's outer
+/// transaction. Borrow it to begin a SQLx transaction: SQLx automatically uses
+/// SAVEPOINT when the connection already has an open transaction.
+pub enum DbConnection {
+    Pooled(sqlx::pool::PoolConnection<Postgres>),
+    Scoped(OwnedMutexGuard<Option<Transaction<'static, Postgres>>>),
+}
+
+impl Deref for DbConnection {
+    type Target = PgConnection;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Pooled(c) => c,
+            Self::Scoped(c) => c.as_ref().expect("active transaction lease"),
+        }
+    }
+}
+
+impl DerefMut for DbConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Pooled(c) => c,
+            Self::Scoped(c) => c.as_mut().expect("active transaction lease"),
+        }
+    }
+}
+
+impl DbConnection {
+    pub async fn begin(&mut self) -> Result<Transaction<'_, Postgres>, sqlx::Error> {
+        self.deref_mut().begin().await
+    }
+
+    /// PostgreSQL cannot change isolation inside a savepoint. Scoped tests must
+    /// start their outer transaction at REPEATABLE READ (the harness does so).
+    pub async fn begin_snapshot(&mut self) -> Result<Transaction<'_, Postgres>, sqlx::Error> {
+        if matches!(self, Self::Scoped(_)) {
+            let isolation: String = sqlx::query_scalar("SHOW transaction_isolation")
+                .fetch_one(&mut **self)
+                .await?;
+            if isolation != "repeatable read" && isolation != "serializable" {
+                return Err(sqlx::Error::Protocol(
+                    "snapshot requires a repeatable-read outer transaction".into(),
+                ));
+            }
+            self.begin().await
+        } else {
+            self.deref_mut()
+                .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ")
+                .await
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -56,7 +120,7 @@ impl Db {
             .connect(database_url)
             .await
             .map_err(DbError::Connect)?;
-        Ok(Self { pool })
+        Ok(Self::from_pool(pool))
     }
 
     /// Runs embedded migrations (`migrations/` at the workspace root).
@@ -69,7 +133,7 @@ impl Db {
     /// returned, so its relaxed settings never leak into request handling.
     pub async fn migrate(&self) -> Result<(), DbError> {
         let mut conn = self
-            .pool
+            .pool()
             .acquire()
             .await
             .map_err(DbError::Connect)?
@@ -86,25 +150,68 @@ impl Db {
     }
 
     pub fn pool(&self) -> &PgPool {
-        &self.pool
+        match &self.source {
+            Source::Pool(pool) => pool,
+            Source::Transaction(_) => {
+                panic!("transaction-scoped Db cannot escape to a pool; use Db::acquire")
+            }
+        }
     }
 
     /// Wraps an existing pool (used by the test suite to share the
     /// test-support fixture).
     pub fn from_pool(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            source: Source::Pool(pool),
+        }
+    }
+
+    /// Explicit transaction injection for repository/HTTP tests. All clones
+    /// share one connection, so concurrent calls are serialized, not race tests.
+    pub fn from_transaction(tx: Transaction<'static, Postgres>) -> Self {
+        Self {
+            source: Source::Transaction(Arc::new(Mutex::new(Some(tx)))),
+        }
+    }
+
+    pub async fn acquire(&self) -> Result<DbConnection, sqlx::Error> {
+        match &self.source {
+            Source::Pool(pool) => Ok(DbConnection::Pooled(pool.acquire().await?)),
+            Source::Transaction(tx) => {
+                let guard = tx.clone().lock_owned().await;
+                if guard.is_none() {
+                    return Err(sqlx::Error::PoolClosed);
+                }
+                Ok(DbConnection::Scoped(guard))
+            }
+        }
+    }
+
+    /// Ends an injected scope, invalidating every clone, even if a router is
+    /// still alive. Production pooled Db instances cannot be rolled back here.
+    pub async fn rollback_scope(&self) -> Result<(), sqlx::Error> {
+        let Source::Transaction(tx) = &self.source else {
+            return Err(sqlx::Error::Protocol("not a transaction-scoped Db".into()));
+        };
+        if let Some(tx) = tx.lock().await.take() {
+            tx.rollback().await?;
+        }
+        Ok(())
     }
 
     /// Simple liveness probe: `SELECT 1` with a short timeout.
     pub async fn ping(&self, timeout: std::time::Duration) -> Result<(), ProbeFailure> {
         let query = sqlx::query("SELECT 1");
-        tokio::time::timeout(timeout, query.execute(&self.pool))
-            .await
-            .map_err(|_| ProbeFailure::Timeout)?
-            .map_err(|e| {
-                crate::db_error::classify_and_log("db.ping", e);
-                ProbeFailure::DbError
-            })?;
+        tokio::time::timeout(timeout, async {
+            let mut conn = self.acquire().await?;
+            query.execute(&mut *conn).await
+        })
+        .await
+        .map_err(|_| ProbeFailure::Timeout)?
+        .map_err(|e| {
+            crate::db_error::classify_and_log("db.ping", e);
+            ProbeFailure::DbError
+        })?;
         Ok(())
     }
 }

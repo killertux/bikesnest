@@ -1,4 +1,4 @@
-//! SQL-backed account + role repository (compile-time `query_as!`).
+//! SQL-backed account + role repository (runtime-checked SQL).
 
 use crate::Db;
 use async_trait::async_trait;
@@ -61,7 +61,7 @@ impl SqlxAccountRepository {
         let rows: Vec<(String,)> =
             sqlx::query_as("SELECT role FROM user_roles WHERE user_id = $1 ORDER BY role")
                 .bind(id.0)
-                .fetch_all(self.db.pool())
+                .fetch_all(&mut *self.db.acquire().await?)
                 .await?;
         Ok(rows
             .into_iter()
@@ -82,6 +82,51 @@ struct UserRow {
 
 #[async_trait]
 impl AccountRepository for SqlxAccountRepository {
+    async fn public_contribution_name(&self, id: UserId) -> Result<bool, AuthError> {
+        sqlx::query_scalar("SELECT public_contribution_name FROM users WHERE id = $1 AND account_state IN ('ACTIVE', 'PENDING_EMAIL_VERIFICATION')")
+            .bind(id.0).fetch_optional(&mut *self.db.acquire().await.map_err(|e| db_err("account.acquire", e))?).await
+            .map_err(|e| db_err("account.public_contribution_name", e))?
+            .ok_or(AuthError::Unauthorized)
+    }
+
+    async fn set_public_contribution_name(
+        &self,
+        id: UserId,
+        enabled: bool,
+    ) -> Result<(), AuthError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("account.set_public_contribution_name", e))?;
+        let mut tx = conn
+            .begin()
+            .await
+            .map_err(|e| db_err("account.set_public_contribution_name", e))?;
+        // Contributions capture consent under this same user-row lock. Revoking
+        // and creating a review/proposal cannot cross and re-expose old content.
+        let updated = sqlx::query("UPDATE users SET public_contribution_name = $2, public_contribution_name_updated_at = now() WHERE id = $1 AND account_state IN ('ACTIVE', 'PENDING_EMAIL_VERIFICATION')")
+            .bind(id.0).bind(enabled).execute(&mut *tx).await
+            .map_err(|e| db_err("account.set_public_contribution_name", e))?;
+        if updated.rows_affected() != 1 {
+            return Err(AuthError::Unauthorized);
+        }
+        if !enabled {
+            sqlx::query(
+                "UPDATE review SET public_author = FALSE WHERE author_id = $1 AND public_author",
+            )
+            .bind(id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| db_err("account.revoke_review_attribution", e))?;
+            sqlx::query("UPDATE parking_proposal SET public_author = FALSE, public_author_revoked_at = now() WHERE proposer_id = $1 AND public_author")
+                .bind(id.0).execute(&mut *tx).await
+                .map_err(|e| db_err("account.revoke_proposal_attribution", e))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| db_err("account.set_public_contribution_name", e))
+    }
     async fn find_by_email(&self, email: &UserEmail) -> Result<Option<User>, AuthError> {
         let row = sqlx::query_as::<_, UserRow>(
             r#"
@@ -91,7 +136,13 @@ impl AccountRepository for SqlxAccountRepository {
             "#,
         )
         .bind(email.as_str().to_lowercase())
-        .fetch_optional(self.db.pool())
+        .fetch_optional(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("account.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("account.find_by_email", e))?;
         match row {
@@ -109,7 +160,13 @@ impl AccountRepository for SqlxAccountRepository {
             "#,
         )
         .bind(id.0)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("account.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("account.find_by_id", e))?;
         match row {
@@ -119,9 +176,12 @@ impl AccountRepository for SqlxAccountRepository {
     }
 
     async fn create(&self, new: NewAccount<'_>) -> Result<UserId, AuthError> {
-        let mut tx = self
+        let mut conn = self
             .db
-            .pool()
+            .acquire()
+            .await
+            .map_err(|e| db_err("account.create", e))?;
+        let mut tx = conn
             .begin()
             .await
             .map_err(|e| db_err("account.create", e))?;
@@ -170,7 +230,13 @@ impl AccountRepository for SqlxAccountRepository {
         sqlx::query("UPDATE users SET account_state = $2, updated_at = now() WHERE id = $1")
             .bind(id.0)
             .bind(state.as_code())
-            .execute(self.db.pool())
+            .execute(
+                &mut *self
+                    .db
+                    .acquire()
+                    .await
+                    .map_err(|e| db_err("account.acquire", e))?,
+            )
             .await
             .map_err(|e| db_err("account.set_state", e))?;
         Ok(())
@@ -180,16 +246,25 @@ impl AccountRepository for SqlxAccountRepository {
         sqlx::query("UPDATE users SET email_verified_at = $2, updated_at = now() WHERE id = $1")
             .bind(id.0)
             .bind(at)
-            .execute(self.db.pool())
+            .execute(
+                &mut *self
+                    .db
+                    .acquire()
+                    .await
+                    .map_err(|e| db_err("account.acquire", e))?,
+            )
             .await
             .map_err(|e| db_err("account.mark_email_verified", e))?;
         Ok(())
     }
 
     async fn update_canonical_email(&self, id: UserId, email: &UserEmail) -> Result<(), AuthError> {
-        let mut tx = self
+        let mut conn = self
             .db
-            .pool()
+            .acquire()
+            .await
+            .map_err(|e| db_err("account.update_canonical_email", e))?;
+        let mut tx = conn
             .begin()
             .await
             .map_err(|e| db_err("account.update_canonical_email", e))?;
@@ -221,9 +296,12 @@ impl AccountRepository for SqlxAccountRepository {
         at: DateTime<Utc>,
         email: &UserEmail,
     ) -> Result<(), AuthError> {
-        let mut tx = self
+        let mut conn = self
             .db
-            .pool()
+            .acquire()
+            .await
+            .map_err(|e| db_err("account.confirm_email", e))?;
+        let mut tx = conn
             .begin()
             .await
             .map_err(|e| db_err("account.confirm_email", e))?;
@@ -262,7 +340,13 @@ impl AccountRepository for SqlxAccountRepository {
         )
         .bind(id.0)
         .bind(hash)
-        .execute(self.db.pool())
+        .execute(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("account.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("account.set_password", e))?;
         Ok(())
@@ -272,7 +356,13 @@ impl AccountRepository for SqlxAccountRepository {
         sqlx::query("UPDATE users SET locale = $2, updated_at = now() WHERE id = $1")
             .bind(id.0)
             .bind(locale.as_str())
-            .execute(self.db.pool())
+            .execute(
+                &mut *self
+                    .db
+                    .acquire()
+                    .await
+                    .map_err(|e| db_err("account.acquire", e))?,
+            )
             .await
             .map_err(|e| db_err("account.set_locale", e))?;
         Ok(())
@@ -297,7 +387,13 @@ impl AccountRepository for SqlxAccountRepository {
         .bind(provider.as_code())
         .bind(subject)
         .bind(hash)
-        .execute(self.db.pool())
+        .execute(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("account.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("account.link_identity", e))?;
         Ok(())
@@ -325,7 +421,13 @@ impl AccountRepository for SqlxAccountRepository {
         )
         .bind(provider.as_code())
         .bind(subject)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("account.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("account.find_identity", e))?;
         match row {
@@ -352,7 +454,13 @@ impl AccountRepository for SqlxAccountRepository {
 
     async fn count_admins(&self) -> Result<i64, AuthError> {
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM user_roles WHERE role = 'ADMIN'")
-            .fetch_one(self.db.pool())
+            .fetch_one(
+                &mut *self
+                    .db
+                    .acquire()
+                    .await
+                    .map_err(|e| db_err("account.acquire", e))?,
+            )
             .await
             .map_err(|e| db_err("account.count_admins", e))
     }
@@ -365,16 +473,25 @@ impl AccountRepository for SqlxAccountRepository {
         .bind(id.0)
         .bind(role.as_code())
         .bind(by.0)
-        .execute(self.db.pool())
+        .execute(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("account.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("account.grant_role", e))?;
         Ok(())
     }
 
     async fn revoke_role_guarded(&self, id: UserId, role: Role) -> Result<bool, AuthError> {
-        let mut tx = self
+        let mut conn = self
             .db
-            .pool()
+            .acquire()
+            .await
+            .map_err(|e| db_err("account.revoke_role_guarded", e))?;
+        let mut tx = conn
             .begin()
             .await
             .map_err(|e| db_err("account.revoke_role_guarded", e))?;
@@ -415,7 +532,13 @@ impl AccountRepository for SqlxAccountRepository {
             ORDER BY id DESC
             "#,
         )
-        .fetch_all(self.db.pool())
+        .fetch_all(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("account.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("account.list_users", e))?;
         self.load_users(rows).await
@@ -439,7 +562,13 @@ impl AccountRepository for SqlxAccountRepository {
         .bind(pattern.as_deref())
         .bind(search.after_id)
         .bind(search.limit.clamp(1, 200))
-        .fetch_all(self.db.pool())
+        .fetch_all(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("account.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("account.search_users", e))?;
         self.load_users(rows).await
@@ -457,7 +586,13 @@ impl AccountRepository for SqlxAccountRepository {
             "#,
         )
         .bind(ids)
-        .fetch_all(self.db.pool())
+        .fetch_all(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("account.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("account.labels_for", e))?;
         Ok(rows.into_iter().collect())
@@ -469,7 +604,13 @@ impl AccountRepository for SqlxAccountRepository {
         }
         let rows = sqlx::query_as::<_, ActivityRow>(ACTIVITY_SQL)
             .bind(ids)
-            .fetch_all(self.db.pool())
+            .fetch_all(
+                &mut *self
+                    .db
+                    .acquire()
+                    .await
+                    .map_err(|e| db_err("account.acquire", e))?,
+            )
             .await
             .map_err(|e| db_err("account.activity_for", e))?;
         Ok(rows

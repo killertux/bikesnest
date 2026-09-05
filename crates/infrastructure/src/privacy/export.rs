@@ -11,8 +11,8 @@ use crate::auth::hash::sha256_hex;
 use async_trait::async_trait;
 use bikesnest_application::{
     Export, ExportAccount, ExportDownload, ExportFavorite, ExportPayload, ExportPhoto,
-    ExportProposal, ExportProvider, ExportReport, ExportRepository, ExportReview,
-    ExportReviewRevision, ExportSession, ExportVerification, NewExport, PrivacyError,
+    ExportProposal, ExportProposalVote, ExportProvider, ExportReport, ExportRepository,
+    ExportReview, ExportReviewRevision, ExportSession, ExportVerification, NewExport, PrivacyError,
 };
 use bikesnest_domain::{ExportState, UserId};
 use chrono::{DateTime, Utc};
@@ -34,6 +34,8 @@ struct AccountRow {
     id: i64,
     email: String,
     display_name: Option<String>,
+    public_contribution_name: bool,
+    public_contribution_name_updated_at: Option<DateTime<Utc>>,
     account_state: String,
     email_verified_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
@@ -70,6 +72,7 @@ struct ReviewRow {
     location_id: i64,
     rating: i16,
     body: String,
+    public_author: bool,
     moderation_state: String,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -100,6 +103,14 @@ struct ProposalRow {
     proposed: serde_json::Value,
     status: String,
     created_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ProposalVoteRow {
+    proposal_id: i64,
+    vote: String,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -170,14 +181,13 @@ impl ExportRepository for SqlxExportRepository {
     /// next. The isolation level is set as the transaction's first statement,
     /// which is where Postgres accepts it.
     async fn assemble_payload(&self, user_id: UserId) -> Result<ExportPayload, PrivacyError> {
-        let mut tx = self
+        let mut conn = self
             .db
-            .pool()
-            .begin()
+            .acquire()
             .await
             .map_err(|e| db_err("export.assemble_payload", e))?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-            .execute(&mut *tx)
+        let mut tx = conn
+            .begin_snapshot()
             .await
             .map_err(|e| db_err("export.assemble_payload", e))?;
         let now = Utc::now();
@@ -185,7 +195,8 @@ impl ExportRepository for SqlxExportRepository {
         let account = {
             let row = sqlx::query_as::<_, AccountRow>(
                 r#"
-                SELECT id, email, display_name, account_state, email_verified_at, created_at
+                SELECT id, email, display_name, public_contribution_name,
+                       public_contribution_name_updated_at, account_state, email_verified_at, created_at
                 FROM users WHERE id = $1
                 "#,
             )
@@ -208,6 +219,8 @@ impl ExportRepository for SqlxExportRepository {
                 user_id: row.id,
                 email: row.email,
                 display_name: row.display_name,
+                public_contribution_name: row.public_contribution_name,
+                public_contribution_name_updated_at: row.public_contribution_name_updated_at,
                 account_state: row.account_state,
                 email_verified_at: row.email_verified_at,
                 created_at: row.created_at,
@@ -265,7 +278,7 @@ impl ExportRepository for SqlxExportRepository {
         let reviews = {
             let rows = sqlx::query_as::<_, ReviewRow>(
                 r#"
-                SELECT id, location_id, rating, body, moderation_state, created_at, updated_at
+                SELECT id, location_id, rating, body, public_author, moderation_state, created_at, updated_at
                 FROM review WHERE author_id = $1 ORDER BY created_at
                 "#,
             )
@@ -312,6 +325,7 @@ impl ExportRepository for SqlxExportRepository {
                     location_id: r.location_id,
                     rating: r.rating,
                     body: r.body,
+                    public_author: r.public_author,
                     moderation_state: r.moderation_state,
                     created_at: r.created_at,
                     updated_at: r.updated_at,
@@ -358,6 +372,17 @@ impl ExportRepository for SqlxExportRepository {
             status: r.status,
             created_at: r.created_at,
         })
+        .collect();
+
+        let proposal_votes = sqlx::query_as::<_, ProposalVoteRow>(
+            "SELECT proposal_id, vote, created_at, updated_at FROM parking_proposal_vote WHERE voter_id = $1 ORDER BY created_at",
+        )
+        .bind(user_id.0)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| db_err("export.assemble_payload", e))?
+        .into_iter()
+        .map(|r| ExportProposalVote { proposal_id: r.proposal_id, vote: r.vote, created_at: r.created_at, updated_at: r.updated_at })
         .collect();
 
         let reports = sqlx::query_as::<_, ReportRow>(
@@ -437,6 +462,7 @@ impl ExportRepository for SqlxExportRepository {
             reviews,
             verifications,
             proposals,
+            proposal_votes,
             reports,
             photos,
             now,
@@ -461,7 +487,13 @@ impl ExportRepository for SqlxExportRepository {
         .bind(token_hash)
         .bind(payload)
         .bind(e.expires_at)
-        .fetch_one(self.db.pool())
+        .fetch_one(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("export.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("export.create", e))?;
         Ok(row.id)
@@ -475,7 +507,13 @@ impl ExportRepository for SqlxExportRepository {
             "#,
         )
         .bind(user_id.0)
-        .fetch_all(self.db.pool())
+        .fetch_all(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("export.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("export.list_for_user", e))?;
         rows.into_iter().map(ExportRow::into_export).collect()
@@ -489,7 +527,13 @@ impl ExportRepository for SqlxExportRepository {
             "#,
         )
         .bind(id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("export.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("export.get", e))?;
         match row {
@@ -509,7 +553,13 @@ impl ExportRepository for SqlxExportRepository {
             "SELECT payload FROM personal_data_export WHERE id = $1",
         )
         .bind(id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("export.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("export.consume_download", e))?
         .ok_or(PrivacyError::NotFound)?;
@@ -525,7 +575,13 @@ impl ExportRepository for SqlxExportRepository {
             "SELECT token_hash, state, expires_at FROM personal_data_export WHERE id = $1",
         )
         .bind(id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("export.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("export.consume_download", e))?
         .ok_or(PrivacyError::NotFound)?;
@@ -550,7 +606,13 @@ impl ExportRepository for SqlxExportRepository {
         )
         .bind(id)
         .bind(now)
-        .execute(self.db.pool())
+        .execute(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("export.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("export.consume_download", e))?;
         if res.rows_affected() != 1 {
@@ -566,7 +628,13 @@ impl ExportRepository for SqlxExportRepository {
             "DELETE FROM personal_data_export WHERE state = 'READY' AND expires_at < $1",
         )
         .bind(now)
-        .execute(self.db.pool())
+        .execute(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("export.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("export.purge_expired", e))?;
         Ok(res.rows_affected())

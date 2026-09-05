@@ -184,6 +184,18 @@ pub trait AccountRepository: Send + Sync {
     /// Persist the account's reading language (the header language toggle, for
     /// a signed-in user). Transactional email is rendered from this value.
     async fn set_locale(&self, id: UserId, locale: LocaleCode) -> Result<(), AuthError>;
+    /// Public attribution is opt-in; unsupported adapters fail closed.
+    async fn public_contribution_name(&self, _id: UserId) -> Result<bool, AuthError> {
+        Ok(false)
+    }
+    /// Disabling must also permanently revoke attribution on old contributions.
+    async fn set_public_contribution_name(
+        &self,
+        _id: UserId,
+        _enabled: bool,
+    ) -> Result<(), AuthError> {
+        Err(AuthError::Internal)
+    }
     async fn link_identity(
         &self,
         user_id: UserId,
@@ -928,6 +940,20 @@ impl AuthService {
     /// request and no `Accept-Language` in scope — speak the same language.
     pub async fn set_locale(&self, user_id: UserId, locale: LocaleCode) -> Result<(), AuthError> {
         self.accounts.set_locale(user_id, locale).await
+    }
+
+    pub async fn public_contribution_name(&self, user_id: UserId) -> Result<bool, AuthError> {
+        self.accounts.public_contribution_name(user_id).await
+    }
+
+    pub async fn set_public_contribution_name(
+        &self,
+        user_id: UserId,
+        enabled: bool,
+    ) -> Result<(), AuthError> {
+        self.accounts
+            .set_public_contribution_name(user_id, enabled)
+            .await
     }
 
     // -----------------------------------------------------------------------

@@ -31,9 +31,10 @@ pub use auth::{
 pub use community::{
     AddParkingLocationOutcome, AttributeSummary, CommunityParkingDetails, ContributionDeps,
     ContributionError, ContributionHistoryReader, ContributionItem, ContributionService,
-    DuplicateCandidate, FavoriteItem, FavoriteRepository, NewParkingLocation, NewProposal,
-    NewVerification, ParkingContributionRepository, ParkingEdit, Reason, Review, ReviewRepository,
-    VerificationRepository, recommendation_reasons,
+    DuplicateCandidate, FavoriteItem, FavoriteRepository, ListingProposal, NewParkingLocation,
+    NewProposal, NewVerification, ParkingContributionRepository, ParkingEdit, ProposalVote,
+    ProposalVoteTotals, Reason, Review, ReviewRepository, VerificationRepository,
+    recommendation_reasons,
 };
 pub use email::{EmailError, EmailKind, EmailMessage, EmailProvider, EmailQueue};
 pub use jobs::{JOB_EMAIL_SEND, JOB_JOBS_GC, JOB_RETENTION, JobError, JobHandler, JobPayload};
@@ -55,12 +56,12 @@ pub use ports::{
 };
 pub use privacy::{
     AnonymizationReport, AnonymizationRepository, Export, ExportAccount, ExportDownload,
-    ExportFavorite, ExportPayload, ExportPhoto, ExportProposal, ExportProvider, ExportReport,
-    ExportRepository, ExportRequested, ExportReview, ExportReviewRevision, ExportSession,
-    ExportVerification, NewExport, NewPrivacyRequest, POLICY_FALLBACK_LOCALE, PolicyDocument,
-    PolicyReader, PrivacyDeps, PrivacyError, PrivacyRequest, PrivacyRequestRepository,
-    PrivacyService, RetentionConfig, RetentionJob, RetentionRepository, RetentionStep,
-    RetentionSummary,
+    ExportFavorite, ExportPayload, ExportPhoto, ExportProposal, ExportProposalVote, ExportProvider,
+    ExportReport, ExportRepository, ExportRequested, ExportReview, ExportReviewRevision,
+    ExportSession, ExportVerification, NewExport, NewPrivacyRequest, POLICY_FALLBACK_LOCALE,
+    PolicyDocument, PolicyReader, PrivacyDeps, PrivacyError, PrivacyRequest,
+    PrivacyRequestRepository, PrivacyService, RetentionConfig, RetentionJob, RetentionRepository,
+    RetentionStep, RetentionSummary,
 };
 pub use rate_limit::{RateLimitError, RateLimiter};
 pub use search::{

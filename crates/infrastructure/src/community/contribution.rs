@@ -8,8 +8,9 @@ use crate::Db;
 use crate::parking::SqlxParkingDetailsReader;
 use async_trait::async_trait;
 use bikesnest_application::{
-    ContributionError, DuplicateCandidate, NewParkingLocation, NewProposal,
-    ParkingContributionRepository, ParkingDetailsReader, ParkingEdit,
+    ContributionError, DuplicateCandidate, ListingProposal, NewParkingLocation, NewProposal,
+    ParkingContributionRepository, ParkingDetailsReader, ParkingEdit, ProposalVote,
+    ProposalVoteTotals,
 };
 use bikesnest_domain::{
     ChangeKind, Cost, GeoPoint, OpeningHours, ParkingLocation, RevisionSummary, SecurityFeature,
@@ -273,11 +274,30 @@ impl ParkingContributionRepository for SqlxParkingContributionRepository {
     }
 
     async fn create_proposal(&self, p: &NewProposal) -> Result<i64, ContributionError> {
+        let mut tx = self
+            .db
+            .pool()
+            .begin()
+            .await
+            .map_err(|e| db_err("contribution.create_proposal", e))?;
+        // The preference setter takes this same user-row lock before it clears
+        // live attribution. Reading the preference under the lock means an
+        // opt-out cannot race this insert and reveal a new proposal.
+        let public_author: Option<(bool,)> = sqlx::query_as(
+            "SELECT public_contribution_name FROM users WHERE id = $1 AND account_state = 'ACTIVE' AND email_verified_at IS NOT NULL FOR UPDATE",
+        )
+        .bind(p.proposer_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| db_err("contribution.create_proposal", e))?;
+        let Some((public_author,)) = public_author else {
+            return Err(ContributionError::NotVerified);
+        };
         let row = sqlx::query_as::<_, IdRow>(
             r#"
             INSERT INTO parking_proposal
-                (location_id, proposer_id, base_version, kind, proposed, status)
-            VALUES ($1, $2, $3, $4, $5, 'PENDING')
+                (location_id, proposer_id, base_version, kind, proposed, status, public_author)
+            VALUES ($1, $2, $3, $4, $5, 'PENDING', $6)
             RETURNING id
             "#,
         )
@@ -286,10 +306,159 @@ impl ParkingContributionRepository for SqlxParkingContributionRepository {
         .bind(p.base_version)
         .bind(p.kind.as_code())
         .bind(&p.proposed)
-        .fetch_one(self.db.pool())
+        .bind(public_author)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| db_err("contribution.create_proposal", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| db_err("contribution.create_proposal", e))?;
         Ok(row.id)
+    }
+
+    async fn vote_on_proposal(
+        &self,
+        proposal_id: i64,
+        voter: UserId,
+        vote: ProposalVote,
+    ) -> Result<ProposalVoteTotals, ContributionError> {
+        let mut tx = self
+            .db
+            .pool()
+            .begin()
+            .await
+            .map_err(|e| db_err("contribution.vote_on_proposal", e))?;
+        // Lock the location before the proposal, matching moderation's lock
+        // order. Separate statements make that order explicit; `FOR UPDATE`
+        // on a join otherwise leaves lock acquisition order to the planner.
+        #[derive(sqlx::FromRow)]
+        struct LockedProposal {
+            proposer_id: Option<i64>,
+            status: String,
+        }
+        let location: (i64,) =
+            sqlx::query_as("SELECT location_id FROM parking_proposal WHERE id = $1")
+                .bind(proposal_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| db_err("contribution.vote_on_proposal", e))?
+                .ok_or(ContributionError::NotFound)?;
+        let locked_location: Option<(i64,)> =
+            sqlx::query_as("SELECT id FROM parking_location WHERE id = $1 FOR UPDATE")
+                .bind(location.0)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| db_err("contribution.vote_on_proposal", e))?;
+        if locked_location.is_none() {
+            return Err(ContributionError::NotFound);
+        }
+        let locked = sqlx::query_as::<_, LockedProposal>(
+            "SELECT proposer_id, status FROM parking_proposal WHERE id = $1 FOR UPDATE",
+        )
+        .bind(proposal_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| db_err("contribution.vote_on_proposal", e))?
+        .ok_or(ContributionError::NotFound)?;
+        if locked.status != "PENDING" {
+            return Err(ContributionError::Conflict);
+        }
+        if locked.proposer_id == Some(voter.0) {
+            return Err(ContributionError::Unauthorized);
+        }
+        // Do not lock the account row: deletion/anonymization owns that row
+        // before cleaning vote rows. The final tally filters account state, so
+        // a concurrent suspension/deletion cannot count toward the threshold.
+        let eligible: Option<(i64,)> = sqlx::query_as(
+            "SELECT id FROM users WHERE id = $1 AND account_state = 'ACTIVE' AND email_verified_at IS NOT NULL"
+        ).bind(voter.0).fetch_optional(&mut *tx).await
+            .map_err(|e| db_err("contribution.vote_on_proposal", e))?;
+        if eligible.is_none() {
+            return Err(ContributionError::NotVerified);
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO parking_proposal_vote (proposal_id, voter_id, vote)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (proposal_id, voter_id)
+            DO UPDATE SET vote = EXCLUDED.vote, updated_at = now()
+        "#,
+        )
+        .bind(proposal_id)
+        .bind(voter.0)
+        .bind(vote.as_code())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| db_err("contribution.vote_on_proposal", e))?;
+        #[derive(sqlx::FromRow)]
+        struct Totals {
+            approvals: i64,
+            rejections: i64,
+        }
+        let totals = sqlx::query_as::<_, Totals>(r#"
+            SELECT COUNT(*) FILTER (WHERE v.vote = 'APPROVE')::bigint AS approvals,
+                   COUNT(*) FILTER (WHERE v.vote = 'REJECT')::bigint AS rejections
+            FROM parking_proposal_vote v JOIN users u ON u.id = v.voter_id
+            WHERE v.proposal_id = $1 AND u.account_state = 'ACTIVE' AND u.email_verified_at IS NOT NULL
+        "#).bind(proposal_id).fetch_one(&mut *tx).await
+            .map_err(|e| db_err("contribution.vote_on_proposal", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| db_err("contribution.vote_on_proposal", e))?;
+        Ok(ProposalVoteTotals {
+            approvals: totals.approvals,
+            rejections: totals.rejections,
+        })
+    }
+
+    async fn listing_proposals(
+        &self,
+        location_id: i64,
+        limit: i64,
+    ) -> Result<Vec<ListingProposal>, ContributionError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            id: i64,
+            kind: String,
+            proposed: serde_json::Value,
+            status: String,
+            approvals: i64,
+            rejections: i64,
+            created_at: chrono::DateTime<chrono::Utc>,
+        }
+        let rows = sqlx::query_as::<_, Row>(r#"
+            SELECT p.id, p.kind, p.proposed, p.status, p.created_at,
+                   COUNT(*) FILTER (WHERE v.vote = 'APPROVE' AND u.id IS NOT NULL)::bigint AS approvals,
+                   COUNT(*) FILTER (WHERE v.vote = 'REJECT' AND u.id IS NOT NULL)::bigint AS rejections
+            FROM parking_proposal p
+            LEFT JOIN parking_proposal_vote v ON v.proposal_id = p.id
+            LEFT JOIN users u ON u.id = v.voter_id
+                 AND u.account_state = 'ACTIVE' AND u.email_verified_at IS NOT NULL
+            WHERE p.location_id = $1
+            GROUP BY p.id
+            ORDER BY p.created_at DESC, p.id DESC
+            LIMIT $2
+        "#).bind(location_id).bind(limit.clamp(1, 100)).fetch_all(self.db.pool()).await
+            .map_err(|e| db_err("contribution.listing_proposals", e))?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ListingProposal {
+                    id: row.id,
+                    kind: bikesnest_domain::ProposalKind::from_code(&row.kind)
+                        .map_err(|e| ContributionError::InvalidField(e.to_string()))?,
+                    reason: row
+                        .proposed
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    status: bikesnest_domain::ProposalStatus::from_code(&row.status)
+                        .map_err(|e| ContributionError::InvalidField(e.to_string()))?,
+                    approvals: row.approvals,
+                    rejections: row.rejections,
+                    created_at: row.created_at,
+                })
+            })
+            .collect()
     }
 
     async fn revision_history(

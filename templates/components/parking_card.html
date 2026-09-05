@@ -1,27 +1,27 @@
 <article
   role="listitem"
   data-parking-id="{{ item.id }}"
-  class="parking-result group relative flex cursor-pointer overflow-hidden rounded-2xl border border-border bg-surface transition-colors hover:border-accent-strong"
+  class="parking-result group relative block cursor-pointer overflow-hidden rounded-2xl border border-border bg-surface transition-colors hover:border-accent-strong focus-within:border-accent-strong sm:flex"
 >
-  <div class="parking-result-photo relative w-40 shrink-0">
+  <div class="parking-result-photo absolute top-4 left-4 h-18 w-18 shrink-0 overflow-hidden rounded-[0.625rem] sm:relative sm:top-auto sm:left-auto sm:h-auto sm:w-36 sm:rounded-none min-[1600px]:w-44">
     {% if let Some(url) = item.photo_url %}
     <img src="{{ url }}" alt="{{ item.name }}" loading="lazy" class="h-full w-full object-cover" />
     {% else %}
     <img src="{{ item.image }}" alt="{{ item.image_alt }}" loading="lazy" class="h-full w-full object-cover" />
     {% endif %}
-    <span class="absolute left-2 top-2 inline-flex items-center rounded-full bg-[oklch(100%_0_0_/_0.92)] px-2 py-0.5 font-mono text-[10px] uppercase tracking-wide text-fg shadow-sm">{{ item.type_label }}</span>
+    <span class="absolute left-2 top-2 hidden items-center rounded-full bg-[oklch(100%_0_0_/_0.92)] px-2 py-0.5 font-mono text-[10px] uppercase tracking-wide text-fg shadow-sm sm:inline-flex">{{ item.type_label }}</span>
   </div>
   <div class="min-w-0 flex-1 p-4 sm:p-5">
-    <div class="parking-result-heading">
+    <div class="parking-result-heading ml-21 grid min-h-18 grid-cols-[auto_minmax(0,1fr)] items-start gap-x-1.5 gap-y-2 sm:ml-0 sm:min-h-0 sm:gap-x-3">
       <!-- The number is the card's handle on the map: the same digit is drawn
            in this location's marker (search.js reads it from #search-data). -->
-      <span aria-label="{{ tr.spot(item.n) }}" class="mt-0.5 grid h-6 w-6 shrink-0 place-items-center rounded-full bg-accent-strong font-mono text-[11px] font-semibold text-white">{{ item.n }}</span>
-      <h3 class="font-display flex-1 text-base font-semibold leading-snug sm:text-lg">
+      <span aria-label="{{ tr.spot(item.n) }}" class="mt-0.5 grid size-5 shrink-0 place-items-center rounded-full bg-accent-strong font-mono text-[11px] font-semibold text-white sm:size-6">{{ item.n }}</span>
+      <h3 class="font-display flex-1 text-base font-semibold leading-snug wrap-anywhere sm:text-lg">
         <a href="{{ item.url }}" class="after:absolute after:inset-0" aria-label="{{ item.name }} — {{ tr.t("card.view") }}">{{ item.name }}</a>
       </h3>
       <span
         title="{{ item.freshness_label }}"
-        class="parking-result-freshness inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium {% if item.freshness_code == "fresh" || item.freshness_code == "recently_verified" %}bg-fresh/10 text-fresh{% else if item.freshness_code == "aging" %}bg-aging/10 text-aging{% else %}bg-stale/10 text-stale{% endif %}"
+        class="parking-result-freshness col-start-2 inline-flex items-center justify-self-start gap-1 rounded-full px-2 py-0.5 text-xs font-medium {% if item.freshness_code == "fresh" || item.freshness_code == "recently_verified" %}bg-fresh/10 text-fresh{% else if item.freshness_code == "aging" %}bg-aging/10 text-aging{% else %}bg-stale/10 text-stale{% endif %}"
       >
         {{ item.freshness_label }}
       </span>

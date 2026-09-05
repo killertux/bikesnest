@@ -99,9 +99,38 @@ async fn connect_and_migrate() -> PgPool {
 pub struct TestTx {
     tx: Option<Transaction<'static, Postgres>>,
     pool: PgPool,
+    scoped: Option<bikesnest_infrastructure::Db>,
 }
 
 impl TestTx {
+    /// Inject this test's outer transaction into real repositories. Call before
+    /// seeding; use `db.acquire()` for fixtures and pass `db.clone()` to adapters.
+    /// Repository `begin`/`commit` then establish/release SQLx savepoints. The
+    /// harness rolls back the outer transaction, including on a test panic.
+    pub async fn db(&mut self) -> bikesnest_infrastructure::Db {
+        if let Some(db) = &self.scoped {
+            return db.clone();
+        }
+        let mut outer = self.tx.take().expect("test transaction available");
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *outer)
+            .await
+            .expect("call tx.db() before fixture queries; snapshot tests need repeatable read");
+        let db = bikesnest_infrastructure::Db::from_transaction(outer);
+        self.scoped = Some(db.clone());
+        db
+    }
+
+    async fn rollback(&mut self) {
+        if let Some(db) = self.scoped.take() {
+            db.rollback_scope()
+                .await
+                .expect("rollback scoped test transaction");
+        }
+        if let Some(tx) = self.tx.take() {
+            tx.rollback().await.expect("rollback test transaction");
+        }
+    }
     /// Opens a named SAVEPOINT on the test transaction.
     ///
     /// End it explicitly with [`Savepoint::commit`] (RELEASE) or
@@ -136,6 +165,10 @@ impl TestTx {
     /// deletes the fixture rows (by tag) via the pool. The fresh transaction
     /// the harness opened is simply rolled back at test end.
     pub async fn commit_fixture(&mut self) {
+        assert!(
+            self.scoped.is_none(),
+            "scoped repository tests must never commit fixtures"
+        );
         if let Some(tx) = self.tx.take() {
             tx.commit().await.expect("commit test fixture");
         }
@@ -259,15 +292,23 @@ pub async fn audit_mutation_tx(pool: &PgPool) -> Transaction<'static, Postgres> 
 /// fresh transaction; the transaction rolls back afterwards no matter what.
 pub fn run_db_test(f: impl AsyncFnOnce(&mut TestTx)) {
     init_test_tracing();
-    shared_runtime().block_on(async {
+    let mut tx = shared_runtime().block_on(async {
         let pool = shared_pool().get_or_init(connect_and_migrate).await;
-        let mut tx = TestTx {
+        TestTx {
             tx: Some(pool.begin().await.expect("begin test transaction")),
             pool: pool.clone(),
-        };
-        f(&mut tx).await;
-        // tx drops here → rollback, via sqlx Transaction's Drop
+            scoped: None,
+        }
     });
+    // Keep the owner outside the future so we can await rollback even when the
+    // test panics. Invalidate Db clones before returning control to the harness.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        shared_runtime().block_on(f(&mut tx));
+    }));
+    shared_runtime().block_on(tx.rollback());
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 // ---------------------------------------------------------------------------

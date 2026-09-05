@@ -107,7 +107,8 @@ impl AnonymizationRepository for SqlxAnonymizationRepository {
             r#"
             UPDATE users
             SET email = $2, display_name = NULL, email_verified_at = NULL,
-                suspended_at = NULL, deleted_at = $3, account_state = 'DELETED'
+                suspended_at = NULL, deleted_at = $3, account_state = 'DELETED',
+                public_contribution_name = FALSE, public_contribution_name_updated_at = NULL
             WHERE id = $1
             "#,
         )
@@ -189,13 +190,14 @@ impl AnonymizationRepository for SqlxAnonymizationRepository {
             .rows_affected();
 
         // 2) Community content is retained but unattributed.
-        let reviews_anonymized =
-            sqlx::query("UPDATE review SET author_id = NULL WHERE author_id = $1")
-                .bind(user_id.0)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| db_err("anonymize.anonymize", e))?
-                .rows_affected();
+        let reviews_anonymized = sqlx::query(
+            "UPDATE review SET author_id = NULL, public_author = FALSE WHERE author_id = $1",
+        )
+        .bind(user_id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| db_err("anonymize.anonymize", e))?
+        .rows_affected();
         let verifications_anonymized = sqlx::query(
             "UPDATE verification SET user_id = NULL WHERE user_id = $1 AND kind <> 'parked_here'",
         )
@@ -204,8 +206,32 @@ impl AnonymizationRepository for SqlxAnonymizationRepository {
         .await
         .map_err(|e| db_err("anonymize.anonymize", e))?
         .rows_affected();
-        let proposals_anonymized = sqlx::query("UPDATE parking_proposal SET proposer_id = NULL, resolved_by = NULL WHERE proposer_id = $1 OR resolved_by = $1").bind(user_id.0)
-        .execute(&mut *tx).await.map_err(|e| db_err("anonymize.anonymize", e))?.rows_affected();
+        // A deleted moderator must not erase the proposer attribution of a
+        // different person's contribution (and vice versa).  These are two
+        // independent nullable relationships, so scrub them independently.
+        let proposals_anonymized =
+            sqlx::query("UPDATE parking_proposal SET proposer_id = NULL WHERE proposer_id = $1")
+                .bind(user_id.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| db_err("anonymize.anonymize", e))?
+                .rows_affected()
+                + sqlx::query(
+                    "UPDATE parking_proposal SET resolved_by = NULL WHERE resolved_by = $1",
+                )
+                .bind(user_id.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| db_err("anonymize.anonymize", e))?
+                .rows_affected();
+        // Votes are a private, mutable eligibility signal rather than retained
+        // community content. Remove them on erasure; this also keeps a deleted
+        // account from contributing to an approval threshold.
+        sqlx::query("DELETE FROM parking_proposal_vote WHERE voter_id = $1")
+            .bind(user_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| db_err("anonymize.anonymize", e))?;
         let reports_anonymized = sqlx::query(
             r#"
             UPDATE report SET reporter_id = NULL, claimed_by = NULL, resolved_by = NULL

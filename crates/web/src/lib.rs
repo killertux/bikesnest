@@ -386,6 +386,9 @@ pub struct DetailsPage {
     pub is_moderator: bool,
     /// The report-reason options for the P3 report modal.
     pub reason_options: Vec<view::OptionVm>,
+    /// Public-safe persisted proposals; no voter identities or photo keys.
+    pub collaboration_proposals: Vec<CollaborationProposalVm>,
+    pub collaboration_history: Vec<CollaborationRevisionVm>,
 }
 
 /// One gallery photo: presigned URLs + accessible text. Grid tiles render the
@@ -483,6 +486,8 @@ impl DetailsPage {
             moderation_state: loc.moderation_state().as_code(),
             is_moderator: false,
             reason_options: view::report_reason_options(tr),
+            collaboration_proposals: Vec::new(),
+            collaboration_history: Vec::new(),
         }
     }
 
@@ -554,6 +559,30 @@ impl DetailsPage {
         self.notice = notice;
         self
     }
+
+    pub fn collaboration_proposals(mut self, proposals: Vec<CollaborationProposalVm>) -> Self {
+        self.collaboration_proposals = proposals;
+        self
+    }
+    pub fn collaboration_history(mut self, history: Vec<CollaborationRevisionVm>) -> Self {
+        self.collaboration_history = history;
+        self
+    }
+}
+
+pub struct CollaborationProposalVm {
+    pub id: i64,
+    pub kind_label: String,
+    pub reason: Option<String>,
+    pub status: &'static str,
+    pub approvals: i64,
+    pub rejections: i64,
+}
+
+pub struct CollaborationRevisionVm {
+    pub version: i64,
+    pub kind: String,
+    pub summary: Option<String>,
 }
 
 pub struct SecVm {
@@ -649,6 +678,7 @@ pub struct AccountPage {
     pub tr: Translator,
     pub email: String,
     pub display_name: Option<String>,
+    pub public_contribution_name: bool,
     pub is_verified: bool,
     pub roles_label: String,
     pub notice: Option<String>,

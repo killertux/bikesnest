@@ -586,7 +586,12 @@ impl ModerationRepository for SqlxModerationRepository {
         )
         .await?;
 
-        sqlx::query("UPDATE parking_proposal SET status = 'APPROVED', resolved_by = $2, resolved_at = now() WHERE id = $1")
+        sqlx::query(r#"
+            UPDATE parking_proposal SET status = 'APPROVED', resolved_by = $2, resolved_at = now(),
+              decision_approvals = (SELECT COUNT(*) FROM parking_proposal_vote v JOIN users u ON u.id = v.voter_id WHERE v.proposal_id = parking_proposal.id AND v.vote = 'APPROVE' AND u.account_state = 'ACTIVE' AND u.email_verified_at IS NOT NULL),
+              decision_rejections = (SELECT COUNT(*) FROM parking_proposal_vote v JOIN users u ON u.id = v.voter_id WHERE v.proposal_id = parking_proposal.id AND v.vote = 'REJECT' AND u.account_state = 'ACTIVE' AND u.email_verified_at IS NOT NULL)
+            WHERE id = $1
+        "#)
             .bind(id)
             .bind(moderator.0)
             .execute(&mut *tx)
@@ -624,13 +629,15 @@ impl ModerationRepository for SqlxModerationRepository {
         moderator: UserId,
         reason: &str,
     ) -> Result<(), ModerationError> {
-        let _ = reason;
         let res = sqlx::query(
-            "UPDATE parking_proposal SET status = 'REJECTED', resolved_by = $2, resolved_at = now()
-             WHERE id = $1 AND status = 'PENDING'",
+            r#"UPDATE parking_proposal SET status = 'REJECTED', resolved_by = $2, resolved_at = now(), decision_reason = NULLIF($3, ''),
+              decision_approvals = (SELECT COUNT(*) FROM parking_proposal_vote v JOIN users u ON u.id = v.voter_id WHERE v.proposal_id = parking_proposal.id AND v.vote = 'APPROVE' AND u.account_state = 'ACTIVE' AND u.email_verified_at IS NOT NULL),
+              decision_rejections = (SELECT COUNT(*) FROM parking_proposal_vote v JOIN users u ON u.id = v.voter_id WHERE v.proposal_id = parking_proposal.id AND v.vote = 'REJECT' AND u.account_state = 'ACTIVE' AND u.email_verified_at IS NOT NULL)
+             WHERE id = $1 AND status = 'PENDING'"#,
         )
         .bind(id)
         .bind(moderator.0)
+        .bind(reason.trim())
         .execute(self.db.pool())
         .await
         .map_err(|e| db_err("moderation.reject_proposal", e))?;

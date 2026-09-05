@@ -323,6 +323,247 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "home.cta.button" => ("Search parking", "Buscar vagas"),
 
         // --- search (P2) ---------------------------------------------------
+        // Frontend-only listing collaboration concept.
+        "collab.preview" => ("Interactive preview", "Prévia interativa"),
+        "collab.preview_body" => (
+            "Sample proposals and history. Nothing here is saved.",
+            "Propostas e histórico de exemplo. Nada aqui é salvo.",
+        ),
+        "collab.reset" => ("Reset preview", "Reiniciar prévia"),
+        "collab.published" => (
+            "You’re viewing the published listing",
+            "Você está vendo a versão publicada",
+        ),
+        "collab.photos" => ("Suggest photos", "Sugerir fotos"),
+        "collab.suggest" => ("Suggest changes", "Sugerir alterações"),
+        "collab.pending_label" => ("proposals to review", "propostas para avaliar"),
+        "collab.pending_body" => (
+            "The current information stays published while the community reviews changes.",
+            "A informação atual continua publicada enquanto a comunidade avalia as alterações.",
+        ),
+        "collab.review" => ("Review proposals", "Avaliar propostas"),
+        "collab.tabs" => ("Listing views", "Visualizações da vaga"),
+        "collab.overview" => ("Overview", "Visão geral"),
+        "collab.proposals" => ("Proposals", "Propostas"),
+        "collab.history" => ("History", "Histórico"),
+        "collab.community" => ("Made better together", "Melhor com a comunidade"),
+        "collab.help_title" => ("Know this spot?", "Conhece esta vaga?"),
+        "collab.help_body" => (
+            "A small correction can make the next rider’s trip easier.",
+            "Uma pequena correção pode facilitar a próxima pedalada.",
+        ),
+        "collab.photos_help" => (
+            "A recent photo helps someone know what to expect.",
+            "Uma foto recente ajuda quem chega a saber o que esperar.",
+        ),
+        "collab.review_heading" => (
+            "Help keep this listing accurate",
+            "Ajude a manter esta vaga atualizada",
+        ),
+        "collab.rules" => (
+            "Non-photo changes are accepted at 6 approvals. A moderator can decide sooner. Rejections are shown separately.",
+            "Alterações sem fotos são aceitas com 6 aprovações. A moderação pode decidir antes. Rejeições são contadas separadamente.",
+        ),
+        "collab.new_proposal" => ("Propose another change", "Propor outra alteração"),
+        "collab.demo_tools" => ("Preview controls", "Controles da prévia"),
+        "collab.demo_tools_body" => (
+            "Try moderator decisions below. These controls only simulate the future workflow.",
+            "Experimente as decisões de moderação abaixo. Estes controles apenas simulam o fluxo futuro.",
+        ),
+        "collab.moderator_preview" => (
+            "Show moderator actions (simulation)",
+            "Mostrar ações de moderação (simulação)",
+        ),
+        "collab.history_eyebrow" => (
+            "An open record of improvements",
+            "Um registro das melhorias",
+        ),
+        "collab.history_heading" => ("Every version has a story", "Cada versão tem uma história"),
+        "collab.history_body" => (
+            "Compare previous versions, proposal decisions and vote totals. These are example records, not the real listing history.",
+            "Compare versões anteriores, decisões e totais de votos. São registros de exemplo, não o histórico real desta vaga.",
+        ),
+        "collab.privacy_title" => (
+            "Transparency without exposing people",
+            "Transparência sem expor pessoas",
+        ),
+        "collab.privacy_body" => (
+            "Only vote totals are public. Authors appear as anonymous unless they choose to show a public name. This preview uses no real contributor identities.",
+            "Apenas os totais de votos são públicos. Autores aparecem como anônimos, a menos que escolham exibir um nome público. Esta prévia não usa identidades reais.",
+        ),
+        "collab.editor_help" => (
+            "Change only what needs updating. You’ll review the differences before sharing.",
+            "Altere apenas o que precisa ser atualizado. Você revisará as diferenças antes de compartilhar.",
+        ),
+        "collab.basics" => ("About this spot", "Sobre esta vaga"),
+        "collab.field_title" => ("Listing title", "Nome da vaga"),
+        "collab.field_description" => ("Description", "Descrição"),
+        "collab.location" => ("Location", "Localização"),
+        "collab.address" => ("Street address", "Endereço"),
+        "collab.latitude" => ("Latitude", "Latitude"),
+        "collab.longitude" => ("Longitude", "Longitude"),
+        "collab.location_help" => (
+            "Adjust the address and coordinates to suggest moving the pin.",
+            "Ajuste o endereço e as coordenadas para sugerir a mudança do ponto.",
+        ),
+        "collab.photo_rule" => (
+            "Photo additions and removals always need moderator approval, regardless of votes.",
+            "Inclusões e remoções de fotos sempre precisam da aprovação da moderação, independentemente dos votos.",
+        ),
+        "collab.choose_photos" => ("Choose photos to add", "Escolher fotos para adicionar"),
+        "collab.upload_hint" => (
+            "Up to 5 JPEG, PNG or WebP images, 10 MB each. Local preview only.",
+            "Até 5 imagens JPEG, PNG ou WebP, de até 10 MB cada. Apenas prévia local.",
+        ),
+        "collab.remove_help" => (
+            "Select any published photo you think should be removed. It stays visible until a moderator accepts.",
+            "Selecione as fotos publicadas que devem ser removidas. Elas continuam visíveis até a aprovação da moderação.",
+        ),
+        "collab.remove_photo" => ("Request removal", "Solicitar remoção"),
+        "collab.other" => ("Other details", "Outras informações"),
+        "collab.other_help" => (
+            "Capacity, access restrictions, or anything else we should update",
+            "Capacidade, restrições de acesso ou outra informação a atualizar",
+        ),
+        "collab.reason" => (
+            "Why are you suggesting this?",
+            "Por que você sugere esta alteração?",
+        ),
+        "collab.reason_placeholder" => (
+            "Tell the community what you noticed…",
+            "Conte à comunidade o que você observou…",
+        ),
+        "collab.review_draft" => (
+            "Check your changes. Photos are submitted separately so the other details can be approved by the community.",
+            "Confira suas alterações. Fotos são enviadas separadamente para que os outros detalhes possam ser aprovados pela comunidade.",
+        ),
+        "collab.back" => ("Back to editing", "Voltar à edição"),
+        "collab.preview_changes" => ("Review changes", "Revisar alterações"),
+        "collab.before" => ("Published now", "Publicado agora"),
+        "collab.after" => ("Proposed", "Proposto"),
+        "collab.pending" => ("Under review", "Em avaliação"),
+        "collab.accepted" => ("Accepted in preview", "Aceita na prévia"),
+        "collab.rejected" => ("Rejected in preview", "Rejeitada na prévia"),
+        "collab.proposed_by" => ("Suggested by", "Sugerida por"),
+        "collab.rider" => ("Cyclist", "Ciclista"),
+        "collab.you" => ("You", "Você"),
+        "collab.sample_time" => ("Example record", "Registro de exemplo"),
+        "collab.now" => ("This preview", "Nesta prévia"),
+        "collab.sample_title" => (
+            "Update price and opening hours",
+            "Atualizar preço e horário",
+        ),
+        "collab.sample_reason" => (
+            "The sign at the entrance lists a fee and new opening hours. I checked during my last visit.",
+            "A placa na entrada informa uma tarifa e novos horários. Conferi na minha última visita.",
+        ),
+        "collab.sample_photo_title" => (
+            "Add a clearer photo of the bike rack",
+            "Adicionar uma foto mais clara do paraciclo",
+        ),
+        "collab.sample_photo_reason" => (
+            "An example photo suggestion to show how image review works.",
+            "Uma sugestão de foto de exemplo para demonstrar como funciona a avaliação de imagens.",
+        ),
+        "collab.your_proposal" => (
+            "Suggested listing update",
+            "Atualização sugerida para a vaga",
+        ),
+        "collab.approve" => ("Approve", "Aprovar"),
+        "collab.reject" => ("Reject", "Rejeitar"),
+        "collab.votes" => ("Vote totals", "Totais de votos"),
+        "collab.approvals" => ("approvals", "aprovações"),
+        "collab.rejections" => ("rejections", "rejeições"),
+        "collab.alternative" => ("Suggest an alternative", "Sugerir uma alternativa"),
+        "collab.vote_help" => (
+            "One vote per person. Click again to withdraw, or choose the other option.",
+            "Um voto por pessoa. Clique novamente para retirar ou escolha a outra opção.",
+        ),
+        "collab.progress" => ("approvals to accept", "aprovações para aceitar"),
+        "collab.compare" => ("See what changes", "Ver o que muda"),
+        "collab.peer" => (
+            "Simulate another person’s approval",
+            "Simular aprovação de outra pessoa",
+        ),
+        "collab.moderator" => ("Moderator simulation", "Simulação de moderação"),
+        "collab.mod_approve" => ("Accept now", "Aceitar agora"),
+        "collab.mod_reject" => ("Reject now", "Rejeitar agora"),
+        "collab.submit" => (
+            "Share proposal in preview",
+            "Compartilhar proposta na prévia",
+        ),
+        "collab.no_changes" => (
+            "Change at least one detail or choose a photo first.",
+            "Altere ao menos uma informação ou escolha uma foto.",
+        ),
+        "collab.saved" => (
+            "Your proposal is visible in this preview. The published listing hasn’t changed.",
+            "Sua proposta está visível nesta prévia. A versão publicada não foi alterada.",
+        ),
+        "collab.voted" => ("Your vote was updated.", "Seu voto foi atualizado."),
+        "collab.decided" => (
+            "Decision recorded in the preview. Open History to inspect the result; the real listing is unchanged.",
+            "Decisão registrada na prévia. Abra o Histórico para ver o resultado; a vaga real não foi alterada.",
+        ),
+        "collab.photo_add" => ("Add photo", "Adicionar foto"),
+        "collab.unset" => ("Not provided", "Não informado"),
+        "collab.invalid_photo" => (
+            "Choose up to 5 JPEG, PNG or WebP photos, no larger than 10 MB each.",
+            "Escolha até 5 fotos JPEG, PNG ou WebP, de no máximo 10 MB cada.",
+        ),
+        "collab.version" => ("Version", "Versão"),
+        "collab.snapshot" => (
+            "View this version’s full details",
+            "Ver todos os detalhes desta versão",
+        ),
+        "collab.original" => (
+            "Published version · example history",
+            "Versão publicada · histórico de exemplo",
+        ),
+        "collab.history_reason" => (
+            "The first version of this listing, shown here as an example.",
+            "A primeira versão desta vaga, exibida aqui como exemplo.",
+        ),
+        "collab.community_accepted" => (
+            "Accepted by the community after 6 approvals.",
+            "Aceita pela comunidade após 6 aprovações.",
+        ),
+        "collab.mod_accepted" => (
+            "Accepted by a moderator without waiting for the vote threshold.",
+            "Aceita pela moderação sem aguardar o mínimo de votos.",
+        ),
+        "collab.sample_price" => ("R$ 5 / hour", "R$ 5 / hora"),
+        "collab.sample_hours" => ("08:00–20:00", "08:00–20:00"),
+        "collab.anonymous" => ("Anonymous cyclist", "Ciclista anônimo"),
+        "account.attribution.label" => (
+            "Show my display name on new reviews and proposals",
+            "Mostrar meu nome em novas avaliações e propostas",
+        ),
+        "account.attribution.help" => (
+            "Off by default. Your display name will be visible to everyone on new contributions only; old anonymous contributions stay anonymous, even if edited. Turning this off removes your name from existing contributions and does not restore it if enabled again. If you have no display name, you remain anonymous. Voter identities are never shown.",
+            "Desativado por padrão. Seu nome ficará visível para todos apenas em novas contribuições; contribuições antigas anônimas continuam anônimas, mesmo se editadas. Desativar remove seu nome das contribuições existentes, sem restaurá-lo se você ativar novamente. Sem um nome definido, você continua anônimo. A identidade de quem votou nunca é exibida.",
+        ),
+        "account.attribution.save" => (
+            "Save privacy preference",
+            "Salvar preferência de privacidade",
+        ),
+        "account.attribution.saved" => (
+            "Your public-name preference was saved.",
+            "Sua preferência de nome público foi salva.",
+        ),
+        "collab.sample_name" => ("Marina (example name)", "Marina (nome de exemplo)"),
+        "collab.name_optin" => (
+            "Show my public name on this proposal (preview)",
+            "Mostrar meu nome público nesta proposta (prévia)",
+        ),
+        "collab.name_help" => (
+            "Off by default. Uses an example name; voter identities are never displayed.",
+            "Desativado por padrão. Usa um nome de exemplo; a identidade de quem vota nunca é exibida.",
+        ),
+        "collab.own_vote" => (
+            "You can’t vote on your own proposal. Other people can review it.",
+            "Você não pode votar na própria proposta. Outras pessoas podem avaliá-la.",
+        ),
         "search.title" => ("Search — BikesNest", "Busca — BikesNest"),
         "search.eyebrow" => ("Find your next stop", "Encontre sua próxima parada"),
         "search.subtitle" => (

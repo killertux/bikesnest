@@ -1,0 +1,38 @@
+{# Real, server-backed contribution entry points. Pending photos and voter
+   identities are intentionally never rendered on a public listing. #}
+<section class="mt-8 rounded-2xl border border-border bg-surface p-5 sm:p-6" aria-labelledby="listing-collaboration-title">
+  <div class="flex flex-wrap items-start justify-between gap-4">
+    <div>
+      <p class="text-xs font-semibold uppercase tracking-[0.12em] text-accent-strong">{{ tr.t("collab.community") }}</p>
+      <h2 id="listing-collaboration-title" class="mt-1 font-display text-xl font-bold tracking-tight">{{ tr.t("collab.help_title") }}</h2>
+      <p class="mt-1 max-w-2xl text-sm text-muted">{{ tr.t("collab.help_body") }}</p>
+    </div>
+    {% if can_contribute %}<a href="/parking/{{ id }}/edit" class="inline-flex min-h-11 items-center rounded-xl bg-accent-strong px-4 py-2 text-sm font-medium text-white hover:bg-accent-dark">{{ tr.t("collab.suggest") }}</a>
+    {% else if is_authenticated %}<a href="/account?verify=1" class="inline-flex min-h-11 items-center rounded-xl border border-border px-4 py-2 text-sm font-medium text-muted hover:text-fg">{{ tr.t("nav.verify_to_contribute") }}</a>
+    {% else %}<a href="/login?next=/parking/{{ id }}" class="inline-flex min-h-11 items-center rounded-xl border border-border px-4 py-2 text-sm font-medium text-muted hover:text-fg">{{ tr.t("auth.login.submit") }}</a>{% endif %}
+  </div>
+  <div class="mt-5 grid gap-4 lg:grid-cols-2">
+    <details class="rounded-xl border border-border p-4"><summary class="cursor-pointer font-medium">{{ tr.t("proposal.kind.move") }}</summary><p class="mt-2 text-sm text-muted">{{ tr.t("collab.location_help") }}</p>
+      {% if can_contribute %}<form action="/parking/{{ id }}/proposal" method="post" class="mt-4 grid gap-3 sm:grid-cols-2"><input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="kind" value="move_location">
+        <label class="text-sm font-medium">{{ tr.t("collab.latitude") }}<input name="lat" value="{{ lat }}" required type="number" min="-90" max="90" step="any" class="mt-1 block w-full rounded-lg border border-border bg-bg px-3 py-2"></label><label class="text-sm font-medium">{{ tr.t("collab.longitude") }}<input name="lon" value="{{ lon }}" required type="number" min="-180" max="180" step="any" class="mt-1 block w-full rounded-lg border border-border bg-bg px-3 py-2"></label>
+        <label class="text-sm font-medium sm:col-span-2">{{ tr.t("proposal.approve.tz") }}<input name="timezone" value="{{ timezone_label }}" class="mt-1 block w-full rounded-lg border border-border bg-bg px-3 py-2"></label><label class="text-sm font-medium sm:col-span-2">{{ tr.t("collab.reason") }}<textarea name="reason" required maxlength="1000" rows="2" class="mt-1 block w-full rounded-lg border border-border bg-bg px-3 py-2"></textarea></label><button type="submit" class="min-h-11 rounded-xl bg-accent-strong px-4 py-2 text-sm font-medium text-white hover:bg-accent-dark sm:col-span-2">{{ tr.t("collab.suggest") }}</button></form>{% endif %}
+    </details>
+    <details class="rounded-xl border border-border p-4"><summary class="cursor-pointer font-medium">{{ tr.t("proposal.kind.existence") }}</summary><p class="mt-2 text-sm text-muted">{{ tr.t("collab.rules") }}</p>
+      {% if can_contribute %}<form action="/parking/{{ id }}/proposal" method="post" class="mt-4 grid gap-3"><input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="kind" value="change_existence"><label class="text-sm font-medium">{{ tr.t("proposal.approve.existence") }}<select name="existence" class="mt-1 block w-full rounded-lg border border-border bg-bg px-3 py-2"><option value="exists">{{ tr.t("proposal.existence.exists") }}</option><option value="removed">{{ tr.t("proposal.existence.removed") }}</option></select></label><label class="text-sm font-medium">{{ tr.t("collab.reason") }}<textarea name="reason" required maxlength="1000" rows="2" class="mt-1 block w-full rounded-lg border border-border bg-bg px-3 py-2"></textarea></label><button type="submit" class="min-h-11 rounded-xl bg-accent-strong px-4 py-2 text-sm font-medium text-white hover:bg-accent-dark">{{ tr.t("collab.suggest") }}</button></form>{% endif %}
+    </details>
+  </div>
+  <section class="mt-6 border-t border-border pt-5" aria-labelledby="listing-proposals-title">
+    <div class="flex items-baseline justify-between gap-3"><h3 id="listing-proposals-title" class="font-display text-lg font-semibold">{{ tr.t("collab.proposals") }}</h3><span class="text-sm text-muted">{{ collaboration_proposals.len() }}</span></div>
+    {% if collaboration_proposals.is_empty() %}<p class="mt-2 text-sm text-muted">{{ tr.t("moderation.proposals.empty") }}</p>
+    {% else %}<div class="mt-3 grid gap-3 lg:grid-cols-2">{% for proposal in collaboration_proposals %}
+      <article class="rounded-xl border border-border p-4"><div class="flex items-start justify-between gap-3"><h4 class="font-medium">{{ proposal.kind_label }}</h4><span class="rounded-full bg-bg px-2 py-1 text-xs font-medium text-muted">{{ proposal.status }}</span></div>
+        {% if let Some(reason) = proposal.reason %}<p class="mt-2 text-sm text-muted">{{ reason }}</p>{% endif %}
+        <p class="mt-3 text-sm"><strong>{{ proposal.approvals }}</strong> {{ tr.t("collab.approvals") }} · <strong>{{ proposal.rejections }}</strong> {{ tr.t("collab.rejections") }}</p>
+        {% if can_contribute && proposal.status == "PENDING" %}<div class="mt-3 flex gap-2"><form action="/parking/proposals/{{ proposal.id }}/vote" method="post"><input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="location_id" value="{{ id }}"><input type="hidden" name="vote" value="approve"><button class="min-h-10 rounded-lg bg-accent-strong px-3 py-2 text-sm font-medium text-white hover:bg-accent-dark" type="submit">{{ tr.t("collab.approve") }}</button></form><form action="/parking/proposals/{{ proposal.id }}/vote" method="post"><input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="location_id" value="{{ id }}"><input type="hidden" name="vote" value="reject"><button class="min-h-10 rounded-lg border border-border px-3 py-2 text-sm font-medium text-muted hover:text-fg" type="submit">{{ tr.t("collab.reject") }}</button></form></div>{% endif %}
+      </article>{% endfor %}</div>{% endif %}
+  </section>
+  <section class="mt-6 border-t border-border pt-5" aria-labelledby="listing-history-title"><h3 id="listing-history-title" class="font-display text-lg font-semibold">{{ tr.t("collab.history") }}</h3>
+    {% if collaboration_history.is_empty() %}<p class="mt-2 text-sm text-muted">{{ tr.t("collab.history_body") }}</p>{% else %}<ol class="mt-3 space-y-2">{% for revision in collaboration_history %}<li class="flex gap-3 rounded-lg bg-bg px-3 py-2 text-sm"><span class="font-mono font-medium text-accent-strong">v{{ revision.version }}</span><span><strong>{{ revision.kind }}</strong>{% if let Some(summary) = revision.summary %} · {{ summary }}{% endif %}</span></li>{% endfor %}</ol>{% endif %}
+  </section>
+  <p class="mt-4 text-sm text-muted">{{ tr.t("collab.photos_help") }} {% if can_contribute %}<a class="font-medium text-accent-strong underline underline-offset-2" href="#photo-upload">{{ tr.t("collab.photos") }}</a>{% endif %}</p>
+</section>

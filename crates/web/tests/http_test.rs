@@ -7768,6 +7768,8 @@ fn no_undefined_tailwind_color_tokens_remain_in_templates() {
         "center",
         "left",
         "right",
+        // `text-balance` controls line wrapping, not text colour.
+        "balance",
         // border side / divide axis (`border-t`, `divide-y`, …)
         "t",
         "b",

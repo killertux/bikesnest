@@ -2,6 +2,8 @@ Esta Política de Privacidade explica como o BikesNest trata dados pessoais, em 
 
 O BikesNest é um mapa colaborativo de estacionamentos para bicicletas. Qualquer pessoa pode buscar vagas sem criar conta. Uma conta é necessária apenas para contribuir (adicionar locais, fotos, avaliações e verificações).
 
+Avaliações e propostas de alteração são anônimas por padrão. Você pode permitir a exibição pública do nome do seu perfil nas configurações da conta. Isso vale apenas para novas avaliações e propostas, não para contribuições anteriores anônimas, mesmo se editadas. Desativar a opção remove seu nome das contribuições existentes; ativá-la novamente não restaura esses nomes. Você pode usar o serviço sem ativar essa opção. Guardamos a preferência e a data de sua última alteração. A identidade de quem vota nunca é pública; outros visitantes veem apenas os totais de votos. O conteúdo de textos e fotos pode identificar você ou outra pessoa, independentemente do nome exibido como autor.
+
 ## 1. Quem é o controlador
 
 **{{OPERATOR_NAME}}**, inscrita no CNPJ sob o nº {{OPERATOR_CNPJ}}, com sede em {{OPERATOR_ADDRESS}} ("nós"), é a controladora dos dados pessoais tratados no BikesNest.

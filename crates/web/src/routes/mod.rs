@@ -41,12 +41,14 @@ use admin::{
 use api::geocode_api;
 use auth::{
     account, account_email, account_email_post, account_password, account_password_post,
-    auth_google, auth_google_callback, auth_google_fake_consent, login_page, login_post, logout,
-    password_reset_new, password_reset_new_post, password_reset_page, password_reset_post,
-    register_page, register_post, verify_email, verify_resend,
+    account_public_name_post, auth_google, auth_google_callback, auth_google_fake_consent,
+    login_page, login_post, logout, password_reset_new, password_reset_new_post,
+    password_reset_page, password_reset_post, register_page, register_post, verify_email,
+    verify_resend,
 };
 use community::{
-    parking_edit_page, parking_edit_post, parking_new_page, parking_new_post, parking_proposal_post,
+    parking_edit_page, parking_edit_post, parking_new_page, parking_new_post,
+    parking_proposal_post, parking_proposal_vote_post,
 };
 use details::parking_details;
 use errors::not_found;
@@ -115,6 +117,7 @@ pub(crate) fn routes(state: &AppState) -> Router<AppState> {
     }
     router
         .route("/account", get(account))
+        .route("/account/public-name", post(account_public_name_post))
         .route(
             "/account/password",
             get(account_password).post(account_password_post),
@@ -157,6 +160,10 @@ pub(crate) fn routes(state: &AppState) -> Router<AppState> {
             get(parking_edit_page).post(parking_edit_post),
         )
         .route("/parking/{id}/proposal", post(parking_proposal_post))
+        .route(
+            "/parking/proposals/{id}/vote",
+            post(parking_proposal_vote_post),
+        )
         .route("/parking/{id}/review", get(review_page).post(review_post))
         .route("/parking/{id}/verify", post(parking_verify_post))
         .route("/parking/{id}/parked-here", post(parking_parked_here_post))

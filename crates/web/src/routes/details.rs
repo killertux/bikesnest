@@ -9,7 +9,7 @@ use crate::auth::Auth;
 use crate::i18n::{Locale, Translator};
 use crate::state::AppState;
 use crate::view;
-use crate::{DetailsPage, PhotoVm};
+use crate::{CollaborationProposalVm, CollaborationRevisionVm, DetailsPage, PhotoVm};
 
 use super::common::render;
 use super::errors::{internal_error, not_found_page};
@@ -38,6 +38,8 @@ pub(crate) struct DetailsNotice {
     reported: Option<String>,
     #[serde(default)]
     photo: Option<String>,
+    #[serde(default)]
+    voted: Option<String>,
 }
 
 /// One notice for the details page banner, newest/strongest action first.
@@ -60,6 +62,8 @@ pub(crate) fn details_notice(tr: Translator, q: &DetailsNotice) -> Option<String
         Some(tr.t("report.submitted").to_string())
     } else if q.photo.is_some() {
         Some(tr.t("photo.upload.success").to_string())
+    } else if q.voted.is_some() {
+        Some(tr.t("collab.voted").to_string())
     } else {
         None
     }
@@ -136,6 +140,44 @@ pub(crate) async fn parking_details(
                 &*state.storage,
             )
             .await
+            .collaboration_proposals(
+                state
+                    .contributions
+                    .listing_proposals(id)
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|p| CollaborationProposalVm {
+                        id: p.id,
+                        kind_label: match p.kind {
+                            bikesnest_domain::ProposalKind::MoveLocation => {
+                                tr.t("proposal.kind.move").to_string()
+                            }
+                            bikesnest_domain::ProposalKind::ChangeExistence => {
+                                tr.t("proposal.kind.existence").to_string()
+                            }
+                        },
+                        reason: p.reason.clone(),
+                        status: p.status.as_code(),
+                        approvals: p.approvals,
+                        rejections: p.rejections,
+                    })
+                    .collect(),
+            )
+            .collaboration_history(
+                state
+                    .contributions
+                    .revision_history(id)
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|r| CollaborationRevisionVm {
+                        version: r.version,
+                        kind: r.change_kind.as_code().to_string(),
+                        summary: r.summary.clone(),
+                    })
+                    .collect(),
+            )
             .notice(notice);
             render(page, StatusCode::OK)
         }

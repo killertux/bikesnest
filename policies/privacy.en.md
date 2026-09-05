@@ -2,6 +2,8 @@ This Privacy Policy explains how BikesNest handles personal data, in line with B
 
 BikesNest is a community map of bicycle parking. Anyone can search without an account. An account is only needed to contribute (adding locations, photos, reviews and verifications).
 
+Reviews and change proposals are anonymous by default. You can optionally enable public display of your profile name in account settings. This applies only to new reviews and proposals, not earlier anonymous contributions, even if you edit them. Turning the setting off removes your name from existing contributions; turning it on again does not restore those names. You can use the service without enabling this setting. We store the preference and the date of its latest change. Voting identities are never public; other visitors see vote totals only. Content you write or photograph may itself identify you or someone else, regardless of the author label.
+
 ## 1. Who the controller is
 
 **{{OPERATOR_NAME}}**, Brazilian company registration (CNPJ) No. {{OPERATOR_CNPJ}}, with registered office at {{OPERATOR_ADDRESS}} ("we"), is the controller of the personal data processed on BikesNest.

@@ -104,6 +104,7 @@ pub struct ExportPayload {
     pub reviews: Vec<ExportReview>,
     pub verifications: Vec<ExportVerification>,
     pub proposals: Vec<ExportProposal>,
+    pub proposal_votes: Vec<ExportProposalVote>,
     pub reports: Vec<ExportReport>,
     pub photos: Vec<ExportPhoto>,
 }
@@ -118,6 +119,7 @@ impl ExportPayload {
         reviews: Vec<ExportReview>,
         verifications: Vec<ExportVerification>,
         proposals: Vec<ExportProposal>,
+        proposal_votes: Vec<ExportProposalVote>,
         reports: Vec<ExportReport>,
         photos: Vec<ExportPhoto>,
         exported_at: DateTime<Utc>,
@@ -132,6 +134,7 @@ impl ExportPayload {
             reviews,
             verifications,
             proposals,
+            proposal_votes,
             reports,
             photos,
         }
@@ -143,6 +146,10 @@ pub struct ExportAccount {
     pub user_id: i64,
     pub email: String,
     pub display_name: Option<String>,
+    #[serde(default)]
+    pub public_contribution_name: bool,
+    #[serde(default)]
+    pub public_contribution_name_updated_at: Option<DateTime<Utc>>,
     pub account_state: String,
     pub email_verified_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -177,6 +184,8 @@ pub struct ExportReview {
     pub location_id: i64,
     pub rating: i16,
     pub body: String,
+    #[serde(default)]
+    pub public_author: bool,
     pub moderation_state: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -207,6 +216,14 @@ pub struct ExportProposal {
     pub proposed: serde_json::Value,
     pub status: String,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportProposalVote {
+    pub proposal_id: i64,
+    pub vote: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -929,11 +946,14 @@ mod tests {
                 user_id: 1,
                 email: "a@example.com".to_string(),
                 display_name: None,
+                public_contribution_name: false,
+                public_contribution_name_updated_at: None,
                 account_state: "ACTIVE".to_string(),
                 email_verified_at: None,
                 created_at: Utc::now(),
                 roles: vec![],
             },
+            vec![],
             vec![],
             vec![],
             vec![],

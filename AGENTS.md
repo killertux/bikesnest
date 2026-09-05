@@ -74,9 +74,13 @@ npm run build:css                        # Tailwind → web/static/css/app.css
 - **Lint:** `unsafe_code = "forbid"` (workspace lint). Keep it clean.
 - **`#[db_test]`** runs against real Postgres; requires `docker compose up -d db`.
   Transaction-per-test with automatic rollback. See `TESTING.md`.
-- **Read-model tests** whose queries run on *other* pool connections use the
-  committed-fixture pattern (`with_fixture_tag` + `tx.commit_fixture()` + tag
-  cleanup) — see `crates/infrastructure/tests/parking_test.rs`.
+- **Repository tests:** prefer `let db = tx.db().await` before fixture queries.
+  Seed through `db.acquire()`, release the lease, and inject `db.clone()` into
+  repositories. Repository transactions use savepoints; the harness awaits
+  outer rollback even after a panic. Adapters must use `Db::acquire()`, not
+  `Db::pool()`. Account/review/export adapters are migrated; others still need
+  migration. True multi-connection race tests need separate database isolation,
+  not this single-connection scope. See `TESTING.md` for legacy pooled tests.
 - **Subcommands** dispatch in `crates/web/src/main.rs`; default is `serve`.
   Add a new `Some("…")` arm there for a new CLI command.
 - **Providers are wired in one place:** `crates/web/src/wiring.rs`
@@ -103,9 +107,9 @@ npm run build:css                        # Tailwind → web/static/css/app.css
   fails on any `text|bg|border|...-<name>` utility whose `<name>` isn't a
   defined token, a Tailwind colour keyword, or on that test's own
   non-colour-utility allowlist.
-- **Legacy references (`§N` / `Ledger #N`):** some `docs/`, `.env.example`,
-  code comments and templates still carry `§N` (section numbers from the
-  now-removed spec) and `Ledger #N` (the old milestone plan's bookkeeping) as
+- **Legacy spec/ledger references:** some `docs/`, `.env.example`,
+  code comments and templates still carry section numbers from the
+  now-removed spec and references to the old milestone plan's bookkeeping as
   historical annotations. There is no such document anymore. **Whenever you edit
   a file that contains one of these, delete it** (rephrase the surrounding text
   if needed so it still reads naturally). This is a slow, file-by-file cleanup —

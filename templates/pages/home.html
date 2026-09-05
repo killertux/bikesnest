@@ -1,13 +1,13 @@
 {% extends "layouts/base.html" %}
 {% block content %}
 
-<div class="landing-page">
+<div class="landing-page [&_h2]:text-balance">
 <!-- Destination search leads; photography gives it a sense of place. -->
-<section class="home-hero">
-  <div class="home-hero-content">
+<section class="home-hero mx-auto grid max-w-shell items-center gap-8 px-6 py-10 sm:gap-10 sm:px-8 sm:pt-14 sm:pb-16 lg:grid-cols-[1.2fr_1fr] lg:gap-12">
+  <div class="home-hero-content min-w-0 max-lg:max-w-2xl">
     <div class="max-w-2xl">
-      <p class="home-eyebrow"><span aria-hidden="true"></span>{{ tr.t("home.eyebrow") }}</p>
-      <h1 class="home-headline font-display">
+      <p class="home-eyebrow mb-6 flex items-center gap-2.5 text-[0.6875rem] font-semibold tracking-[0.04em] text-accent-strong uppercase sm:text-xs sm:tracking-[0.07em]"><span class="size-2 shrink-0 rounded-full bg-accent-strong" aria-hidden="true"></span>{{ tr.t("home.eyebrow") }}</p>
+      <h1 class="home-headline font-display text-[clamp(2.75rem,4.5vw,4.25rem)] leading-[1.06] font-bold tracking-[-0.05em] text-balance">
         {{ tr.t("home.hero.title") }}
       </h1>
       <p class="mt-6 max-w-xl text-lg leading-relaxed text-muted">
@@ -17,7 +17,7 @@
 
     <!-- Search card -->
     <div class="mt-10 max-w-2xl" x-data="homeHero">
-      <form action="/search" method="get" role="search" class="home-search flex flex-col gap-2 rounded-2xl border border-border bg-surface p-2 sm:flex-row sm:items-center">
+      <form action="/search" method="get" role="search" class="home-search flex flex-col gap-2 rounded-2xl border border-border bg-surface p-2 shadow-[0_8px_24px_oklch(20%_0.02_240/0.05)] sm:flex-row sm:items-center">
         <div class="flex min-w-0 flex-1 items-center gap-3 px-3 py-1.5">
           <svg aria-hidden="true" class="h-5 w-5 shrink-0 text-muted" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 10c0 4.993-5.539 10.193-7.399 11.799a1 1 0 0 1-1.202 0C9.539 20.193 4 14.993 4 10a8 8 0 0 1 16 0" /><circle cx="12" cy="10" r="3" /></svg>
           <label for="q" class="sr-only">{{ tr.t("home.search.placeholder") }}</label>
@@ -27,7 +27,7 @@
             class="min-w-0 w-full bg-transparent py-2 text-base"
           />
         </div>
-        <button type="submit" class="inline-flex items-center justify-center gap-2 rounded-xl bg-accent-strong px-6 py-3.5 text-base font-medium text-white transition-colors hover:bg-accent-dark">
+        <button type="submit" class="inline-flex shrink-0 items-center justify-center gap-2 rounded-xl bg-accent-strong px-6 py-3.5 text-base font-medium text-white transition-colors hover:bg-accent-dark">
           <svg aria-hidden="true" class="h-5 w-5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21 21-4.34-4.34" /><circle cx="11" cy="11" r="8" /></svg>
           {{ tr.t("home.search.button") }}
         </button>
@@ -53,7 +53,7 @@
       </p>
     </div>
   </div>
-  <div class="home-hero-photo">
+  <div class="home-hero-photo relative order-2 h-68 overflow-hidden rounded-3xl bg-border sm:h-88 lg:h-128">
     <img
       src="{{ layout.asset("img/hero-bike-parking-2000.jpg") }}"
       srcset="{{ layout.asset("img/hero-bike-parking-640.jpg") }} 640w, {{ layout.asset("img/hero-bike-parking-1024.jpg") }} 1024w, {{ layout.asset("img/hero-bike-parking-2000.jpg") }} 2000w"
@@ -61,21 +61,21 @@
       alt=""
       width="2000" height="1125"
       fetchpriority="high"
-      class="h-full w-full object-cover"
+      class="h-full w-full object-cover object-[52%_center]"
     />
-    <a href="/search?bbox={{ layout.browse_bbox() }}" class="home-photo-link">
+    <a href="/search?bbox={{ layout.browse_bbox() }}" class="home-photo-link absolute inset-x-5 bottom-5 flex items-center justify-between gap-4 rounded-xl bg-surface px-5 py-4 text-sm font-semibold text-accent-strong hover:bg-bg">
       <span>{{ tr.t("home.explore_center") }}</span>
-      <svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14m-6-6 6 6-6 6" /></svg>
+      <svg aria-hidden="true" class="shrink-0" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14m-6-6 6 6-6 6" /></svg>
     </a>
   </div>
 </section>
 
 <!-- ======== How it works (P1) ======== -->
-<section id="how-it-works" class="home-how mx-auto max-w-shell px-6 py-12 lg:px-8 lg:py-16">
+<section id="how-it-works" class="home-how mx-auto max-w-shell scroll-mt-20 border-t border-border px-6 py-12 lg:px-8 lg:py-16">
   <p class="mb-3 font-mono text-xs uppercase tracking-[0.14em] text-accent-strong">{{ tr.t("home.how.title") }}</p>
   <h2 class="font-display text-3xl font-bold tracking-tight sm:text-4xl">{{ tr.t("home.how.heading") }}</h2>
 
-  <div class="mt-10 grid gap-6 md:grid-cols-3">
+  <div class="mt-10 grid gap-6 md:grid-cols-3 [&>div]:pr-6 max-sm:[&>div]:border-b max-sm:[&>div]:border-border max-sm:[&>div]:pb-6 md:[&>div+div]:border-l md:[&>div+div]:border-border md:[&>div+div]:pl-6">
     <div class="home-step">
       <span class="inline-flex items-center rounded-full bg-accent/10 px-2.5 py-1 font-mono text-xs font-semibold text-accent-strong">01</span>
       <h3 class="font-display mt-4 text-xl font-semibold">{{ tr.t("home.how.s1.title") }}</h3>

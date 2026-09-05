@@ -663,6 +663,7 @@ pub struct ReviewVm {
     pub stars: String,
     pub body: String,
     pub created_label: String,
+    pub author_label: String,
     pub is_own: bool,
     pub photos: Vec<PhotoVm>,
 }
@@ -681,6 +682,10 @@ pub fn review_vm(
         stars,
         body: r.body.as_str().to_string(),
         created_label,
+        author_label: r
+            .public_author_name
+            .clone()
+            .unwrap_or_else(|| t.t("collab.anonymous").to_string()),
         is_own,
         photos,
     }

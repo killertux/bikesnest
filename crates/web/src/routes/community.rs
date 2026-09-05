@@ -6,7 +6,7 @@
 use axum::extract::{Form, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use bikesnest_application::{ContributionError, NewParkingLocation, ParkingEdit};
+use bikesnest_application::{ContributionError, NewParkingLocation, ParkingEdit, ProposalVote};
 use bikesnest_domain::{
     Cost, CurrencyCode, GeoPoint, ModerationState, Money, ParkingLocation, ParkingType,
     PricingUnit, ProposalKind, ProposalPayload, ProposedChange,
@@ -809,6 +809,41 @@ pub(crate) fn parse_proposed_existence(raw: &str) -> Option<bool> {
 /// returns there with an error flag rather than rendering a bare 400.
 pub(crate) fn proposal_error(id: i64) -> Response {
     axum::response::Redirect::to(&format!("/parking/{id}?proposal_error=1")).into_response()
+}
+
+/// POST /parking/proposals/{proposal_id}/vote. The response never reveals a
+/// voter list; clients return to the listing where only aggregate read models
+/// may be rendered.
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct ProposalVoteForm {
+    #[serde(default)]
+    vote: String,
+    #[serde(default)]
+    location_id: i64,
+}
+
+pub(crate) async fn parking_proposal_vote_post(
+    State(state): State<AppState>,
+    auth: Auth,
+    Path(proposal_id): Path<i64>,
+    Form(form): Form<ProposalVoteForm>,
+) -> Response {
+    let user = match auth.require_verified() {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(vote) = ProposalVote::from_code(&form.vote) else {
+        return proposal_error(form.location_id);
+    };
+    match state
+        .contributions
+        .vote_on_proposal(user, proposal_id, vote)
+        .await
+    {
+        Ok(_) => axum::response::Redirect::to(&format!("/parking/{}?voted=1", form.location_id))
+            .into_response(),
+        Err(_) => proposal_error(form.location_id),
+    }
 }
 
 #[cfg(test)]
