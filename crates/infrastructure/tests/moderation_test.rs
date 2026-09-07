@@ -1,4 +1,4 @@
-//! M5 moderation infrastructure tests: the report repo state machine, the
+//! Moderation infrastructure tests: the report repo state machine, the
 //! moderation actions (proposal apply + supersede, parking invalidate revision),
 //! and the audit-log reader filter/pagination. Uses the committed-fixture
 //! pattern (the repos read/write through the pool, on other connections).
@@ -401,14 +401,14 @@ async fn audit_reader_filters_and_paginates(tx: &mut bikesnest_test_support::Tes
     let reader = SqlxAuditLogReader::new(db().await);
     // Insert a batch of audit events, then filter by action + keyset paginate.
     for i in 0..5 {
-        sqlx::query!(
+        sqlx::query(
             "INSERT INTO audit_events (actor_user_id, action, target_type, target_id, result, metadata) \
              VALUES ($1, $2, $3, $4, 'success', '{}'::jsonb)",
-            actor,
-            if i % 2 == 0 { "mod.foo" } else { "mod.bar" },
-            "report",
-            i.to_string(),
         )
+        .bind(actor)
+        .bind(if i % 2 == 0 { "mod.foo" } else { "mod.bar" })
+        .bind("report")
+        .bind(i.to_string())
         .execute(&pool().await)
         .await
         .unwrap();
@@ -710,7 +710,7 @@ async fn queue_counts_on_reflects_an_exact_delta_race_free(
 }
 
 // ---------------------------------------------------------------------------
-// WP13 — the proposal payload is parsed at the repository boundary, and the
+// The proposal payload is parsed at the repository boundary, and the
 // queue rows carry the location's current values so a diff needs no extra
 // query. Legacy rows must keep reading correctly with no migration.
 // ---------------------------------------------------------------------------
@@ -741,7 +741,7 @@ async fn proposal_rows_parse_the_stored_payload_and_carry_current_values(
         .unwrap();
 
     // Exactly the three payload shapes the database holds: the seeded
-    // existence row, a move written by the M3 form, and a row this build
+    // existence row, a move written by the previous form, and a row this build
     // cannot interpret.
     let mut ids = Vec::new();
     for (kind, payload) in [

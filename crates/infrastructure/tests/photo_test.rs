@@ -1,4 +1,4 @@
-//! M4 photo infrastructure tests: the image processor (EXIF strip/orientation,
+//! Photo infrastructure tests: the image processor (EXIF strip/orientation,
 //! format gate, thumbnailing) and the SQL photo repository.
 
 use bikesnest_application::{
@@ -10,6 +10,7 @@ use bikesnest_infrastructure::{
     Db, LocalImageProcessor, SqlxParkingPhotoReader, SqlxPhotoRepository,
 };
 use bikesnest_test_support::{ParkingBuilder, UserBuilder, db_test, pool};
+use sqlx::Row;
 
 async fn db() -> Db {
     Db::from_pool(pool().await)
@@ -298,24 +299,30 @@ async fn repo_insert_pending_creates_pending_row(tx: &mut bikesnest_test_support
     // The row is PENDING_REVIEW *and* complete: one insert, both derivative
     // keys, the dimensions and `processed_at`. There is no window in which
     // `storage_key` is empty (migration 0019 CHECKs that it never is).
-    let row = sqlx::query!(
+    let row = sqlx::query(
         "SELECT moderation_state, storage_key, thumbnail_key, width, height, processed_at, \
          uploader_id FROM parking_photo WHERE id = $1",
-        id
     )
+    .bind(id)
     .fetch_one(&pool().await)
     .await
     .unwrap();
-    assert_eq!(row.moderation_state, "PENDING_REVIEW");
-    assert_eq!(row.storage_key, "uploads/insert/full.jpg");
+    assert_eq!(row.get::<String, _>("moderation_state"), "PENDING_REVIEW");
     assert_eq!(
-        row.thumbnail_key.as_deref(),
-        Some("uploads/insert/thumb.jpg")
+        row.get::<String, _>("storage_key"),
+        "uploads/insert/full.jpg"
     );
-    assert_eq!(row.width, Some(800));
-    assert_eq!(row.height, Some(600));
-    assert!(row.processed_at.is_some());
-    assert_eq!(row.uploader_id, Some(fx.user_id.0));
+    assert_eq!(
+        row.get::<Option<String>, _>("thumbnail_key").as_deref(),
+        Some("uploads/insert/thumb.jpg"),
+    );
+    assert_eq!(row.get::<Option<i32>, _>("width"), Some(800));
+    assert_eq!(row.get::<Option<i32>, _>("height"), Some(600));
+    assert!(
+        row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("processed_at")
+            .is_some()
+    );
+    assert_eq!(row.get::<Option<i64>, _>("uploader_id"), Some(fx.user_id.0));
 
     cleanup(&fx).await;
 }
@@ -363,16 +370,16 @@ async fn repo_approve_sets_position_and_reviewer(tx: &mut bikesnest_test_support
         .await
         .unwrap();
 
-    let row = sqlx::query!(
+    let row = sqlx::query(
         "SELECT moderation_state, position, reviewed_by FROM parking_photo WHERE id = $1",
-        id
     )
+    .bind(id)
     .fetch_one(&pool().await)
     .await
     .unwrap();
-    assert_eq!(row.moderation_state, "APPROVED");
-    assert_eq!(row.position, 5);
-    assert_eq!(row.reviewed_by, Some(moderator.0));
+    assert_eq!(row.get::<String, _>("moderation_state"), "APPROVED");
+    assert_eq!(row.get::<i32, _>("position"), 5);
+    assert_eq!(row.get::<Option<i64>, _>("reviewed_by"), Some(moderator.0));
 
     // Approving a non-pending photo again → NotPending.
     assert!(matches!(
@@ -403,16 +410,19 @@ async fn repo_reject_records_reason_and_returns_keys(tx: &mut bikesnest_test_sup
         Some("uploads/reject/thumb.jpg")
     );
 
-    let row = sqlx::query!(
+    let row = sqlx::query(
         "SELECT moderation_state, rejection_reason, reviewed_by FROM parking_photo WHERE id = $1",
-        id
     )
+    .bind(id)
     .fetch_one(&pool().await)
     .await
     .unwrap();
-    assert_eq!(row.moderation_state, "REJECTED");
-    assert_eq!(row.rejection_reason.as_deref(), Some("unclear image"));
-    assert_eq!(row.reviewed_by, Some(moderator.0));
+    assert_eq!(row.get::<String, _>("moderation_state"), "REJECTED");
+    assert_eq!(
+        row.get::<Option<String>, _>("rejection_reason").as_deref(),
+        Some("unclear image"),
+    );
+    assert_eq!(row.get::<Option<i64>, _>("reviewed_by"), Some(moderator.0));
 
     cleanup(&fx).await;
 }
