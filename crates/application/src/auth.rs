@@ -21,6 +21,8 @@ use std::collections::HashMap;
 pub enum AuthError {
     #[error("invalid credentials")]
     InvalidCredentials,
+    #[error("current password is incorrect")]
+    InvalidCurrentPassword,
     #[error("email already registered")]
     EmailTaken,
     #[error("password does not meet the policy")]
@@ -93,7 +95,7 @@ impl From<bikesnest_domain::DomainError> for AuthError {
 // Ports: password hashing, token generation, clock
 // ---------------------------------------------------------------------------
 
-/// Port: hash / verify a password (argon2id in M2).
+/// Port: hash / verify a password (argon2id in production).
 #[async_trait]
 pub trait PasswordHasher: Send + Sync {
     async fn hash(&self, pw: &Password) -> Result<String, AuthError>;
@@ -146,7 +148,7 @@ pub struct UserActivity {
     /// that has never signed in (or whose sessions have been purged).
     pub last_active_at: Option<DateTime<Utc>>,
     /// Locations added, edits, proposals, reviews, verifications and photos —
-    /// the same events the C5 contribution feed lists, counted.
+    /// the same events the contribution feed lists, counted.
     pub contributions: i64,
 }
 
@@ -588,7 +590,7 @@ impl AuthService {
 
         let is_change_email = user.email.as_str() != email;
         let new_email = UserEmail::parse(&email).map_err(|_| AuthError::InvalidEmail)?;
-        // One atomic operation (per the plan): set `email_verified_at`, advance
+        // One atomic operation: set `email_verified_at`, advance
         // to `Active`, and (when changing) switch `users.email` + the password
         // identity subject in a single transaction — one login-lookup key, never
         // divergent.
@@ -840,7 +842,7 @@ impl AuthService {
     }
 
     // -----------------------------------------------------------------------
-    // Authenticated settings (C2 / C3)
+    // Authenticated settings
     // -----------------------------------------------------------------------
 
     /// Change the password. Requires the current password; revokes all *other*
@@ -864,7 +866,7 @@ impl AuthService {
             return Err(AuthError::InvalidCredentials);
         };
         if !self.hasher.verify(&Password::new(current), hash).await? {
-            return Err(AuthError::InvalidCredentials);
+            return Err(AuthError::InvalidCurrentPassword);
         }
         self.password_policy.validate(new)?;
         let new_hash = self.hasher.hash(&Password::new(new)).await?;
@@ -908,7 +910,7 @@ impl AuthService {
             .verify(&Password::new(current_password), hash)
             .await?
         {
-            return Err(AuthError::InvalidCredentials);
+            return Err(AuthError::InvalidCurrentPassword);
         }
         // Reject a taken address here rather than at confirm time: the unique
         // index would otherwise fire only after the mail was sent and the
@@ -1185,7 +1187,7 @@ impl AuthService {
     /// Resolve a raw session id (from the cookie) to an authenticated principal
     /// and the CSRF token. `None` for a missing / invalid / expired / revoked session
     /// (deny-by-default).
-    /// All accounts with roles (admin user list, M5).
+    /// All accounts with roles for the admin user list.
     pub async fn list_users(&self) -> Result<Vec<AuthenticatedUser>, AuthError> {
         let users = self.accounts.list_users().await?;
         Ok(users.iter().map(AuthenticatedUser::from_user).collect())

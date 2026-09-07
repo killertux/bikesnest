@@ -3,7 +3,9 @@
 use async_trait::async_trait;
 use bikesnest_domain::{Cost, FreshnessThresholds, GeoPoint, ParkingType, Rating};
 
-/// A geocoding result for a free-text destination.
+/// A resolved search origin. Geocoders return this for free-text destinations;
+/// coordinate searches construct the same shape so callers can render both
+/// origins consistently.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GeoHit {
     pub label: String,

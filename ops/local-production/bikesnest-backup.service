@@ -1,0 +1,10 @@
+[Unit]
+Description=Back up BikesNest PostgreSQL to private Google Storage
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/bruno/Projects/bikenest/ops/local-production/backup.py
+TimeoutStartSec=1800
+UMask=0077
+NoNewPrivileges=true

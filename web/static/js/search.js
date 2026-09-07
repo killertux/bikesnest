@@ -169,6 +169,7 @@
       st.dest = map.addMarker({
         element: destEl,
         position: { lon: data.origin.lon, lat: data.origin.lat },
+        anchor: "bottom",
       });
     }
     (data.items || []).forEach(function (item) {

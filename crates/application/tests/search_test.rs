@@ -170,8 +170,28 @@ async fn explicit_coordinates_win_over_query_and_skip_geocoder() {
         .execute(input)
         .await
         .unwrap();
-    assert!(hit.is_none(), "explicit coordinates need no geocode hit");
+    let hit = hit.expect("explicit coordinates are returned as the map origin");
+    assert_eq!(hit.label, "Rua XV de Novembro");
+    assert_eq!(
+        hit.point,
+        bikesnest_domain::GeoPoint::new(-23.55, -46.66).unwrap()
+    );
     assert!(geocoder.calls.lock().unwrap().is_empty());
+    assert_eq!(page.total, 0);
+}
+
+#[tokio::test]
+async fn coordinate_only_search_labels_its_map_origin_with_the_coordinates() {
+    let (page, hit) = use_case(FakeGeocoder::default(), FakeReader::default())
+        .execute(SearchInput {
+            lat: Some(-25.4284),
+            lon: Some(-49.2733),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(hit.unwrap().label, "-25.42840, -49.27330");
     assert_eq!(page.total, 0);
 }
 
@@ -483,7 +503,7 @@ async fn details_of_unknown_id_is_none() {
 }
 
 // ---------------------------------------------------------------------------
-// Browse mode (WP20): the box is the request, and it is validated here
+// Browse mode: the box is the request, and it is validated here
 // ---------------------------------------------------------------------------
 
 fn browse_input(bbox: &str) -> SearchInput {
