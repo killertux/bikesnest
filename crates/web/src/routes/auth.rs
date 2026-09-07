@@ -1,4 +1,4 @@
-//! M2 accounts: register, sign in/out, email verification, password reset,
+//! Accounts: register, sign in/out, email verification, password reset,
 //! the Google sign-in stub and the account settings pages.
 
 use axum::extract::{Form, Query, State};
@@ -33,6 +33,7 @@ pub(crate) fn redirect_with_cookie(path: &str, cookie: &str) -> Response {
 pub(crate) fn auth_error_message(tr: Translator, err: &AuthError) -> String {
     match err {
         AuthError::WeakPassword => tr.t("auth.error.weak_password").to_string(),
+        AuthError::InvalidCurrentPassword => tr.t("account.pw_current_incorrect").to_string(),
         AuthError::InvalidEmail => tr.t("auth.error.invalid_email").to_string(),
         AuthError::RateLimited => tr.t("auth.error.rate_limited").to_string(),
         AuthError::TokenExpired | AuthError::TokenUsed | AuthError::TokenInvalid => {
@@ -45,7 +46,7 @@ pub(crate) fn auth_error_message(tr: Translator, err: &AuthError) -> String {
     }
 }
 
-/// Which register input a rejected submission belongs to (WP21 a11y pass):
+/// Which register input a rejected submission belongs to:
 /// `None` for the errors that are not about one particular field (rate
 /// limits, conflicts, "try again") — those stay a banner-only message.
 pub(crate) fn register_field_error(err: &AuthError) -> Option<&'static str> {
@@ -272,7 +273,7 @@ pub(crate) async fn login_post(
             let token = anon_csrf_token();
             let message = tr.t("auth.error.invalid_credentials").to_string();
             // Never disclose which of the two was wrong: both inputs are
-            // flagged with the same generic message (WP21 a11y pass) rather
+            // flagged with the same generic message rather
             // than only one, which would leak that the other was correct.
             let mut field_errors = view::FieldErrors::new();
             field_errors.push("email", message.clone());
@@ -827,7 +828,11 @@ mod tests {
     }
 
     #[test]
-    fn auth_conflict_and_unavailable_get_their_own_copy() {
+    fn expected_auth_errors_get_specific_copy() {
+        assert_eq!(
+            auth_error_message(en(), &AuthError::InvalidCurrentPassword),
+            en().t("account.pw_current_incorrect")
+        );
         assert_eq!(
             auth_error_message(en(), &AuthError::Conflict),
             en().t("error.conflict")

@@ -1221,7 +1221,7 @@ async fn change_password_requires_current_and_verifies_new() {
         auth.change_password(UserId(1), "wrong", "new-password", &session)
             .await
             .unwrap_err(),
-        AuthError::InvalidCredentials
+        AuthError::InvalidCurrentPassword
     );
     // Correct current password succeeds.
     auth.change_password(UserId(1), "correct-horse", "new-password", &session)

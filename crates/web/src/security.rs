@@ -53,6 +53,10 @@ impl SecurityHeaders {
 
     /// The `Content-Security-Policy` value, with hosts selected from config.
     pub fn csp(&self) -> String {
+        // Cloudflare injects its Web Analytics beacon at the edge in production.
+        // https://developers.cloudflare.com/fundamentals/reference/policies-compliances/content-security-policies/
+        const CLOUDFLARE_SCRIPT: &str = " https://static.cloudflareinsights.com";
+        const CLOUDFLARE_CONNECT: &str = " https://cloudflareinsights.com";
         let tile = self.join_hosts(&self.tile_hosts);
         let geocode = self.join_hosts(&self.geocode_hosts);
         let media = self.join_hosts(&self.media_hosts);
@@ -76,6 +80,9 @@ impl SecurityHeaders {
         } else {
             ""
         };
+        // Google Maps workers fetch inline images, so img-src alone is insufficient.
+        // https://developers.google.com/maps/documentation/javascript/content-security-policy
+        let google_connect = if self.google_maps { " data: blob:" } else { "" };
         let frame = if self.google_maps {
             "; frame-src https://*.google.com"
         } else {
@@ -88,11 +95,11 @@ impl SecurityHeaders {
         };
         format!(
             "default-src 'self'; \
-             script-src 'self'{google_script}; \
+             script-src 'self'{google_script}{CLOUDFLARE_SCRIPT}; \
              style-src 'self' 'unsafe-inline'{google_style}; \
              img-src 'self' data: blob:{tile}{media}{google_content}{mapbox_content}; \
              font-src 'self'{tile}{google_font}; \
-             connect-src 'self'{tile}{geocode}{google_content}{mapbox_content}; \
+             connect-src 'self'{tile}{geocode}{google_content}{google_connect}{mapbox_content}{CLOUDFLARE_CONNECT}; \
              worker-src 'self' blob:; \
              object-src 'none'; \
              base-uri 'self'; \
@@ -236,12 +243,20 @@ mod tests {
     }
 
     #[test]
-    fn csp_hosts_omitted_when_absent() {
+    fn configured_csp_hosts_are_omitted_when_absent() {
         let csp = headers(false, &[], &[]).csp();
-        assert!(!csp.contains("https://"));
+        assert!(!csp.contains("tiles.example.com"));
+        assert!(!csp.contains("geo.example.com"));
         assert!(csp.contains("img-src 'self' data: blob:"));
         assert!(csp.contains("font-src 'self'"));
         assert!(csp.contains("connect-src 'self'"));
+    }
+
+    #[test]
+    fn cloudflare_web_analytics_is_allowed() {
+        let csp = headers(false, &[], &[]).csp();
+        assert!(csp.contains("script-src 'self' https://static.cloudflareinsights.com"));
+        assert!(csp.contains("connect-src 'self' https://cloudflareinsights.com"));
     }
 
     #[test]
@@ -275,6 +290,28 @@ mod tests {
             csp.contains("connect-src 'self' https://api.mapbox.com https://events.mapbox.com")
         );
         assert!(!csp.contains("unsafe-eval"));
+    }
+
+    #[test]
+    fn worker_inline_fetches_are_allowed_only_for_google_maps() {
+        for (google_maps, mapbox_maps) in [(true, false), (false, false), (false, true)] {
+            let mut policy = headers(false, &["https://tiles.openfreemap.org"], &[]);
+            policy.google_maps = google_maps;
+            policy.mapbox_maps = mapbox_maps;
+            let csp = policy.csp();
+            let connect = csp
+                .split(';')
+                .map(str::trim)
+                .find(|directive| directive.starts_with("connect-src "))
+                .unwrap();
+            for scheme in ["data:", "blob:"] {
+                assert_eq!(
+                    connect.split_whitespace().any(|source| source == scheme),
+                    google_maps,
+                    "unexpected {scheme} allowance in {connect}"
+                );
+            }
+        }
     }
 
     #[test]

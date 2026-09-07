@@ -1020,7 +1020,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
             "Algo deu errado. Tente novamente.",
         ),
 
-        // --- account (C1) --------------------------------------------------
+        // --- account -------------------------------------------------------
         "account.title" => ("Your account", "Sua conta"),
         "account.nav" => ("Account", "Conta"),
         "account.profile" => ("Profile", "Perfil"),
@@ -1048,9 +1048,13 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
             "Um link de confirmação foi enviado para seu novo e-mail.",
         ),
 
-        // --- change password (C2) / change email (C3) ----------------------
+        // --- change password / change email -------------------------------
         "account.pw_title" => ("Change password", "Alterar senha"),
         "account.pw_current" => ("Current password", "Senha atual"),
+        "account.pw_current_incorrect" => (
+            "Current password is incorrect.",
+            "A senha atual está incorreta.",
+        ),
         "account.pw_new" => ("New password", "Nova senha"),
         "account.pw_submit" => ("Update password", "Atualizar senha"),
         "account.email_title" => ("Change email", "Alterar e-mail"),

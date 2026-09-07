@@ -38,6 +38,7 @@
     var marker = new window.maplibregl.Marker({
       element: options.element,
       draggable: !!options.draggable,
+      anchor: options.anchor || "center",
     }).setLngLat(position(options.position));
     if (options.popup) {
       marker.setPopup(

@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh BikesNest Maps server IP restrictions
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/bruno/Projects/bikenest/ops/local-production/update-maps-ip.py
+TimeoutStartSec=120
+UMask=0077
+NoNewPrivileges=true

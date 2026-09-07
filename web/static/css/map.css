@@ -108,9 +108,39 @@
 }
 
 .marker-destination {
+  position: relative;
+  width: 28px;
+  height: 36px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  cursor: default;
+}
+
+.marker-destination::before {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 24px;
+  height: 24px;
+  border: 2px solid white;
+  border-radius: 50% 50% 50% 0;
   background: var(--color-accent-dark);
-  width: 22px;
-  height: 22px;
+  box-shadow: 0 1px 5px rgb(0 0 0 / 0.4);
+  transform: rotate(-45deg);
+}
+
+.marker-destination::after {
+  content: "";
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: white;
 }
 
 /* The "before" pin on a move proposal's mini-map: hollow and muted, so the

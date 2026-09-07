@@ -4,9 +4,11 @@
 
 # Env
 .env
+.local-production/
+/LOCAL_SETUP.md
 
 # Node
 node_modules/
 
-# Object storage (seeded/uploaded media — Ledger #7, dev only)
+# Local development media
 /media

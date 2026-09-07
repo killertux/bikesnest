@@ -65,9 +65,9 @@ impl SearchParking {
         Self { geocoder, reader }
     }
 
-    /// Executes the search. Returns the result page plus the geocode hit when
-    /// the origin came from resolving a query (the web layer shows the
-    /// resolved label; the coordinates are never persisted — ).
+    /// Executes the search. Returns the result page plus its resolved origin.
+    /// The web layer uses the origin for the destination marker and label;
+    /// the coordinates are never persisted.
     pub async fn execute(
         &self,
         input: SearchInput,
@@ -124,7 +124,10 @@ impl SearchParking {
 
         let origin = if let (Some(lat), Some(lon)) = (input.lat, input.lon) {
             let point = GeoPoint::new(lat, lon).map_err(|_| SearchError::InvalidOrigin)?;
-            (point, None)
+            let label = query
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{lat:.5}, {lon:.5}"));
+            (point, Some(GeoHit { label, point }))
         } else {
             let Some(q) = query else {
                 return Err(SearchError::MissingDestination);
@@ -199,7 +202,7 @@ pub enum DetailsError {
     Read(#[from] ReaderError),
 }
 
-/// Use case: everything the P3 details page needs.
+/// Use case: everything the parking details page needs.
 pub struct GetParkingDetails {
     reader: Box<dyn ParkingDetailsReader>,
     freshness: FreshnessConfig,
