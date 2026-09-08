@@ -33,7 +33,7 @@ Statuses: `queued`, `implementing`, `reviewing`, `changes-requested`, `accepted`
 
 | Batch | Implementation model | Scope / audit mapping | Required acceptance evidence | Status |
 |---|---|---|---|---|
-| B00 | Terra | Safe DB-test target selection; truthful quick commands (`ENG-02`) | Missing/invalid/non-test targets fail before connecting/migrating without leaking URLs; explicit isolated target works; no `DATABASE_URL` fallback; CI/docs updated; pure guard tests | implementing |
+| B00 | Terra | Safe DB-test target selection; truthful quick commands (`ENG-02`) | Missing/invalid/non-test targets fail before connecting/migrating without leaking URLs; explicit isolated target works; no `DATABASE_URL` fallback; CI/docs updated; pure guard tests | accepted |
 | B01 | Sol | Suspension-safe verification and token invalidation (`SEC-01`) | Suspended/deleted cannot reactivate; legitimate initial verification and active email change work; repository predicate handles races; old verification tokens cannot bypass suspension | queued |
 | B02 | Sol | CSRF token lifecycle and usable expiry handling (`HX-01/02/03`) | Real middleware/browser matrix: cold/boosted forms, invalid→valid retry, login/logout, two tabs, history, expiry, multipart; invalid tokens still fail; no automatic mutation replay; token-free diagnostics | queued |
 | B03 | Terra | Search query contract and request synchronization (`HX-04/05`) | Multiple type/security filters work natively and through htmx; exactly one sort request; stale delayed response cannot win; filters/sort/pagination/history persist; explicit clear semantics | queued |
@@ -127,3 +127,10 @@ These remain explicit until the owner supplies evidence or approves action:
 ## Progress log
 
 - 2026-09-08: plan created; isolated branch/worktree created; demo-data exception recorded; B00 assigned first. No production changes.
+- Plan/audit checkpoint: `78b0b1d`.
+- Local validation infrastructure: new container `bikesnest-audit-test-20260908`, loopback `127.0.0.1:55439`, database `bikesnest_test_audit`, role `bikesnest_test`; identity verified with `current_database()`/`current_user`. It contains no production data and must not be confused with either existing database.
+- Isolated-worktree baseline: `npm ci --no-audit --no-fund` succeeded; all 13 browser tests passed in ~7.39s. Package lock and generated assets unchanged.
+- B00 implementation agent: GPT Terra (`b00_implement`); reports 5 pure guard tests, fmt, targeted Clippy and one rollback DB smoke passed. Independent GPT Sol (`b00_review`) assigned; acceptance pending.
+- B00 review round 1: behavioral checks passed, but changes requested for an overstated isolation claim in TESTING.md and required cleanup of legacy annotations in the touched test-support file. Returned to Terra; B01 remains queued.
+- B00 corrections: legacy annotations removed and guard documented as defense in depth; 5 guard tests/fmt/diff check passed again. Sol re-review pending.
+- B00 gate passed: independent Sol re-review confirmed both findings resolved, reran 5 guard tests and fmt, and recorded PASS in [B00 review](../reviews/remediation/B00-review.md). Lead accepted source changes; nothing deployed.

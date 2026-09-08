@@ -188,9 +188,10 @@ source of truth). The ones you'll most often touch:
 ## Tests
 
 ```bash
-cargo test                     # domain + application tests (no DB needed)
+cargo test -p bikesnest-domain -p bikesnest-application  # no DB needed
 docker compose up -d db        # required for DB-backed tests
-cargo test --workspace         # everything, incl. #[db_test] integration/HTTP tests
+TEST_DATABASE_URL=postgres://bikesnest:bikesnest@localhost:5432/bikesnest_test \
+  cargo test --workspace       # everything, incl. #[db_test] integration/HTTP tests
 ```
 
 How tests are structured and how to write one: [`TESTING.md`](TESTING.md).

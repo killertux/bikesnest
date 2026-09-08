@@ -9,6 +9,7 @@
 
 use sqlx::postgres::{PgPoolOptions, Postgres};
 use sqlx::{PgPool, Transaction};
+use std::str::FromStr;
 use tokio::sync::OnceCell;
 
 /// Re-exported so test crates only need `bikesnest_test_support` in scope.
@@ -60,10 +61,74 @@ pub fn init_test_tracing() {
     });
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TestDatabaseTargetError {
+    Missing,
+    Malformed,
+    UnsafeDatabaseName,
+}
+
+impl TestDatabaseTargetError {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Missing => "test-support: TEST_DATABASE_URL is required for DB-backed tests",
+            Self::Malformed => {
+                "test-support: TEST_DATABASE_URL must be a valid PostgreSQL connection URL"
+            }
+            Self::UnsafeDatabaseName => {
+                "test-support: TEST_DATABASE_URL must target `bikesnest_test` or `bikesnest_test_<suffix>`"
+            }
+        }
+    }
+}
+
+fn is_disposable_test_database_name(database: &str) -> bool {
+    database == "bikesnest_test"
+        || database
+            .strip_prefix("bikesnest_test_")
+            .is_some_and(|suffix| {
+                !suffix.is_empty()
+                    && suffix.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                    })
+            })
+}
+
+fn validate_test_database_url(database_url: &str) -> Result<(), TestDatabaseTargetError> {
+    let scheme = database_url
+        .split_once(':')
+        .map(|(scheme, _)| scheme)
+        .filter(|scheme| {
+            scheme.eq_ignore_ascii_case("postgres") || scheme.eq_ignore_ascii_case("postgresql")
+        });
+    if scheme.is_none() {
+        return Err(TestDatabaseTargetError::Malformed);
+    }
+
+    // Validate the final parsed database name rather than just the path. SQLx
+    // accepts `dbname` as a URL option, and that option takes precedence over
+    // the path when it opens the connection.
+    let options = sqlx::postgres::PgConnectOptions::from_str(database_url)
+        .map_err(|_| TestDatabaseTargetError::Malformed)?;
+    let database = options
+        .get_database()
+        .ok_or(TestDatabaseTargetError::UnsafeDatabaseName)?;
+    if !is_disposable_test_database_name(database) {
+        return Err(TestDatabaseTargetError::UnsafeDatabaseName);
+    }
+
+    Ok(())
+}
+
+fn database_url_from_value(value: Option<&str>) -> Result<String, TestDatabaseTargetError> {
+    let database_url = value.ok_or(TestDatabaseTargetError::Missing)?;
+    validate_test_database_url(database_url)?;
+    Ok(database_url.to_owned())
+}
+
 fn database_url() -> String {
-    std::env::var("TEST_DATABASE_URL")
-        .or_else(|_| std::env::var("DATABASE_URL"))
-        .unwrap_or_else(|_| "postgres://bikesnest:bikesnest@localhost:5432/bikesnest".to_string())
+    let value = std::env::var("TEST_DATABASE_URL").ok();
+    database_url_from_value(value.as_deref()).unwrap_or_else(|error| panic!("{}", error.message()))
 }
 
 /// The configuration the HTTP tests build their router from: a development
@@ -86,6 +151,75 @@ async fn connect_and_migrate() -> PgPool {
         .expect("test-support: migrations failed");
 
     pool
+}
+
+#[cfg(test)]
+mod test_database_target_tests {
+    use super::{TestDatabaseTargetError, database_url_from_value, validate_test_database_url};
+
+    #[test]
+    fn missing_test_database_url_is_rejected() {
+        assert_eq!(
+            database_url_from_value(None),
+            Err(TestDatabaseTargetError::Missing)
+        );
+    }
+
+    #[test]
+    fn malformed_or_non_postgres_urls_are_rejected() {
+        for database_url in [
+            "not a URL",
+            "mysql://test:test@localhost/bikesnest_test",
+            "https://localhost/bikesnest_test",
+        ] {
+            assert_eq!(
+                validate_test_database_url(database_url),
+                Err(TestDatabaseTargetError::Malformed),
+                "{database_url}",
+            );
+        }
+    }
+
+    #[test]
+    fn missing_or_non_test_database_names_are_rejected() {
+        for database_url in [
+            "postgres://test:test@localhost",
+            "postgres://test:test@localhost/bikesnest",
+            "postgres://test:test@localhost/bikesnest-test",
+            "postgres://test:test@localhost/bikesnest_test-Audit",
+        ] {
+            assert_eq!(
+                validate_test_database_url(database_url),
+                Err(TestDatabaseTargetError::UnsafeDatabaseName),
+                "{database_url}",
+            );
+        }
+    }
+
+    #[test]
+    fn dbname_option_cannot_bypass_the_test_database_name_check() {
+        assert_eq!(
+            validate_test_database_url(
+                "postgres://test:test@localhost/bikesnest_test?dbname=bikesnest",
+            ),
+            Err(TestDatabaseTargetError::UnsafeDatabaseName)
+        );
+    }
+
+    #[test]
+    fn explicit_disposable_test_database_names_are_accepted() {
+        for database_url in [
+            "postgres://test:test@localhost/bikesnest_test",
+            "postgresql://test:test@localhost/bikesnest_test_audit_20260908",
+            "postgres://test:test@localhost/bikesnest?dbname=bikesnest_test_ci",
+        ] {
+            assert_eq!(
+                validate_test_database_url(database_url),
+                Ok(()),
+                "{database_url}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -350,9 +484,7 @@ impl UserBuilder {
 
     /// Inserts the row using the test transaction; returns the domain `User`.
     ///
-    /// Runtime query (not `query!`) so the workspace builds without
-    /// `DATABASE_URL` at compile time; compile-time checked macros arrive
-    /// with the M1 schema work (with `.env` + offline cache).
+    /// Runtime query so the workspace builds without a database connection.
     pub async fn create<'e, E>(&self, exec: E) -> Result<bikesnest_domain::User, sqlx::Error>
     where
         E: sqlx::Executor<'e, Database = Postgres>,
@@ -375,7 +507,7 @@ impl UserBuilder {
 }
 
 // ---------------------------------------------------------------------------
-// Parking builder (M1)
+// Parking builder
 // ---------------------------------------------------------------------------
 
 use bikesnest_domain::{Cost, ParkingType, TimeRange};
@@ -699,7 +831,7 @@ impl ParkingBuilder {
 }
 
 // ---------------------------------------------------------------------------
-// Fast test password hasher (M2)
+// Fast test password hasher
 // ---------------------------------------------------------------------------
 
 use async_trait::async_trait;

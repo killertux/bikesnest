@@ -66,9 +66,10 @@ cargo run -p bikesnest-web -- seed-admin  # create admin (ADMIN_EMAIL/ADMIN_PASS
 cargo run -p bikesnest-web -- seed-policies  # version legal pages (POLICY_* env)
 cargo run -p bikesnest-web -- retention   # run the retention purge job
 
-cargo test                               # domain + application (no DB)
+cargo test -p bikesnest-domain -p bikesnest-application  # no DB
 docker compose up -d db                  # needed before DB-backed tests
-cargo test --workspace                   # everything incl. #[db_test]
+TEST_DATABASE_URL=postgres://bikesnest:bikesnest@localhost:5432/bikesnest_test \
+  cargo test --workspace                 # everything incl. #[db_test]
 
 npm run build:assets                     # vendor htmx/alpine/maplibre into web/static/vendor
 npm run build:css                        # Tailwind → web/static/css/app.css
@@ -77,7 +78,10 @@ npm run build:css                        # Tailwind → web/static/css/app.css
 ## Conventions & gotchas
 
 - **Lint:** `unsafe_code = "forbid"` (workspace lint). Keep it clean.
-- **`#[db_test]`** runs against real Postgres; requires `docker compose up -d db`.
+- **`#[db_test]`** runs against real Postgres; it requires an explicit
+  `TEST_DATABASE_URL` for a disposable database named `bikesnest_test` or
+  `bikesnest_test_<suffix>`. The harness ignores `DATABASE_URL` and rejects
+  other targets before connecting or applying migrations. See `TESTING.md`.
   Transaction-per-test with automatic rollback. See `TESTING.md`.
 - **Repository tests:** prefer `let db = tx.db().await` before fixture queries.
   Seed through `db.acquire()`, release the lease, and inject `db.clone()` into

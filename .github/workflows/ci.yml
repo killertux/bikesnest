@@ -47,7 +47,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      DATABASE_URL: postgres://bikesnest:bikesnest@localhost:5432/bikesnest
+      TEST_DATABASE_URL: postgres://bikesnest_test:bikesnest_test@localhost:5432/bikesnest_test_ci
       S3_ENDPOINT: http://localhost:9000
       S3_REGION: us-east-1
       S3_BUCKET: bikesnest
@@ -65,13 +65,13 @@ jobs:
       postgres:
         image: postgis/postgis:17-3.5
         env:
-          POSTGRES_USER: bikesnest
-          POSTGRES_PASSWORD: bikesnest
-          POSTGRES_DB: bikesnest
+          POSTGRES_USER: bikesnest_test
+          POSTGRES_PASSWORD: bikesnest_test
+          POSTGRES_DB: bikesnest_test_ci
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U bikesnest -d bikesnest"
+          --health-cmd "pg_isready -U bikesnest_test -d bikesnest_test_ci"
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10

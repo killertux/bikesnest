@@ -5,16 +5,34 @@ How BikesNest is tested and how to write a test.
 ## Running tests
 
 ```bash
-cargo test                    # domain + application only (no database needed)
+cargo test -p bikesnest-domain -p bikesnest-application  # no database needed
 docker compose up -d db       # required once, before DB-backed tests
-cargo test --workspace        # everything, including #[db_test] integration/HTTP tests
-cargo test -p bikesnest-web    # a single crate
-cargo test search_            # filter by name substring
+TEST_DATABASE_URL=postgres://bikesnest:bikesnest@localhost:5432/bikesnest_test \
+  cargo test --workspace      # everything, including #[db_test] integration/HTTP tests
+TEST_DATABASE_URL=postgres://bikesnest:bikesnest@localhost:5432/bikesnest_test \
+  cargo test -p bikesnest-web # a single DB-backed crate
+TEST_DATABASE_URL=postgres://bikesnest:bikesnest@localhost:5432/bikesnest_test \
+  cargo test search_          # filter by name substring
 ```
 
 `cargo build` itself needs **no database** (queries are runtime-checked), but
-the DB-backed tests do — they connect to the compose database
-(`TEST_DATABASE_URL`, falling back to `DATABASE_URL`).
+the DB-backed tests do. They require an explicit `TEST_DATABASE_URL`; the
+harness never reads `DATABASE_URL`. Its final parsed database name must be
+`bikesnest_test` or `bikesnest_test_<suffix>`, which rejects common accidental
+targets before the harness connects or runs migrations. This name allowlist
+does not prove that a server is disposable: keep the target on an isolated host
+and use a dedicated test role with no production access in CI or shared
+environments.
+
+The default compose database is the application's development database. Create
+the separate local test database once before using the command above:
+
+```bash
+docker compose exec db createdb -U bikesnest bikesnest_test
+```
+
+Plain `cargo test` selects every crate in this virtual workspace, including
+DB-backed tests, so it is not the database-free quick command.
 
 Every `#[db_test]` installs a `tracing` subscriber (see "Tracing in tests"
 below), so a repository's error-classification logging is visible with:
