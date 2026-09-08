@@ -7,9 +7,7 @@ use axum::response::{IntoResponse, Response};
 use bikesnest_application::AuthError;
 use bikesnest_domain::{Role, UserEmail};
 
-use crate::auth::{
-    Auth, anon_csrf_token, clear_session_cookie, random_state_hex, set_session_cookie,
-};
+use crate::auth::{Auth, clear_session_cookie, random_state_hex, set_session_cookie};
 use crate::client_ip::ClientIp;
 use crate::htmx;
 use crate::i18n::{Locale, Translator};
@@ -86,7 +84,7 @@ pub(crate) async fn register_page(
         return axum::response::Redirect::to("/account").into_response();
     }
     let tr = Translator::new(locale);
-    let token = anon_csrf_token();
+    let token = auth.csrf_value();
     render_anon(
         RegisterPage {
             layout: PageLayout::new(&state.map, tr.t("auth.register_title").to_string(), "auth")
@@ -131,8 +129,7 @@ pub(crate) async fn register_post(
     {
         Ok(()) => axum::response::Redirect::to("/login?registered=1").into_response(),
         Err(err) => {
-            // Re-render with a fresh double-submit CSRF token so the next POST validates.
-            let token = anon_csrf_token();
+            let token = auth.csrf_value();
             let message = auth_error_message(tr, &err);
             let field_errors = match register_field_error(&err) {
                 Some(field) => view::FieldErrors::single(field, message.clone()),
@@ -222,7 +219,7 @@ pub(crate) async fn login_page(
         return axum::response::Redirect::to(&login_destination(&q.next)).into_response();
     }
     let tr = Translator::new(locale);
-    let token = anon_csrf_token();
+    let token = auth.csrf_value();
     render_anon(
         LoginPage {
             layout: PageLayout::new(&state.map, tr.t("auth.login_title").to_string(), "auth")
@@ -267,10 +264,10 @@ pub(crate) async fn login_post(
         // reply never reveals which of the two it was.
         // The submitted email is NOT echoed back, so the failure response is
         // byte-identical whether or not the account exists — and it still
-        // carries a fresh double-submit CSRF token for the next attempt.
+        // carries the same anonymous CSRF context for the next attempt.
         Err(_) => {
             tracing::warn!("login failed"); // no email/IP/PII in the log field
-            let token = anon_csrf_token();
+            let token = auth.csrf_value();
             let message = tr.t("auth.error.invalid_credentials").to_string();
             // Never disclose which of the two was wrong: both inputs are
             // flagged with the same generic message rather
@@ -320,11 +317,12 @@ pub(crate) struct VerifyParams {
 pub(crate) async fn verify_email(
     State(state): State<AppState>,
     locale: Locale,
+    auth: Auth,
     Query(q): Query<VerifyParams>,
 ) -> Response {
     let tr = Translator::new(locale);
     let Some(token) = q.token.filter(|t| !t.is_empty()) else {
-        let t = anon_csrf_token();
+        let t = auth.csrf_value();
         return render_anon(
             VerifyEmailPage {
                 layout: PageLayout::new(&state.map, tr.t("auth.verify_title").to_string(), "auth")
@@ -339,7 +337,7 @@ pub(crate) async fn verify_email(
     match state.auth.verify_email(&token).await {
         Ok(()) => axum::response::Redirect::to("/login?verified=1").into_response(),
         Err(err) => {
-            let t = anon_csrf_token();
+            let t = auth.csrf_value();
             render_anon(
                 VerifyEmailPage {
                     layout: PageLayout::new(
@@ -368,6 +366,7 @@ pub(crate) async fn verify_resend(
     State(state): State<AppState>,
     locale: Locale,
     ClientIp(ip): ClientIp,
+    auth: Auth,
     Form(form): Form<ResendForm>,
 ) -> Response {
     let tr = Translator::new(locale);
@@ -377,7 +376,7 @@ pub(crate) async fn verify_resend(
     match state.auth.resend_verification(&ip, &email).await {
         Ok(()) => axum::response::Redirect::to("/login?resend=1").into_response(),
         Err(err) => {
-            let t = anon_csrf_token();
+            let t = auth.csrf_value();
             render_anon(
                 LoginPage {
                     layout: PageLayout::new(
@@ -415,6 +414,7 @@ pub(crate) struct ResetSent {
 pub(crate) async fn password_reset_page(
     State(state): State<AppState>,
     locale: Locale,
+    auth: Auth,
     Query(q): Query<ResetSent>,
 ) -> Response {
     let tr = Translator::new(locale);
@@ -423,7 +423,7 @@ pub(crate) async fn password_reset_page(
     } else {
         None
     };
-    let token = anon_csrf_token();
+    let token = auth.csrf_value();
     render_anon(
         PasswordResetPage {
             layout: PageLayout::new(&state.map, tr.t("auth.reset_title").to_string(), "auth")
@@ -441,6 +441,7 @@ pub(crate) async fn password_reset_post(
     State(state): State<AppState>,
     locale: Locale,
     ClientIp(ip): ClientIp,
+    auth: Auth,
     Form(form): Form<ResetRequestForm>,
 ) -> Response {
     let tr = Translator::new(locale);
@@ -450,7 +451,7 @@ pub(crate) async fn password_reset_post(
     match state.auth.request_password_reset(&ip, &email).await {
         Ok(()) => axum::response::Redirect::to("/password-reset?sent=1").into_response(),
         Err(err) => {
-            let t = anon_csrf_token();
+            let t = auth.csrf_value();
             render_anon(
                 PasswordResetPage {
                     layout: PageLayout::new(
@@ -473,11 +474,12 @@ pub(crate) async fn password_reset_post(
 pub(crate) async fn password_reset_new(
     State(state): State<AppState>,
     locale: Locale,
+    auth: Auth,
     Query(q): Query<VerifyParams>,
 ) -> Response {
     let tr = Translator::new(locale);
     let token = q.token.unwrap_or_default();
-    let t = anon_csrf_token();
+    let t = auth.csrf_value();
     render_anon(
         PasswordResetNewPage {
             layout: PageLayout::new(&state.map, tr.t("auth.reset_new_title").to_string(), "auth")
@@ -501,13 +503,14 @@ pub(crate) struct ResetNewForm {
 pub(crate) async fn password_reset_new_post(
     State(state): State<AppState>,
     locale: Locale,
+    auth: Auth,
     Form(form): Form<ResetNewForm>,
 ) -> Response {
     let tr = Translator::new(locale);
     match state.auth.reset_password(&form.token, &form.password).await {
         Ok(()) => axum::response::Redirect::to("/login?reset=1").into_response(),
         Err(err) => {
-            let t = anon_csrf_token();
+            let t = auth.csrf_value();
             render_anon(
                 PasswordResetNewPage {
                     layout: PageLayout::new(

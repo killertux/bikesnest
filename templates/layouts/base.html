@@ -45,7 +45,7 @@
    The `:inherited` suffix is what `#attributeValue` walks up to
    (`closest('[hx-boost\:inherited]')`), so this is the attribute that actually
    boosts the document's links and forms. #}
-<body class="bg-bg font-body text-fg" hx-boost:inherited="true"
+<body class="bg-bg font-body text-fg" data-csrf="{{ layout.csrf }}" data-csrf-error="{{ tr.t("error.csrf") }}" data-csrf-reload="{{ tr.t("error.reload") }}" data-csrf-login="{{ tr.t("auth.login") }}" hx-boost:inherited="true"
       data-map-provider="{{ layout.map_provider }}"
       data-map-style-url="{{ layout.map_style_url }}"
       data-map-access-token="{{ layout.map_access_token }}"

@@ -724,6 +724,39 @@ async fn auth_app() -> (axum::Router, FakeEmailProvider) {
     auth_app_opts(true).await
 }
 
+async fn scoped_auth_app(tx: &mut bikesnest_test_support::TestTx) -> axum::Router {
+    let deps = RouterDeps {
+        email: std::sync::Arc::new(FakeEmailProvider::with_root(None)),
+        oauth: None,
+        hasher: TestPasswordHasher,
+        rate_limiter: Box::new(bikesnest_infrastructure::InMemoryRateLimiter::new()),
+        storage: std::sync::Arc::new(bikesnest_test_support::TestObjectStorage::new()),
+    };
+    app_router_with(std::sync::Arc::new(test_config()), tx.db().await, deps)
+}
+
+async fn scoped_login(app: &axum::Router, email: &str) -> (String, String) {
+    let (status, _, _) = post_form(
+        app,
+        "/register",
+        &[("email", email), ("password", "password123")],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (status, _, cookie) = post_form(
+        app,
+        "/login",
+        &[("email", email), ("password", "password123")],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let cookie = cookie.unwrap().split(';').next().unwrap().to_string();
+    let (_, account) = get_c(app, "/account", Some(&cookie)).await;
+    (cookie, extract_csrf(&account))
+}
+
 /// Like [`auth_app`], but with the Google sign-in feature flag set explicitly
 /// (product decision: disabled by default until a real OAuth provider exists).
 async fn auth_app_opts(google_oauth_enabled: bool) -> (axum::Router, FakeEmailProvider) {
@@ -826,7 +859,7 @@ async fn anon_csrf(app: &axum::Router, page_uri: &str) -> Option<(String, String
         .get("set-cookie")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string)?;
-    if !sc.starts_with("csrf=") {
+    if !sc.starts_with("__Host-csrf=") {
         return None;
     }
     let cookie_line = sc.split(';').next().unwrap().to_string();
@@ -1399,6 +1432,253 @@ fn extract_csrf(html: &str) -> String {
     let marker = r#"name="csrf" content=""#;
     let start = html.find(marker).map(|i| i + marker.len()).unwrap_or(0);
     html[start..].split('"').next().unwrap_or("").to_string()
+}
+
+#[db_test]
+async fn anonymous_csrf_is_stable_across_pages_tabs_and_validation_errors(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let app = scoped_auth_app(tx).await;
+    let (cookie, token) = anon_csrf(&app, "/login").await.expect("first token");
+    assert!(cookie.starts_with("__Host-csrf="));
+
+    for uri in ["/register", "/password-reset", "/login"] {
+        let request = Request::builder()
+            .uri(uri)
+            .header("cookie", &cookie)
+            .header("accept-language", "en")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert!(!response.headers().contains_key("set-cookie"));
+        let html =
+            String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+                .to_string();
+        assert_eq!(extract_csrf(&html), token, "token changed on {uri}");
+    }
+
+    let (status, html, set_cookie) = post_form(
+        &app,
+        "/login",
+        &[
+            ("csrf", &token),
+            ("email", "not-an-account@example.com"),
+            ("password", "incorrect-password"),
+        ],
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(set_cookie.is_none());
+    assert_eq!(extract_csrf(&html), token);
+    assert!(
+        !html.contains("incorrect-password"),
+        "credentials must not be repopulated"
+    );
+}
+
+#[db_test]
+async fn stale_header_is_rejected_even_when_body_token_is_valid(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let app = scoped_auth_app(tx).await;
+    let (cookie, token) = anon_csrf(&app, "/login").await.expect("anonymous token");
+    let body = format!("csrf={token}&email=x%40example.com&password=password123");
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("cookie", cookie)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("x-csrf-token", "attacker-or-stale-token")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        response.headers()["x-bikesnest-csrf-recovery"],
+        "reload-required"
+    );
+}
+
+#[db_test]
+async fn duplicate_cookie_and_cross_site_requests_are_rejected(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let app = scoped_auth_app(tx).await;
+    let (cookie, token) = anon_csrf(&app, "/login").await.expect("anonymous token");
+    let body = format!("csrf={token}&email=x%40example.com&password=password123");
+
+    for (cookie_header, fetch_site) in [
+        (format!("{cookie}; {cookie}"), None),
+        (cookie.clone(), Some("cross-site")),
+    ] {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/login")
+            .header("cookie", cookie_header)
+            .header("content-type", "application/x-www-form-urlencoded");
+        if let Some(value) = fetch_site {
+            request = request.header("sec-fetch-site", value);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::from(body.clone())).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+}
+
+#[db_test]
+async fn multipart_content_type_cannot_bypass_non_upload_csrf(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let app = scoped_auth_app(tx).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/logout")
+                .header("content-type", "multipart/form-data; boundary=attack")
+                .body(Body::from("--attack--\r\n"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let html = String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+        .to_string();
+    assert!(
+        html.contains(r#"href="/""#),
+        "recovery returns to a GET page"
+    );
+    assert!(
+        !html.contains(r#"href="""#),
+        "recovery must not GET the POST action"
+    );
+}
+
+#[db_test]
+async fn expired_and_revoked_session_cookies_get_stale_form_recovery(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    for (email, state_change) in [
+        ("csrf-expired@example.com", "expire"),
+        ("csrf-revoked@example.com", "revoke"),
+    ] {
+        let app = scoped_auth_app(tx).await;
+        let (cookie, csrf) = scoped_login(&app, email).await;
+        let db = tx.db().await;
+        let mut conn = db.acquire().await.unwrap();
+        if state_change == "expire" {
+            sqlx::query(
+                "UPDATE sessions SET expires_at = now() - interval '1 second' WHERE user_id = (SELECT id FROM users WHERE email = $1)",
+            )
+            .bind(email)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        } else {
+            sqlx::query(
+                "UPDATE sessions SET revoked_at = now() WHERE user_id = (SELECT id FROM users WHERE email = $1)",
+            )
+            .bind(email)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        }
+        drop(conn);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/logout")
+                    .header("cookie", &cookie)
+                    .header("accept-language", "en")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("csrf={csrf}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response.headers()["x-bikesnest-csrf-recovery"],
+            "reload-required"
+        );
+        let html =
+            String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+                .to_string();
+        assert!(html.contains("Your session expired or this form is stale"));
+        assert!(html.contains(r#"href="/""#));
+    }
+}
+
+#[db_test]
+async fn csrf_token_from_another_live_session_cannot_mutate(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let app = scoped_auth_app(tx).await;
+    let (first_cookie, _) = scoped_login(&app, "csrf-first-session@example.com").await;
+    let (_, second_csrf) = scoped_login(&app, "csrf-second-session@example.com").await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/logout")
+                .header("cookie", &first_cookie)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(format!("csrf={second_csrf}")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let (status, _) = get_c(&app, "/account", Some(&first_cookie)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "rejected request did not log out session"
+    );
+}
+
+#[db_test]
+async fn session_store_failure_is_unavailable_not_stale_recovery(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let app = scoped_auth_app(tx).await;
+    let db = tx.db().await;
+    sqlx::query("SET LOCAL search_path = pg_catalog")
+        .execute(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/account")
+                .header("cookie", format!("session_id={}", "01".repeat(32)))
+                .header("accept-language", "en")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!response.headers().contains_key("x-bikesnest-csrf-recovery"));
+    assert!(!response.headers().contains_key("set-cookie"));
+    let html = String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+        .to_string();
+    assert!(
+        html.contains(
+            ">The service is temporarily unavailable. Please try again in a moment.</h1>"
+        )
+    );
 }
 
 #[db_test]
@@ -3150,7 +3430,7 @@ async fn photo_upload_alt_too_long_is_bad_request(tx: &mut bikesnest_test_suppor
 // ---------------------------------------------------------------------------
 // moderation & reporting — end-to-end (report → claim → resolve → hide;
 // invalidate/restore parking; suspend/restore; audit viewer gating; the
-// self-resolve guard; D3 multipart review-photo attach).
+// self-resolve guard; multipart review-photo attach).
 // ---------------------------------------------------------------------------
 
 async fn last_report_id(reporter_email: &str, target_type: &str, target_id: i64) -> i64 {
@@ -3177,7 +3457,7 @@ async fn report_review_flow_claim_resolve_hides_and_audits(
     const MOD: &str = "m5-mod@example.com";
     let loc = fixture_location(tx, "m5-report-loc", "M5 Report Loc").await;
 
-    // Uploader (verified) writes a review (D3 multipart).
+    // Uploader (verified) writes a multipart review.
     let uploader = verified_cookie(&app, &email, UPLOADER).await;
     let (_, rev_form) = get_c(&app, &format!("/parking/{loc}/review"), Some(&uploader)).await;
     let rcsrf = extract_csrf(&rev_form);
@@ -3577,7 +3857,7 @@ async fn d3_review_photos_held_pending_until_approved(tx: &mut bikesnest_test_su
     let (_, form) = get_c(&app, &format!("/parking/{loc}/review"), Some(&cookie)).await;
     let csrf = extract_csrf(&form);
 
-    // D3 multipart review with an attached photo (rating + body + photo in one body).
+    // Multipart review with an attached photo (rating + body + photo in one body).
     let jpeg = tiny_jpeg();
     let mut body = Vec::new();
     body.extend_from_slice(
@@ -3637,7 +3917,7 @@ async fn approved_review_photo_renders_on_p3(tx: &mut bikesnest_test_support::Te
     let (_, form) = get_c(&app, &format!("/parking/{loc}/review"), Some(&cookie)).await;
     let csrf = extract_csrf(&form);
 
-    // D3 multipart review with an attached (pending) photo.
+    // Multipart review with an attached (pending) photo.
     let jpeg = tiny_jpeg();
     let mut body = Vec::new();
     body.extend_from_slice(
@@ -4040,7 +4320,7 @@ async fn contribution_routes_refuse_a_location_that_is_not_active(
     let cookie = verified_cookie(&app, &email, EMAIL).await;
     let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
     let csrf = extract_csrf(&form);
-    let id = add_location(&app, &cookie, &csrf, "WP8 Taken Down", &[]).await;
+    let id = add_location(&app, &cookie, &csrf, "Taken Down", &[]).await;
 
     // A verification while the spot is still ACTIVE, so `last_verified_at` has
     // a value a later `still_exists` could reset.
@@ -4186,7 +4466,7 @@ async fn duplicate_report_is_refused_with_a_conflict(tx: &mut bikesnest_test_sup
     let cookie = verified_cookie(&app, &email, EMAIL).await;
     let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
     let csrf = extract_csrf(&form);
-    let id = add_location(&app, &cookie, &csrf, "WP8 Report Target", &[]).await;
+    let id = add_location(&app, &cookie, &csrf, "Report Target", &[]).await;
 
     let fields = [
         ("csrf", csrf.as_str()),
@@ -4370,7 +4650,7 @@ async fn p3_fragment_endpoints_redirect_a_whole_document_request(
     let cookie = verified_cookie(&app, &email, EMAIL).await;
     let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
     let csrf = extract_csrf(&form);
-    let id = add_location(&app, &cookie, &csrf, "WP10 P3 Target", &[]).await;
+    let id = add_location(&app, &cookie, &csrf, "Proposal Target", &[]).await;
 
     // favorite — the success response *is* the button.
     let (s, body, _) = post_form_hx(
@@ -4477,7 +4757,7 @@ async fn p3_fragment_endpoints_send_a_no_js_caller_to_the_page(
     let cookie = verified_cookie(&app, &email, EMAIL).await;
     let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
     let csrf = extract_csrf(&form);
-    let id = add_location(&app, &cookie, &csrf, "WP10 Redirect Target", &[]).await;
+    let id = add_location(&app, &cookie, &csrf, "Redirect Target", &[]).await;
 
     // Every redirect target is the page that now shows the new state.
     for (uri, fields, want) in [
@@ -4546,7 +4826,7 @@ async fn moderation_fragment_endpoints_redirect_to_their_queue(
     let (app, email) = auth_app().await;
     const UPLOADER: &str = "wp10-uploader@example.com";
     const MOD: &str = "wp10-mod@example.com";
-    let loc = fixture_location(tx, "wp10-mod-queue", "WP10 Moderation Queue").await;
+    let loc = fixture_location(tx, "moderation-queue", "Moderation Queue").await;
 
     let uploader = verified_cookie(&app, &email, UPLOADER).await;
     let (_, page) = get_c(&app, &format!("/parking/{loc}"), Some(&uploader)).await;
@@ -4881,7 +5161,7 @@ async fn multipart_review_accepts_the_token_from_the_query(
     // extractor needs it), so the form carries the token on its action.
     let (app, email) = auth_app().await;
     const EMAIL: &str = "wp10-review-csrf@example.com";
-    let loc = fixture_location(tx, "wp10-review-csrf", "WP10 Review CSRF").await;
+    let loc = fixture_location(tx, "review-csrf", "Review CSRF").await;
     let cookie = verified_cookie(&app, &email, EMAIL).await;
     let (_, form) = get_c(&app, &format!("/parking/{loc}/review"), Some(&cookie)).await;
     let csrf = extract_csrf(&form);
@@ -4905,7 +5185,7 @@ async fn multipart_review_without_any_token_is_the_styled_error_page(
 ) {
     let (app, email) = auth_app().await;
     const EMAIL: &str = "wp10-review-nocsrf@example.com";
-    let loc = fixture_location(tx, "wp10-review-nocsrf", "WP10 Review NoCSRF").await;
+    let loc = fixture_location(tx, "review-nocsrf", "Review No CSRF").await;
     let cookie = verified_cookie(&app, &email, EMAIL).await;
 
     let (s, body) = post_multipart(
@@ -4932,7 +5212,7 @@ async fn an_axum_rejection_is_rendered_as_the_styled_error_page(
     // with plain English text, which used to reach the user verbatim.
     let (app, email) = auth_app().await;
     const EMAIL: &str = "wp10-rejection@example.com";
-    let loc = fixture_location(tx, "wp10-rejection", "WP10 Rejection").await;
+    let loc = fixture_location(tx, "multipart-rejection", "Multipart Rejection").await;
     let cookie = verified_cookie(&app, &email, EMAIL).await;
     let (_, form) = get_c(&app, &format!("/parking/{loc}/review"), Some(&cookie)).await;
     let csrf = extract_csrf(&form);
@@ -5612,7 +5892,7 @@ async fn wp13_proposal_queue_prefills_the_move_and_links_the_location(
     const MOD: &str = "wp13-prop-mod@example.com";
     const PROPOSER: &str = "wp13-prop-author@example.com";
     let (app, email) = auth_app().await;
-    let loc = fixture_location(tx, "wp13-prop", "WP13 Proposal Spot").await;
+    let loc = fixture_location(tx, "proposal-spot", "Proposal Spot").await;
     let proposer = verified_cookie(&app, &email, PROPOSER).await;
     let _ = proposer;
     let proposer_id = user_id_for(PROPOSER).await;
@@ -5644,7 +5924,7 @@ async fn wp13_proposal_queue_prefills_the_move_and_links_the_location(
 
     // The row names the location and links to it, instead of showing an id.
     assert!(
-        body.contains("WP13 Proposal Spot"),
+        body.contains("Proposal Spot"),
         "the queue names the location"
     );
     assert!(
@@ -5816,7 +6096,7 @@ async fn wp13_report_queue_previews_and_links_its_targets(tx: &mut bikesnest_tes
     const MOD: &str = "wp13-rep-mod@example.com";
     const AUTHOR: &str = "wp13-rep-author@example.com";
     let (app, email) = auth_app().await;
-    let loc = fixture_location(tx, "wp13-rep", "WP13 Reported Spot").await;
+    let loc = fixture_location(tx, "reported-spot", "Reported Spot").await;
     let author_cookie = verified_cookie(&app, &email, AUTHOR).await;
     let author_id = user_id_for(AUTHOR).await;
 
@@ -5860,7 +6140,7 @@ async fn wp13_report_queue_previews_and_links_its_targets(tx: &mut bikesnest_tes
 
     // The row names and links the target instead of printing `#4057`.
     assert!(
-        body.contains("WP13 Reported Spot"),
+        body.contains("Reported Spot"),
         "the row names the reported location"
     );
     assert!(
@@ -5935,7 +6215,7 @@ async fn wp13_photo_queue_refuses_to_approve_an_image_it_cannot_show(
     const MOD: &str = "wp13-photo-mod@example.com";
     const UPLOADER: &str = "wp13-photo-up@example.com";
     let (app, email, storage) = auth_app_with_storage().await;
-    let loc = fixture_location(tx, "wp13-photo", "WP13 Photo Spot").await;
+    let loc = fixture_location(tx, "photo-spot", "Photo Spot").await;
     let uploader_id = {
         let cookie = verified_cookie(&app, &email, UPLOADER).await;
         let _ = cookie;
@@ -6421,7 +6701,7 @@ async fn parking_details_page_loads_maplibre_once_with_a_preconnect(tx: &mut Tes
     let conn = tx.executor();
     let created = ParkingBuilder::new()
         .with_fixture_tag(MARK)
-        .with_name("WP14 Map Assets Fixture")
+        .with_name("Map Assets Fixture")
         .at(-25.4300, -49.2700)
         .create(&mut *conn)
         .await
@@ -7439,7 +7719,7 @@ async fn review_with_an_empty_body_flags_the_body_field(tx: &mut bikesnest_test_
     let cookie = verified_cookie(&app, &email, EMAIL).await;
     let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
     let csrf = extract_csrf(&form);
-    let id = add_location(&app, &cookie, &csrf, "WP21 Review Spot", &[]).await;
+    let id = add_location(&app, &cookie, &csrf, "Review Spot", &[]).await;
 
     let (_, review_form) = get_c(&app, &format!("/parking/{id}/review"), Some(&cookie)).await;
     let rcsrf = extract_csrf(&review_form);
@@ -7473,7 +7753,7 @@ async fn parking_details_dialogs_and_swap_targets_are_accessible(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
     let (app, email) = auth_app().await;
-    let loc = fixture_location(tx, "wp21-dialogs", "WP21 Dialogs Spot").await;
+    let loc = fixture_location(tx, "dialogs-spot", "Dialogs Spot").await;
     const UPLOADER: &str = "wp21-dialogs-up@example.com";
     const MODERATOR: &str = "wp21-dialogs-mod@example.com";
     let uploader = verified_cookie(&app, &email, UPLOADER).await;
@@ -7573,7 +7853,7 @@ async fn search_results_list_has_no_script_child_and_listitems_are_direct_childr
     // guaranteed to be in range of the query the task names.
     ParkingBuilder::new()
         .with_fixture_tag(MARK)
-        .with_name("WP21 List Structure Rack")
+        .with_name("List Structure Rack")
         .at(-25.4284, -49.2733)
         .create(tx.executor())
         .await
@@ -7583,7 +7863,7 @@ async fn search_results_list_has_no_script_child_and_listitems_are_direct_childr
     let (status, body) = get("/search?q=Rua+XV+de+Novembro").await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        body.contains("WP21 List Structure Rack"),
+        body.contains("List Structure Rack"),
         "the seeded fixture is in the results: {body}"
     );
 

@@ -51,6 +51,19 @@ The suite covers mobile menus, history navigation, every map consumer and
 provider configuration, and retry after an asset failure. CI installs Chromium
 with its system dependencies and runs these tests in the Frontend assets job.
 
+The CSRF lifecycle also has a rendered-router browser regression. It requires
+the disposable PostgreSQL target and Chromium, starts the real Axum router on a
+loopback ephemeral port, and never contacts external providers:
+
+```bash
+TEST_DATABASE_URL=postgres://bikesnest:bikesnest@localhost:5432/bikesnest_test \
+  cargo test -p bikesnest-web --test csrf_browser_test --locked -- --ignored
+```
+
+It is explicitly ignored in ordinary workspace runs because spawning a browser
+is comparatively expensive; CI invokes it separately rather than silently
+omitting the security journey.
+
 ## The four layers
 
 | Layer | Where | Kind | Needs DB? |
@@ -431,8 +444,9 @@ without waiting for the integration suite:
 - **Format** runs `cargo fmt --all -- --check`.
 - **Clippy** runs `cargo clippy --workspace --all-targets --locked -- -D warnings`.
 - **Tests** runs `cargo test --workspace --locked` against PostgreSQL/PostGIS,
-  ValKey, and MinIO. The provider smoke tests remain opt-in and skip when their
-  external API keys are absent.
+  ValKey, and MinIO, followed by the rendered CSRF lifecycle in Chromium. The
+  provider smoke tests remain opt-in and skip when their external API keys are
+  absent.
 - **Frontend assets** rebuilds the vendored JavaScript/CSS and Tailwind output,
   then fails if the generated files differ from the committed copies.
 - **Docker image** builds the production image and checks that startup rejects

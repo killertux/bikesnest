@@ -11,10 +11,8 @@
 
     {# A plain multipart POST: the handler answers with a redirect, so there is
        nothing to swap (an `hx-post` with no `hx-target` would have swapped the
-       redirect's destination into this form). The CSRF token rides the action's
-       query string because the middleware cannot read a multipart body without
-       consuming the stream the handler's `Multipart` extractor needs; the hidden
-       field stays for defence in depth. #}
+       redirect's destination into this form). Native multipart fallback uses
+       the action token because middleware must not consume the upload stream. #}
     <form action="/parking/{{ id }}/review?csrf={{ layout.csrf }}" method="post"
           enctype="multipart/form-data" class="mt-6 space-y-4">
       <input type="hidden" name="csrf" value="{{ layout.csrf }}" />

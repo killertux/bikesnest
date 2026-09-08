@@ -1,4 +1,4 @@
-//! M3 activity on a location: reviews, verifications, "parked here" and
+//! Activity on a location: reviews, verifications, "parked here" and
 //! favorites, plus the two account pages that list what a user contributed.
 
 use axum::extract::{Form, Multipart, Path, Query, State};
@@ -84,7 +84,7 @@ pub(crate) async fn review_post(
         Err(resp) => return resp,
     };
 
-    // Multipart form (D3 now carries 0..N photos). Gather text fields, then
+    // Multipart form carries 0..N photos. Gather text fields, then
     // any uploaded `photo` files. The text publishes immediately; photos hold PENDING_REVIEW.
     let mut rating_u8 = 0u8;
     let mut body = String::new();
@@ -244,7 +244,7 @@ pub(crate) fn render_review_error(
 }
 
 /// Like [`render_review_error`], but also flags the one input (`"rating"` or
-/// `"body"`) the rejection is about (WP21 a11y pass) — `None` for the errors
+/// `"body"`) the rejection is about — `None` for the errors
 /// that are not about one particular field (rate limits, conflicts).
 pub(crate) fn render_review_field_error(
     map: &MapConfig,
@@ -362,7 +362,7 @@ pub(crate) async fn parking_verify_post(
     }
 }
 
-/// What the small P3 verification fragments need to answer both callers: the
+/// What the small verification fragments need to answer both callers: the
 /// request's htmx headers, the map config for the styled error page, and the
 /// page a whole-document request is redirected back to.
 pub(crate) struct VerifyCtx<'a> {
@@ -416,7 +416,7 @@ pub(crate) fn verification_error(ctx: &VerifyCtx<'_>, e: &ContributionError) -> 
     )
 }
 
-/// Message for the small htmx fragments the P3 detail page swaps in. Only the
+/// Message for the small htmx fragments the detail page swaps in. Only the
 /// variants a user can act on get their own copy; anything else stays
 /// deliberately vague.
 pub(crate) fn contribution_fragment_message(tr: Translator, e: &ContributionError) -> String {
@@ -672,7 +672,7 @@ mod tests {
         Translator::new(Locale::En)
     }
 
-    /// The three htmx endpoints on the P3 detail page (verify, parked-here,
+    /// The three htmx endpoints on the detail page (verify, parked-here,
     /// favorite) used to collapse every error into a generic 400 or a bare
     /// "Internal" 500.
     #[test]

@@ -111,8 +111,18 @@ jobs:
         with:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install CSRF browser dependencies
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
       - name: Run workspace tests
         run: cargo test --workspace --locked
+      - name: Test rendered CSRF lifecycle in Chromium
+        run: cargo test -p bikesnest-web --test csrf_browser_test --locked -- --ignored
 
   frontend-assets:
     name: Frontend assets

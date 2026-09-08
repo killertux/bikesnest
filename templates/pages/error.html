@@ -5,6 +5,10 @@
     <p class="font-display text-5xl font-bold text-accent-strong">{{ status }}</p>
     <h1 class="font-display mt-3 text-xl font-semibold">{{ message }}</h1>
     <div class="mt-6 flex flex-wrap items-center justify-center gap-3">
+      {% if status == 403 %}
+      <a href="{{ recovery_url }}" class="rounded-xl bg-accent-strong px-5 py-2.5 text-sm font-medium text-white transition-colors hover:bg-accent-dark">{{ tr.t("error.reload") }}</a>
+      <a href="{{ login_url }}" class="rounded-xl border border-border px-5 py-2.5 text-sm font-medium text-fg transition-colors hover:border-fg">{{ tr.t("auth.login") }}</a>
+      {% endif %}
       <a href="/" class="rounded-xl bg-accent-strong px-5 py-2.5 text-sm font-medium text-white transition-colors hover:bg-accent-dark">{{ tr.t("error.home") }}</a>
       <a href="/search" class="rounded-xl border border-border px-5 py-2.5 text-sm font-medium text-fg transition-colors hover:border-fg">{{ tr.t("error.search") }}</a>
     </div>

@@ -1,4 +1,4 @@
-//! CSP/asset consistency (WP22): the CSP media-host bug shipped because
+//! CSP/asset consistency: the CSP media-host bug shipped because
 //! nothing checked that a rendered page's own asset origins are actually
 //! allowed by the `Content-Security-Policy` header riding the same response.
 //! This file renders a representative page set, extracts every
@@ -111,7 +111,7 @@ async fn anon_csrf(app: &axum::Router, page_uri: &str) -> Option<(String, String
         .get("set-cookie")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string)?;
-    if !sc.starts_with("csrf=") {
+    if !sc.starts_with("__Host-csrf=") {
         return None;
     }
     let cookie_line = sc.split(';').next().unwrap().to_string();

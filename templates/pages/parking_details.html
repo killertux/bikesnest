@@ -129,10 +129,8 @@
       <details id="photo-upload" class="mt-4 rounded-xl border border-border p-4" data-od-id="photo-upload">
         <summary class="min-h-11 cursor-pointer py-2 text-sm font-medium">{{ tr.t("photo.upload.title") }}</summary>
         <p class="mt-1 text-sm text-muted">{{ tr.t("photo.upload.hint") }}</p>
-        {# `?csrf=` on the action is the no-JS token source: the CSRF middleware
-           must not drain a multipart body (the handler's `Multipart` extractor
-           needs it), so it reads the query instead. With JS the `hx-headers`
-           X-CSRF-Token below is used and the query value is simply redundant. #}
+        {# Native multipart fallback carries CSRF in the action because the
+           middleware intentionally does not consume the upload stream. #}
         <form action="/parking/{{ id }}/photo?csrf={{ layout.csrf }}" method="post"
               enctype="multipart/form-data"
               hx-post="/parking/{{ id }}/photo"

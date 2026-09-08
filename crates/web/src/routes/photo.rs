@@ -1,4 +1,4 @@
-//! M4 photo pipeline: upload (validate → process → queue for moderation)
+//! Photo pipeline: upload (validate → process → queue for moderation)
 //! and the moderation queue that publishes or rejects what was uploaded.
 
 use axum::extract::{Form, Multipart, Path, Query, State};
@@ -24,7 +24,7 @@ use super::moderation::{
 };
 
 /// POST /parking/{id}/photo — a verified user uploads one photo (multipart:
-/// `photo` file + optional `alt`). Runs the same pipeline as the D1 attach and
+/// `photo` file + optional `alt`). Runs the same pipeline as review attachments and
 /// holds the upload in `PENDING_REVIEW`. Returns a swap-safe fragment.
 pub(crate) async fn upload_photo(
     State(state): State<AppState>,
@@ -103,7 +103,7 @@ pub(crate) async fn upload_photo(
     )
 }
 
-/// GET /moderation/photos — the M2 photo moderation queue (MODERATOR/ADMIN).
+/// GET /moderation/photos — the photo moderation queue (MODERATOR/ADMIN).
 pub(crate) async fn moderation_photos(
     State(state): State<AppState>,
     locale: Locale,

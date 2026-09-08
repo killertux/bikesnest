@@ -961,6 +961,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
             "Your session expired or this form is stale. Reload the page and try again.",
             "Sua sessão expirou ou este formulário está desatualizado. Recarregue a página e tente de novo.",
         ),
+        "error.reload" => ("Reload safely", "Recarregar com segurança"),
         "error.method_not_allowed" => (
             "That action is not available here.",
             "Essa ação não está disponível aqui.",

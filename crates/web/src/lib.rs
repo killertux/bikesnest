@@ -28,8 +28,8 @@ use routes::contribution_form::{
 };
 
 /// Base layout data shared by all pages. `current` drives the active nav item;
-/// `csrf` is the per-session synchronizer token (empty when anonymous) — rendered
-/// into the `<meta name="csrf">` tag the CSRF middleware / htmx reads.
+/// `csrf` is the request's session or stable anonymous token, rendered into
+/// forms and document metadata for native and htmx submissions.
 pub struct PageLayout {
     pub title: String,
     pub current: String,
@@ -53,8 +53,8 @@ pub struct PageLayout {
     pub google_map_id: String,
     /// Whether this request carries a resolved session (signed in). Drives the
     /// header: an account menu vs. Entrar/Criar conta. An anonymous page that
-    /// still mints a double-submit CSRF token (login/register/reset/verify)
-    /// keeps this `false` even though `csrf` is non-empty — see [`Self::new`].
+    /// can still carry an anonymous double-submit CSRF token and keeps this
+    /// `false` even though `csrf` is non-empty — see [`Self::new`].
     pub is_authenticated: bool,
     /// Session user has MODERATOR or ADMIN (shows the Moderação link).
     pub is_moderator: bool,
@@ -66,7 +66,9 @@ pub struct PageLayout {
 }
 
 impl PageLayout {
-    /// An anonymous page layout: no session identity, no CSRF token. The map
+    /// A bare anonymous page layout: no session identity or token. Request
+    /// handlers should normally prefer [`Self::for_request`] so middleware's
+    /// anonymous token context is retained. The map
     /// style/token come from the configuration parsed at startup and held in
     /// `AppState`, never from the process environment at render time.
     pub fn new(map: &MapConfig, title: String, current: &str) -> Self {
@@ -229,7 +231,7 @@ impl PageLayout {
     }
 }
 
-/// Error page (E1/E2), styled via Tailwind tokens.
+/// Error page, styled via Tailwind tokens.
 #[derive(Template)]
 #[template(path = "pages/error.html")]
 pub struct ErrorPage {
@@ -237,6 +239,8 @@ pub struct ErrorPage {
     pub tr: Translator,
     pub status: u16,
     pub message: String,
+    pub recovery_url: String,
+    pub login_url: String,
 }
 
 /// One translated failure, rendered the way the caller can use it: a real
@@ -287,6 +291,8 @@ pub fn error_response(
             tr,
             status: status.as_u16(),
             message: message.clone(),
+            recovery_url: auth.next.clone(),
+            login_url: auth.login_url(),
         }
         .render()
     };
