@@ -532,12 +532,19 @@ async fn apply_edit_propagates_version_conflict() {
         .unwrap_err();
     assert!(matches!(err, ContributionError::VersionConflict));
 
-    // Correct version succeeds.
+    // Correct version creates a proposal and leaves the published version alone.
     let v = svc
         .apply_parking_edit(&verified_user(1), 10, 3, &edit)
         .await
         .unwrap();
-    assert_eq!(v, 4);
+    assert_eq!(v, 7);
+    assert_eq!(
+        svc.apply_parking_edit(&verified_user(1), 10, 3, &edit)
+            .await
+            .unwrap(),
+        7,
+        "a proposal does not advance the published version"
+    );
 }
 
 /// Every contribution write refuses a location moderation has taken down, in

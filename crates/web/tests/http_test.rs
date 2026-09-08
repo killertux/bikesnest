@@ -1,4 +1,4 @@
-//! HTTP-layer tests: M0 health/readiness endpoints + M1 pages.
+//! HTTP-layer tests: health/readiness endpoints + pages.
 //!
 //! Run via `#[db_test]` so they share the suite's runtime and migrated pool.
 //! Page tests that assert against seeded search results use the committed-
@@ -49,7 +49,7 @@ async fn get(uri: &str) -> (StatusCode, String) {
 }
 
 // ---------------------------------------------------------------------------
-// M0: health / readiness
+// health / readiness
 // ---------------------------------------------------------------------------
 
 #[db_test]
@@ -145,7 +145,7 @@ async fn hsts_absent_in_dev_without_tls(_tx: &mut TestTx) {
 }
 
 // ---------------------------------------------------------------------------
-// SEO / indexing (//)
+// SEO / indexing
 // ---------------------------------------------------------------------------
 
 #[db_test]
@@ -230,7 +230,7 @@ async fn private_pages_are_noindex(_tx: &mut TestTx) {
 }
 
 // ---------------------------------------------------------------------------
-// M1: pages
+// pages
 // ---------------------------------------------------------------------------
 
 #[db_test]
@@ -445,7 +445,7 @@ async fn search_map_payload_is_html_safe_for_ugc_names(tx: &mut TestTx) {
         .unwrap();
 }
 
-// --- Browse mode (WP20): ?bbox= ---------------------------------------------
+// --- Browse mode: ?bbox= ---------------------------------------------
 
 /// A box around the fixture below, as the map writes it: `west,south,east,north`.
 const BROWSE_BBOX: &str = "-49.30,-25.45,-49.25,-25.41";
@@ -696,7 +696,7 @@ async fn never_verified_location_shows_the_freshness_label_once(tx: &mut TestTx)
 }
 
 // ---------------------------------------------------------------------------
-// M2: accounts & authentication
+// accounts & authentication
 // ---------------------------------------------------------------------------
 
 use bikesnest_infrastructure::{FakeEmailProvider, FakeOAuthProvider};
@@ -718,8 +718,8 @@ fn urlencode(s: &str) -> String {
 }
 
 async fn auth_app() -> (axum::Router, FakeEmailProvider) {
-    // The wider M2/M3/... suite exercises the fake OAuth flow's plumbing, so
-    // it builds with Google sign-in enabled; WP1's own tests below build with
+    // The wider suite exercises the fake OAuth flow's plumbing, so
+    // it builds with Google sign-in enabled; feature-flag tests below build with
     // `auth_app_opts(false)` to cover the disabled (default) product state.
     auth_app_opts(true).await
 }
@@ -836,7 +836,7 @@ async fn anon_csrf(app: &axum::Router, page_uri: &str) -> Option<(String, String
 
 /// The headers htmx 4 puts on a request whose target is a real element (see
 /// `#createCoreHeaders` + the `HX-Request-Type` assignment in
-/// web/static/vendor/htmx.js). WP10: the fragment endpoints answer a request
+/// web/static/vendor/htmx.js). the fragment endpoints answer a request
 /// *without* them with a 303 to the page, so every test that asserts on a
 /// partial has to send them.
 const HX_FRAGMENT: &[(&str, &str)] = &[("HX-Request", "true"), ("HX-Request-Type", "partial")];
@@ -1088,7 +1088,7 @@ async fn privacy_public_pages_gating_and_export_flow(tx: &mut bikesnest_test_sup
     .await;
     let cookie = cookie.unwrap().split(';').next().unwrap().to_string();
 
-    // C6 hub renders with a CSRF token.
+    // privacy hub renders with a CSRF token.
     let (s, body) = get_c(&app, "/account/privacy", Some(&cookie)).await;
     assert_eq!(s, StatusCode::OK);
     assert!(body.contains("Export your data"));
@@ -1148,7 +1148,7 @@ async fn privacy_public_pages_gating_and_export_flow(tx: &mut bikesnest_test_sup
     let export_pair = export_cookie.split(';').next().unwrap().to_string();
     let with_export = format!("{cookie}; {export_pair}");
 
-    // The C7 page renders the export status (Ready) and the download link —
+    // The export page renders the export status (Ready) and the download link —
     // with no token in the href, because the browser attaches the cookie.
     let (s, body) = get_c(&app, &loc, Some(&with_export)).await;
     assert_eq!(s, StatusCode::OK);
@@ -1547,7 +1547,7 @@ async fn csrf_header_path_is_accepted(tx: &mut bikesnest_test_support::TestTx) {
 }
 
 // ---------------------------------------------------------------------------
-// WP1: Google sign-in disabled by default (product decision: disable, do not
+// Google sign-in disabled by default (product decision: disable, do not
 // implement real OAuth). `FakeOAuthProvider` still exists for opt-in dev use,
 // but the routes are unregistered unless `GOOGLE_OAUTH_ENABLED` is set.
 // ---------------------------------------------------------------------------
@@ -1609,7 +1609,7 @@ async fn google_oauth_enabled_flag_still_redirects(_tx: &mut TestTx) {
 }
 
 // ---------------------------------------------------------------------------
-// M3 community routes
+// community routes
 // ---------------------------------------------------------------------------
 
 async fn cleanup_user_contributions(email: &str) {
@@ -1816,7 +1816,7 @@ async fn favorite_toggle_and_list_work_for_authenticated_user(
         "favorite toggle succeeds for authenticated user"
     );
 
-    // C4 lists the favorited location.
+    // favorites lists the favorited location.
     let (s, body) = get_c(&app, "/account/favorites", Some(&cookie)).await;
     assert_eq!(s, StatusCode::OK);
     assert!(
@@ -1834,7 +1834,7 @@ async fn favorite_toggle_and_list_work_for_authenticated_user(
 }
 
 // ---------------------------------------------------------------------------
-// Added coverage — edit prefill/data-loss, revision in C5,
+// Added coverage — edit prefill/data-loss, revision in contribution history,
 // pin-move→PENDING, review aggregate, rate-limit→429, identity absence.
 // ---------------------------------------------------------------------------
 
@@ -1883,16 +1883,96 @@ async fn add_location(
     id
 }
 
+async fn scoped_edit_app(
+    tx: &mut bikesnest_test_support::TestTx,
+    email: &str,
+) -> (Db, axum::Router, String) {
+    use bikesnest_application::SessionStore;
+    use bikesnest_domain::{CsrfToken, SessionId};
+    let db = tx.db().await;
+    let mut conn = db.acquire().await.unwrap();
+    let user = bikesnest_test_support::UserBuilder::new()
+        .with_email(email)
+        .create(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET account_state='ACTIVE', email_verified_at=now() WHERE id=$1")
+        .bind(user.id.0)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    drop(conn);
+    let raw = SessionId::new([email.as_bytes()[5]; 32]);
+    bikesnest_infrastructure::SqlxSessionStore::new(db.clone())
+        .create(user.id, &raw, &CsrfToken::new([42; 32]), chrono::Utc::now())
+        .await
+        .unwrap();
+    let deps = RouterDeps {
+        email: std::sync::Arc::new(FakeEmailProvider::with_root(None)),
+        oauth: None,
+        hasher: TestPasswordHasher,
+        rate_limiter: Box::new(bikesnest_infrastructure::InMemoryRateLimiter::new()),
+        storage: std::sync::Arc::new(bikesnest_test_support::TestObjectStorage::new()),
+    };
+    let app = app_router_with(std::sync::Arc::new(test_config()), db.clone(), deps);
+    (db, app, format!("session_id={}", raw.to_hex()))
+}
+
+async fn scoped_add_location(
+    db: &Db,
+    app: &axum::Router,
+    cookie: &str,
+    csrf: &str,
+    name: &str,
+    extra: &[(&str, &str)],
+) -> i64 {
+    let mut fields: Vec<(String, String)> = vec![
+        ("csrf".into(), csrf.into()),
+        ("name".into(), name.into()),
+        ("address".into(), "Rua X, 1".into()),
+        ("parking_type".into(), "rack".into()),
+        // Serrra da Cantareira area — well away from the Curitiba seed data.
+        ("lat".into(), "-23.4".into()),
+        ("lon".into(), "-46.6".into()),
+        ("timezone".into(), "America/Sao_Paulo".into()),
+    ];
+    // cost_kind defaults to unknown; the caller may override it via `extra`.
+    if !extra.iter().any(|(k, _)| *k == "cost_kind") {
+        fields.push(("cost_kind".into(), "unknown".into()));
+    }
+    // `confirm=1` skips the pre-create duplicate interstitial: this helper's
+    // job is "a spot now exists", and without it a submission that resembles
+    // one an earlier test left behind answers 200 with the interstitial
+    // instead of the 303 the callers assert on.
+    if !extra.iter().any(|(k, _)| *k == "confirm") {
+        fields.push(("confirm".into(), "1".into()));
+    }
+    fields.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+    let refs: Vec<(&str, &str)> = fields
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let (s, _, _) = post_form(app, "/parking/new", &refs, Some(cookie)).await;
+    assert_eq!(s, StatusCode::SEE_OTHER, "add should redirect: {s}");
+    let (id,): (i64,) =
+        sqlx::query_as("SELECT id FROM parking_location WHERE name = $1 ORDER BY id DESC LIMIT 1")
+            .bind(name)
+            .fetch_one(&mut *db.acquire().await.unwrap())
+            .await
+            .unwrap();
+    id
+}
+
 #[db_test]
 async fn edit_preserves_cost_security_and_hours(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
     const EMAIL: &str = "edit-prefill@example.com";
-    let cookie = verified_cookie(&app, &email, EMAIL).await;
+    let (db, app, cookie) = scoped_edit_app(tx, EMAIL).await;
     let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
     let csrf = extract_csrf(&form);
 
     // Create with a paid price + a security attribute + all-day hours.
-    let id = add_location(
+    let id = scoped_add_location(
+        &db,
         &app,
         &cookie,
         &csrf,
@@ -1964,30 +2044,36 @@ async fn edit_preserves_cost_security_and_hours(tx: &mut bikesnest_test_support:
             "SELECT name, cost_kind, price_cents, version FROM parking_location WHERE id = $1",
         )
         .bind(id)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
-    assert_eq!(name, "Prefill Spot Renamed");
+    assert_eq!(name, "Prefill Spot", "submitted name stays unpublished");
     assert_eq!(cost_kind, "paid", "cost not reset to free");
     assert_eq!(price_cents, Some(100), "price preserved");
-    assert_eq!(version, 2, "optimistic bump");
+    assert_eq!(version, 1, "approval is required before a version bump");
+    let (proposed,): (serde_json::Value,) = sqlx::query_as(
+        "SELECT proposed FROM parking_proposal WHERE location_id=$1 AND status=\'PENDING\'",
+    )
+    .bind(id)
+    .fetch_one(&mut *db.acquire().await.unwrap())
+    .await
+    .unwrap();
+    assert_eq!(proposed["name"], "Prefill Spot Renamed");
     let (sec,): (i64,) = sqlx::query_as(
         "SELECT count(*) FROM parking_security WHERE location_id = $1 AND state = 1 AND feature_code = 'well_lit'")
-        .bind(id).fetch_one(&pool().await).await.unwrap();
+        .bind(id).fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
     assert_eq!(sec, 1, "security preserved");
-
-    let _ = tx;
-    cleanup_user_contributions(EMAIL).await;
 }
 
 #[db_test]
-async fn edit_writes_revision_visible_in_contributions(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
+async fn edit_proposal_is_visible_in_contributions_without_publishing(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
     const EMAIL: &str = "edit-c5@example.com";
-    let cookie = verified_cookie(&app, &email, EMAIL).await;
+    let (db, app, cookie) = scoped_edit_app(tx, EMAIL).await;
     let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
     let csrf = extract_csrf(&form);
-    let id = add_location(&app, &cookie, &csrf, "Revision Spot", &[]).await;
+    let id = scoped_add_location(&db, &app, &cookie, &csrf, "Revision Spot", &[]).await;
 
     let (_, edit_html) = get_c(&app, &format!("/parking/{id}/edit"), Some(&cookie)).await;
     let edit_csrf = extract_csrf(&edit_html);
@@ -2007,22 +2093,25 @@ async fn edit_writes_revision_visible_in_contributions(tx: &mut bikesnest_test_s
     .await;
     assert_eq!(s, StatusCode::SEE_OTHER);
 
-    // The revision row is recorded and C5 shows the edit.
+    // Submission records a proposal, not a published revision.
     let (rev,): (i64,) = sqlx::query_as(
         "SELECT count(*) FROM parking_revision WHERE location_id = $1 AND change_kind = 'edit'",
     )
     .bind(id)
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
-    assert_eq!(rev, 1, "edit revision recorded");
+    assert_eq!(rev, 0, "no published edit before approval");
     let (s, body) = get_c(&app, "/account/contributions", Some(&cookie)).await;
     assert_eq!(s, StatusCode::OK);
-    assert!(body.contains("Revision Spot 2"), "C5 lists the edited spot");
-    assert!(body.contains("Edited"), "C5 shows the edit kind");
-
-    let _ = tx;
-    cleanup_user_contributions(EMAIL).await;
+    assert!(
+        body.contains("Revision Spot"),
+        "contribution lists the published spot"
+    );
+    assert!(
+        body.contains("Proposed"),
+        "contribution shows the proposal kind"
+    );
 }
 
 #[db_test]
@@ -2072,7 +2161,7 @@ async fn proposing_a_move_creates_pending_proposal(tx: &mut bikesnest_test_suppo
     let (s, body) = get_c(&app, &format!("/parking/{id}?proposed=1"), Some(&cookie)).await;
     assert_eq!(s, StatusCode::OK);
     assert!(
-        body.contains("will be reviewed by a moderator"),
+        body.contains("Your change is pending approval"),
         "proposal confirmation shown"
     );
 
@@ -2193,7 +2282,7 @@ async fn no_identity_leak_in_rendered_html(tx: &mut bikesnest_test_support::Test
         .await
         .unwrap();
 
-    // The details page, favorite/verify state and C5 must never render the
+    // The details page, favorite/verify state and contribution history must never render the
     // contributor's email, user id, or the OAuth subject (only counts/labels).
     let uris: Vec<String> = vec![
         format!("/parking/{id}"),
@@ -2301,7 +2390,7 @@ async fn multiple_security_values_and_major_unit_price(tx: &mut bikesnest_test_s
 }
 
 // ---------------------------------------------------------------------------
-// M4 photos — upload → queue → moderate → publish (//)
+// photos — upload → queue → moderate → publish
 // ---------------------------------------------------------------------------
 
 /// The origin `TestObjectStorage::presigned_get` signs every URL under (see
@@ -2933,7 +3022,7 @@ async fn admin_can_access_moderation_queue(tx: &mut bikesnest_test_support::Test
     cleanup_user_contributions("photo-admin@example.com").await;
 }
 
-/// WP11: the dashboard renders four numeric count tiles wired to
+/// the dashboard renders four numeric count tiles wired to
 /// `queue_counts()`. This only checks the page actually renders four real,
 /// non-negative numbers (not a placeholder, and not zero from a broken
 /// query) — asserting *exact* values here would be racy, since
@@ -2976,7 +3065,7 @@ async fn moderation_dashboard_renders_four_numeric_tiles(tx: &mut bikesnest_test
     cleanup_user_contributions("dash-tiles-mod@example.com").await;
 }
 
-/// WP11: a full page (== the limit) renders the "load more" keyset-pagination
+/// a full page (== the limit) renders the "load more" keyset-pagination
 /// control; a fixture of `limit + 1` rows guarantees the first page is full.
 #[db_test]
 async fn moderation_reports_queue_shows_load_more_when_full(
@@ -3059,7 +3148,7 @@ async fn photo_upload_alt_too_long_is_bad_request(tx: &mut bikesnest_test_suppor
 }
 
 // ---------------------------------------------------------------------------
-// M5 moderation & reporting — end-to-end (report → claim → resolve → hide;
+// moderation & reporting — end-to-end (report → claim → resolve → hide;
 // invalidate/restore parking; suspend/restore; audit viewer gating; the
 // self-resolve guard; D3 multipart review-photo attach).
 // ---------------------------------------------------------------------------
@@ -3651,7 +3740,7 @@ fn no_error_colour_classes_remain_in_templates() {
     );
 }
 
-/// WP12: the header used to decide "signed in" from `layout.csrf != ""`, which
+/// the header used to decide "signed in" from `layout.csrf != ""`, which
 /// also lit up for the anonymous auth pages (login/register/reset/verify) that
 /// mint a double-submit CSRF token without a session. It must branch on the
 /// real session flag instead.
@@ -3809,7 +3898,7 @@ fn no_web_source_file_is_longer_than_1200_lines() {
 }
 
 // ---------------------------------------------------------------------------
-// WP7: `X-Forwarded-For` is not a rate-limit identity unless a proxy is trusted
+// `X-Forwarded-For` is not a rate-limit identity unless a proxy is trusted
 // ---------------------------------------------------------------------------
 
 /// POST a form with an explicit `X-Forwarded-For`, carrying the anonymous
@@ -3936,7 +4025,7 @@ async fn a_trusted_proxys_forwarded_for_does_key_the_bucket(_tx: &mut TestTx) {
 }
 
 // ---------------------------------------------------------------------------
-// WP8: moderation state is enforced on the write path, not only on reads.
+// moderation state is enforced on the write path, not only on reads.
 // ---------------------------------------------------------------------------
 
 /// Every contribution route refuses a location moderation has taken down, and
@@ -4135,7 +4224,7 @@ async fn duplicate_report_is_refused_with_a_conflict(tx: &mut bikesnest_test_sup
 }
 
 // ---------------------------------------------------------------------------
-// WP10: htmx response discipline
+// htmx response discipline
 //
 // htmx 4 sends `HX-Request: true` on every request it issues, including boosted
 // navigations and back/forward history replays — both of which swap `<body>`.
@@ -5165,7 +5254,7 @@ async fn the_anonymous_htmx_401_carries_exactly_one_vary(_tx: &mut TestTx) {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-    // `CompressionLayer` (outermost, WP14) only appends its own
+    // `CompressionLayer` (outermost, ) only appends its own
     // `Vary: accept-encoding` to a response it actually compresses, and this
     // one is `text/html` — excluded from compression (BREACH) — so it never
     // gets that extra header. The strict count still guards the app's own
@@ -5194,7 +5283,7 @@ async fn the_anonymous_htmx_401_carries_exactly_one_vary(_tx: &mut TestTx) {
 }
 
 // ---------------------------------------------------------------------------
-// WP12: navigation and identity in the layout
+// navigation and identity in the layout
 // ---------------------------------------------------------------------------
 
 #[db_test]
@@ -5479,10 +5568,10 @@ async fn contributions_history_labels_parked_here_distinct_from_verified(
 }
 
 // ---------------------------------------------------------------------------
-// WP13 — moderation queues that show what they judge.
+// — moderation queues that show what they judge.
 // ---------------------------------------------------------------------------
 
-/// Insert a PENDING proposal directly, the way M3 wrote them: a JSONB payload
+/// Insert a PENDING proposal directly, the way wrote them: a JSONB payload
 /// whose shape the typed [`bikesnest_domain::ProposedChange`] has to keep
 /// reading unchanged.
 async fn seed_proposal(
@@ -5630,35 +5719,38 @@ async fn wp13_proposal_queue_flags_stale_and_unreadable_proposals(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
     const MOD: &str = "wp13-stale-mod@example.com";
-    let (app, email) = auth_app().await;
-    let loc = fixture_location(tx, "wp13-stale", "WP13 Stale Spot").await;
-    let mod_cookie = moderator_cookie(&app, &email, MOD).await;
-    let mod_id = user_id_for(MOD).await;
-
-    // Written against v1, but the location has moved on to v7: approving it
-    // would clobber an edit the proposer never saw.
-    sqlx::query("UPDATE parking_location SET version = 7 WHERE id = $1")
-        .bind(loc)
-        .execute(&pool().await)
+    let (db, app, mod_cookie) = scoped_edit_app(tx, MOD).await;
+    let mut conn = db.acquire().await.unwrap();
+    sqlx::query(
+        "INSERT INTO user_roles (user_id, role) SELECT id, 'MODERATOR' FROM users WHERE email=$1",
+    )
+    .bind(MOD)
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    let proposer = bikesnest_test_support::UserBuilder::new()
+        .with_email("approval-manual-author@example.com")
+        .create(&mut *conn)
         .await
         .unwrap();
-    let stale = seed_proposal(
-        loc,
-        mod_id,
-        1,
-        "change_existence",
-        r#"{"existence":"removed"}"#,
-    )
-    .await;
-    // A payload this build cannot read must degrade to a card, not a 500.
-    let unreadable = seed_proposal(
-        loc,
-        mod_id,
-        7,
-        "change_existence",
-        r#"{"existence":"who_knows"}"#,
-    )
-    .await;
+    let loc = ParkingBuilder::new()
+        .with_name("Stale proposal spot")
+        .with_version(7)
+        .create(&mut conn)
+        .await
+        .unwrap()
+        .id();
+    let mut ids = Vec::new();
+    for (version, existence) in [(1_i64, "removed"), (7, "who_knows")] {
+        let (id,): (i64,) = sqlx::query_as(
+            "INSERT INTO parking_proposal (location_id, proposer_id, base_version, kind, proposed, status) VALUES ($1, $2, $3, 'change_existence', $4, 'PENDING') RETURNING id")
+            .bind(loc).bind(proposer.id.0).bind(version)
+            .bind(serde_json::json!({"existence": existence}))
+            .fetch_one(&mut *conn).await.unwrap();
+        ids.push(id);
+    }
+    let (stale, unreadable) = (ids[0], ids[1]);
+    drop(conn);
 
     let queue_url = format!("/moderation/proposals?after_id={}", stale - 1);
     let (s, body) = get_c(&app, &queue_url, Some(&mod_cookie)).await;
@@ -5692,7 +5784,7 @@ async fn wp13_proposal_queue_flags_stale_and_unreadable_proposals(
     );
     let (status,): (String,) = sqlx::query_as("SELECT status FROM parking_proposal WHERE id = $1")
         .bind(stale)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     assert_eq!(status, "PENDING", "a refused approval changes nothing");
@@ -5713,13 +5805,10 @@ async fn wp13_proposal_queue_flags_stale_and_unreadable_proposals(
     let (state,): (String,) =
         sqlx::query_as("SELECT moderation_state FROM parking_location WHERE id = $1")
             .bind(loc)
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
     assert_eq!(state, "REMOVED");
-
-    let _ = tx;
-    cleanup_user_contributions(MOD).await;
 }
 
 #[db_test]
@@ -6164,7 +6253,7 @@ async fn wp13_admin_user_list_searches_masks_and_confirms(tx: &mut bikesnest_tes
 }
 
 // ---------------------------------------------------------------------------
-// WP14: assets and page weight
+// assets and page weight
 // ---------------------------------------------------------------------------
 
 /// Like `get`, but keeps the raw response (headers + bytes) instead of
@@ -6660,7 +6749,7 @@ async fn with_the_worker_enabled_registration_queues_the_email(_tx: &mut TestTx)
 }
 
 // ---------------------------------------------------------------------------
-// WP17: the per-IP geocode budget on /search
+// the per-IP geocode budget on /search
 // ---------------------------------------------------------------------------
 
 /// A router whose geocode budget is `per_ip` cache-missing searches. The
@@ -6763,7 +6852,7 @@ async fn a_search_without_a_destination_is_not_metered(_tx: &mut TestTx) {
 }
 
 // ---------------------------------------------------------------------------
-// WP19: contributing from a phone — the map picker's no-JS fields, the hours
+// contributing from a phone — the map picker's no-JS fields, the hours
 // and tri-state security editors, the pre-create duplicate interstitial, and
 // the address→coordinates endpoint behind the picker.
 // ---------------------------------------------------------------------------
@@ -7171,7 +7260,7 @@ async fn the_geocode_endpoint_refuses_over_budget(tx: &mut TestTx) {
 }
 
 // ---------------------------------------------------------------------------
-// WP21: accessibility pass
+// accessibility pass
 // ---------------------------------------------------------------------------
 
 /// The full `<tag ...>` opening tag containing `id="{id}"` — a substring
@@ -7240,7 +7329,7 @@ async fn login_wrong_password_banner_is_an_alert(tx: &mut bikesnest_test_support
         "the login error banner must itself carry role=\"alert\": {banner}"
     );
     // The generic message never says which of the two was wrong, but a
-    // failure still flags both inputs (WP21 a11y pass) rather than neither.
+    // failure still flags both inputs rather than neither.
     assert!(
         body.contains(r#"aria-describedby="email-error""#)
             && body.contains(r#"aria-describedby="password-error""#),
@@ -7544,7 +7633,7 @@ async fn search_results_list_has_no_script_child_and_listitems_are_direct_childr
 
 /// No `focus:outline-none` may remain in a template: it strips the *keyboard*
 /// focus ring along with the mouse one, defeating the global `:focus-visible`
-/// rule input.css now carries (WP21 a11y pass).
+/// rule input.css now carries.
 #[test]
 fn no_focus_outline_none_remains_in_templates() {
     let templates_dir =
@@ -7573,7 +7662,7 @@ fn no_focus_outline_none_remains_in_templates() {
 /// No cramped `<button>` (`text-xs` + `py-0.5`/exactly `py-1`) may remain: at
 /// that padding a button's tap target falls under the 24×24 CSS px minimum
 /// (WCAG 2.5.8). `.btn-compact` (input.css) is the fix; every real offender
-/// found during the WP21 audit now carries it.
+/// found during the audit now carries it.
 #[test]
 fn no_tiny_text_xs_buttons_remain_in_templates() {
     let templates_dir =
@@ -7616,11 +7705,11 @@ fn no_tiny_text_xs_buttons_remain_in_templates() {
 /// becomes the button's accessible name.
 ///
 /// Heuristic, not a real DOM/accessible-name computation — false positives go
-/// in `ALLOWED` with a comment, not a code change. Empty today: the WP21
+/// in `ALLOWED` with a comment, not a code change. Empty today: the
 /// audit found and fixed every real gap.
 #[test]
 fn every_button_has_visible_text_or_an_aria_label() {
-    // (path substring, snippet substring) — none needed yet: the WP21 audit
+    // (path substring, snippet substring) — none needed yet: the audit
     // found and fixed every real gap.
     const ALLOWED: &[(&str, &str)] = &[];
     let templates_dir =
@@ -7674,7 +7763,7 @@ fn every_button_has_visible_text_or_an_aria_label() {
 }
 
 /// JS static check: the shared focus-trap helper and the after-swap focus
-/// listener both live in app.js (WP21 a11y pass), and search.js still finds
+/// listener both live in app.js, and search.js still finds
 /// `#search-data` by id regardless of where in the DOM it now renders.
 #[test]
 fn app_js_has_the_focus_trap_and_after_swap_focus_listener() {
@@ -7779,6 +7868,8 @@ fn no_undefined_tailwind_color_tokens_remain_in_templates() {
         "y",
         "l-2",
         // border/outline style keywords
+        // Bottom-border width used for the active profile tab, not a colour.
+        "b-2",
         "dashed",
         "none",
         // `bg-gradient-to-*` is a fixed Tailwind direction keyword, not

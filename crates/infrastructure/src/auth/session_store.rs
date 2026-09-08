@@ -64,7 +64,13 @@ impl SessionStore for SqlxSessionStore {
         .bind(user_id.0)
         .bind(csrf.to_base64url())
         .bind(expires_at)
-        .execute(self.db.pool())
+        .execute(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("session.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("session.create", e))?;
         Ok(())
@@ -114,7 +120,13 @@ impl SessionStore for SqlxSessionStore {
         let row = sqlx::query_as::<_, SessionRow>(&sql)
             .bind(token_hash)
             .bind(now)
-            .fetch_optional(self.db.pool())
+            .fetch_optional(
+                &mut *self
+                    .db
+                    .acquire()
+                    .await
+                    .map_err(|e| db_err("session.acquire", e))?,
+            )
             .await
             .map_err(|e| db_err("session.resolve", e))?;
         let Some(row) = row else {
@@ -146,7 +158,13 @@ impl SessionStore for SqlxSessionStore {
             "UPDATE sessions SET revoked_at = now() WHERE token_hash = $1 AND revoked_at IS NULL",
         )
         .bind(token_hash)
-        .execute(self.db.pool())
+        .execute(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("session.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("session.revoke", e))?;
         Ok(())
@@ -164,7 +182,13 @@ impl SessionStore for SqlxSessionStore {
         )
         .bind(user_id.0)
         .bind(keep_hash)
-        .execute(self.db.pool())
+        .execute(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("session.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("session.revoke_all_for_user_except", e))?;
         Ok(())
@@ -176,7 +200,13 @@ impl SessionStore for SqlxSessionStore {
              WHERE user_id = $1 AND revoked_at IS NULL",
         )
         .bind(user_id.0)
-        .execute(self.db.pool())
+        .execute(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("session.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("session.revoke_all_for_user", e))?;
         Ok(())

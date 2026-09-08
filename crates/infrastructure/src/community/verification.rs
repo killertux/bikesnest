@@ -80,7 +80,7 @@ impl VerificationRepository for SqlxVerificationRepository {
         .bind(result)
         .bind(attribute_code)
         .bind(expires_at)
-        .execute(self.db.pool())
+        .execute(&mut *self.db.acquire().await.map_err(|e| db_err("verification.acquire", e))?)
         .await
         .map_err(|e| db_err("verification.record", e))?;
         Ok(())
@@ -105,7 +105,13 @@ impl VerificationRepository for SqlxVerificationRepository {
             "#,
         )
         .bind(location_id)
-        .fetch_all(self.db.pool())
+        .fetch_all(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("verification.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("verification.latest_existence_per_user", e))?;
 
@@ -160,7 +166,13 @@ impl VerificationRepository for SqlxVerificationRepository {
             "#,
         )
         .bind(location_id)
-        .fetch_all(self.db.pool())
+        .fetch_all(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("verification.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("verification.attribute_and_parked_summary", e))?;
 
@@ -191,7 +203,13 @@ impl VerificationRepository for SqlxVerificationRepository {
         sqlx::query("UPDATE parking_location SET last_verified_at = $1 WHERE id = $2")
             .bind(at)
             .bind(location_id)
-            .execute(self.db.pool())
+            .execute(
+                &mut *self
+                    .db
+                    .acquire()
+                    .await
+                    .map_err(|e| db_err("verification.acquire", e))?,
+            )
             .await
             .map_err(|e| db_err("verification.mark_verified_at", e))?;
         Ok(())

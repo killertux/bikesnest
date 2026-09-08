@@ -106,21 +106,10 @@ pub struct NewParkingLocation {
     pub security: Vec<SecurityFeature>,
 }
 
-/// A reversible (non-sensitive) edit to a location.
-#[derive(Debug, Clone)]
-pub struct ParkingEdit {
-    pub name: String,
-    pub address: String,
-    pub description: Option<String>,
-    pub parking_type: ParkingType,
-    pub cost: Cost,
-    pub hours: OpeningHours,
-    pub security: Vec<SecurityFeature>,
-}
+pub use bikesnest_domain::ParkingEdit;
 
-/// A gated, sensitive change proposal. `proposed` is a JSONB payload
-/// shaped by `kind`: move_location → `{point, timezone, reason}`;
-/// change_existence → `{existence, reason}`.
+/// A gated listing change. `proposed` carries the typed edit, move, or existence
+/// payload; publication belongs to the approval workflow.
 #[derive(Debug, Clone)]
 pub struct NewProposal {
     pub location_id: i64,
@@ -159,6 +148,7 @@ impl ProposalVote {
 pub struct ProposalVoteTotals {
     pub approvals: i64,
     pub rejections: i64,
+    pub published: bool,
 }
 
 /// Privacy-safe proposal card data for a listing. It deliberately omits voter
@@ -167,11 +157,14 @@ pub struct ProposalVoteTotals {
 pub struct ListingProposal {
     pub id: i64,
     pub kind: bikesnest_domain::ProposalKind,
+    pub change: bikesnest_domain::ProposedChange,
     pub reason: Option<String>,
     pub status: bikesnest_domain::ProposalStatus,
     pub approvals: i64,
     pub rejections: i64,
     pub created_at: DateTime<Utc>,
+    pub base_version: i64,
+    pub proposer_id: Option<UserId>,
 }
 
 /// An advisory duplicate candidate. Non-blocking; ranked by
@@ -186,7 +179,7 @@ pub struct DuplicateCandidate {
 }
 
 /// A review as read from the store (only `ACTIVE` rows are ever returned).
-/// `author` is `None` once the reviewer's account is anonymized (M6).
+/// `author` is `None` once the reviewer's account is anonymized.
 #[derive(Debug, Clone)]
 pub struct Review {
     pub id: i64,
@@ -267,7 +260,7 @@ pub struct FavoriteItem {
     pub created_at: DateTime<Utc>,
 }
 
-/// One row of the C5 contribution-history feed.
+/// One row of the contribution history contribution-history feed.
 #[derive(Debug, Clone)]
 pub struct ContributionItem {
     /// "added" | "edited" | "proposed" | "reviewed" | "verified" |
@@ -284,7 +277,7 @@ pub struct ContributionItem {
     pub id: i64,
 }
 
-/// The extended P3 detail view (reviews, confidence, verification, favorite,
+/// The extended detail view (reviews, confidence, verification, favorite,
 /// recommendation explanation) produced by [`ContributionService::community_details`].
 #[derive(Debug, Clone)]
 pub struct CommunityParkingDetails {
@@ -454,7 +447,7 @@ pub trait FavoriteRepository: Send + Sync {
     ) -> Result<Vec<FavoriteItem>, ContributionError>;
 }
 
-/// C5 read-model: aggregate all of a user's contributions into one feed.
+/// contribution history read-model: aggregate all of a user's contributions into one feed.
 #[async_trait]
 pub trait ContributionHistoryReader: Send + Sync {
     /// Keyset-paginated, newest first (`at DESC`, ties broken by `id`).
@@ -569,7 +562,7 @@ const PARKED_HERE_USER_LIMIT: u32 = 20;
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 const HOUR: Duration = Duration::from_secs(60 * 60);
 
-/// The P3 details page shows at most this many reviews inline, newest first
+/// The details page shows at most this many reviews inline, newest first
 /// (no "load more" control — see [`ContributionService::community_details`]).
 const DETAILS_REVIEW_LIMIT: i64 = 50;
 
@@ -739,9 +732,7 @@ impl ContributionService {
             .await
     }
 
-    /// Applies a reversible edit with optimistic concurrency. The web
-    /// layer routes sensitive changes (move / removal) to [`Self::propose_location_change`]
-    /// separately, so the typed [`ParkingEdit`] cannot express them.
+    /// Submit an edit for approval. Returns the proposal id; never publishes.
     pub async fn apply_parking_edit(
         &self,
         user: &crate::auth::AuthenticatedUser,
@@ -757,22 +748,34 @@ impl ContributionService {
         )
         .await?;
         validate_name_address(&edit.name, &edit.address)?;
-        self.require_active(id).await?;
-
-        let new_version = self
+        let current = self.require_active(id).await?;
+        if current.version() != expected_version {
+            return Err(ContributionError::VersionConflict);
+        }
+        let proposed = edit.to_json();
+        if ParkingEdit::from_json(&proposed).is_none() {
+            return Err(ContributionError::InvalidField("invalid edit".into()));
+        }
+        let proposal_id = self
             .deps
             .contributions
-            .apply_edit(id, expected_version, edit, user.id, self.now())
+            .create_proposal(&NewProposal {
+                location_id: id,
+                proposer_id: user.id,
+                base_version: expected_version,
+                kind: bikesnest_domain::ProposalKind::EditDetails,
+                proposed,
+            })
             .await?;
         self.audit(
             Some(user.id),
-            "parking.edited",
-            "parking_location",
-            id.to_string(),
-            serde_json::json!({ "version": new_version }),
+            "parking.proposal_created",
+            "parking_proposal",
+            proposal_id.to_string(),
+            serde_json::json!({ "kind": "edit_details" }),
         )
         .await?;
-        Ok(new_version)
+        Ok(proposal_id)
     }
 
     /// Creates a `PENDING` sensitive-change proposal. No live change.
@@ -792,13 +795,30 @@ impl ContributionService {
         .await?;
 
         let current = self.require_active(id).await?;
-
+        let mut payload = bikesnest_domain::ProposalPayload::from_json(kind, &proposed);
+        if payload.change == bikesnest_domain::ProposedChange::Unknown {
+            return Err(ContributionError::InvalidField("invalid proposal".into()));
+        }
+        if let bikesnest_domain::ProposedChange::MoveLocation { lat, lon, timezone } =
+            &mut payload.change
+        {
+            *timezone = Some(
+                match timezone.as_deref() {
+                    Some(tz) => tz
+                        .parse::<chrono_tz::Tz>()
+                        .map_err(|_| ContributionError::Timezone)?,
+                    None => self.deps.tz.resolve(GeoPoint::new(*lat, *lon)?).await?,
+                }
+                .name()
+                .to_string(),
+            );
+        }
         let proposal = NewProposal {
             location_id: id,
             proposer_id: user.id,
             base_version: current.version(),
             kind,
-            proposed,
+            proposed: payload.to_json(),
         };
         let proposal_id = self.deps.contributions.create_proposal(&proposal).await?;
         self.audit(
@@ -827,6 +847,16 @@ impl ContributionService {
             .contributions
             .vote_on_proposal(proposal_id, user.id, vote)
             .await?;
+        if totals.published {
+            self.audit(
+                Some(user.id),
+                "proposal.approved",
+                "parking_proposal",
+                proposal_id.to_string(),
+                serde_json::json!({"decision":"community", "approvals":totals.approvals}),
+            )
+            .await?;
+        }
         self.audit(
             Some(user.id),
             "parking.proposal_voted",
@@ -979,7 +1009,7 @@ impl ContributionService {
     }
 
     // -----------------------------------------------------------------------
-    // Extended P3 details ( + reviews/confidence/favorite/explanation)
+    // Extended details ( + reviews/confidence/favorite/explanation)
     // -----------------------------------------------------------------------
 
     /// Builds the community view over an **already-loaded** location: reviews,
@@ -988,7 +1018,7 @@ impl ContributionService {
     /// (no origin on the details page, so the distance factor is omitted).
     ///
     /// Takes `location` by value instead of an id so the caller (which already
-    /// ran [`crate::search::GetParkingDetails`] to build the base P3 view) loads
+    /// ran [`crate::search::GetParkingDetails`] to build the base view) loads
     /// the `parking_location` aggregate exactly once per request — this used to
     /// re-fetch it here via `ParkingDetailsReader`, doubling that read.
     pub async fn community_details(
@@ -1000,7 +1030,7 @@ impl ContributionService {
         let now = self.now();
 
         // Capped, not paginated: the details page renders the newest reviews
-        // inline with no "load more" control (WP11 keeps this simple — a
+        // inline with no "load more" control (a
         // dedicated paginated reviews view is a separate feature, not a
         // performance fix). `list_active`'s keyset API still supports one.
         let reviews = self
@@ -1039,7 +1069,7 @@ impl ContributionService {
         };
 
         // Recommendation explanation from a summary with no origin (distance
-        // factor omitted). Page with origin rendering is C4/search territory.
+        // factor omitted). Page with origin rendering is favorites/search territory.
         let summary = summary_of(&location, &reviews);
         let reasons = recommendation_reasons(
             &summary,

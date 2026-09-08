@@ -1,4 +1,4 @@
-//! `/parking/{id}` — the P3 detail page (aggregate + gallery + reviews).
+//! `/parking/{id}` — parking details, gallery, and community proposals.
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -9,7 +9,7 @@ use crate::auth::Auth;
 use crate::i18n::{Locale, Translator};
 use crate::state::AppState;
 use crate::view;
-use crate::{CollaborationProposalVm, CollaborationRevisionVm, DetailsPage, PhotoVm};
+use crate::{DetailsPage, PhotoVm};
 
 use super::common::render;
 use super::errors::{internal_error, not_found_page};
@@ -19,6 +19,10 @@ use super::errors::{internal_error, not_found_page};
 /// scripting off those POSTs redirect here instead of answering with a partial.
 #[derive(Debug, Default, serde::Deserialize)]
 pub(crate) struct DetailsNotice {
+    #[serde(default)]
+    tab: String,
+    #[serde(default)]
+    proposal_error: Option<String>,
     #[serde(default)]
     added: Option<String>,
     /// A spot the contributor just created (the "what happens next" notice).
@@ -44,6 +48,9 @@ pub(crate) struct DetailsNotice {
 
 /// One notice for the details page banner, newest/strongest action first.
 pub(crate) fn details_notice(tr: Translator, q: &DetailsNotice) -> Option<String> {
+    if q.proposal_error.is_some() {
+        return Some(tr.t("profile.proposal_error").into());
+    }
     if q.created.is_some() {
         Some(tr.t("contribution.created_notice").to_string())
     } else if q.proposed.is_some() {
@@ -69,7 +76,7 @@ pub(crate) fn details_notice(tr: Translator, q: &DetailsNotice) -> Option<String
     }
 }
 
-/// P3 — parking details.
+/// Parking details.
 pub(crate) async fn parking_details(
     State(state): State<AppState>,
     locale: Locale,
@@ -81,7 +88,7 @@ pub(crate) async fn parking_details(
     let tr = Translator::new(locale);
     match state.details.execute(id).await {
         Ok(Some(view)) => {
-            // The public P3 page returns 404 for a non-ACTIVE location (removed/
+            // The public page returns 404 for a non-ACTIVE location (removed/
             // invalid/flagged). Moderators/admins still see the page with a banner.
             let is_moderator = auth
                 .user
@@ -91,7 +98,7 @@ pub(crate) async fn parking_details(
             if view.location.moderation_state() != ModerationState::Active && !is_moderator {
                 return not_found_page(&headers, &state.map, &auth, tr);
             }
-            // Approved photos (P3 gallery). A read failure degrades to no
+            // Approved photos. A read failure degrades to no
             // gallery rather than failing the page.
             let gallery = match state.photos.photos(id).await {
                 Ok(photos) => {
@@ -130,7 +137,7 @@ pub(crate) async fn parking_details(
                 .ok();
             // Post-action confirmation (e.g. "this change will be reviewed").
             let notice = details_notice(tr, &q);
-            let page = DetailsPage::build_community(
+            let mut page = DetailsPage::build_community(
                 &state.map,
                 tr,
                 view,
@@ -145,40 +152,23 @@ pub(crate) async fn parking_details(
                     .contributions
                     .listing_proposals(id)
                     .await
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|p| CollaborationProposalVm {
-                        id: p.id,
-                        kind_label: match p.kind {
-                            bikesnest_domain::ProposalKind::MoveLocation => {
-                                tr.t("proposal.kind.move").to_string()
-                            }
-                            bikesnest_domain::ProposalKind::ChangeExistence => {
-                                tr.t("proposal.kind.existence").to_string()
-                            }
-                        },
-                        reason: p.reason.clone(),
-                        status: p.status.as_code(),
-                        approvals: p.approvals,
-                        rejections: p.rejections,
-                    })
-                    .collect(),
+                    .unwrap_or_default(),
             )
             .collaboration_history(
                 state
                     .contributions
                     .revision_history(id)
                     .await
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|r| CollaborationRevisionVm {
-                        version: r.version,
-                        kind: r.change_kind.as_code().to_string(),
-                        summary: r.summary.clone(),
-                    })
-                    .collect(),
+                    .unwrap_or_default(),
             )
             .notice(notice);
+            page.pending_photos = state.photos.pending_count(id).await.unwrap_or_default();
+            page.tab = match q.tab.as_str() {
+                "history" => "history",
+                "approvals" => "approvals",
+                _ => "current",
+            }
+            .into();
             render(page, StatusCode::OK)
         }
         Ok(None) => not_found_page(&headers, &state.map, &auth, tr),

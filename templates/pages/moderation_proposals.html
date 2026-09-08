@@ -100,6 +100,13 @@
               </label>
               <button type="submit" class="rounded-lg bg-accent-strong px-3 py-2 font-medium text-white">{{ tr.t("moderation.approve") }}</button>
             </form>
+          {% else if p.kind_code == "edit_details" %}
+            {% if !p.needs_manual_review && !p.is_stale %}
+            <form action="/moderation/proposals/{{ p.id }}/approve" method="post">
+              <input type="hidden" name="csrf" value="{{ layout.csrf }}">
+              <button type="submit" class="min-h-11 rounded-lg bg-accent-strong px-3 py-2 font-medium text-white">{{ tr.t("moderation.approve") }}</button>
+            </form>
+            {% endif %}
           {% else %}
             <form action="/moderation/proposals/{{ p.id }}/approve" method="post"
                   {% if let Some(confirm) = p.confirm %}hx-confirm="{{ confirm }}"{% endif %}

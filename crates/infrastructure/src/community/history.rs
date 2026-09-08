@@ -1,4 +1,4 @@
-//! SQL-backed contribution-history read model (C5).
+//! SQL-backed contribution-history read model (contribution history).
 //!
 //! Aggregates a user's contributions across the creator / editor / reviewer /
 //! verifier / proposer / favoriter / photo-uploader tables into one
@@ -23,11 +23,11 @@
 //!
 //! The verification branch (tag 5) further splits `kind = 'verified'` from
 //! `kind = 'parked_here'` — the `verification` table stores both signals, and
-//! the web layer (WP12) needs to tell a real existence/attribute verification
+//! the web layer needs to tell a real existence/attribute verification
 //! apart from a "parked here" note (which does not confirm anything about the
 //! listing). Tags 7/8 (`parking_photo`/`review_photo`, uploader's own pending
 //! upload) surface as `kind = 'photo.pending'` — the smaller of two options
-//! considered for showing a user their pending photos in C5 (the alternative,
+//! considered for showing a user their pending photos in contribution history (the alternative,
 //! a `PhotoRepository::pending_for_user` method threaded through
 //! `PhotoService`/`AppState` plus a second web-layer read per contributions
 //! request, was more surface for the same result).
@@ -73,7 +73,7 @@ WITH events AS (
 
     UNION ALL
 
-    SELECT 'proposed', 'pending', pl.name, pp.created_at, pp.id * 10 + 3
+    SELECT 'proposed', lower(pp.status), pl.name, pp.created_at, pp.id * 10 + 3
     FROM parking_proposal pp
     JOIN parking_location pl ON pl.id = pp.location_id
     WHERE pp.proposer_id = $1
@@ -140,7 +140,13 @@ impl ContributionHistoryReader for SqlxContributionHistoryReader {
             .bind(after_at)
             .bind(after_id)
             .bind(limit)
-            .fetch_all(self.db.pool())
+            .fetch_all(
+                &mut *self
+                    .db
+                    .acquire()
+                    .await
+                    .map_err(|e| db_err("history.acquire", e))?,
+            )
             .await
             .map_err(|e| db_err("history.history", e))?;
 

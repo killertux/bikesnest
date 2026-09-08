@@ -1,14 +1,14 @@
-//! Community contribution domain (REQUIREMENTS §37–§42, §106).
+//! Community contribution domain.
 //!
 //! Pure, no I/O. Models the value objects and the confidence-resolution rule
-//! for the M3 write flows (add/edit/propose/review/verify/favorite). Persistence
+//! for the write flows (add/edit/propose/review/verify/favorite). Persistence
 //! and orchestration live in the application / infrastructure layers.
 
 use crate::{DomainError, FreshnessThresholds, UserId};
 use chrono::{DateTime, Utc};
 
 // ---------------------------------------------------------------------------
-// StarRating (§38)
+// StarRating
 // ---------------------------------------------------------------------------
 
 /// A five-star rating, validated to `1..=5`.
@@ -45,7 +45,7 @@ impl StarRating {
 }
 
 // ---------------------------------------------------------------------------
-// ReviewBody (§38)
+// ReviewBody
 // ---------------------------------------------------------------------------
 
 /// A review body, trimmed to `1..=2000` chars.
@@ -70,7 +70,7 @@ impl ReviewBody {
 }
 
 // ---------------------------------------------------------------------------
-// Verification kinds / results (§39)
+// Verification kinds / results
 // ---------------------------------------------------------------------------
 
 /// The kind of a verification signal.
@@ -80,7 +80,7 @@ pub enum VerificationKind {
     Existence,
     /// A rider confirms or disputes one attribute (name/address/type/…).
     Attribute,
-    /// A rider "parked here" — a private, short-lived usage signal (§41).
+    /// A rider "parked here" — a private, short-lived usage signal.
     ParkedHere,
 }
 
@@ -163,23 +163,24 @@ impl AttributeResult {
     }
 }
 
-/// The per-attribute codes that an *attribute* verification may target (§39).
+/// The per-attribute codes that an *attribute* verification may target.
 pub const ATTRIBUTE_CODES: &[&str] = &[
     "name", "address", "type", "cost", "hours", "security", "location",
 ];
 
-/// Whether `code` is a recognized attribute target (§39).
+/// Whether `code` is a recognized attribute target.
 pub fn is_known_attribute_code(code: &str) -> bool {
     ATTRIBUTE_CODES.contains(&code)
 }
 
 // ---------------------------------------------------------------------------
-// Proposals (§37/§107)
+// Proposals
 // ---------------------------------------------------------------------------
 
-/// The kind of gated, sensitive change a rider can propose.
+/// The kind of listing change a rider can submit for approval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProposalKind {
+    EditDetails,
     /// Move the pin / change the coordinates or timezone.
     MoveLocation,
     /// Change the existence (e.g. propose removal).
@@ -189,6 +190,7 @@ pub enum ProposalKind {
 impl ProposalKind {
     pub fn as_code(&self) -> &'static str {
         match self {
+            ProposalKind::EditDetails => "edit_details",
             ProposalKind::MoveLocation => "move_location",
             ProposalKind::ChangeExistence => "change_existence",
         }
@@ -196,6 +198,7 @@ impl ProposalKind {
 
     pub fn from_code(code: &str) -> Result<Self, DomainError> {
         match code {
+            "edit_details" => Ok(ProposalKind::EditDetails),
             "move_location" => Ok(ProposalKind::MoveLocation),
             "change_existence" => Ok(ProposalKind::ChangeExistence),
             other => Err(DomainError::Invalid(format!(
@@ -208,7 +211,7 @@ impl ProposalKind {
 /// The typed body of a proposal — what the proposer actually wants changed.
 ///
 /// Stored as one JSONB object in `parking_proposal.proposed`. The wire shape is
-/// exactly the one M3 already writes, so existing rows parse unchanged and no
+/// exactly the one already writes, so existing rows parse unchanged and no
 /// migration is needed:
 ///
 /// - `move_location` → `{"lat": -25.43, "lon": -49.27, "timezone": "America/Sao_Paulo"}`
@@ -221,6 +224,7 @@ impl ProposalKind {
 /// take the whole moderation queue down.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProposedChange {
+    EditDetails(crate::ParkingEdit),
     MoveLocation {
         lat: f64,
         lon: f64,
@@ -230,7 +234,9 @@ pub enum ProposedChange {
     },
     /// `true` = the spot exists (restore to `ACTIVE`); `false` = it is gone
     /// (`REMOVED`).
-    ChangeExistence { exists: bool },
+    ChangeExistence {
+        exists: bool,
+    },
     /// A payload this build cannot interpret. The queue renders it as "needs
     /// manual review" and approval requires the moderator to fill every value.
     Unknown,
@@ -245,6 +251,7 @@ impl ProposedChange {
     /// [`ProposedChange::Unknown`] (whose kind only the row's column knows).
     pub fn kind(&self) -> Option<ProposalKind> {
         match self {
+            ProposedChange::EditDetails(_) => Some(ProposalKind::EditDetails),
             ProposedChange::MoveLocation { .. } => Some(ProposalKind::MoveLocation),
             ProposedChange::ChangeExistence { .. } => Some(ProposalKind::ChangeExistence),
             ProposedChange::Unknown => None,
@@ -255,6 +262,9 @@ impl ProposedChange {
     /// unreadable/legacy-incompatible object yields [`ProposedChange::Unknown`].
     pub fn from_json(kind: ProposalKind, raw: &serde_json::Value) -> Self {
         match kind {
+            ProposalKind::EditDetails => crate::ParkingEdit::from_json(raw)
+                .map(ProposedChange::EditDetails)
+                .unwrap_or(ProposedChange::Unknown),
             ProposalKind::MoveLocation => {
                 let lat = raw.get("lat").and_then(|v| v.as_f64());
                 let lon = raw.get("lon").and_then(|v| v.as_f64());
@@ -290,11 +300,12 @@ impl ProposedChange {
         }
     }
 
-    /// Render back to the stored wire shape — byte-for-byte the shape M3 wrote,
+    /// Render back to the stored wire shape — byte-for-byte the shape wrote,
     /// which is what keeps this a code change rather than a migration.
     /// [`ProposedChange::Unknown`] has nothing to say, so it renders `{}`.
     pub fn to_json(&self) -> serde_json::Value {
         match self {
+            ProposedChange::EditDetails(edit) => edit.to_json(),
             ProposedChange::MoveLocation { lat, lon, timezone } => match timezone {
                 Some(tz) => serde_json::json!({ "lat": lat, "lon": lon, "timezone": tz }),
                 None => serde_json::json!({ "lat": lat, "lon": lon }),
@@ -351,7 +362,7 @@ impl ProposalPayload {
     }
 }
 
-/// Lifecycle of a proposal. M3 creates `Pending`; resolution is M5.
+/// Lifecycle of a proposal. creates `Pending`; resolution is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProposalStatus {
     Pending,
@@ -383,7 +394,7 @@ impl ProposalStatus {
     }
 }
 
-/// The kind of a `parking_revision` row (field-level history, §107).
+/// The kind of a `parking_revision` row (field-level history, ).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChangeKind {
     Create,
@@ -416,7 +427,7 @@ impl ChangeKind {
 }
 
 // ---------------------------------------------------------------------------
-// Confidence (§106)
+// Confidence
 // ---------------------------------------------------------------------------
 
 /// Computed, per-detail-read confidence in a location's reported existence and
@@ -475,7 +486,7 @@ impl ExistenceSignal {
 }
 
 /// Resolve the [`Confidence`] of a location from its latest-per-user existence
-/// signals (§106).
+/// signals.
 ///
 /// 1. No existence signals → [`Confidence::Reported`].
 /// 2. Any `no_longer_exists` → [`Confidence::Conflicting`] (the DB says active;
@@ -523,7 +534,7 @@ pub fn confidence(
 // ChangeKind / code round-trip helpers for history summaries
 // ---------------------------------------------------------------------------
 
-/// A short, human-readable change summary for C5 (localization happens at the
+/// A short, human-readable change summary for contribution history (localization happens at the
 /// web boundary; this is a machine code + a generic label).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevisionSummary {
@@ -531,6 +542,7 @@ pub struct RevisionSummary {
     pub change_kind: ChangeKind,
     pub summary: Option<String>,
     pub at: DateTime<Utc>,
+    pub snapshot: serde_json::Value,
 }
 
 #[cfg(test)]
@@ -754,7 +766,7 @@ mod proposed_change_tests {
     /// The exact payload every seeded `change_existence` row in the dev
     /// database carries today (`select proposed from parking_proposal`).
     const LEGACY_EXISTENCE: &str = r#"{"existence": "exists"}"#;
-    /// The shape `parking_proposal_post` has written for moves since M3.
+    /// The shape `parking_proposal_post` has written for moves since.
     const LEGACY_MOVE: &str = r#"{"lat": -25.4284, "lon": -49.2733, "timezone": "America/Sao_Paulo", "reason": "pin is off"}"#;
 
     #[test]
