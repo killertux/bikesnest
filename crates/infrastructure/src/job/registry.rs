@@ -1,4 +1,4 @@
-//! Job handler registry + the built-in handlers (plans/m9-background-jobs.md).
+//! Job handler registry and the built-in handlers.
 
 use crate::Db;
 use crate::auth::{SqlxAuditLog, SystemClock};
@@ -13,8 +13,10 @@ use bikesnest_application::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// An always-on recurring job the worker bootstraps at startup (self-healing:
-/// `enqueue` with a stable `idempotency_key` is a no-op if the row already exists).
+pub const RETENTION_RECURRING_KEY: &str = "recurring:retention";
+pub const JOBS_GC_RECURRING_KEY: &str = "recurring:jobs.gc";
+
+/// An always-on recurring job the worker reconciles at startup.
 pub struct RecurringKind {
     pub job_kind: &'static str,
     pub payload: JobPayload,
@@ -83,14 +85,14 @@ pub fn job_services(
             job_kind: JOB_RETENTION,
             payload: serde_json::json!({}),
             schedule: serde_json::json!({ "every_seconds": 86_400 }),
-            idempotency_key: "recurring:retention",
+            idempotency_key: RETENTION_RECURRING_KEY,
             max_attempts: config.jobs.max_attempts,
         },
         RecurringKind {
             job_kind: JOB_JOBS_GC,
             payload: serde_json::json!({}),
             schedule: serde_json::json!({ "every_seconds": 86_400 }),
-            idempotency_key: "recurring:jobs.gc",
+            idempotency_key: JOBS_GC_RECURRING_KEY,
             max_attempts: config.jobs.max_attempts,
         },
     ];

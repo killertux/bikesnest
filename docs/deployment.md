@@ -292,18 +292,59 @@ times are UTC.
   resets the row to `pending`.
 - **Retries** use exponential backoff + jitter; after `JOBS_MAX_ATTEMPTS` a job
   is dead-lettered to `failed` (kept with `last_error` for inspection).
-- **`jobs.gc`** (itself a recurring job) deletes `succeeded`/`failed` rows older
-  than `JOBS_HISTORY_RETENTION_DAYS` (default 7).
+- **`jobs.gc`** (itself a recurring job) deletes one-shot `succeeded`/`failed`
+  rows older than `JOBS_HISTORY_RETENTION_DAYS` (default 7). Scheduled terminal
+  rows are retained for reconciliation and explicit operator recovery. The
+  built-ins currently have `{}` payloads; any future sensitive recurring payload
+  needs a separate minimization and retention review before registration.
 - **At-least-once**: a worker crash leaves the job leasable; it is re-claimed
   after the lease. Handlers must be idempotent.
 - On a multi-instance deploy each instance runs its own worker; claims are safe
   because `SKIP LOCKED` assigns disjoint rows. `JOBS_ENABLED=false` keeps an
   instance web-only (no worker).
 
-The always-on recurring jobs (`retention`, `jobs.gc`) are bootstrapped by the
-worker at startup (idempotent via a stable `idempotency_key`), so no manual
-seeding is required. The legacy `cargo run -- retention` subcommand still works
-as a manual escape hatch.
+The worker authoritatively registers exactly two built-ins at startup:
+
+| Kind | Stable key | Schedule |
+|---|---|---|
+| `retention` | `recurring:retention` | every 86,400 seconds |
+| `jobs.gc` | `recurring:jobs.gc` | every 86,400 seconds |
+
+Registration validates and persists the schedule. On restart it preserves a
+healthy pending row's future `run_at` and any active running lease. It repairs
+an exact kind/key/payload legacy row whose schedule is NULL. A live legacy row
+is revisited after its current lease/attempt finishes, so its active owner is
+never overwritten. Any key collision with a different kind, payload or non-NULL
+schedule is logged and left untouched. Startup continues processing independent
+queue work while retrying reconciliation on later polls.
+
+A legacy failed row with a NULL schedule is reactivated once. If a recurring
+row exhausts attempts after its schedule has been installed, subsequent boots
+leave it failed with its error intact: investigate and explicitly recover it
+instead of relying on restart loops. Scheduled terminal rows are excluded from
+history GC so this evidence and policy are not bypassed. The legacy
+`cargo run -- retention` subcommand remains a manual escape hatch.
+
+Before a rollout, use a read-only preflight scoped to the two exact stable keys;
+inspect `kind`, `payload`, `state`, `schedule`, `run_at`, `attempts`,
+`claimed_by`, `lease_expires_at`, `finished_at` and `last_error`. Stop if either
+key belongs to unexpected data. After the separately approved deployment,
+verify that each key has exactly one row, the schedule is present, running
+ownership was not changed, and a successful execution returns the same row to
+`pending` with a future `run_at`. Do not delete job history as a repair.
+
+Rollback to the previous binary does not require a schema rollback (this change
+adds no migration). It can finish and reschedule a row whose schedule is already
+persisted, but cannot recreate or safely repair a missing/legacy row. Keep the
+persisted schedules intact, use the documented manual retention command only
+with explicit operational approval, and roll forward promptly. Alert separately
+on each built-in's completion timestamp and state, lateness beyond its expected
+next run, a scheduled `failed` state, and recurring-bootstrap errors. For a
+successfully rescheduled pending row, `finished_at` is its last success; once a
+later attempt becomes `failed`, that column is the failed completion time and
+must not be reported as last-success history. Richer history/metrics need a
+separate change. HTTP readiness alone does not establish that background
+retention is healthy.
 
 ## 5d. Transactional email goes through the queue
 

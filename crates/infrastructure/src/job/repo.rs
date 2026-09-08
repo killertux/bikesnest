@@ -1,4 +1,4 @@
-//! SQL-backed job repository (plans/m9-background-jobs.md).
+//! SQL-backed job repository.
 //!
 //! The claim query uses `FOR UPDATE SKIP LOCKED` so multiple in-process workers
 //! (or instances) pull disjoint jobs without blocking. Attempts are incremented
@@ -20,6 +20,22 @@ use serde_json::Value;
 pub enum JobRepoError {
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
+    #[error("invalid recurring registration: {0}")]
+    InvalidRecurring(String),
+    #[error("recurring registration needs retry after active lease: {0}")]
+    ReconciliationDeferred(String),
+    #[error("recurring bootstrap incomplete for {0:?}")]
+    BootstrapIncomplete(Vec<String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecurringRegistrationOutcome {
+    Inserted,
+    HealthyPreserved,
+    PendingScheduleRepaired,
+    TerminalReactivated,
+    RunningPreserved,
+    FailedPreserved,
 }
 
 /// A row claimed by a worker, ready to run.
@@ -46,9 +62,132 @@ impl SqlxJobRepository {
         Self { db }
     }
 
-    /// Insert a job. `idempotency_key = Some(k)` is a no-op (`Ok(None)`) when a
-    /// row with that key already exists — used so always-on recurring jobs
-    /// self-heal across restarts. `max_attempts` falls back to the schema default.
+    /// Register one authoritative recurring row under a stable key.
+    ///
+    /// Only an exact kind/payload match can be repaired. Active leases are
+    /// preserved. A legacy running row without a schedule asks startup to retry
+    /// after it finishes, because that worker's claimed snapshot is still
+    /// one-shot. Scheduled failed rows remain dead-lettered for explicit
+    /// operator recovery; legacy unscheduled failures are reactivated once.
+    pub async fn register_recurring(
+        &self,
+        kind: &str,
+        payload: &JobPayload,
+        schedule: &Value,
+        run_at: DateTime<Utc>,
+        max_attempts: i32,
+        idempotency_key: &str,
+    ) -> Result<RecurringRegistrationOutcome, JobRepoError> {
+        if kind.is_empty() || idempotency_key.is_empty() || max_attempts <= 0 {
+            return Err(JobRepoError::InvalidRecurring(
+                "kind/key must be non-empty and max_attempts must be positive".into(),
+            ));
+        }
+        let next = crate::job::schedule::next_run_at(Some(schedule), run_at)
+            .map_err(|e| JobRepoError::InvalidRecurring(e.to_string()))?;
+        if next.is_none() {
+            return Err(JobRepoError::InvalidRecurring(
+                "schedule must produce a future run".into(),
+            ));
+        }
+
+        let mut conn = self.db.acquire().await?;
+        let mut tx = conn.begin().await?;
+        let inserted = sqlx::query_scalar::<_, i64>(
+            r#"
+            INSERT INTO background_job
+                (kind, payload, run_at, schedule, max_attempts, idempotency_key)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (idempotency_key) DO NOTHING
+            RETURNING id
+            "#,
+        )
+        .bind(kind)
+        .bind(payload)
+        .bind(run_at)
+        .bind(schedule)
+        .bind(max_attempts)
+        .bind(idempotency_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if inserted.is_some() {
+            tx.commit().await?;
+            return Ok(RecurringRegistrationOutcome::Inserted);
+        }
+
+        let (id, existing_kind, existing_payload, state, existing_schedule): (
+            i64,
+            String,
+            Value,
+            String,
+            Option<Value>,
+        ) = sqlx::query_as(
+            "SELECT id, kind, payload, state, schedule FROM background_job WHERE idempotency_key=$1 FOR UPDATE",
+        )
+        .bind(idempotency_key)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        if existing_kind != kind || existing_payload != *payload {
+            return Err(JobRepoError::InvalidRecurring(format!(
+                "stable key {idempotency_key:?} belongs to a different kind or payload"
+            )));
+        }
+        if existing_schedule.as_ref().is_some_and(|s| s != schedule) {
+            return Err(JobRepoError::InvalidRecurring(format!(
+                "stable key {idempotency_key:?} has an unexpected schedule"
+            )));
+        }
+
+        let outcome = match (state.as_str(), existing_schedule.is_none()) {
+            ("running", true) => {
+                return Err(JobRepoError::ReconciliationDeferred(
+                    idempotency_key.to_string(),
+                ));
+            }
+            ("running", false) => RecurringRegistrationOutcome::RunningPreserved,
+            ("pending", false) => RecurringRegistrationOutcome::HealthyPreserved,
+            ("pending", true) => {
+                sqlx::query(
+                    "UPDATE background_job SET schedule=$2, max_attempts=$3, updated_at=now() WHERE id=$1",
+                )
+                .bind(id)
+                .bind(schedule)
+                .bind(max_attempts)
+                .execute(&mut *tx)
+                .await?;
+                RecurringRegistrationOutcome::PendingScheduleRepaired
+            }
+            ("failed", false) => RecurringRegistrationOutcome::FailedPreserved,
+            ("succeeded" | "failed", true) | ("succeeded", false) => {
+                sqlx::query(
+                    r#"UPDATE background_job
+                       SET state='pending', attempts=0, run_at=$2, schedule=$3,
+                           max_attempts=$4, claimed_by=NULL, lease_expires_at=NULL,
+                           heartbeat_at=NULL, started_at=NULL, updated_at=now()
+                       WHERE id=$1"#,
+                )
+                .bind(id)
+                .bind(run_at)
+                .bind(schedule)
+                .bind(max_attempts)
+                .execute(&mut *tx)
+                .await?;
+                RecurringRegistrationOutcome::TerminalReactivated
+            }
+            _ => {
+                return Err(JobRepoError::InvalidRecurring(format!(
+                    "stable key {idempotency_key:?} has unexpected state {state:?}"
+                )));
+            }
+        };
+        tx.commit().await?;
+        Ok(outcome)
+    }
+
+    /// Insert a one-shot job. `idempotency_key = Some(k)` is a no-op (`Ok(None)`)
+    /// when a row with that key already exists. Recurring jobs must use
+    /// [`Self::register_recurring`] so their schedule is persisted and checked.
     pub async fn enqueue(
         &self,
         kind: &str,
@@ -57,6 +196,7 @@ impl SqlxJobRepository {
         max_attempts: Option<i32>,
         idempotency_key: Option<&str>,
     ) -> Result<Option<i64>, JobRepoError> {
+        let mut conn = self.db.acquire().await?;
         let id = sqlx::query_scalar::<_, i64>(
             r#"
             INSERT INTO background_job (kind, payload, run_at, max_attempts, idempotency_key)
@@ -70,7 +210,7 @@ impl SqlxJobRepository {
         .bind(run_at)
         .bind(max_attempts)
         .bind(idempotency_key)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *conn)
         .await
         .map_err(JobRepoError::Db)?;
         Ok(id)
@@ -130,8 +270,8 @@ impl SqlxJobRepository {
             r#"
             WITH candidate AS (
                 SELECT id FROM background_job
-                WHERE (state = 'pending' OR (state = 'running' AND lease_expires_at < now()))
-                  AND run_at <= now()
+                WHERE (state = 'pending' OR (state = 'running' AND lease_expires_at < clock_timestamp()))
+                  AND run_at <= clock_timestamp()
                   {kind_clause}
                 ORDER BY run_at, id
                 FOR UPDATE SKIP LOCKED
@@ -155,8 +295,9 @@ impl SqlxJobRepository {
             let owned: Vec<String> = kinds.iter().map(|k| (*k).to_string()).collect();
             query = query.bind(owned);
         }
+        let mut conn = self.db.acquire().await?;
         let rows = query
-            .fetch_all(self.db.pool())
+            .fetch_all(&mut *conn)
             .await
             .map_err(JobRepoError::Db)?;
         Ok(rows)
@@ -169,6 +310,7 @@ impl SqlxJobRepository {
         worker_id: &str,
         lease_ttl: std::time::Duration,
     ) -> Result<(), JobRepoError> {
+        let mut conn = self.db.acquire().await?;
         sqlx::query(
             r#"
             UPDATE background_job
@@ -181,7 +323,7 @@ impl SqlxJobRepository {
         .bind(id)
         .bind(lease_ttl.as_secs() as i32)
         .bind(worker_id)
-        .execute(self.db.pool())
+        .execute(&mut *conn)
         .await
         .map_err(JobRepoError::Db)?;
         Ok(())
@@ -199,6 +341,7 @@ impl SqlxJobRepository {
         next_run_at: Option<DateTime<Utc>>,
         finished_at: DateTime<Utc>,
     ) -> Result<(), JobRepoError> {
+        let mut conn = self.db.acquire().await?;
         if let Some(next) = next_run_at {
             sqlx::query(
                 r#"
@@ -213,7 +356,7 @@ impl SqlxJobRepository {
             .bind(next)
             .bind(finished_at)
             .bind(worker_id)
-            .execute(self.db.pool())
+            .execute(&mut *conn)
             .await
             .map_err(JobRepoError::Db)?;
         } else {
@@ -229,7 +372,7 @@ impl SqlxJobRepository {
             .bind(id)
             .bind(finished_at)
             .bind(worker_id)
-            .execute(self.db.pool())
+            .execute(&mut *conn)
             .await
             .map_err(JobRepoError::Db)?;
         }
@@ -245,6 +388,7 @@ impl SqlxJobRepository {
         error: &str,
         run_at: DateTime<Utc>,
     ) -> Result<(), JobRepoError> {
+        let mut conn = self.db.acquire().await?;
         sqlx::query(
             r#"
             UPDATE background_job
@@ -258,7 +402,7 @@ impl SqlxJobRepository {
         .bind(run_at)
         .bind(error)
         .bind(worker_id)
-        .execute(self.db.pool())
+        .execute(&mut *conn)
         .await
         .map_err(JobRepoError::Db)?;
         Ok(())
@@ -268,6 +412,7 @@ impl SqlxJobRepository {
     /// is later removed by `jobs.gc`. Scoped to `claimed_by = worker_id` (see
     /// [`Self::finish_success`]).
     pub async fn fail(&self, id: i64, worker_id: &str, error: &str) -> Result<(), JobRepoError> {
+        let mut conn = self.db.acquire().await?;
         sqlx::query(
             r#"
             UPDATE background_job
@@ -279,7 +424,7 @@ impl SqlxJobRepository {
         .bind(id)
         .bind(error)
         .bind(worker_id)
-        .execute(self.db.pool())
+        .execute(&mut *conn)
         .await
         .map_err(JobRepoError::Db)?;
         Ok(())
@@ -288,11 +433,12 @@ impl SqlxJobRepository {
     /// Delete terminal (`succeeded`/`failed`) rows whose `finished_at` is before
     /// `cutoff`. Returns the number of rows removed.
     pub async fn gc(&self, cutoff: DateTime<Utc>) -> Result<u64, JobRepoError> {
+        let mut conn = self.db.acquire().await?;
         let res = sqlx::query(
-            "DELETE FROM background_job WHERE state IN ('succeeded', 'failed') AND finished_at < $1",
+            "DELETE FROM background_job WHERE state IN ('succeeded', 'failed') AND schedule IS NULL AND finished_at < $1",
         )
         .bind(cutoff)
-        .execute(self.db.pool())
+        .execute(&mut *conn)
         .await
         .map_err(JobRepoError::Db)?;
         Ok(res.rows_affected())

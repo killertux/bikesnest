@@ -1,8 +1,8 @@
-//! In-process background job worker loop (plans/m9-background-jobs.md).
+//! In-process background job worker loop.
 
 use crate::config::JobConfig;
 use crate::job::registry::JobRegistry;
-use crate::job::repo::{ClaimedJob, SqlxJobRepository};
+use crate::job::repo::{ClaimedJob, JobRepoError, SqlxJobRepository};
 use crate::job::schedule::{backoff_ms, next_run_at};
 use bikesnest_application::JobError;
 use chrono::Utc;
@@ -28,6 +28,18 @@ pub struct Worker {
     registry: Arc<JobRegistry>,
     config: JobConfig,
     id: String,
+    bootstrap_attempts: Arc<AtomicU64>,
+}
+
+#[derive(Clone)]
+pub struct WorkerDiagnostics {
+    bootstrap_attempts: Arc<AtomicU64>,
+}
+
+impl WorkerDiagnostics {
+    pub fn bootstrap_attempts(&self) -> u64 {
+        self.bootstrap_attempts.load(Ordering::Relaxed)
+    }
 }
 
 impl Worker {
@@ -44,6 +56,14 @@ impl Worker {
             registry,
             config,
             id,
+            bootstrap_attempts: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Read-only worker diagnostics that remain observable while `run` owns the worker.
+    pub fn diagnostics(&self) -> WorkerDiagnostics {
+        WorkerDiagnostics {
+            bootstrap_attempts: self.bootstrap_attempts.clone(),
         }
     }
 
@@ -61,20 +81,54 @@ impl Worker {
     /// already in flight is always run to completion and its outcome recorded —
     /// abandoning it would leave the row `running` until its lease expired.
     pub async fn run(self, shutdown: CancellationToken) {
-        self.bootstrap().await;
+        self.run_inner(shutdown, None).await;
+    }
+
+    /// Run a worker restricted to an explicit set of registered kinds.
+    /// This shares the production loop and is useful for independently scoped
+    /// worker deployments and isolated integration tests.
+    pub async fn run_kinds(self, shutdown: CancellationToken, kinds: Vec<String>) {
+        self.run_inner(shutdown, Some(kinds)).await;
+    }
+
+    async fn run_inner(self, shutdown: CancellationToken, claim_kinds: Option<Vec<String>>) {
         let poll = std::time::Duration::from_millis(self.config.poll_interval.as_millis() as u64);
+        let bootstrap_retry = poll.max(std::time::Duration::from_millis(250));
+        let mut bootstrapped = false;
+        let mut next_bootstrap_attempt = tokio::time::Instant::now();
         while !shutdown.is_cancelled() {
-            match self
-                .repo
-                .claim(self.config.batch_size, &self.id, self.config.lease_ttl)
-                .await
-            {
+            if !bootstrapped && tokio::time::Instant::now() >= next_bootstrap_attempt {
+                self.bootstrap_attempts.fetch_add(1, Ordering::Relaxed);
+                match self.bootstrap().await {
+                    Ok(()) => bootstrapped = true,
+                    Err(e) => {
+                        tracing::error!(error = %e, "recurring job bootstrap failed; will retry");
+                        next_bootstrap_attempt = tokio::time::Instant::now() + bootstrap_retry;
+                    }
+                }
+            }
+            let claim = if let Some(kinds) = claim_kinds.as_ref() {
+                let refs: Vec<&str> = kinds.iter().map(String::as_str).collect();
+                self.repo
+                    .claim_kinds(
+                        self.config.batch_size,
+                        &self.id,
+                        self.config.lease_ttl,
+                        &refs,
+                    )
+                    .await
+            } else {
+                self.repo
+                    .claim(self.config.batch_size, &self.id, self.config.lease_ttl)
+                    .await
+            };
+            match claim {
                 Ok(jobs) if jobs.is_empty() => sleep_or_cancel(poll, &shutdown).await,
                 Ok(jobs) => {
                     for job in jobs {
                         // Finish the batch we already claimed: these rows are
                         // marked `running` and would otherwise wait out a lease.
-                        self.process(job).await;
+                        self.process_claimed(job).await;
                     }
                 }
                 Err(e) => {
@@ -86,28 +140,51 @@ impl Worker {
         tracing::info!(worker = %self.id, "background worker stopped");
     }
 
-    /// Ensure the always-on recurring rows exist (idempotent via `idempotency_key`).
-    async fn bootstrap(&self) {
+    /// Reconcile the always-on recurring rows through the production startup path.
+    /// A caller may continue claiming independent work after an error; `run`
+    /// retries on later poll iterations without starving one-shot jobs.
+    pub async fn bootstrap(&self) -> Result<(), JobRepoError> {
         let now = Utc::now();
+        let mut incomplete = Vec::new();
         for rk in self.registry.recurring() {
-            if let Err(e) = self
+            match self
                 .repo
-                .enqueue(
+                .register_recurring(
                     rk.job_kind,
                     &rk.payload,
+                    &rk.schedule,
                     now,
-                    Some(rk.max_attempts),
-                    Some(rk.idempotency_key),
+                    rk.max_attempts,
+                    rk.idempotency_key,
                 )
                 .await
             {
-                tracing::warn!(kind = rk.job_kind, error = %e, "failed to bootstrap recurring job");
+                Ok(outcome) => tracing::info!(
+                    kind = rk.job_kind,
+                    key = rk.idempotency_key,
+                    ?outcome,
+                    "recurring job reconciled"
+                ),
+                Err(error) => {
+                    tracing::error!(
+                        kind = rk.job_kind,
+                        key = rk.idempotency_key,
+                        %error,
+                        "recurring job reconciliation incomplete"
+                    );
+                    incomplete.push(rk.idempotency_key.to_string());
+                }
             }
         }
+        if !incomplete.is_empty() {
+            return Err(JobRepoError::BootstrapIncomplete(incomplete));
+        }
+        Ok(())
     }
 
     /// Claim → run → finish, wrapped in a `background_job` tracing span.
-    async fn process(&self, job: ClaimedJob) {
+    /// Execute and persist the outcome of one repository claim.
+    pub async fn process_claimed(&self, job: ClaimedJob) {
         let span = tracing::info_span!(
             "background_job",
             kind = %job.kind,
