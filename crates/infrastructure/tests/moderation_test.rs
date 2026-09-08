@@ -1,7 +1,7 @@
 //! Moderation infrastructure tests: the report repo state machine, the
 //! moderation actions (proposal apply + supersede, parking invalidate revision),
-//! and the audit-log reader filter/pagination. Uses the committed-fixture
-//! pattern (the repos read/write through the pool, on other connections).
+//! and the audit-log reader filter/pagination. Approval scenarios use automatic
+//! transaction rollback; legacy scenarios still use committed pooled fixtures.
 
 use bikesnest_application::{
     AuditFilter, AuditLogReader, ModerationError, ModerationRepository, NewReport,
@@ -163,20 +163,31 @@ async fn parking_invalidate_writes_moderation_revision(tx: &mut bikesnest_test_s
 async fn proposal_approve_applies_change_supersedes_and_writes_revision(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
-    let moderator = committed_user(tx, "m5-infra-prop-mod@example.com", "MODERATOR").await;
-    const MARK: &str = "m5-infra-prop";
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
+    let db = tx.db().await;
+    let mut conn = db.acquire().await.unwrap();
+    let moderator = UserBuilder::new()
+        .with_email("approval-publish-mod@example.com")
+        .create(&mut *conn)
+        .await
+        .unwrap()
+        .id;
+    let proposer = UserBuilder::new()
+        .with_email("approval-publish-author@example.com")
+        .create(&mut *conn)
+        .await
+        .unwrap()
+        .id;
+    sqlx::query("INSERT INTO user_roles (user_id, role) VALUES ($1, 'MODERATOR')")
+        .bind(moderator.0)
+        .execute(&mut *conn)
         .await
         .unwrap();
     let loc = ParkingBuilder::new()
         .with_name("Infra Proposal")
-        .with_fixture_tag(MARK)
-        .create(tx.executor())
+        .create(&mut conn)
         .await
         .unwrap();
-    tx.commit_fixture().await;
+    drop(conn);
     let id = loc.id();
 
     // Two PENDING proposals on the same location: an older existence-removal and
@@ -184,16 +195,16 @@ async fn proposal_approve_applies_change_supersedes_and_writes_revision(
     let (p1,): (i64,) = sqlx::query_as(
         "INSERT INTO parking_proposal (location_id, proposer_id, base_version, kind, proposed, status) \
          VALUES ($1, $2, 1, 'change_existence', '{\"existence\":\"removed\"}', 'PENDING') RETURNING id")
-        .bind(id).bind(moderator).fetch_one(&pool().await).await.unwrap();
+        .bind(id).bind(proposer.0).fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
     let (p2,): (i64,) = sqlx::query_as(
         "INSERT INTO parking_proposal (location_id, proposer_id, base_version, kind, proposed, status) \
          VALUES ($1, $2, 1, 'change_existence', '{\"existence\":\"removed\"}', 'PENDING') RETURNING id")
-        .bind(id).bind(moderator).fetch_one(&pool().await).await.unwrap();
+        .bind(id).bind(proposer.0).fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
 
-    let repo = SqlxModerationRepository::new(db().await);
+    let repo = SqlxModerationRepository::new(db.clone());
     repo.approve_proposal(
         p1,
-        UserId(moderator),
+        moderator,
         ProposalApplication::ChangeExistence { exists: false },
     )
     .await
@@ -202,7 +213,7 @@ async fn proposal_approve_applies_change_supersedes_and_writes_revision(
     let (lstate, lversion): (String, i64) =
         sqlx::query_as("SELECT moderation_state, version FROM parking_location WHERE id = $1")
             .bind(id)
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
     assert_eq!(lstate, "REMOVED", "approved existence-removal sets REMOVED");
@@ -211,7 +222,7 @@ async fn proposal_approve_applies_change_supersedes_and_writes_revision(
     let (p1_status,): (String,) =
         sqlx::query_as("SELECT status FROM parking_proposal WHERE id = $1")
             .bind(p1)
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
     assert_eq!(p1_status, "APPROVED");
@@ -219,59 +230,58 @@ async fn proposal_approve_applies_change_supersedes_and_writes_revision(
     let (p2_status,): (String,) =
         sqlx::query_as("SELECT status FROM parking_proposal WHERE id = $1")
             .bind(p2)
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
     assert_eq!(p2_status, "SUPERSEDED");
 
     let (rev,): (i64,) = sqlx::query_as(
         "SELECT count(*) FROM parking_revision WHERE location_id = $1 AND change_kind = 'moderation' AND version = 2")
-        .bind(id).fetch_one(&pool().await).await.unwrap();
+        .bind(id).fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
     assert_eq!(rev, 1, "approval writes a moderation revision");
-
-    let _ = tx;
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM users WHERE id = $1")
-        .bind(moderator)
-        .execute(&pool().await)
-        .await
-        .unwrap();
 }
 
 #[db_test]
 async fn proposal_approve_refuses_a_stale_base_version(tx: &mut bikesnest_test_support::TestTx) {
-    let moderator = committed_user(tx, "m5-infra-stale-mod@example.com", "MODERATOR").await;
-    const MARK: &str = "m5-infra-stale";
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
+    let db = tx.db().await;
+    let mut conn = db.acquire().await.unwrap();
+    let moderator = UserBuilder::new()
+        .with_email("approval-stale-mod@example.com")
+        .create(&mut *conn)
+        .await
+        .unwrap()
+        .id;
+    let proposer = UserBuilder::new()
+        .with_email("approval-stale-author@example.com")
+        .create(&mut *conn)
+        .await
+        .unwrap()
+        .id;
+    sqlx::query("INSERT INTO user_roles (user_id, role) VALUES ($1, 'MODERATOR')")
+        .bind(moderator.0)
+        .execute(&mut *conn)
         .await
         .unwrap();
     let loc = ParkingBuilder::new()
         .with_name("Infra Stale Proposal")
-        .with_fixture_tag(MARK)
         .with_version(5)
-        .create(tx.executor())
+        .create(&mut conn)
         .await
         .unwrap();
-    tx.commit_fixture().await;
+    drop(conn);
     let id = loc.id();
 
     // Proposed against v3, but the location has moved on to v5.
     let (stale,): (i64,) = sqlx::query_as(
         "INSERT INTO parking_proposal (location_id, proposer_id, base_version, kind, proposed, status) \
          VALUES ($1, $2, 3, 'change_existence', '{\"existence\":\"removed\"}', 'PENDING') RETURNING id")
-        .bind(id).bind(moderator).fetch_one(&pool().await).await.unwrap();
+        .bind(id).bind(proposer.0).fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
 
-    let repo = SqlxModerationRepository::new(db().await);
+    let repo = SqlxModerationRepository::new(db.clone());
     let err = repo
         .approve_proposal(
             stale,
-            UserId(moderator),
+            moderator,
             ProposalApplication::ChangeExistence { exists: false },
         )
         .await
@@ -285,7 +295,7 @@ async fn proposal_approve_refuses_a_stale_base_version(tx: &mut bikesnest_test_s
     let (state, version): (String, i64) =
         sqlx::query_as("SELECT moderation_state, version FROM parking_location WHERE id = $1")
             .bind(id)
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
     assert_eq!(state, "ACTIVE");
@@ -293,13 +303,13 @@ async fn proposal_approve_refuses_a_stale_base_version(tx: &mut bikesnest_test_s
     let (revs,): (i64,) =
         sqlx::query_as("SELECT count(*) FROM parking_revision WHERE location_id = $1")
             .bind(id)
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
     assert_eq!(revs, 0, "a refused approval writes no revision");
     let (status,): (String,) = sqlx::query_as("SELECT status FROM parking_proposal WHERE id = $1")
         .bind(stale)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     assert_eq!(status, "PENDING");
@@ -308,10 +318,10 @@ async fn proposal_approve_refuses_a_stale_base_version(tx: &mut bikesnest_test_s
     let (fresh,): (i64,) = sqlx::query_as(
         "INSERT INTO parking_proposal (location_id, proposer_id, base_version, kind, proposed, status) \
          VALUES ($1, $2, 5, 'change_existence', '{\"existence\":\"removed\"}', 'PENDING') RETURNING id")
-        .bind(id).bind(moderator).fetch_one(&pool().await).await.unwrap();
+        .bind(id).bind(proposer.0).fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
     repo.approve_proposal(
         fresh,
-        UserId(moderator),
+        moderator,
         ProposalApplication::ChangeExistence { exists: false },
     )
     .await
@@ -319,7 +329,7 @@ async fn proposal_approve_refuses_a_stale_base_version(tx: &mut bikesnest_test_s
     let (state, version): (String, i64) =
         sqlx::query_as("SELECT moderation_state, version FROM parking_location WHERE id = $1")
             .bind(id)
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
     assert_eq!(state, "REMOVED");
@@ -327,22 +337,10 @@ async fn proposal_approve_refuses_a_stale_base_version(tx: &mut bikesnest_test_s
     // Approving it superseded the stale sibling.
     let (status,): (String,) = sqlx::query_as("SELECT status FROM parking_proposal WHERE id = $1")
         .bind(stale)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     assert_eq!(status, "SUPERSEDED");
-
-    let _ = tx;
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM users WHERE id = $1")
-        .bind(moderator)
-        .execute(&pool().await)
-        .await
-        .unwrap();
 }
 
 #[db_test]

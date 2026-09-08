@@ -5719,35 +5719,38 @@ async fn wp13_proposal_queue_flags_stale_and_unreadable_proposals(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
     const MOD: &str = "wp13-stale-mod@example.com";
-    let (app, email) = auth_app().await;
-    let loc = fixture_location(tx, "wp13-stale", "WP13 Stale Spot").await;
-    let mod_cookie = moderator_cookie(&app, &email, MOD).await;
-    let mod_id = user_id_for(MOD).await;
-
-    // Written against v1, but the location has moved on to v7: approving it
-    // would clobber an edit the proposer never saw.
-    sqlx::query("UPDATE parking_location SET version = 7 WHERE id = $1")
-        .bind(loc)
-        .execute(&pool().await)
+    let (db, app, mod_cookie) = scoped_edit_app(tx, MOD).await;
+    let mut conn = db.acquire().await.unwrap();
+    sqlx::query(
+        "INSERT INTO user_roles (user_id, role) SELECT id, 'MODERATOR' FROM users WHERE email=$1",
+    )
+    .bind(MOD)
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    let proposer = bikesnest_test_support::UserBuilder::new()
+        .with_email("approval-manual-author@example.com")
+        .create(&mut *conn)
         .await
         .unwrap();
-    let stale = seed_proposal(
-        loc,
-        mod_id,
-        1,
-        "change_existence",
-        r#"{"existence":"removed"}"#,
-    )
-    .await;
-    // A payload this build cannot read must degrade to a card, not a 500.
-    let unreadable = seed_proposal(
-        loc,
-        mod_id,
-        7,
-        "change_existence",
-        r#"{"existence":"who_knows"}"#,
-    )
-    .await;
+    let loc = ParkingBuilder::new()
+        .with_name("Stale proposal spot")
+        .with_version(7)
+        .create(&mut conn)
+        .await
+        .unwrap()
+        .id();
+    let mut ids = Vec::new();
+    for (version, existence) in [(1_i64, "removed"), (7, "who_knows")] {
+        let (id,): (i64,) = sqlx::query_as(
+            "INSERT INTO parking_proposal (location_id, proposer_id, base_version, kind, proposed, status) VALUES ($1, $2, $3, 'change_existence', $4, 'PENDING') RETURNING id")
+            .bind(loc).bind(proposer.id.0).bind(version)
+            .bind(serde_json::json!({"existence": existence}))
+            .fetch_one(&mut *conn).await.unwrap();
+        ids.push(id);
+    }
+    let (stale, unreadable) = (ids[0], ids[1]);
+    drop(conn);
 
     let queue_url = format!("/moderation/proposals?after_id={}", stale - 1);
     let (s, body) = get_c(&app, &queue_url, Some(&mod_cookie)).await;
@@ -5781,7 +5784,7 @@ async fn wp13_proposal_queue_flags_stale_and_unreadable_proposals(
     );
     let (status,): (String,) = sqlx::query_as("SELECT status FROM parking_proposal WHERE id = $1")
         .bind(stale)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     assert_eq!(status, "PENDING", "a refused approval changes nothing");
@@ -5802,13 +5805,10 @@ async fn wp13_proposal_queue_flags_stale_and_unreadable_proposals(
     let (state,): (String,) =
         sqlx::query_as("SELECT moderation_state FROM parking_location WHERE id = $1")
             .bind(loc)
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
     assert_eq!(state, "REMOVED");
-
-    let _ = tx;
-    cleanup_user_contributions(MOD).await;
 }
 
 #[db_test]
