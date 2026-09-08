@@ -471,7 +471,7 @@ pub const DEFAULT_S3_REGION: &str = "us-east-1";
 pub const DEFAULT_S3_BUCKET: &str = "bikesnest";
 const DEV_S3_KEY: &str = "minioadmin";
 const DEFAULT_EMAIL_FROM: &str = "no-reply@bikesnest.local";
-const DEFAULT_POLICY_VERSION: &str = "2026-09-05.1";
+const DEFAULT_POLICY_VERSION: &str = "2026-09-08.1";
 /// Compile-time location of the static assets, used only when neither
 /// `STATIC_ROOT` nor a `web/static` directory beside the CWD exists (so
 /// `cargo run` from anywhere in the repo still serves CSS/JS).

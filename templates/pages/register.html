@@ -21,8 +21,9 @@
       <div>
         <label for="display_name" class="mb-1 block text-sm font-medium">{{ tr.t("auth.display_name") }}</label>
         <input id="display_name" name="display_name" type="text" value="{{ display_name }}" autocomplete="name"
-               {% if let Some(msg) = field_errors.err("display_name") %}aria-invalid="true" aria-describedby="display_name-error"{% endif %}
+               {% if let Some(msg) = field_errors.err("display_name") %}aria-invalid="true" aria-describedby="name-visibility-help display_name-error"{% else %}aria-describedby="name-visibility-help"{% endif %}
                class="w-full rounded-lg border border-border bg-surface px-3 py-2 text-fg outline-none focus:border-accent" />
+        <p id="name-visibility-help" class="mt-2 text-sm text-muted">{{ tr.t("auth.name_visibility_hint") }}</p>
         {% if let Some(msg) = field_errors.err("display_name") %}
           <p id="display_name-error" role="alert" class="mt-1 text-sm text-danger">{{ msg }}</p>
         {% endif %}

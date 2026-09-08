@@ -21,6 +21,7 @@ async fn public_names_apply_only_to_new_reviews_and_revocation_is_permanent(tx: 
     .execute(&mut *conn)
     .await
     .unwrap();
+    let default_named = ParkingBuilder::new().create(&mut conn).await.unwrap().id();
     let first = ParkingBuilder::new().create(&mut conn).await.unwrap().id();
     let second = ParkingBuilder::new().create(&mut conn).await.unwrap().id();
     let third = ParkingBuilder::new().create(&mut conn).await.unwrap().id();
@@ -30,7 +31,26 @@ async fn public_names_apply_only_to_new_reviews_and_revocation_is_permanent(tx: 
     let body = ReviewBody::new("A useful parking space").unwrap();
     let rating = StarRating::new(4).unwrap();
 
-    assert!(!accounts.public_contribution_name(user.id).await.unwrap());
+    assert!(accounts.public_contribution_name(user.id).await.unwrap());
+    reviews
+        .upsert_review(default_named, user.id, rating, &body)
+        .await
+        .unwrap();
+    assert_eq!(
+        reviews.list_active(default_named, None, 10).await.unwrap()[0]
+            .public_author_name
+            .as_deref(),
+        Some("Private Cyclist")
+    );
+    accounts
+        .set_public_contribution_name(user.id, false)
+        .await
+        .unwrap();
+    assert!(
+        reviews.list_active(default_named, None, 10).await.unwrap()[0]
+            .public_author_name
+            .is_none()
+    );
     reviews
         .upsert_review(first, user.id, rating, &body)
         .await
