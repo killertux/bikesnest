@@ -1197,12 +1197,14 @@ mod tests {
         ) -> Result<(), AuthError> {
             Ok(())
         }
-        async fn confirm_email(
+        async fn confirm_email_verification(
             &self,
-            _i: UserId,
+            _token: &bikesnest_domain::VerificationToken,
             _a: DateTime<Utc>,
-            _e: &bikesnest_domain::UserEmail,
-        ) -> Result<(), AuthError> {
+        ) -> Result<Option<crate::auth::EmailVerificationOutcome>, AuthError> {
+            Ok(None)
+        }
+        async fn suspend_and_revoke_security_tokens(&self, _i: UserId) -> Result<(), AuthError> {
             Ok(())
         }
         async fn set_password(&self, _i: UserId, _h: &str) -> Result<(), AuthError> {

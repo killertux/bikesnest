@@ -127,6 +127,13 @@ pub struct IdentityRecord {
     pub credential_hash: Option<String>,
 }
 
+/// Result of the repository's atomic email-verification transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmailVerificationOutcome {
+    pub user_id: UserId,
+    pub email_changed: bool,
+}
+
 /// A new account to create (user + password identity + baseline USER role).
 #[derive(Debug)]
 pub struct NewAccount<'a> {
@@ -173,15 +180,19 @@ pub trait AccountRepository: Send + Sync {
     async fn set_state(&self, id: UserId, state: AccountState) -> Result<(), AuthError>;
     async fn mark_email_verified(&self, id: UserId, at: DateTime<Utc>) -> Result<(), AuthError>;
     async fn update_canonical_email(&self, id: UserId, email: &UserEmail) -> Result<(), AuthError>;
-    /// Atomic confirm: set `email_verified_at`, advance to `Active`, and (when
-    /// the address differs) switch `users.email` + the password identity subject
-    /// in a single transaction.
-    async fn confirm_email(
+    /// Atomically consume a verification token and confirm its address.
+    /// Implementations must lock the account before consuming the token and
+    /// permit only pending or active accounts, so suspension cannot race a
+    /// token into reactivating an account.
+    async fn confirm_email_verification(
         &self,
-        id: UserId,
+        token: &VerificationToken,
         at: DateTime<Utc>,
-        email: &UserEmail,
-    ) -> Result<(), AuthError>;
+    ) -> Result<Option<EmailVerificationOutcome>, AuthError>;
+    /// Atomically suspend the account and revoke its sessions plus all
+    /// outstanding verification and password-reset tokens while holding the
+    /// account row lock.
+    async fn suspend_and_revoke_security_tokens(&self, id: UserId) -> Result<(), AuthError>;
     async fn set_password(&self, id: UserId, hash: &str) -> Result<(), AuthError>;
     /// Persist the account's reading language (the header language toggle, for
     /// a signed-in user). Transactional email is rendered from this value.
@@ -284,18 +295,27 @@ pub trait TokenStore: Send + Sync {
         email: &str,
         raw: &VerificationToken,
         now: DateTime<Utc>,
-    ) -> Result<(), AuthError>;
+        expected_state: AccountState,
+    ) -> Result<bool, AuthError>;
     async fn consume_verification(
         &self,
         raw: &VerificationToken,
         now: DateTime<Utc>,
     ) -> Result<Option<(UserId, String)>, AuthError>;
+    /// Non-consuming lookup used for the application-layer eligibility gate.
+    /// The account repository must still repeat the guard atomically when it
+    /// consumes and confirms the token.
+    async fn find_verification(
+        &self,
+        raw: &VerificationToken,
+        now: DateTime<Utc>,
+    ) -> Result<Option<UserId>, AuthError>;
     async fn issue_reset(
         &self,
         user_id: UserId,
         raw: &VerificationToken,
         now: DateTime<Utc>,
-    ) -> Result<(), AuthError>;
+    ) -> Result<bool, AuthError>;
     async fn consume_reset(
         &self,
         raw: &VerificationToken,
@@ -549,9 +569,19 @@ impl AuthService {
             .await?;
 
         let token = VerificationToken::new(self.tokens_gen.generate());
-        self.tokens
-            .issue_verification(user_id, email.as_str(), &token, now)
+        let issued = self
+            .tokens
+            .issue_verification(
+                user_id,
+                email.as_str(),
+                &token,
+                now,
+                AccountState::PendingEmailVerification,
+            )
             .await?;
+        if !issued {
+            return Ok(());
+        }
         // Hand the mail to the queue, never to a provider: a slow or broken
         // ESP can no longer hold this request open, nor fail it *after* the
         // account and token exist. The durable queue is one INSERT into the
@@ -581,46 +611,47 @@ impl AuthService {
     pub async fn verify_email(&self, raw_token: &str) -> Result<(), AuthError> {
         let now = self.now();
         let token = decode_token(raw_token).ok_or(AuthError::TokenInvalid)?;
-        let Some((user_id, email)) = self.tokens.consume_verification(&token, now).await? else {
+        let Some(user_id) = self.tokens.find_verification(&token, now).await? else {
             return Err(AuthError::TokenInvalid);
         };
         let Some(user) = self.accounts.find_by_id(user_id).await? else {
             return Err(AuthError::TokenInvalid);
         };
-
-        let is_change_email = user.email.as_str() != email;
-        let new_email = UserEmail::parse(&email).map_err(|_| AuthError::InvalidEmail)?;
-        // One atomic operation: set `email_verified_at`, advance
-        // to `Active`, and (when changing) switch `users.email` + the password
-        // identity subject in a single transaction — one login-lookup key, never
-        // divergent.
-        // Someone may have claimed the address between the request and the
-        // click: that is "email taken", not an internal failure.
-        self.accounts
-            .confirm_email(user_id, now, &new_email)
+        if !matches!(
+            user.account_state,
+            AccountState::PendingEmailVerification | AccountState::Active
+        ) {
+            return Err(AuthError::TokenInvalid);
+        }
+        let Some(outcome) = self
+            .accounts
+            .confirm_email_verification(&token, now)
             .await
             .map_err(|e| match e {
                 AuthError::Conflict => AuthError::EmailTaken,
                 other => other,
-            })?;
-        if is_change_email {
+            })?
+        else {
+            return Err(AuthError::TokenInvalid);
+        };
+        if outcome.email_changed {
             // An email change is a security event: invalidate every session so
             // a stale credential on the old address can't keep a session alive.
             self.sessions
-                .revoke_all_for_user_except(user_id, &SessionId::new([0u8; 32]))
+                .revoke_all_for_user_except(outcome.user_id, &SessionId::new([0u8; 32]))
                 .await?;
         }
-        let action = if is_change_email {
+        let action = if outcome.email_changed {
             "auth.email_changed"
         } else {
             "auth.email_verified"
         };
         self.audit
             .record(AuditEvent::success(
-                Some(user_id),
+                Some(outcome.user_id),
                 action,
                 "user",
-                user_id.0.to_string(),
+                outcome.user_id.0.to_string(),
             ))
             .await?;
         Ok(())
@@ -631,6 +662,9 @@ impl AuthService {
         let Some(user) = self.accounts.find_by_email(email).await? else {
             return Ok(());
         };
+        if user.account_state != AccountState::PendingEmailVerification {
+            return Ok(());
+        }
         self.allowed(
             &format!("verif:user:{}", user.id.0),
             VERIFY_RESEND_USER_LIMIT,
@@ -645,9 +679,19 @@ impl AuthService {
         .await?;
 
         let token = VerificationToken::new(self.tokens_gen.generate());
-        self.tokens
-            .issue_verification(user.id, email.as_str(), &token, self.now())
+        let issued = self
+            .tokens
+            .issue_verification(
+                user.id,
+                email.as_str(),
+                &token,
+                self.now(),
+                AccountState::PendingEmailVerification,
+            )
             .await?;
+        if !issued {
+            return Ok(());
+        }
         self.email
             .enqueue(self.verification_email(email, user.locale, &token))
             .await?;
@@ -802,8 +846,13 @@ impl AuthService {
         let Some(user) = self.accounts.find_by_email(email).await? else {
             return Ok(());
         };
+        if !user.account_state.can_log_in() {
+            return Ok(());
+        }
         let token = VerificationToken::new(self.tokens_gen.generate());
-        self.tokens.issue_reset(user.id, &token, self.now()).await?;
+        if !self.tokens.issue_reset(user.id, &token, self.now()).await? {
+            return Ok(());
+        }
         self.email
             .enqueue(self.reset_email(email, user.locale, &token))
             .await?;
@@ -919,9 +968,19 @@ impl AuthService {
             return Err(AuthError::EmailTaken);
         }
         let token = VerificationToken::new(self.tokens_gen.generate());
-        self.tokens
-            .issue_verification(user_id, new_email.as_str(), &token, self.now())
-            .await?;
+        if !self
+            .tokens
+            .issue_verification(
+                user_id,
+                new_email.as_str(),
+                &token,
+                self.now(),
+                AccountState::Active,
+            )
+            .await?
+        {
+            return Err(AuthError::InvalidCredentials);
+        }
         self.email
             .enqueue(self.change_email_message(new_email, user.locale, &token))
             .await?;
@@ -1140,11 +1199,7 @@ impl AuthService {
             return Err(AuthError::Unauthorized);
         }
         self.accounts
-            .set_state(target, AccountState::Suspended)
-            .await?;
-        // Revoke every session (keep none): immediate mid-session suspension.
-        self.sessions
-            .revoke_all_for_user_except(target, &SessionId::new([0u8; 32]))
+            .suspend_and_revoke_security_tokens(target)
             .await?;
         self.audit
             .record(AuditEvent::success(

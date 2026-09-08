@@ -1,9 +1,8 @@
 //! Database-backed auth integration tests against real PostgreSQL.
 //!
-//! The auth repo/store write through the pool (they take `Db`, not the test
-//! transaction), so each test seeds a user with a unique email marker, asserts
-//! against readers, deletes the user (cascading to identities/sessions/tokens/
-//! roles), and never leaks rows.
+//! Older tests below use committed, uniquely marked pool fixtures and clean
+//! them up explicitly. New sequential repository regressions inject `tx.db()`
+//! and rely on the harness's automatic outer rollback.
 
 use bikesnest_application::{AccountRepository, AuditEvent, AuditLog, SessionStore, TokenStore};
 use bikesnest_domain::{
@@ -187,7 +186,13 @@ async fn token_store_single_use_is_atomic(_tx: &mut bikesnest_test_support::Test
 
     let raw = VerificationToken::new([42u8; 32]);
     store
-        .issue_verification(user_id, &email, &raw, now)
+        .issue_verification(
+            user_id,
+            &email,
+            &raw,
+            now,
+            AccountState::PendingEmailVerification,
+        )
         .await
         .unwrap();
 
@@ -233,7 +238,13 @@ async fn token_expiry_blocks_consumption_after_ttl(_tx: &mut bikesnest_test_supp
 
     // Verification token: issued at `now`, TTL 24h — a consume at +25h is expired.
     store
-        .issue_verification(user_id, &email, &raw, now)
+        .issue_verification(
+            user_id,
+            &email,
+            &raw,
+            now,
+            AccountState::PendingEmailVerification,
+        )
         .await
         .unwrap();
     assert!(
@@ -255,6 +266,347 @@ async fn token_expiry_blocks_consumption_after_ttl(_tx: &mut bikesnest_test_supp
     );
 
     cleanup_user(&email).await;
+}
+
+#[db_test]
+async fn pending_account_confirmation_activates_without_changing_identity(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let accounts = SqlxAccountRepository::new(db.clone());
+    let tokens = SqlxTokenStore::new(db);
+    let email = UserEmail::parse(&unique_email("pending-confirm")).unwrap();
+    let user_id = accounts
+        .create(bikesnest_application::NewAccount {
+            email: &email,
+            display_name: None,
+            password_hash: "pending-hash",
+            state: AccountState::PendingEmailVerification,
+            locale: bikesnest_domain::LocaleCode::PtBr,
+        })
+        .await
+        .unwrap();
+    let token = VerificationToken::new([61; 32]);
+    let now = Utc::now();
+    assert!(
+        tokens
+            .issue_verification(
+                user_id,
+                email.as_str(),
+                &token,
+                now,
+                AccountState::PendingEmailVerification,
+            )
+            .await
+            .unwrap()
+    );
+
+    let outcome = accounts
+        .confirm_email_verification(&token, now)
+        .await
+        .unwrap()
+        .expect("pending account is eligible for initial confirmation");
+    assert_eq!(outcome.user_id, user_id);
+    assert!(!outcome.email_changed);
+    let user = accounts.find_by_id(user_id).await.unwrap().unwrap();
+    assert_eq!(user.account_state, AccountState::Active);
+    assert!(user.email_verified_at.is_some());
+    assert_eq!(user.email, email);
+    let identity = accounts
+        .find_identity(AuthenticationProvider::Password, email.as_str())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(identity.user_id, user_id);
+    assert!(
+        accounts
+            .confirm_email_verification(&token, now)
+            .await
+            .unwrap()
+            .is_none(),
+        "confirmation remains single-use"
+    );
+}
+
+#[db_test]
+async fn confirmation_rejects_unused_tokens_for_suspended_and_deleted_accounts(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let accounts = SqlxAccountRepository::new(db.clone());
+    let tokens = SqlxTokenStore::new(db);
+    for (index, blocked_state) in [AccountState::Suspended, AccountState::Deleted]
+        .into_iter()
+        .enumerate()
+    {
+        let old_email = UserEmail::parse(&unique_email("blocked-confirm-old")).unwrap();
+        let new_email = UserEmail::parse(&unique_email("blocked-confirm-new")).unwrap();
+        let user_id = accounts
+            .create(bikesnest_application::NewAccount {
+                email: &old_email,
+                display_name: None,
+                password_hash: "blocked-hash",
+                state: AccountState::Active,
+                locale: bikesnest_domain::LocaleCode::PtBr,
+            })
+            .await
+            .unwrap();
+        let token = VerificationToken::new([71 + index as u8; 32]);
+        let now = Utc::now();
+        assert!(
+            tokens
+                .issue_verification(
+                    user_id,
+                    new_email.as_str(),
+                    &token,
+                    now,
+                    AccountState::Active,
+                )
+                .await
+                .unwrap()
+        );
+        accounts.set_state(user_id, blocked_state).await.unwrap();
+
+        assert!(
+            accounts
+                .confirm_email_verification(&token, now)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let user = accounts.find_by_id(user_id).await.unwrap().unwrap();
+        assert_eq!(user.account_state, blocked_state);
+        assert!(user.email_verified_at.is_none());
+        assert_eq!(user.email, old_email);
+        assert_eq!(
+            accounts
+                .find_identity(AuthenticationProvider::Password, old_email.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .user_id,
+            user_id
+        );
+        assert!(
+            tokens
+                .find_verification(&token, now)
+                .await
+                .unwrap()
+                .is_some(),
+            "the guard is exercised with a still-unused token"
+        );
+    }
+}
+
+#[db_test]
+async fn token_issuance_rejects_mismatched_and_blocked_account_states(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let accounts = SqlxAccountRepository::new(db.clone());
+    let tokens = SqlxTokenStore::new(db);
+    let now = Utc::now();
+    for (index, state) in [
+        AccountState::PendingEmailVerification,
+        AccountState::Active,
+        AccountState::Suspended,
+        AccountState::Deleted,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let email = UserEmail::parse(&unique_email("issuance-guard")).unwrap();
+        let user_id = accounts
+            .create(bikesnest_application::NewAccount {
+                email: &email,
+                display_name: None,
+                password_hash: "guard-hash",
+                state,
+                locale: bikesnest_domain::LocaleCode::PtBr,
+            })
+            .await
+            .unwrap();
+        let expected_states: &[AccountState] = match state {
+            AccountState::PendingEmailVerification => &[AccountState::Active],
+            AccountState::Active => &[AccountState::PendingEmailVerification],
+            AccountState::Suspended => &[
+                AccountState::PendingEmailVerification,
+                AccountState::Active,
+                AccountState::Suspended,
+            ],
+            AccountState::Deleted => &[
+                AccountState::PendingEmailVerification,
+                AccountState::Active,
+                AccountState::Deleted,
+            ],
+        };
+        let reset = VerificationToken::new([111 + index as u8; 32]);
+
+        for (expected_index, expected_state) in expected_states.iter().copied().enumerate() {
+            let verification =
+                VerificationToken::new([101 + (index * 4 + expected_index) as u8; 32]);
+            assert!(
+                !tokens
+                    .issue_verification(
+                        user_id,
+                        email.as_str(),
+                        &verification,
+                        now,
+                        expected_state,
+                    )
+                    .await
+                    .unwrap(),
+                "actual {state:?} must reject expected {expected_state:?}"
+            );
+            assert!(
+                tokens
+                    .find_verification(&verification, now)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        if matches!(state, AccountState::Suspended | AccountState::Deleted) {
+            assert!(!tokens.issue_reset(user_id, &reset, now).await.unwrap());
+            assert!(tokens.consume_reset(&reset, now).await.unwrap().is_none());
+        }
+    }
+}
+
+#[db_test]
+async fn suspension_revokes_security_tokens_and_sessions_across_restore(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let accounts = SqlxAccountRepository::new(db.clone());
+    let tokens = SqlxTokenStore::new(db.clone());
+    let sessions = SqlxSessionStore::new(db);
+    let email = UserEmail::parse(&unique_email("suspension-atomic")).unwrap();
+    let user_id = accounts
+        .create(bikesnest_application::NewAccount {
+            email: &email,
+            display_name: None,
+            password_hash: "hash",
+            state: AccountState::PendingEmailVerification,
+            locale: bikesnest_domain::LocaleCode::PtBr,
+        })
+        .await
+        .unwrap();
+    let now = Utc::now();
+    let verification = VerificationToken::new([81; 32]);
+    let reset = VerificationToken::new([82; 32]);
+    assert!(
+        tokens
+            .issue_verification(
+                user_id,
+                email.as_str(),
+                &verification,
+                now,
+                AccountState::PendingEmailVerification,
+            )
+            .await
+            .unwrap()
+    );
+    tokens.issue_reset(user_id, &reset, now).await.unwrap();
+    let session = SessionId::new([83; 32]);
+    sessions
+        .create(user_id, &session, &CsrfToken::new([84; 32]), now)
+        .await
+        .unwrap();
+
+    accounts
+        .suspend_and_revoke_security_tokens(user_id)
+        .await
+        .unwrap();
+    accounts
+        .set_state(user_id, AccountState::Active)
+        .await
+        .unwrap();
+
+    assert!(
+        accounts
+            .confirm_email_verification(&verification, now)
+            .await
+            .unwrap()
+            .is_none(),
+        "a pre-suspension verification token stays revoked after restore"
+    );
+    assert!(tokens.consume_reset(&reset, now).await.unwrap().is_none());
+    assert!(sessions.resolve(&session, now).await.unwrap().is_none());
+    let user = accounts.find_by_id(user_id).await.unwrap().unwrap();
+    assert!(user.email_verified_at.is_none());
+    assert_eq!(user.account_state, AccountState::Active);
+}
+
+#[db_test]
+async fn failed_email_confirmation_rolls_back_token_consumption(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let accounts = SqlxAccountRepository::new(db.clone());
+    let tokens = SqlxTokenStore::new(db);
+    let old_email = UserEmail::parse(&unique_email("rollback-old")).unwrap();
+    let occupied_email = UserEmail::parse(&unique_email("rollback-occupied")).unwrap();
+    let freed_email = UserEmail::parse(&unique_email("rollback-freed")).unwrap();
+    let source = accounts
+        .create(bikesnest_application::NewAccount {
+            email: &old_email,
+            display_name: None,
+            password_hash: "source-hash",
+            state: AccountState::Active,
+            locale: bikesnest_domain::LocaleCode::PtBr,
+        })
+        .await
+        .unwrap();
+    let occupied = accounts
+        .create(bikesnest_application::NewAccount {
+            email: &occupied_email,
+            display_name: None,
+            password_hash: "occupied-hash",
+            state: AccountState::Active,
+            locale: bikesnest_domain::LocaleCode::PtBr,
+        })
+        .await
+        .unwrap();
+    let token = VerificationToken::new([91; 32]);
+    let now = Utc::now();
+    assert!(
+        tokens
+            .issue_verification(
+                source,
+                occupied_email.as_str(),
+                &token,
+                now,
+                AccountState::Active,
+            )
+            .await
+            .unwrap()
+    );
+
+    assert_eq!(
+        accounts.confirm_email_verification(&token, now).await,
+        Err(bikesnest_application::AuthError::Conflict)
+    );
+    assert_eq!(
+        accounts.find_by_id(source).await.unwrap().unwrap().email,
+        old_email
+    );
+
+    accounts
+        .update_canonical_email(occupied, &freed_email)
+        .await
+        .unwrap();
+    let outcome = accounts
+        .confirm_email_verification(&token, now)
+        .await
+        .unwrap()
+        .expect("the failed transaction must leave the token usable");
+    assert_eq!(outcome.user_id, source);
+    assert!(outcome.email_changed);
+    assert_eq!(
+        accounts.find_by_id(source).await.unwrap().unwrap().email,
+        occupied_email
+    );
 }
 
 #[db_test]
