@@ -25,7 +25,7 @@ impl SqlxModerationRepository {
     }
 }
 
-/// The M1 dashboard's four counts, in one statement (four scalar subqueries).
+/// The dashboard's four counts, in one statement (four scalar subqueries).
 const QUEUE_COUNTS_SQL: &str = r#"
     SELECT
         (SELECT COUNT(*) FROM parking_photo WHERE moderation_state = 'PENDING_REVIEW')
@@ -85,6 +85,7 @@ struct ProposalRow {
     current_lon: Option<f64>,
     current_timezone: String,
     current_state: String,
+    current_snapshot: serde_json::Value,
     status: String,
     created_at: DateTime<Utc>,
 }
@@ -98,11 +99,14 @@ const PROPOSAL_COLUMNS: &str = r#"
     p.kind, p.proposed,
     l.lat AS current_lat, l.lon AS current_lon, l.timezone AS current_timezone,
     l.moderation_state AS current_state,
+    COALESCE((SELECT snapshot FROM parking_revision WHERE location_id=l.id AND version=l.version), '{}'::jsonb) AS current_snapshot,
     p.status, p.created_at
 "#;
 
 #[derive(sqlx::FromRow)]
 struct ProposalLockRow {
+    kind: String,
+    proposer_id: Option<i64>,
     status: String,
     base_version: i64,
 }
@@ -246,7 +250,13 @@ impl ModerationRepository for SqlxModerationRepository {
         };
         let row: Option<(i32,)> = sqlx::query_as(sql)
             .bind(target_id)
-            .fetch_optional(self.db.pool())
+            .fetch_optional(
+                &mut *self
+                    .db
+                    .acquire()
+                    .await
+                    .map_err(|e| db_err("moderation.acquire", e))?,
+            )
             .await
             .map_err(|e| db_err("moderation.target_exists", e))?;
         Ok(row.is_some())
@@ -275,7 +285,13 @@ impl ModerationRepository for SqlxModerationRepository {
             }
             let rows = sqlx::query_as::<_, PreviewRow>(preview_sql(target_type))
                 .bind(&ids)
-                .fetch_all(self.db.pool())
+                .fetch_all(
+                    &mut *self
+                        .db
+                        .acquire()
+                        .await
+                        .map_err(|e| db_err("moderation.acquire", e))?,
+                )
                 .await
                 .map_err(|e| db_err("moderation.report_previews", e))?;
             for row in rows {
@@ -292,7 +308,13 @@ impl ModerationRepository for SqlxModerationRepository {
              WHERE id = $1 AND moderation_state = 'ACTIVE'",
         )
         .bind(id)
-        .execute(self.db.pool())
+        .execute(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("moderation.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("moderation.hide_review", e))?;
         if res.rows_affected() != 1 {
@@ -308,7 +330,13 @@ impl ModerationRepository for SqlxModerationRepository {
              WHERE id = $1 AND moderation_state = 'HIDDEN'",
         )
         .bind(id)
-        .execute(self.db.pool())
+        .execute(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("moderation.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("moderation.restore_review", e))?;
         if res.rows_affected() != 1 {
@@ -331,7 +359,13 @@ impl ModerationRepository for SqlxModerationRepository {
         ))
         .bind(id)
         .bind(moderator.0)
-        .execute(self.db.pool())
+        .execute(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("moderation.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("moderation.hide_photo", e))?;
         if res.rows_affected() != 1 {
@@ -354,7 +388,13 @@ impl ModerationRepository for SqlxModerationRepository {
         ))
         .bind(id)
         .bind(moderator.0)
-        .execute(self.db.pool())
+        .execute(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("moderation.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("moderation.restore_photo", e))?;
         if res.rows_affected() != 1 {
@@ -371,9 +411,12 @@ impl ModerationRepository for SqlxModerationRepository {
         moderator: UserId,
     ) -> Result<(), ModerationError> {
         let from_codes: Vec<String> = from.iter().map(|s| s.as_code().to_string()).collect();
-        let mut tx = self
+        let mut conn = self
             .db
-            .pool()
+            .acquire()
+            .await
+            .map_err(|e| db_err("moderation.set_parking_state", e))?;
+        let mut tx = conn
             .begin()
             .await
             .map_err(|e| db_err("moderation.set_parking_state", e))?;
@@ -437,16 +480,29 @@ impl ModerationRepository for SqlxModerationRepository {
         let rows = sqlx::query_as::<_, ProposalRow>(&sql)
             .bind(after_id)
             .bind(limit)
-            .fetch_all(self.db.pool())
+            .fetch_all(
+                &mut *self
+                    .db
+                    .acquire()
+                    .await
+                    .map_err(|e| db_err("moderation.acquire", e))?,
+            )
             .await
             .map_err(|e| db_err("moderation.list_pending_proposals", e))?;
         rows.into_iter().map(map_proposal).collect()
     }
 
-    /// The M1 dashboard's four counts in one statement (four scalar
+    /// The dashboard's four counts in one statement (four scalar
     /// subqueries), instead of loading and `.len()`-ing four full lists.
     async fn queue_counts(&self) -> Result<bikesnest_application::QueueCounts, ModerationError> {
-        Self::queue_counts_on(self.db.pool()).await
+        Self::queue_counts_on(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("moderation.acquire", e))?,
+        )
+        .await
     }
 
     async fn get_proposal(&self, id: i64) -> Result<Option<Proposal>, ModerationError> {
@@ -460,7 +516,13 @@ impl ModerationRepository for SqlxModerationRepository {
         );
         let row = sqlx::query_as::<_, ProposalRow>(&sql)
             .bind(id)
-            .fetch_optional(self.db.pool())
+            .fetch_optional(
+                &mut *self
+                    .db
+                    .acquire()
+                    .await
+                    .map_err(|e| db_err("moderation.acquire", e))?,
+            )
             .await
             .map_err(|e| db_err("moderation.get_proposal", e))?;
         match row {
@@ -475,147 +537,17 @@ impl ModerationRepository for SqlxModerationRepository {
         moderator: UserId,
         applied: ProposalApplication,
     ) -> Result<(), ModerationError> {
-        let mut tx = self
+        let mut conn = self
             .db
-            .pool()
+            .acquire()
+            .await
+            .map_err(|e| db_err("moderation.approve_proposal", e))?;
+        let mut tx = conn
             .begin()
             .await
             .map_err(|e| db_err("moderation.approve_proposal", e))?;
 
-        // Lock order — location, then this proposal, then its siblings by id.
-        // Taking the location first is what keeps two moderators approving two
-        // proposals on the SAME location from deadlocking: they queue on the
-        // one location row instead of each holding a proposal the other wants.
-        // Never reverse this, and never lock a sibling before the location.
-        let locked: Option<(i64, i64)> = sqlx::query_as(
-            r#"
-            SELECT id, version FROM parking_location
-            WHERE id = (SELECT location_id FROM parking_proposal WHERE id = $1)
-            FOR UPDATE
-            "#,
-        )
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| db_err("moderation.approve_proposal", e))?;
-        let Some((location_id, current_version)) = locked else {
-            return Err(ModerationError::NotFound);
-        };
-
-        let prop = sqlx::query_as::<_, ProposalLockRow>(
-            "SELECT status, base_version FROM parking_proposal WHERE id = $1 FOR UPDATE",
-        )
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| db_err("moderation.approve_proposal", e))?;
-        let Some(prop) = prop else {
-            return Err(ModerationError::NotFound);
-        };
-        if prop.status != ProposalStatus::Pending.as_code() {
-            return Err(ModerationError::InvalidState);
-        }
-        // The proposal describes a change to the location AS IT WAS. If the
-        // location moved on since, applying it would silently overwrite work
-        // the proposer never saw — the moderator has to look again.
-        if prop.base_version != current_version {
-            return Err(ModerationError::StaleProposal);
-        }
-        let base_version = prop.base_version;
-
-        let row = match &applied {
-            ProposalApplication::MoveLocation { lat, lon, timezone } => {
-                sqlx::query_as::<_, LocationRow>(
-                    r#"
-                    UPDATE parking_location
-                    SET location = ST_SetSRID(ST_MakePoint($2, $1), 4326)::geography,
-                        timezone = $3, version = version + 1, updated_at = now()
-                    WHERE id = $4 AND version = $5
-                    RETURNING id, name, address, description, parking_type, cost_kind, price_cents,
-                              price_currency, price_unit, lat, lon, timezone, hours_unknown,
-                              moderation_state, version
-                    "#,
-                )
-                .bind(lat)
-                .bind(lon)
-                .bind(timezone.name())
-                .bind(location_id)
-                .bind(base_version)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| db_err("moderation.approve_proposal", e))?
-            }
-            ProposalApplication::ChangeExistence { exists } => {
-                let state = if *exists { "ACTIVE" } else { "REMOVED" };
-                sqlx::query_as::<_, LocationRow>(
-                    r#"
-                    UPDATE parking_location
-                    SET moderation_state = $2, version = version + 1, updated_at = now()
-                    WHERE id = $1 AND version = $3
-                    RETURNING id, name, address, description, parking_type, cost_kind, price_cents,
-                              price_currency, price_unit, lat, lon, timezone, hours_unknown,
-                              moderation_state, version
-                    "#,
-                )
-                .bind(location_id)
-                .bind(state)
-                .bind(base_version)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| db_err("moderation.approve_proposal", e))?
-            }
-        };
-        let Some(row) = row else {
-            // The location is locked above, so it exists: 0 rows can only mean
-            // the `version = base_version` predicate failed.
-            return Err(ModerationError::StaleProposal);
-        };
-
-        let snapshot = snapshot_with(&mut tx, &row).await?;
-        let summary = match &applied {
-            ProposalApplication::MoveLocation { .. } => "proposal applied (move)",
-            ProposalApplication::ChangeExistence { .. } => "proposal applied (existence)",
-        };
-        insert_revision(
-            &mut tx,
-            location_id,
-            row.version,
-            moderator,
-            summary,
-            snapshot,
-        )
-        .await?;
-
-        sqlx::query(r#"
-            UPDATE parking_proposal SET status = 'APPROVED', resolved_by = $2, resolved_at = now(),
-              decision_approvals = (SELECT COUNT(*) FROM parking_proposal_vote v JOIN users u ON u.id = v.voter_id WHERE v.proposal_id = parking_proposal.id AND v.vote = 'APPROVE' AND u.account_state = 'ACTIVE' AND u.email_verified_at IS NOT NULL),
-              decision_rejections = (SELECT COUNT(*) FROM parking_proposal_vote v JOIN users u ON u.id = v.voter_id WHERE v.proposal_id = parking_proposal.id AND v.vote = 'REJECT' AND u.account_state = 'ACTIVE' AND u.email_verified_at IS NOT NULL)
-            WHERE id = $1
-        "#)
-            .bind(id)
-            .bind(moderator.0)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| db_err("moderation.approve_proposal", e))?;
-        // Supersede the other PENDING proposals on this location. The
-        // sub-select takes their row locks in id order, so two transactions
-        // that reach this point on different locations never cross-lock.
-        sqlx::query(
-            r#"
-            UPDATE parking_proposal SET status = 'SUPERSEDED'
-            WHERE id IN (
-                SELECT id FROM parking_proposal
-                WHERE location_id = $1 AND status = 'PENDING' AND id <> $2
-                ORDER BY id
-                FOR UPDATE
-            )
-            "#,
-        )
-        .bind(location_id)
-        .bind(id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| db_err("moderation.approve_proposal", e))?;
+        approve_in_transaction(&mut tx, id, moderator, applied).await?;
 
         tx.commit()
             .await
@@ -638,7 +570,7 @@ impl ModerationRepository for SqlxModerationRepository {
         .bind(id)
         .bind(moderator.0)
         .bind(reason.trim())
-        .execute(self.db.pool())
+        .execute(&mut *self.db.acquire().await.map_err(|e| db_err("moderation.acquire", e))?)
         .await
         .map_err(|e| db_err("moderation.reject_proposal", e))?;
         if res.rows_affected() != 1 {
@@ -678,6 +610,7 @@ fn map_proposal(r: ProposalRow) -> Result<Proposal, ModerationError> {
         current_timezone: r.current_timezone,
         current_state: ModerationState::from_code(&r.current_state)
             .map_err(ModerationError::from)?,
+        current_snapshot: r.current_snapshot,
         status: ProposalStatus::from_code(&r.status).map_err(ModerationError::from)?,
         created_at: r.created_at,
     })
@@ -814,4 +747,161 @@ fn cost_json(
 /// the feature error. `context` names the operation, e.g. `"moderation.hide_review"`.
 fn db_err(context: &'static str, e: sqlx::Error) -> ModerationError {
     crate::db_error::classify_and_log(context, e).into()
+}
+
+/// Shared atomic publisher; callers hold a transaction through vote/decision and revision.
+pub(crate) async fn approve_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: i64,
+    moderator: UserId,
+    applied: ProposalApplication,
+) -> Result<(), ModerationError> {
+    // Lock order — location, then this proposal, then its siblings by id.
+    // Taking the location first is what keeps two moderators approving two
+    // proposals on the SAME location from deadlocking: they queue on the
+    // one location row instead of each holding a proposal the other wants.
+    // Never reverse this, and never lock a sibling before the location.
+    let locked: Option<(i64, i64)> = sqlx::query_as(
+        r#"
+            SELECT id, version FROM parking_location
+            WHERE id = (SELECT location_id FROM parking_proposal WHERE id = $1)
+            FOR UPDATE
+            "#,
+    )
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| db_err("moderation.approve_proposal", e))?;
+    let Some((location_id, current_version)) = locked else {
+        return Err(ModerationError::NotFound);
+    };
+
+    let prop = sqlx::query_as::<_, ProposalLockRow>(
+            "SELECT status, base_version, kind, proposer_id FROM parking_proposal WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| db_err("moderation.approve_proposal", e))?;
+    let Some(prop) = prop else {
+        return Err(ModerationError::NotFound);
+    };
+    if prop.status != ProposalStatus::Pending.as_code() {
+        return Err(ModerationError::InvalidState);
+    }
+    // The proposal describes a change to the location AS IT WAS. If the
+    // location moved on since, applying it would silently overwrite work
+    // the proposer never saw — the moderator has to look again.
+    if prop.base_version != current_version {
+        return Err(ModerationError::StaleProposal);
+    }
+    if prop.kind != applied.kind().as_code() || prop.proposer_id == Some(moderator.0) {
+        return Err(ModerationError::InvalidState);
+    }
+    let base_version = prop.base_version;
+
+    let row = match &applied {
+            ProposalApplication::EditDetails(edit) => {
+                let (kind, cents, currency, unit) = crate::community::contribution::cost_parts(&edit.cost);
+                let row = sqlx::query_as::<_, LocationRow>(r#"
+                    UPDATE parking_location SET name=$1, address=$2, description=$3, parking_type=$4,
+                        cost_kind=$5, price_cents=$6, price_currency=$7, price_unit=$8, hours_unknown=$9,
+                        version=version+1, updated_at=now(), last_meaningful_update_at=now()
+                    WHERE id=$10 AND version=$11 AND moderation_state='ACTIVE'
+                    RETURNING id, name, address, description, parking_type, cost_kind, price_cents,
+                              price_currency, price_unit, lat, lon, timezone, hours_unknown, moderation_state, version
+                "#).bind(edit.name.trim()).bind(edit.address.trim()).bind(&edit.description).bind(edit.parking_type.as_code())
+                .bind(kind).bind(cents).bind(currency).bind(unit).bind(edit.hours.is_unknown()).bind(location_id).bind(base_version)
+                .fetch_optional(&mut **tx).await.map_err(|e| db_err("moderation.approve_proposal",e))?;
+                crate::community::contribution::write_hours(tx, location_id, &edit.hours).await.map_err(|_| ModerationError::Internal)?;
+                crate::community::contribution::write_security(tx, location_id, &edit.security).await.map_err(|_| ModerationError::Internal)?;
+                row
+            }
+            ProposalApplication::MoveLocation { lat, lon, timezone } => {
+                sqlx::query_as::<_, LocationRow>(
+                    r#"
+                    UPDATE parking_location
+                    SET location = ST_SetSRID(ST_MakePoint($2, $1), 4326)::geography,
+                        timezone = $3, version = version + 1, updated_at = now(), last_meaningful_update_at = now()
+                    WHERE id = $4 AND version = $5
+                    RETURNING id, name, address, description, parking_type, cost_kind, price_cents,
+                              price_currency, price_unit, lat, lon, timezone, hours_unknown,
+                              moderation_state, version
+                    "#,
+                )
+                .bind(lat)
+                .bind(lon)
+                .bind(timezone.name())
+                .bind(location_id)
+                .bind(base_version)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(|e| db_err("moderation.approve_proposal", e))?
+            }
+            ProposalApplication::ChangeExistence { exists } => {
+                let state = if *exists { "ACTIVE" } else { "REMOVED" };
+                sqlx::query_as::<_, LocationRow>(
+                    r#"
+                    UPDATE parking_location
+                    SET moderation_state = $2, version = version + 1, updated_at = now()
+                    WHERE id = $1 AND version = $3
+                    RETURNING id, name, address, description, parking_type, cost_kind, price_cents,
+                              price_currency, price_unit, lat, lon, timezone, hours_unknown,
+                              moderation_state, version
+                    "#,
+                )
+                .bind(location_id)
+                .bind(state)
+                .bind(base_version)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(|e| db_err("moderation.approve_proposal", e))?
+            }
+        };
+    let Some(row) = row else {
+        // The location is locked above, so it exists: 0 rows can only mean
+        // the `version = base_version` predicate failed.
+        return Err(ModerationError::StaleProposal);
+    };
+
+    let snapshot = snapshot_with(tx, &row).await?;
+    let summary = match &applied {
+        ProposalApplication::EditDetails(_) => "proposal applied (details)",
+        ProposalApplication::MoveLocation { .. } => "proposal applied (move)",
+        ProposalApplication::ChangeExistence { .. } => "proposal applied (existence)",
+    };
+    insert_revision(tx, location_id, row.version, moderator, summary, snapshot).await?;
+
+    sqlx::query(r#"
+            UPDATE parking_proposal SET status = 'APPROVED', resolved_by = $2, resolved_at = now(),
+              decision_approvals = (SELECT COUNT(*) FROM parking_proposal_vote v JOIN users u ON u.id = v.voter_id WHERE v.proposal_id = parking_proposal.id AND v.vote = 'APPROVE' AND u.account_state = 'ACTIVE' AND u.email_verified_at IS NOT NULL),
+              decision_rejections = (SELECT COUNT(*) FROM parking_proposal_vote v JOIN users u ON u.id = v.voter_id WHERE v.proposal_id = parking_proposal.id AND v.vote = 'REJECT' AND u.account_state = 'ACTIVE' AND u.email_verified_at IS NOT NULL)
+            WHERE id = $1
+        "#)
+            .bind(id)
+            .bind(moderator.0)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| db_err("moderation.approve_proposal", e))?;
+    // Supersede the other PENDING proposals on this location. The
+    // sub-select takes their row locks in id order, so two transactions
+    // that reach this point on different locations never cross-lock.
+    sqlx::query(
+        r#"
+            UPDATE parking_proposal SET status = 'SUPERSEDED'
+            WHERE id IN (
+                SELECT id FROM parking_proposal
+                WHERE location_id = $1 AND status = 'PENDING' AND id <> $2
+                ORDER BY id
+                FOR UPDATE
+            )
+            "#,
+    )
+    .bind(location_id)
+    .bind(id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| db_err("moderation.approve_proposal", e))?;
+
+    Ok(())
 }

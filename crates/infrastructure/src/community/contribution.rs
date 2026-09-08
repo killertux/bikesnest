@@ -1,8 +1,7 @@
 //! SQL-backed parking contribution repository.
 //!
-//! Owns the create / optimistic-edit / proposal / history / duplicate-detection
-//! writes. Sensitive changes (move / removal) become `PENDING` proposals; only
-//! reversible fields are applied directly (//).
+//! Owns listing creation, proposal submission, voting, history and duplicate
+//! detection. User edits enter as `PENDING` proposals; approval publishes them.
 
 use crate::Db;
 use crate::parking::SqlxParkingDetailsReader;
@@ -77,9 +76,12 @@ impl ParkingContributionRepository for SqlxParkingContributionRepository {
         let tz = new
             .timezone
             .ok_or_else(|| ContributionError::InvalidField("timezone is required".to_string()))?;
-        let mut tx = self
+        let mut conn = self
             .db
-            .pool()
+            .acquire()
+            .await
+            .map_err(|e| db_err("contribution.create", e))?;
+        let mut tx = conn
             .begin()
             .await
             .map_err(|e| db_err("contribution.create", e))?;
@@ -159,9 +161,12 @@ impl ParkingContributionRepository for SqlxParkingContributionRepository {
         editor: UserId,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<i64, ContributionError> {
-        let mut tx = self
+        let mut conn = self
             .db
-            .pool()
+            .acquire()
+            .await
+            .map_err(|e| db_err("contribution.apply_edit", e))?;
+        let mut tx = conn
             .begin()
             .await
             .map_err(|e| db_err("contribution.apply_edit", e))?;
@@ -274,12 +279,34 @@ impl ParkingContributionRepository for SqlxParkingContributionRepository {
     }
 
     async fn create_proposal(&self, p: &NewProposal) -> Result<i64, ContributionError> {
-        let mut tx = self
+        let mut conn = self
             .db
-            .pool()
+            .acquire()
+            .await
+            .map_err(|e| db_err("contribution.create_proposal", e))?;
+        let mut tx = conn
             .begin()
             .await
             .map_err(|e| db_err("contribution.create_proposal", e))?;
+        let location: Option<(i64, String)> = sqlx::query_as(
+            "SELECT version, moderation_state FROM parking_location WHERE id=$1 FOR UPDATE",
+        )
+        .bind(p.location_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| db_err("contribution.create_proposal", e))?;
+        let (version, state) = location.ok_or(ContributionError::NotFound)?;
+        if state != "ACTIVE" {
+            return Err(ContributionError::LocationNotActive);
+        }
+        if version != p.base_version {
+            return Err(ContributionError::VersionConflict);
+        }
+        if bikesnest_domain::ProposedChange::from_json(p.kind, &p.proposed)
+            == bikesnest_domain::ProposedChange::Unknown
+        {
+            return Err(ContributionError::InvalidField("invalid proposal".into()));
+        }
         // The preference setter takes this same user-row lock before it clears
         // live attribution. Reading the preference under the lock means an
         // opt-out cannot race this insert and reveal a new proposal.
@@ -322,9 +349,12 @@ impl ParkingContributionRepository for SqlxParkingContributionRepository {
         voter: UserId,
         vote: ProposalVote,
     ) -> Result<ProposalVoteTotals, ContributionError> {
-        let mut tx = self
+        let mut conn = self
             .db
-            .pool()
+            .acquire()
+            .await
+            .map_err(|e| db_err("contribution.vote_on_proposal", e))?;
+        let mut tx = conn
             .begin()
             .await
             .map_err(|e| db_err("contribution.vote_on_proposal", e))?;
@@ -335,6 +365,9 @@ impl ParkingContributionRepository for SqlxParkingContributionRepository {
         struct LockedProposal {
             proposer_id: Option<i64>,
             status: String,
+            base_version: i64,
+            kind: String,
+            proposed: serde_json::Value,
         }
         let location: (i64,) =
             sqlx::query_as("SELECT location_id FROM parking_proposal WHERE id = $1")
@@ -343,23 +376,29 @@ impl ParkingContributionRepository for SqlxParkingContributionRepository {
                 .await
                 .map_err(|e| db_err("contribution.vote_on_proposal", e))?
                 .ok_or(ContributionError::NotFound)?;
-        let locked_location: Option<(i64,)> =
-            sqlx::query_as("SELECT id FROM parking_location WHERE id = $1 FOR UPDATE")
-                .bind(location.0)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| db_err("contribution.vote_on_proposal", e))?;
-        if locked_location.is_none() {
-            return Err(ContributionError::NotFound);
+        let locked_location: Option<(i64, String)> = sqlx::query_as(
+            "SELECT version, moderation_state FROM parking_location WHERE id = $1 FOR UPDATE",
+        )
+        .bind(location.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| db_err("contribution.vote_on_proposal", e))?;
+        let (current_version, current_state) =
+            locked_location.ok_or(ContributionError::NotFound)?;
+        if current_state != "ACTIVE" {
+            return Err(ContributionError::LocationNotActive);
         }
         let locked = sqlx::query_as::<_, LockedProposal>(
-            "SELECT proposer_id, status FROM parking_proposal WHERE id = $1 FOR UPDATE",
+            "SELECT proposer_id, status, base_version, kind, proposed FROM parking_proposal WHERE id = $1 FOR UPDATE",
         )
         .bind(proposal_id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| db_err("contribution.vote_on_proposal", e))?
         .ok_or(ContributionError::NotFound)?;
+        if locked.base_version != current_version {
+            return Err(ContributionError::VersionConflict);
+        }
         if locked.status != "PENDING" {
             return Err(ContributionError::Conflict);
         }
@@ -367,8 +406,8 @@ impl ParkingContributionRepository for SqlxParkingContributionRepository {
             return Err(ContributionError::Unauthorized);
         }
         // Do not lock the account row: deletion/anonymization owns that row
-        // before cleaning vote rows. The final tally filters account state, so
-        // a concurrent suspension/deletion cannot count toward the threshold.
+        // before cleaning vote rows. The final tally rechecks eligibility at
+        // its statement snapshot instead of trusting eligibility at vote time.
         let eligible: Option<(i64,)> = sqlx::query_as(
             "SELECT id FROM users WHERE id = $1 AND account_state = 'ACTIVE' AND email_verified_at IS NOT NULL"
         ).bind(voter.0).fetch_optional(&mut *tx).await
@@ -402,12 +441,41 @@ impl ParkingContributionRepository for SqlxParkingContributionRepository {
             WHERE v.proposal_id = $1 AND u.account_state = 'ACTIVE' AND u.email_verified_at IS NOT NULL
         "#).bind(proposal_id).fetch_one(&mut *tx).await
             .map_err(|e| db_err("contribution.vote_on_proposal", e))?;
+        let mut published = false;
+        if totals.approvals >= 6 {
+            let kind = bikesnest_domain::ProposalKind::from_code(&locked.kind)?;
+            let change = bikesnest_domain::ProposedChange::from_json(kind, &locked.proposed);
+            if let Ok(applied) = bikesnest_application::ProposalApplication::merge(
+                kind,
+                &change,
+                &Default::default(),
+            ) {
+                crate::moderation::actions::approve_in_transaction(
+                    &mut tx,
+                    proposal_id,
+                    voter,
+                    applied,
+                )
+                .await
+                .map_err(|e| match e {
+                    bikesnest_application::ModerationError::StaleProposal => {
+                        ContributionError::VersionConflict
+                    }
+                    bikesnest_application::ModerationError::InvalidState => {
+                        ContributionError::Conflict
+                    }
+                    _ => ContributionError::Internal,
+                })?;
+                published = true;
+            }
+        }
         tx.commit()
             .await
             .map_err(|e| db_err("contribution.vote_on_proposal", e))?;
         Ok(ProposalVoteTotals {
             approvals: totals.approvals,
             rejections: totals.rejections,
+            published,
         })
     }
 
@@ -419,6 +487,8 @@ impl ParkingContributionRepository for SqlxParkingContributionRepository {
         #[derive(sqlx::FromRow)]
         struct Row {
             id: i64,
+            base_version: i64,
+            proposer_id: Option<i64>,
             kind: String,
             proposed: serde_json::Value,
             status: String,
@@ -426,8 +496,13 @@ impl ParkingContributionRepository for SqlxParkingContributionRepository {
             rejections: i64,
             created_at: chrono::DateTime<chrono::Utc>,
         }
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("contribution.listing_proposals", e))?;
         let rows = sqlx::query_as::<_, Row>(r#"
-            SELECT p.id, p.kind, p.proposed, p.status, p.created_at,
+            SELECT p.id, p.kind, p.proposed, p.status, p.created_at, p.base_version, p.proposer_id,
                    COUNT(*) FILTER (WHERE v.vote = 'APPROVE' AND u.id IS NOT NULL)::bigint AS approvals,
                    COUNT(*) FILTER (WHERE v.vote = 'REJECT' AND u.id IS NOT NULL)::bigint AS rejections
             FROM parking_proposal p
@@ -436,16 +511,23 @@ impl ParkingContributionRepository for SqlxParkingContributionRepository {
                  AND u.account_state = 'ACTIVE' AND u.email_verified_at IS NOT NULL
             WHERE p.location_id = $1
             GROUP BY p.id
-            ORDER BY p.created_at DESC, p.id DESC
+            ORDER BY (p.status = 'PENDING') DESC, p.created_at DESC, p.id DESC
             LIMIT $2
-        "#).bind(location_id).bind(limit.clamp(1, 100)).fetch_all(self.db.pool()).await
+        "#).bind(location_id).bind(limit.clamp(1, 100)).fetch_all(&mut *conn).await
             .map_err(|e| db_err("contribution.listing_proposals", e))?;
         rows.into_iter()
             .map(|row| {
                 Ok(ListingProposal {
                     id: row.id,
+                    base_version: row.base_version,
+                    proposer_id: row.proposer_id.map(UserId),
                     kind: bikesnest_domain::ProposalKind::from_code(&row.kind)
                         .map_err(|e| ContributionError::InvalidField(e.to_string()))?,
+                    change: bikesnest_domain::ProposedChange::from_json(
+                        bikesnest_domain::ProposalKind::from_code(&row.kind)
+                            .map_err(|e| ContributionError::InvalidField(e.to_string()))?,
+                        &row.proposed,
+                    ),
                     reason: row
                         .proposed
                         .get("reason")
@@ -471,12 +553,13 @@ impl ParkingContributionRepository for SqlxParkingContributionRepository {
         struct RevRow {
             version: i64,
             change_kind: String,
+            snapshot: serde_json::Value,
             summary: Option<String>,
             created_at: chrono::DateTime<chrono::Utc>,
         }
         let rows = sqlx::query_as::<_, RevRow>(
             r#"
-            SELECT version, change_kind, summary, created_at
+            SELECT version, change_kind, summary, created_at, snapshot
             FROM parking_revision
             WHERE location_id = $1
             ORDER BY version DESC
@@ -485,7 +568,13 @@ impl ParkingContributionRepository for SqlxParkingContributionRepository {
         )
         .bind(id)
         .bind(limit)
-        .fetch_all(self.db.pool())
+        .fetch_all(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("contribution.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("contribution.revision_history", e))?;
 
@@ -497,6 +586,7 @@ impl ParkingContributionRepository for SqlxParkingContributionRepository {
                         .map_err(|e| ContributionError::InvalidField(e.to_string()))?,
                     summary: r.summary,
                     at: r.created_at,
+                    snapshot: r.snapshot,
                 })
             })
             .collect()
@@ -529,7 +619,7 @@ impl ParkingContributionRepository for SqlxParkingContributionRepository {
             ORDER BY location <-> ST_SetSRID(ST_MakePoint($2, $1), 4326)::geography
             LIMIT 50
             "#).bind(point.lat()).bind(point.lon()).bind(f64::from(DUPLICATE_RADIUS_M))
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *self.db.acquire().await.map_err(|e| db_err("contribution.acquire", e))?)
         .await
         .map_err(|e| db_err("contribution.duplicate_candidates", e))?;
 
@@ -573,7 +663,9 @@ fn map_reader_err_to_contribution(e: bikesnest_application::ReaderError) -> Cont
     }
 }
 
-fn cost_parts(cost: &Cost) -> (&'static str, Option<i64>, Option<String>, Option<String>) {
+pub(crate) fn cost_parts(
+    cost: &Cost,
+) -> (&'static str, Option<i64>, Option<String>, Option<String>) {
     match cost {
         Cost::Free => ("free", None, None, None),
         Cost::Unknown => ("unknown", None, None, None),
@@ -592,7 +684,7 @@ fn cost_parts(cost: &Cost) -> (&'static str, Option<i64>, Option<String>, Option
 /// an edit can change a range's times entirely, which is a different primary
 /// key tuple — so a delete-then-insert stays the right shape; the insert side
 /// is now one multi-row statement via `unnest` instead of N round trips.
-async fn write_hours(
+pub(crate) async fn write_hours(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: i64,
     hours: &OpeningHours,
@@ -648,7 +740,7 @@ async fn write_hours(
 /// codes the caller didn't set) — the row set per location never shrinks —
 /// so `ON CONFLICT … DO UPDATE` is equivalent to delete-then-insert with no
 /// separate DELETE needed.
-async fn write_security(
+pub(crate) async fn write_security(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: i64,
     security: &[SecurityFeature],

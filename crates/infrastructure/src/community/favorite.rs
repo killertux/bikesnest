@@ -41,7 +41,13 @@ impl FavoriteRepository for SqlxFavoriteRepository {
         )
         .bind(user.0)
         .bind(location_id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("favorite.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("favorite.toggle", e))?;
         Ok(row.is_some())
@@ -57,7 +63,13 @@ impl FavoriteRepository for SqlxFavoriteRepository {
         )
         .bind(user.0)
         .bind(location_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("favorite.acquire", e))?,
+        )
         .await
         .map_err(|e| db_err("favorite.is_favorited", e))?;
         Ok(row.0)
@@ -97,7 +109,7 @@ impl FavoriteRepository for SqlxFavoriteRepository {
         .bind(after_at)
         .bind(after_id)
         .bind(limit)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *self.db.acquire().await.map_err(|e| db_err("favorite.acquire", e))?)
         .await
         .map_err(|e| db_err("favorite.list", e))?;
         Ok(rows

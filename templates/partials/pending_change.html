@@ -1,0 +1,6 @@
+{% if self.has_pending(pending_field) %}
+<a href="{{ self.pending_url(pending_field) }}" data-pending-field="{{ pending_field }}" class="inline-flex min-h-11 items-center gap-1.5 text-sm font-medium text-accent-strong" title="{{ tr.t("profile.approvals") }}">
+  <svg aria-hidden="true" class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 3v12a4 4 0 0 0 4 4h4M16 3v6a4 4 0 0 1-4 4H8"/><circle cx="8" cy="3" r="2"/><circle cx="16" cy="3" r="2"/><circle cx="16" cy="19" r="2"/></svg>
+  {{ tr.t("profile.pending") }}
+</a>
+{% endif %}

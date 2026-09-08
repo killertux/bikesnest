@@ -11,6 +11,8 @@ pub mod freshness;
 pub mod hours;
 pub mod moderation;
 pub mod parking;
+pub mod parking_edit;
+pub use parking_edit::ParkingEdit;
 pub mod photo;
 pub mod privacy;
 
@@ -71,9 +73,9 @@ pub enum DomainError {
 impl UserEmail {
     /// Validates and normalizes (lowercase, trimmed) an email address.
     ///
-    /// M0 keeps validation deliberately simple (shape check only);
+    /// keeps validation deliberately simple (shape check only);
     /// full RFC-style validation is unnecessary for storage and
-    /// deliverability is confirmed by the verification flow (M2).
+    /// deliverability is confirmed by the verification flow.
     pub fn parse(raw: &str) -> Result<Self, DomainError> {
         let normalized = raw.trim().to_lowercase();
         if normalized.is_empty() {

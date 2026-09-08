@@ -129,7 +129,7 @@ pub struct NewReport {
 }
 
 /// A report as read from the store (for the queue + detail + resolution).
-/// `reporter_id` is `None` once the reporter's account is anonymized (M6).
+/// `reporter_id` is `None` once the reporter's account is anonymized.
 #[derive(Debug, Clone)]
 pub struct Report {
     pub id: i64,
@@ -158,7 +158,7 @@ pub struct Proposal {
     pub location_id: i64,
     pub location_name: String,
     pub location_address: String,
-    /// `None` once the proposer's account is anonymized (M6).
+    /// `None` once the proposer's account is anonymized.
     pub proposer_id: Option<UserId>,
     pub base_version: i64,
     /// The location's version *now*. Equal to `base_version` for a proposal
@@ -172,6 +172,7 @@ pub struct Proposal {
     pub current_lon: Option<f64>,
     pub current_timezone: String,
     pub current_state: ModerationState,
+    pub current_snapshot: serde_json::Value,
     pub status: ProposalStatus,
     pub created_at: DateTime<Utc>,
 }
@@ -212,7 +213,7 @@ pub struct ReportTargetPreview {
     pub location_address: Option<String>,
     /// The reported review, or the review a reported review photo hangs off.
     pub review_id: Option<i64>,
-    /// `None` for an anonymized author (M6).
+    /// `None` for an anonymized author.
     pub review_author_id: Option<UserId>,
     pub review_rating: Option<i16>,
     /// The first [`REVIEW_EXCERPT_CHARS`] characters of the review body.
@@ -241,7 +242,7 @@ pub fn review_excerpt(body: &str) -> String {
     format!("{}…", head.trim_end())
 }
 
-/// The M1 moderation dashboard's four counts (one query, not four full lists).
+/// The moderation dashboard's four counts (one query, not four full lists).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct QueueCounts {
     pub pending_photos: i64,
@@ -256,20 +257,23 @@ pub struct QueueCounts {
 /// half-parsed payload.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProposalApplication {
+    EditDetails(crate::ParkingEdit),
     MoveLocation {
         lat: f64,
         lon: f64,
         timezone: chrono_tz::Tz,
     },
     /// `true` = exists/restore to `ACTIVE`; `false` = removed → `REMOVED`.
-    ChangeExistence { exists: bool },
+    ChangeExistence {
+        exists: bool,
+    },
 }
 
 impl ProposalApplication {
     /// **The override-merge rule.** Combine what the proposer asked for with
     /// whatever the moderator retyped on the approve form: a field the
     /// moderator filled in wins, an empty one leaves the proposer's value
-    /// standing. It used to live in the web handler (A-M6), where no test
+    /// standing. It used to live in the web handler, where no test
     /// could reach it and where "empty means keep" was an accident of string
     /// parsing rather than a decision.
     ///
@@ -283,6 +287,10 @@ impl ProposalApplication {
         over: &ProposalOverride,
     ) -> Result<Self, ModerationError> {
         match (kind, change) {
+            (ProposalKind::EditDetails, ProposedChange::EditDetails(edit)) => {
+                Ok(Self::EditDetails(edit.clone()))
+            }
+            (ProposalKind::EditDetails, _) => Err(ModerationError::InvalidState),
             (ProposalKind::MoveLocation, ProposedChange::MoveLocation { lat, lon, timezone }) => {
                 Self::move_location(
                     over.lat.or(Some(*lat)),
@@ -336,6 +344,7 @@ impl ProposalApplication {
 
     pub fn kind(&self) -> ProposalKind {
         match self {
+            ProposalApplication::EditDetails(_) => ProposalKind::EditDetails,
             ProposalApplication::MoveLocation { .. } => ProposalKind::MoveLocation,
             ProposalApplication::ChangeExistence { .. } => ProposalKind::ChangeExistence,
         }
@@ -511,7 +520,7 @@ impl ModerationService {
     }
 
     // -----------------------------------------------------------------------
-    // Reports (//)
+    // Reports
     // -----------------------------------------------------------------------
 
     /// Submit a report. Gated to *authenticated* users (not verified — reporting
@@ -601,7 +610,7 @@ impl ModerationService {
         self.deps.reports.list(state, after_id, limit).await
     }
 
-    /// The M1 dashboard's four counts in one call (`require_moderator`).
+    /// The dashboard's four counts in one call (`require_moderator`).
     pub async fn queue_counts(
         &self,
         moderator: &crate::auth::AuthenticatedUser,
@@ -923,7 +932,7 @@ impl ModerationService {
     /// [`ProposalApplication::merge`] itself — the caller only says which
     /// fields the moderator retyped. That is what keeps the "an empty input
     /// means keep the proposer's value" rule testable and identical for every
-    /// caller (it used to be re-derived inside the HTTP handler, A-M6).
+    /// caller (it used to be re-derived inside the HTTP handler).
     pub async fn approve_proposal(
         &self,
         moderator: &crate::auth::AuthenticatedUser,
@@ -995,7 +1004,7 @@ impl ModerationService {
             .map_err(ModerationError::from)
     }
 
-    /// Inspect a target user's contribution history (MODERATOR/ADMIN) — the C5
+    /// Inspect a target user's contribution history (MODERATOR/ADMIN) — the contribution history
     /// aggregation scoped to that user.
     pub async fn user_contribution_history(
         &self,

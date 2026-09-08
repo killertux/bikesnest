@@ -73,7 +73,13 @@ impl ParkingDetailsReader for SqlxParkingDetailsReader {
             "#,
         )
         .bind(id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| reader_err("details.acquire", e))?,
+        )
         .await
         .map_err(|e| reader_err("details.details", e))?
         else {
@@ -88,7 +94,13 @@ impl ParkingDetailsReader for SqlxParkingDetailsReader {
             "#,
         )
         .bind(id)
-        .fetch_all(self.db.pool())
+        .fetch_all(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| reader_err("details.acquire", e))?,
+        )
         .await
         .map_err(|e| reader_err("details.details", e))?;
 
@@ -101,7 +113,13 @@ impl ParkingDetailsReader for SqlxParkingDetailsReader {
             "#,
         )
         .bind(id)
-        .fetch_all(self.db.pool())
+        .fetch_all(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| reader_err("details.acquire", e))?,
+        )
         .await
         .map_err(|e| reader_err("details.details", e))?;
 

@@ -1,4 +1,4 @@
-//! M5 moderation service tests (pure, with fakes): report submission + rate
+//! moderation service tests (pure, with fakes): report submission + rate
 //! limit, the self-resolve guard, content hide/restore, parking invalidation and
 //! proposal apply/reject. Persistence is faked; the orchestrating service rules
 //! are what's under test.
@@ -372,6 +372,7 @@ fn proposal(id: i64, kind: ProposalKind, change: ProposedChange) -> Proposal {
         current_lon: Some(-49.0),
         current_timezone: "America/Sao_Paulo".to_string(),
         current_state: ModerationState::Active,
+        current_snapshot: serde_json::json!({}),
         status: ProposalStatus::Pending,
         created_at: chrono::Utc::now(),
     }
@@ -763,7 +764,7 @@ async fn submission_has_no_role_gate() {
 }
 
 // ---------------------------------------------------------------------------
-// The override-merge rule (A-M6). It used to live in the HTTP handler, where no
+// The override-merge rule. It used to live in the HTTP handler, where no
 // test could reach it; these are the cases that rule has to get right.
 // ---------------------------------------------------------------------------
 

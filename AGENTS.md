@@ -21,6 +21,10 @@ that data. Bilingual (en + pt-BR). Works on mobile and desktop browsers.
   **no** compile-time `sqlx::query!` macros — `cargo build` needs no database.
 - **Migrations are forward-only** and applied automatically on startup
   (`serve`). Add a new `migrations/NNNN_*.sql` file; never edit an applied one.
+- **Existing parking facts require approval:** detail edits, moves, and existence
+  changes create proposals. Six eligible community approvals or a moderator
+  decision publish one version atomically; never write submitted edits directly
+  to the public listing. Photos retain their moderator-only approval flow.
 - **Every external dependency is behind a port** (a `trait` in
   `crates/application`). Replacing a provider = new impl + wiring change, never
   a domain change.
@@ -90,7 +94,7 @@ npm run build:css                        # Tailwind → web/static/css/app.css
   a test in `crates/web/tests/http_test.rs` fails if one of them names a
   repository, a pool or a concrete adapter, and another fails if any file in
   `crates/web/src` passes 1200 lines.
-- **Background jobs** (M9) are a Postgres-backed queue (`background_job` table)
+- **Background jobs** are a Postgres-backed queue (`background_job` table)
   with an in-process worker; handlers live in `crates/infrastructure/src/job/`
   and implement `bikesnest_application::JobHandler`. Set `JOBS_ENABLED=false` for
   web-only instances. A test that claims jobs directly (rather than simulating

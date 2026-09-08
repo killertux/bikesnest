@@ -353,6 +353,38 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "collab.tabs" => ("Listing views", "Visualizações da vaga"),
         "collab.overview" => ("Overview", "Visão geral"),
         "collab.proposals" => ("Proposals", "Propostas"),
+        "profile.current" => ("Current version", "Versão atual"),
+        "profile.approved" => ("Approved", "Aprovada"),
+        "profile.rejected" => ("Rejected", "Rejeitada"),
+        "profile.superseded" => ("Superseded", "Substituída"),
+        "profile.photos_pending" => ("Photos awaiting moderation", "Fotos aguardando moderação"),
+        "profile.photos_private" => (
+            "New photos stay private until a moderator approves them.",
+            "Novas fotos ficam privadas até a aprovação da moderação.",
+        ),
+        "profile.history" => ("Version history", "Versões anteriores"),
+        "profile.approvals" => ("Pending approvals", "Aprovações pendentes"),
+        "profile.pending" => ("Change pending", "Alteração pendente"),
+        "profile.edit_details" => ("Update parking details", "Atualizar informações da vaga"),
+        "profile.version" => ("Version", "Versão"),
+        "profile.history_empty" => ("No saved versions yet.", "Nenhuma versão salva ainda."),
+        "profile.history_hint" => (
+            "Published versions. Open a version to see its saved information.",
+            "Versões publicadas. Abra uma versão para ver as informações salvas.",
+        ),
+        "profile.no_changes" => (
+            "No differences from the current version.",
+            "Nenhuma diferença em relação à versão atual.",
+        ),
+        "profile.proposal_error" => (
+            "This change could not be recorded. Refresh the page and try again.",
+            "Não foi possível registrar esta alteração. Atualize a página e tente novamente.",
+        ),
+        "details.proposals.active" => ("Active proposals", "Propostas ativas"),
+        "details.proposals.other" => (
+            "Location or existence change",
+            "Alterar localização ou existência",
+        ),
         "collab.history" => ("History", "Histórico"),
         "collab.community" => ("Made better together", "Melhor com a comunidade"),
         "collab.help_title" => ("Know this spot?", "Conhece esta vaga?"),
@@ -1176,15 +1208,15 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         // --- contributions: edit -----------------------------------------
         "edit.title" => ("Edit parking spot", "Editar vaga"),
         "edit.subtitle" => (
-            "Update the details of this spot. Moving the pin or removal are separate actions below.",
-            "Atualize os detalhes desta vaga. Mover o ponto ou remover são ações separadas abaixo.",
+            "All changes are reviewed before publication. The current version stays visible until approval.",
+            "Todas as alterações passam por avaliação antes de serem publicadas. A versão atual continua visível até a aprovação.",
         ),
-        "edit.submit" => ("Save changes", "Salvar alterações"),
+        "edit.submit" => ("Submit for approval", "Enviar para aprovação"),
         "edit.link" => ("Edit this spot", "Editar esta vaga"),
-        "edit.sensitive.title" => ("Sensitive changes", "Mudanças sensíveis"),
+        "edit.sensitive.title" => ("Location and existence", "Localização e existência"),
         "edit.sensitive.body" => (
-            "Moving the pin or removing a spot could mislead other riders, so these are proposed and reviewed.",
-            "Mover o ponto ou remover uma vaga pode enganar outros ciclistas, então isso é proposto e revisado.",
+            "Propose a new map position or report that this spot is gone.",
+            "Sugira uma nova posição no mapa ou informe que esta vaga não existe mais.",
         ),
         "edit.move.title" => ("Move the pin", "Mover o ponto"),
         "edit.move.submit" => ("Propose new location", "Propor novo local"),
@@ -1289,8 +1321,8 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
 
         // --- post-action notices -----------------------------------------
         "details.notice.proposed" => (
-            "Your change has been submitted and will be reviewed by a moderator before it appears.",
-            "Sua mudança foi enviada e será revisada por um moderador antes de aparecer.",
+            "Your change is pending approval. The published version has not changed.",
+            "Sua alteração aguarda aprovação. A versão publicada não mudou.",
         ),
         "details.notice.edited" => ("Your changes were saved.", "Suas alterações foram salvas."),
         "details.notice.reviewed" => (

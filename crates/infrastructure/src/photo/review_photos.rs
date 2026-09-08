@@ -43,7 +43,13 @@ impl ReviewPhotosReader for SqlxReviewPhotosReader {
             "#,
         )
         .bind(review_ids)
-        .fetch_all(self.db.pool())
+        .fetch_all(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| crate::parking::search::reader_err("review_photos.acquire", e))?,
+        )
         .await
         .map_err(|e| reader_err("review_photos.for_reviews", e))?;
 

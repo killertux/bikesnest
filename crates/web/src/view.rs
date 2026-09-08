@@ -57,7 +57,7 @@ pub struct OptionVm {
     pub checked: bool,
 }
 
-/// Field-scoped form errors (WP21 accessibility pass): a small set of
+/// Field-scoped form errors: a small set of
 /// `(input name, message)` pairs a handler records when it already knows
 /// which input a rejected submission belongs to. Askama calls methods on a
 /// struct field directly (as it already does for `tr.t(...)`), so a template
@@ -325,7 +325,7 @@ fn image_for(ty: ParkingType) -> (&'static str, &'static str) {
 }
 
 /// One marker's data for the search page's `<script type="application/json"
-/// id="search-data">` island (WP14) — only what `web/static/js/search.js`
+/// id="search-data">` island — only what `web/static/js/search.js`
 /// actually reads: `id` (card↔marker sync via `data-parking-id`), `n` (the
 /// number drawn in the marker, matching the card's badge), `lat`/`lon`
 /// (position), `name`, the two labels the popup shows, and `href` (the popup's
@@ -420,7 +420,7 @@ pub async fn build_results(
         items.push(card);
     }
 
-    // Trimmed to what search.js reads (WP14) — see `MapItemVm`.
+    // Trimmed to what search.js reads — see `MapItemVm`.
     let map_items: Vec<MapItemVm> = items.iter().map(|c| MapItemVm::from_card(c, c.n)).collect();
     let map_json = escape_script_json(
         serde_json::json!({
@@ -594,7 +594,7 @@ pub fn role_label(t: Translator, role: Role) -> &'static str {
     }
 }
 
-/// Localized account-state label (C1 / M5).
+/// Localized account-state label (C1 / ).
 pub fn account_state_label(t: Translator, s: AccountState) -> &'static str {
     match s {
         AccountState::PendingEmailVerification => t.t("account.state.pending"),
@@ -604,7 +604,7 @@ pub fn account_state_label(t: Translator, s: AccountState) -> &'static str {
     }
 }
 
-/// One row of the admin user-management table (M5).
+/// One row of the admin user-management table.
 ///
 /// The email is **masked** by default: an admin managing roles does not need
 /// every address on screen (and neither does anyone glancing at the screen).
@@ -651,7 +651,7 @@ pub fn mask_email(email: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Community (M3) view models
+// Community view models
 // ---------------------------------------------------------------------------
 
 /// One rendered review (D3 / P3). `photos` are the review's APPROVED photos
@@ -830,7 +830,7 @@ pub fn reason_vm(t: Translator, r: &bikesnest_application::Reason) -> ReasonVm {
     }
 }
 
-/// One rendered row of the C5 contribution history feed.
+/// One rendered row of the contribution history contribution history feed.
 #[derive(Debug, Clone)]
 pub struct ContributionVm {
     /// Stable code for the row's icon: "added" | "edited" | "proposed" |
@@ -862,7 +862,7 @@ pub fn duplicate_vm(_t: Translator, d: &bikesnest_application::DuplicateCandidat
     }
 }
 
-/// One photo in the moderator queue (M2 screen). Includes the presigned URL of
+/// One photo in the moderator queue. Includes the presigned URL of
 /// the *processed derivative* (exactly what would publish), a small preview and
 /// an anonymized "Contributor #id" label — never an email/OAuth subject.
 #[derive(Debug, Clone)]
@@ -934,7 +934,7 @@ pub async fn moderation_photo_vm(
 }
 
 // ---------------------------------------------------------------------------
-// Moderation & reporting (M5) view models
+// Moderation & reporting view models
 // ---------------------------------------------------------------------------
 
 /// The one "act on the reported content" button a queue row offers, when the
@@ -952,13 +952,13 @@ pub struct ReportActionVm {
     pub needs_reason: bool,
 }
 
-/// One row of the M3 reports queue.
+/// One row of the reports queue.
 #[derive(Debug, Clone)]
 pub struct ReportVm {
     pub id: i64,
     /// The submitting user's id (moderators may compare against the viewer to
     /// hide resolve/dismiss on one's own report); never rendered on public pages.
-    /// `None` once the reporter's account is anonymized (M6).
+    /// `None` once the reporter's account is anonymized.
     pub reporter_id: Option<i64>,
     pub target_type_label: &'static str,
     pub target_id: i64,
@@ -1192,7 +1192,7 @@ pub fn report_vm(
 /// One "current → proposed" pair the moderator has to judge.
 #[derive(Debug, Clone)]
 pub struct ProposalDiffVm {
-    pub label: &'static str,
+    pub label: String,
     pub current: String,
     pub proposed: String,
     /// `false` when the proposal would leave this field as it is — the row is
@@ -1211,7 +1211,7 @@ pub struct ProposalMapVm {
     pub proposed_lon: String,
 }
 
-/// One row of the M4 proposal review queue.
+/// One row of the proposal review queue.
 ///
 /// Everything the moderator needs to decide without leaving the page: where the
 /// spot is, who asked, why, what would change, and — for a move — the approve
@@ -1257,6 +1257,7 @@ pub struct ProposalVm {
 
 fn proposal_kind_label(t: Translator, kind: bikesnest_domain::ProposalKind) -> &'static str {
     match kind {
+        bikesnest_domain::ProposalKind::EditDetails => t.t("profile.edit_details"),
         bikesnest_domain::ProposalKind::MoveLocation => t.t("proposal.kind.move"),
         bikesnest_domain::ProposalKind::ChangeExistence => t.t("proposal.kind.existence"),
     }
@@ -1295,10 +1296,28 @@ pub fn proposal_vm(t: Translator, p: &bikesnest_application::Proposal) -> Propos
     let mut confirm = None;
 
     match &p.change {
+        ProposedChange::EditDetails(edit) => {
+            let current = crate::profile::snapshot_values(&p.current_snapshot, t);
+            for field in crate::profile::edit_values(edit, t) {
+                let before = current
+                    .iter()
+                    .find(|f| f.key == field.key)
+                    .map(|f| f.value.clone())
+                    .unwrap_or_else(|| t.t("proposal.value.unknown").into());
+                if before != field.value {
+                    diff.push(ProposalDiffVm {
+                        label: field.label,
+                        current: before,
+                        proposed: field.value,
+                        changed: true,
+                    });
+                }
+            }
+        }
         ProposedChange::MoveLocation { lat, lon, timezone } => {
             let changed = p.current_lat != Some(*lat) || p.current_lon != Some(*lon);
             diff.push(ProposalDiffVm {
-                label: t.t("proposal.field.coordinates"),
+                label: t.t("proposal.field.coordinates").into(),
                 current: coord_pair(p.current_lat, p.current_lon, t),
                 proposed: format!("{}, {}", coord(*lat), coord(*lon)),
                 changed,
@@ -1307,7 +1326,7 @@ pub fn proposal_vm(t: Translator, p: &bikesnest_application::Proposal) -> Propos
                 .clone()
                 .unwrap_or_else(|| p.current_timezone.clone());
             diff.push(ProposalDiffVm {
-                label: t.t("proposal.field.timezone"),
+                label: t.t("proposal.field.timezone").into(),
                 current: p.current_timezone.clone(),
                 proposed: proposed_tz.clone(),
                 changed: proposed_tz != p.current_timezone,
@@ -1327,7 +1346,7 @@ pub fn proposal_vm(t: Translator, p: &bikesnest_application::Proposal) -> Propos
         ProposedChange::ChangeExistence { exists } => {
             let currently_exists = p.current_state == bikesnest_domain::ModerationState::Active;
             diff.push(ProposalDiffVm {
-                label: t.t("proposal.field.existence"),
+                label: t.t("proposal.field.existence").into(),
                 current: existence_label(t, currently_exists).to_string(),
                 proposed: existence_label(t, *exists).to_string(),
                 changed: currently_exists != *exists,
@@ -1376,7 +1395,7 @@ pub fn proposal_vm(t: Translator, p: &bikesnest_application::Proposal) -> Propos
     }
 }
 
-/// One row of the admin audit-log viewer (M6). Metadata rendered as an escaped
+/// One row of the admin audit-log viewer. Metadata rendered as an escaped
 /// JSON blob — by construction it carries no secrets/PII.
 ///
 /// An audit log is read to answer "who did what, exactly when" — so the
@@ -1470,7 +1489,7 @@ pub fn datetime_local_value(dt: chrono::DateTime<chrono::Utc>) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Privacy & account lifecycle (M6)
+// Privacy & account lifecycle
 // ---------------------------------------------------------------------------
 
 /// A locale-neutral ISO date-time label (YYYY-MM-DD HH:MM).
@@ -1482,7 +1501,7 @@ pub fn iso_datetime_label(t: Translator, dt: chrono::DateTime<chrono::Utc>) -> S
     }
 }
 
-/// One row of the C7 export-status page (status + optional single-use link).
+/// One row of the export export-status page (status + optional single-use link).
 #[derive(Debug, Clone)]
 pub struct ExportVm {
     pub id: i64,
@@ -1505,7 +1524,7 @@ pub fn export_state_label(t: Translator, s: bikesnest_domain::ExportState) -> &'
     }
 }
 
-/// Build a C7 row. `token_held` says whether this request carries the export's
+/// Build a export row. `token_held` says whether this request carries the export's
 /// single-use download token (the `export_{id}` cookie) — true only for the
 /// export the owner just requested, and only while it is still `READY`.
 pub fn export_vm(t: Translator, e: &bikesnest_application::Export, token_held: bool) -> ExportVm {
@@ -1521,7 +1540,7 @@ pub fn export_vm(t: Translator, e: &bikesnest_application::Export, token_held: b
     }
 }
 
-/// One row of the admin privacy-request queue (or the C6 rights list).
+/// One row of the admin privacy-request queue (or the privacy rights list).
 ///
 /// A rights request is a legal clock, so the row carries the three facts an
 /// operator needs to act: who asked, what they wrote, and how long is left
@@ -1640,7 +1659,7 @@ pub fn policy_version_vm(
     }
 }
 
-/// One selectable manual rights kind on the C6 hub.
+/// One selectable manual rights kind on the privacy hub.
 #[derive(Debug, Clone)]
 pub struct PrivacyRequestKindVm {
     pub code: &'static str,
@@ -1648,7 +1667,7 @@ pub struct PrivacyRequestKindVm {
     pub description: &'static str,
 }
 
-/// The manual (operator-fulfilled) rights kinds, with descriptions, for the C6
+/// The manual (operator-fulfilled) rights kinds, with descriptions, for the privacy
 /// request list. Access/export and deletion are automatic and have their
 /// own cards.
 pub fn privacy_request_kind_options(t: Translator) -> Vec<PrivacyRequestKindVm> {
@@ -1704,6 +1723,9 @@ pub fn contribution_vm(
     let state = match i.state.as_str() {
         "active" => t.t("contrib.state.active"),
         "pending" => t.t("contrib.state.pending"),
+        "approved" => t.t("profile.approved"),
+        "rejected" => t.t("profile.rejected"),
+        "superseded" => t.t("profile.superseded"),
         "history" => t.t("contrib.state.history"),
         _ => t.t("contrib.state.other"),
     };
@@ -1794,7 +1816,7 @@ mod tests {
         assert!(results.cursor_url.is_none());
     }
 
-    /// WP14: the search map's JSON island must carry only what `search.js`
+    /// the search map's JSON island must carry only what `search.js`
     /// reads for a marker — not the full `CardVm` (labels, image paths,
     /// security chips, …).
     #[test]

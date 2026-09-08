@@ -1,4 +1,6 @@
 //! BikesNest web crate: axum routing, handlers, Askama templates.
+pub mod profile;
+pub use profile::{CollaborationProposalVm, CollaborationRevisionVm};
 
 pub mod assets;
 pub mod auth;
@@ -444,6 +446,11 @@ pub struct DetailsPage {
     /// Public-safe persisted proposals; no voter identities or photo keys.
     pub collaboration_proposals: Vec<CollaborationProposalVm>,
     pub collaboration_history: Vec<CollaborationRevisionVm>,
+    pub version: i64,
+    pub tab: String,
+    pub pending_photos: i64,
+    pub published_values: Vec<profile::ProfileValueVm>,
+    pub viewer_id: Option<bikesnest_domain::UserId>,
 }
 
 /// One gallery photo: presigned URLs + accessible text. Grid tiles render the
@@ -494,6 +501,7 @@ impl DetailsPage {
                 .security()
                 .iter()
                 .map(|f| SecVm {
+                    code: f.code().to_string(),
                     label: tr.security(f.code()).to_string(),
                     state: match f.state() {
                         bikesnest_domain::SecurityState::Yes => "yes",
@@ -543,6 +551,17 @@ impl DetailsPage {
             reason_options: view::report_reason_options(tr),
             collaboration_proposals: Vec::new(),
             collaboration_history: Vec::new(),
+            version: loc.version(),
+            tab: "current".into(),
+            pending_photos: 0,
+            published_values: {
+                let mut snapshot = bikesnest_domain::ParkingEdit::from_location(loc).to_json();
+                snapshot["point"] = serde_json::json!({"lat":lat,"lon":lon});
+                snapshot["timezone"] = serde_json::json!(loc.timezone().name());
+                snapshot["moderation_state"] = serde_json::json!(loc.moderation_state().as_code());
+                profile::snapshot_values(&snapshot, tr)
+            },
+            viewer_id: auth.user.as_ref().map(|u| u.id),
         }
     }
 
@@ -614,33 +633,10 @@ impl DetailsPage {
         self.notice = notice;
         self
     }
-
-    pub fn collaboration_proposals(mut self, proposals: Vec<CollaborationProposalVm>) -> Self {
-        self.collaboration_proposals = proposals;
-        self
-    }
-    pub fn collaboration_history(mut self, history: Vec<CollaborationRevisionVm>) -> Self {
-        self.collaboration_history = history;
-        self
-    }
-}
-
-pub struct CollaborationProposalVm {
-    pub id: i64,
-    pub kind_label: String,
-    pub reason: Option<String>,
-    pub status: &'static str,
-    pub approvals: i64,
-    pub rejections: i64,
-}
-
-pub struct CollaborationRevisionVm {
-    pub version: i64,
-    pub kind: String,
-    pub summary: Option<String>,
 }
 
 pub struct SecVm {
+    pub code: String,
     pub label: String,
     /// "yes" | "no" | "unknown"
     pub state: &'static str,
@@ -933,7 +929,7 @@ pub struct ReviewFormPage {
     pub field_errors: view::FieldErrors,
 }
 
-/// C4 — favorites list.
+/// favorites — favorites list.
 #[derive(Template)]
 #[template(path = "pages/favorites.html")]
 pub struct FavoritesPage {
@@ -945,7 +941,7 @@ pub struct FavoritesPage {
     pub next_url: Option<String>,
 }
 
-/// C5 — contribution history.
+/// contribution history — contribution history.
 #[derive(Template)]
 #[template(path = "pages/contributions.html")]
 pub struct ContributionsPage {
@@ -1064,7 +1060,7 @@ pub struct AdminAuditPage {
     pub notice: Option<String>,
 }
 
-/// Admin: a target user's contribution history (C5 aggregation scoped to a user).
+/// Admin: a target user's contribution history (contribution history aggregation scoped to a user).
 #[derive(Template)]
 #[template(path = "pages/admin_user_contributions.html")]
 pub struct AdminUserContributionsPage {
