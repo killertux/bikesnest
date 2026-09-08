@@ -553,6 +553,10 @@ pub struct StoredPhoto {
 #[async_trait]
 pub trait ParkingPhotoReader: Send + Sync {
     async fn photos(&self, location_id: i64) -> Result<Vec<StoredPhoto>, ReaderError>;
+    /// Public-safe count only; pending images and uploader identities stay private.
+    async fn pending_count(&self, _location_id: i64) -> Result<i64, ReaderError> {
+        Ok(0)
+    }
 }
 
 /// Port: approved photos attached to *reviews*, in display order.

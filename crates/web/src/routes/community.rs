@@ -1,4 +1,4 @@
-//! M3 contributions to a location: adding one, editing one, and proposing a
+//! contributions to a location: adding one, editing one, and proposing a
 //! change to one. The wire shape the three share — and the hours/security
 //! grammars — live in `super::contribution_form`; this module is the handlers,
 //! the form → domain mapping, and the pages they render.
@@ -67,7 +67,7 @@ impl FormError {
         }
     }
 
-    /// Which input(s) this rejection belongs to (WP21 a11y pass), so the page
+    /// Which input(s) this rejection belongs to, so the page
     /// can flag them directly instead of leaving the contributor to guess from
     /// one generic banner. The hours editor already reports its own per-day
     /// error, so it is deliberately not represented here.
@@ -250,7 +250,7 @@ pub(crate) fn new_parking_layout(map: &MapConfig, tr: Translator, auth: &Auth) -
     PageLayout::for_request(tr.t("new.title").to_string(), "new", auth, map)
 }
 
-/// Build a `ParkingEditPage` with all reversible fields pre-filled from `loc`.
+/// Build a `ParkingEditPage` pre-filled from the published listing.
 pub(crate) fn parking_edit_page_vm(
     layout: PageLayout,
     tr: Translator,
@@ -589,7 +589,8 @@ pub(crate) async fn parking_edit_post(
         .apply_parking_edit(user, id, form.version, &edit)
         .await
     {
-        Ok(_) => axum::response::Redirect::to(&format!("/parking/{id}?edited=1")).into_response(),
+        Ok(_) => axum::response::Redirect::to(&format!("/parking/{id}?proposed=1&tab=approvals"))
+            .into_response(),
         Err(ContributionError::VersionConflict) => {
             let Some(view) = state.details.execute(id).await.ok().flatten() else {
                 return not_found_page(&headers, &state.map, &auth, tr);
@@ -753,6 +754,7 @@ pub(crate) async fn parking_proposal_post(
         Err(_) => return axum::response::Redirect::to(&format!("/parking/{id}")).into_response(),
     };
     let change = match kind {
+        ProposalKind::EditDetails => return proposal_error(id),
         ProposalKind::MoveLocation => {
             let Ok(lat) = form.lat.trim().parse::<f64>() else {
                 return proposal_error(id);
@@ -780,7 +782,8 @@ pub(crate) async fn parking_proposal_post(
         .propose_location_change(user, id, kind, proposed)
         .await
     {
-        Ok(_) => axum::response::Redirect::to(&format!("/parking/{id}?proposed=1")).into_response(),
+        Ok(_) => axum::response::Redirect::to(&format!("/parking/{id}?proposed=1&tab=approvals"))
+            .into_response(),
         Err(ContributionError::LocationNotActive) => {
             not_found_page(&headers, &state.map, &auth, tr)
         }
@@ -793,7 +796,7 @@ pub(crate) async fn parking_proposal_post(
 /// Two vocabularies reach this field. `removed`/`exists` are the payload's own
 /// codes (what the moderation queue's approve form posts). `no_longer_exists`
 /// and `info_changed` are the *verification* codes the edit page's radios have
-/// posted since M3 — they were stored verbatim and the queue, which only knew
+/// posted since — they were stored verbatim and the queue, which only knew
 /// `removed`, read `no_longer_exists` as "still exists", quietly inverting
 /// every removal proposal a rider filed. Both vocabularies are mapped here, so
 /// the stored payload is canonical whichever form submitted it.
@@ -840,8 +843,19 @@ pub(crate) async fn parking_proposal_vote_post(
         .vote_on_proposal(user, proposal_id, vote)
         .await
     {
-        Ok(_) => axum::response::Redirect::to(&format!("/parking/{}?voted=1", form.location_id))
-            .into_response(),
+        Ok(totals) => {
+            if totals.published
+                && let Ok(Some(view)) = state.details.execute(form.location_id).await
+                && view.location.moderation_state() != bikesnest_domain::ModerationState::Active
+            {
+                return axum::response::Redirect::to("/account/contributions").into_response();
+            }
+            axum::response::Redirect::to(&format!(
+                "/parking/{}?voted=1&tab=approvals",
+                form.location_id
+            ))
+            .into_response()
+        }
         Err(_) => proposal_error(form.location_id),
     }
 }

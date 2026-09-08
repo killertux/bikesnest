@@ -66,7 +66,13 @@ impl AuditLog for SqlxAuditLog {
         .bind(event.target_id)
         .bind(event.result)
         .bind(event.metadata)
-        .execute(self.db.pool())
+        .execute(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| crate::db_error::classify_and_log("audit.acquire", e))?,
+        )
         .await
         .map_err(|e| crate::db_error::classify_and_log("audit.record", e))?;
         Ok(())

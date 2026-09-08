@@ -88,9 +88,10 @@ Value objects and rules, no I/O. Notable concepts:
   agreement (a conflict is never silently averaged).
 - **`VerificationKind`** — `Existence | Attribute | ParkedHere` (parked-here is
   a private, short-lived usage signal).
-- **`Proposal`** — `ProposalKind` (`MoveLocation | ChangeExistence`) +
-  `ProposalStatus` (`Pending | Approved | Rejected | Superseded`); sensitive
-  changes require a proposal rather than a direct edit.
+- **`Proposal`** — `ProposalKind` (`EditDetails | MoveLocation | ChangeExistence`) +
+  `ProposalStatus` (`Pending | Approved | Rejected | Superseded`). All user edits
+  to existing listing facts require approval. `ParkingEdit` owns the typed
+  editable fields and the proposal/snapshot codec in `domain::parking_edit`.
 - **`StarRating`** (1–5) and **`ReviewBody`** for reviews.
 - **Accounts/auth** — `AccountState` (`PendingEmailVerification | Active |
   Suspended | Deleted`), `Role` (`User | Moderator | Admin`), `Password` (with
@@ -181,10 +182,20 @@ The router is split three ways:
 catalogs; `security.rs` the headers/CSP; `observability.rs` the JSON structured
 logging; `markdown.rs` the sanitizing renderer for the legal pages.
 
-The parking detail page includes a frontend-only collaboration prototype in
-`listing_collaboration.html` and `listing-prototype.js`/`.css`. Its proposals,
-votes, moderation and version history are page-local mock state; see
-[`docs/listing-collaboration-prototype.md`](docs/listing-collaboration-prototype.md).
+The parking profile has server-rendered Current version, Version history, and
+Pending approvals tabs. `web::profile` builds localized field diffs and saved
+revision values. Field-level pending links lead to the relevant proposal;
+unapproved values never replace published facts. `listing_collaboration.html`
+renders proposal diffs and voting, while `parking_versions.html` renders saved
+versions. Pending photos expose only a count, never unapproved media.
+
+Detail edits, moves, and removal proposals publish after six distinct eligible
+community approvals or a moderator decision. Both paths share one atomic
+publisher: lock the location then the proposal, check the base version, apply
+the change, write one immutable revision, resolve the proposal, and supersede
+competing proposals. Self-approval and stale proposals are rejected. Photos use
+their separate moderator-only approval flow; reviews and verification remain
+community signals, not direct updates to listing facts.
 
 ## Tech stack
 
@@ -235,6 +246,7 @@ Versioned, forward-only migrations in `migrations/`:
 | `0018_user_locale.sql` | per-account locale |
 | `0019_photo_key_and_audit_integrity.sql` | non-empty `storage_key`, append-only audit |
 | `0020_open_now_fn.sql` | `bikesnest_is_open_at()` + confirmed-attribute index |
+| `0024_approve_all_parking_edits.sql` | allow detail-edit proposals alongside moves and existence changes |
 
 Key modeling notes:
 
@@ -252,7 +264,7 @@ Key modeling notes:
   same-day boundaries, overnight ranges, all-day rows, a DST transition and
   locations with no hours at all.
 - **`parking_revision`** is an immutable field-level history (JSONB after-state
-  snapshots); **`parking_proposal`** holds sensitive changes pending moderation.
+  snapshots); **`parking_proposal`** holds all listing edits pending approval.
 - **Optimistic concurrency** via `version` on `parking_location`; conflicting
   edits are rejected and the client re-fetches.
 - **`review`** is one-per-user-per-location with an aggregate rating recomputed

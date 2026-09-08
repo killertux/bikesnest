@@ -1,0 +1,21 @@
+<section data-od-id="listing-history" aria-labelledby="history-heading" class="py-2">
+  <h2 id="history-heading" class="sr-only">{{ tr.t("profile.history") }}</h2>
+  <p class="mb-6 text-sm text-muted">{{ tr.t("profile.history_hint") }}</p>
+  {% if collaboration_history.is_empty() %}<p class="text-sm text-muted">{{ tr.t("profile.history_empty") }}</p>{% endif %}
+  <div class="space-y-3">
+    {% for revision in collaboration_history %}
+    <details class="rounded-xl border border-border bg-surface px-5 py-2" data-od-id="saved-version">
+      <summary class="min-h-11 cursor-pointer py-3 font-medium">
+        {{ tr.t("profile.version") }} <span class="font-mono">{{ revision.version }}</span>
+        <span class="ml-3 text-sm font-normal text-muted">{{ revision.created_label }}</span>
+        {% if revision.version == version %}<span class="ml-2 rounded-full bg-accent-soft px-2 py-1 text-xs text-accent-strong">{{ tr.t("profile.current") }}</span>{% endif %}
+      </summary>
+      <dl class="divide-y divide-border border-t border-border pb-3">
+        {% for field in revision.values %}
+        <div class="grid gap-2 py-3 sm:grid-cols-[180px_1fr]"><dt class="text-sm text-muted">{{ field.label }}</dt><dd class="min-w-0 whitespace-pre-line break-words text-sm">{{ field.value }}</dd></div>
+        {% endfor %}
+      </dl>
+    </details>
+    {% endfor %}
+  </div>
+</section>
