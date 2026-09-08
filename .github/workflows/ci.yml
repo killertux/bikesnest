@@ -132,6 +132,10 @@ jobs:
           npm run build:css
       - name: Check generated assets are committed
         run: git diff --exit-code -- web/static/css/app.css web/static/vendor
+      - name: Install browser
+        run: npx playwright install --with-deps chromium
+      - name: Test navigation lifecycle
+        run: npm run test:browser
 
   docker:
     name: Docker image

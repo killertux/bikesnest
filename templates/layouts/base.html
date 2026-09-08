@@ -10,7 +10,7 @@
   {% endif %}
   {% if !layout.canonical.is_empty() %}
   <link rel="canonical" href="{{ layout.canonical }}">
-  <!-- Locale is selected via Accept-Language + `lang` cookie (.7); the same
+  <!-- Locale is selected via Accept-Language + `lang` cookie; the same
        URL serves both pt-BR and en, so hreflang points at the identical URL. -->
   <link rel="alternate" hreflang="pt-BR" href="{{ layout.canonical }}">
   <link rel="alternate" hreflang="en" href="{{ layout.canonical }}">
@@ -32,6 +32,13 @@
        — search.html, parking_details.html, moderation_proposals.html — via
        their own head/scripts blocks, not unconditionally here. -->
   {% block head %}{% endblock %}
+  <!-- Persistent scripts run once. Register components before Alpine starts. -->
+  <script defer src="{{ layout.asset("vendor/htmx.js") }}"></script>
+  <script defer src="{{ layout.asset("vendor/hx-alpine-compat.js") }}"></script>
+  <script defer src="{{ layout.asset("js/app.js") }}"></script>
+  <script defer src="{{ layout.asset("vendor/alpine.min.js") }}"></script>
+  <script defer src="{{ layout.asset("js/auth.js") }}"></script>
+  <script defer src="{{ layout.asset("js/navigation.js") }}"></script>
 </head>
 {# htmx 4 has `config.implicitInheritance = false`, so a plain `hx-boost` on
    <body> applies to <body> alone and every link/form below it stayed unboosted.
@@ -45,7 +52,8 @@
       data-google-maps-api-key="{{ layout.google_maps_api_key }}"
       data-google-map-id="{{ layout.google_map_id }}">
   <a href="#content" class="sr-only focus:not-sr-only focus:absolute focus:left-4 focus:top-4 focus:z-50 focus:rounded-lg focus:bg-surface focus:px-4 focus:py-2 focus:text-fg">{{ tr.t("a11y.skip") }}</a>
-  <header id="top" class="sticky top-0 z-40 border-b border-border bg-[oklch(98%_0.004_240_/_0.9)] backdrop-blur" x-data="mobileMenu">
+  <header id="top" class="sticky top-0 z-40 border-b border-border bg-[oklch(98%_0.004_240_/_0.9)] backdrop-blur" x-data="mobileMenu"
+          @htmx:before:request.window="close" @pageshow.window="close" @keydown.escape.window="close">
     <div class="mx-auto flex h-16 max-w-shell items-center justify-between gap-6 px-4 lg:px-8">
       <a href="/" class="flex items-center gap-2.5" aria-label="{{ tr.t("brand.home_aria") }}">
         <img src="{{ layout.asset("img/bikesnest-logo.png") }}" width="640" height="213" alt="" class="w-40">
@@ -205,20 +213,6 @@
     </div>
   </footer>
 
-  <!-- Load order matters. hx-alpine-compat registers itself through
-       `htmx.registerExtension` at parse time, so it must run after htmx.js and
-       before Alpine (deferred) — it hands the morph the old node's Alpine data
-       stack, which is what keeps component state (open menu, open modal) alive
-       across the whole-body swaps `hx-boost:inherited` now performs. htmx 4
-       gates registration only on `config.extensions` (default ""), so no
-       `hx-ext` attribute is needed: the extension is global once loaded. -->
-  <script src="{{ layout.asset("vendor/htmx.js") }}"></script>
-  <script src="{{ layout.asset("vendor/hx-alpine-compat.js") }}"></script>
-  <!-- app.js registers the Alpine CSP-build components; it must load (and register
-       the alpine:init listener) before the deferred Alpine script starts. -->
-  <script src="{{ layout.asset("js/app.js") }}"></script>
-  <script defer src="{{ layout.asset("vendor/alpine.min.js") }}"></script>
-  <script src="{{ layout.asset("js/auth.js") }}"></script>
   {% block scripts %}{% endblock %}
 </body>
 </html>

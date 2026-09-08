@@ -44,6 +44,7 @@ fn map_adapters_expose_the_same_contract() {
         "jumpTo",
         "fitBounds",
         "resize",
+        "destroy",
     ] {
         assert!(maplibre.contains(method), "MapLibre adapter lacks {method}");
         assert!(mapbox.contains(method), "Mapbox adapter lacks {method}");

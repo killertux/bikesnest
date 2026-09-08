@@ -7,7 +7,7 @@
  * method-call expressions, which the CSP evaluator parses without eval.
  *
  * Components must be registered before Alpine starts, so this file (loaded
- * synchronously, before the deferred Alpine script) only registers an
+ * before the deferred Alpine script) only registers an
  * `alpine:init` listener — the callback runs once the `Alpine` global exists.
  */
 document.addEventListener('alpine:init', function () {
@@ -107,6 +107,7 @@ document.addEventListener('alpine:init', function () {
     return {
       open: false,
       toggle: function () { this.open = !this.open; },
+      close: function () { this.open = false; },
     };
   });
 

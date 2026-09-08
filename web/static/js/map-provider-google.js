@@ -24,6 +24,8 @@
         encodeURIComponent(apiKey) + "&loading=async&v=weekly&libraries=marker&callback=" + callback;
       script.onerror = function () {
         delete window[callback];
+        loading = null;
+        script.remove();
         reject(new Error("Google Maps unavailable"));
       };
       document.head.appendChild(script);
@@ -37,6 +39,7 @@
 
   function GoogleAdapter(el, options) {
     this.loaded = false;
+    this.markers = new Set();
     this.raw = new window.google.maps.Map(el, {
       center: latLng(options.center),
       zoom: options.zoom,
@@ -82,6 +85,9 @@
     if (options.popup) {
       info = new window.google.maps.InfoWindow({ content: options.popup });
     }
+    var entry = { marker: marker, info: info };
+    var markers = this.markers;
+    markers.add(entry);
     if (options.onDragEnd) {
       marker.addListener("dragend", function () {
         var at = marker.position;
@@ -91,7 +97,12 @@
       });
     }
     return {
-      remove: function () { marker.map = null; },
+      remove: function () {
+        marker.map = null;
+        if (info) info.close();
+        window.google.maps.event.clearInstanceListeners(marker);
+        markers.delete(entry);
+      },
       getElement: function () { return options.element; },
       togglePopup: function () {
         if (!info) return;
@@ -141,6 +152,17 @@
   };
   GoogleAdapter.prototype.resize = function () {
     window.google.maps.event.trigger(this.raw, "resize");
+  };
+
+  GoogleAdapter.prototype.destroy = function () {
+    this.markers.forEach(function (entry) {
+      entry.marker.map = null;
+      if (entry.info) entry.info.close();
+      window.google.maps.event.clearInstanceListeners(entry.marker);
+    });
+    this.markers.clear();
+    window.google.maps.event.clearInstanceListeners(this.raw);
+    this.raw = null;
   };
 
   window.BikesNestMapProvider = {

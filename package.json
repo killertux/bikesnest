@@ -2,6 +2,7 @@
   "name": "bikesnest-frontend",
   "private": true,
   "scripts": {
+    "test:browser": "node --test tests/browser/*.test.cjs",
     "build:css": "tailwindcss -i web/static/css/input.css -o web/static/css/app.css --minify",
     "watch:css": "tailwindcss -i web/static/css/input.css -o web/static/css/app.css --watch",
     "build:assets": "mkdir -p web/static/vendor web/static/js && cp node_modules/htmx.org/dist/htmx.min.js web/static/vendor/htmx.js && cp node_modules/htmx.org/dist/ext/hx-alpine-compat.min.js web/static/vendor/hx-alpine-compat.js && cp node_modules/@alpinejs/csp/dist/cdn.min.js web/static/vendor/alpine.min.js && cp node_modules/maplibre-gl/dist/maplibre-gl.js web/static/vendor/maplibre-gl.js && cp node_modules/maplibre-gl/dist/maplibre-gl.css web/static/vendor/maplibre-gl.css && cp node_modules/mapbox-gl/dist/mapbox-gl.js web/static/vendor/mapbox-gl.js && cp node_modules/mapbox-gl/dist/mapbox-gl.css web/static/vendor/mapbox-gl.css"
@@ -14,5 +15,8 @@
     "mapbox-gl": "3.29.0",
     "maplibre-gl": "4.7.1",
     "tailwindcss": "^4.3.0"
+  },
+  "devDependencies": {
+    "playwright": "1.63.0"
   }
 }

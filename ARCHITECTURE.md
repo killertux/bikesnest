@@ -221,6 +221,21 @@ community signals, not direct updates to listing facts.
   fake with OpenFreeMap. The same profile controls direct geocoding,
   autocomplete, suggestion resolution, and map rendering.
 
+## Browser navigation
+
+Persistent htmx, Alpine and app scripts load once from the layout head. Whole-page
+boosted navigation uses a body sync swap to reset page-local state; targeted
+fragment swaps retain their declared behavior. The visibility extension in
+`web/static/js/navigation.js` preserves Alpine-owned `x-show` display during
+fragment morphs.
+
+Map pages declare an inert `template[data-map-assets]` containing their hashed
+stylesheet, SDK, adapter and consumer URLs. The navigation lifecycle loads these
+in order, caches successful loads, and signals consumers after swaps (including
+history restoration). Failed downloads can retry on subsequent navigation or
+reconnection. Map adapters expose `destroy`; detached maps and resize observers
+are disposed, while search-result fragment updates retain the live map.
+
 ## Data model
 
 Versioned, forward-only migrations in `migrations/`:

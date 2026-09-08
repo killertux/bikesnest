@@ -25,8 +25,7 @@
   function initReady() {
     var el = document.getElementById("pin-map");
     var provider = window.BikesNestMapProvider;
-    if (!el || !provider || el.dataset.initialized) return;
-    el.dataset.initialized = "1";
+    if (!el || !provider || el._bnMap) return;
 
     var latInput = document.getElementById(el.dataset.latInput || "lat");
     var lonInput = document.getElementById(el.dataset.lonInput || "lon");
@@ -55,6 +54,7 @@
       zoom: picked ? 17 : 14,
       navigation: true,
     });
+    window.BikesNestMaps.track(el, map);
 
     var markerEl = document.createElement("div");
     markerEl.className = "marker marker-pin";
@@ -99,6 +99,7 @@
     });
   }
 
+  document.addEventListener("bikesnest:maps-ready", init);
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", init);
   } else {
