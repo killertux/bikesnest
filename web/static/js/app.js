@@ -10,6 +10,39 @@
  * before the deferred Alpine script) only registers an
  * `alpine:init` listener — the callback runs once the `Alpine` global exists.
  */
+
+/* Search requests can outlive the `.search-page` that issued them when htmx
+ * restores history with a body swap. Keep request ownership at the document
+ * lifetime: a detached source is retargeted here by htmx, so stale fragments
+ * cannot update the new page's URL or out-of-band controls. */
+(function installSearchIntentGuard() {
+  var latestIntent = 0;
+  var searchSources = '#search-form, #search-sort-form, #search-filter-form, #search-browse-form, [data-search-clear], #results';
+
+  function isSearchSource(source) {
+    return source && source.closest && source.closest(searchSources);
+  }
+
+  function rejectStale(event) {
+    var intent = event.detail.ctx.bikesnestSearchIntent;
+    if (intent && intent !== latestIntent) event.preventDefault();
+  }
+
+  document.addEventListener('htmx:config:request', function (event) {
+    if (!isSearchSource(event.detail.ctx.sourceElement)) return;
+    latestIntent += 1;
+    event.detail.ctx.bikesnestSearchIntent = latestIntent;
+  }, true);
+  document.addEventListener('htmx:before:response', rejectStale, true);
+  document.addEventListener('htmx:after:request', rejectStale, true);
+  document.addEventListener('htmx:before:history:restore', function () {
+    latestIntent += 1;
+  }, true);
+  document.addEventListener('htmx:before:cleanup', function (event) {
+    if (event.target.matches && event.target.matches('.search-page')) latestIntent += 1;
+  }, true);
+})();
+
 document.addEventListener('alpine:init', function () {
   var Alpine = window.Alpine;
 
@@ -382,6 +415,22 @@ document.addEventListener('alpine:init', function () {
       moved: false,
       init: function () {
         var self = this;
+        /* htmx registers delegated bubbling listeners before Alpine starts.
+         * Capture makes these mirrors current before htmx serializes a changed
+         * filter form, and before a native form begins its submission. */
+        this.$el.addEventListener('change', function (event) {
+          if (event.target.closest('#search-sort-form, #search-filter-form')) {
+            self.syncSearchState();
+          }
+        }, true);
+        this.$el.addEventListener('submit', function (event) {
+          if (event.target.closest('#search-form, #search-sort-form, #search-filter-form, #search-browse-form')) {
+            self.syncSearchState();
+          }
+        }, true);
+        this.$el.addEventListener('click', function (event) {
+          if (event.target.closest('[data-search-clear]')) self.clearSearchState();
+        }, true);
         // Keep applied filters visible on arrival; otherwise lead with results.
         var params = new URLSearchParams(window.location.search);
         this.filtersOpen = ['type', 'cost', 'security', 'open_now', 'radius'].some(function (key) {
@@ -427,7 +476,87 @@ document.addEventListener('alpine:init', function () {
       get resultsClass() {
         return this.mapOpen ? 'lg:col-span-7' : 'lg:col-span-12';
       },
-      submitSort: function (e) { e.target.form.requestSubmit(); },
+      /* Every search source targets the same results region. htmx 4 shares a
+       * `#results:replace` queue between those sources; this synchronizes the
+       * hidden form mirrors *before* either a native or htmx submission so a
+       * filter click immediately after changing sort cannot submit stale sort
+       * state while the first response is still in flight. Deliberately leave
+       * q/coordinates/bbox alone: they identify the committed destination,
+       * rather than an address currently being typed but not yet submitted. */
+      syncSearchState: function () {
+        var root = this.$el;
+        var sort = root.querySelector('#search-sort-form select[name="sort"]');
+        var filters = root.querySelector('#search-filter-form');
+        if (!sort || !filters) return;
+
+        var values = {};
+        ['radius', 'cost', 'open_now'].forEach(function (name) {
+          var selected = filters.querySelector('[name="' + name + '"]:checked') ||
+            filters.querySelector('select[name="' + name + '"]');
+          values[name] = selected ? [selected.value] : [];
+        });
+        ['type', 'security'].forEach(function (name) {
+          values[name] = Array.prototype.map.call(
+            filters.querySelectorAll('[name="' + name + '"]:checked'),
+            function (input) { return input.value; }
+          );
+        });
+        values.sort = [sort.value];
+
+        root.querySelectorAll('[id$="-state"]').forEach(function (state) {
+          var form = state.closest('form');
+          if (!form) return;
+          Object.keys(values).forEach(function (name) {
+            // A form's visible control is already authoritative. Only update
+            // the hidden mirror it uses to carry another form's state.
+            if (form.querySelector(':scope > [name="' + name + '"]') ||
+                form.querySelector(':scope label [name="' + name + '"]') ||
+                form.querySelector(':scope fieldset [name="' + name + '"]')) return;
+            state.querySelectorAll('[name="' + name + '"]').forEach(function (input) {
+              input.remove();
+            });
+            values[name].forEach(function (value) {
+              var input = document.createElement('input');
+              input.type = 'hidden';
+              input.name = name;
+              input.value = value;
+              state.appendChild(input);
+            });
+          });
+        });
+      },
+      clearSearchState: function () {
+        var root = this.$el;
+        var filters = root.querySelector('#search-filter-form');
+        var sort = root.querySelector('#search-sort-form select[name="sort"]');
+        if (!filters || !sort) return;
+        filters.querySelectorAll('input[type="checkbox"]').forEach(function (input) { input.checked = false; });
+        var anyCost = filters.querySelector('input[name="cost"][value=""]');
+        if (anyCost) anyCost.checked = true;
+        var radius = filters.querySelector('select[name="radius"]');
+        if (radius) radius.value = '1000';
+        sort.value = 'recommended';
+        this.syncSearchState();
+
+        // Fragment responses replace hidden state but not this link. Rebuild
+        // its URL from the currently committed destination before htmx reads
+        // hx-get, so clearing after a new destination never revives the old one.
+        var state = root.querySelector('#search-filter-state');
+        var parts = [];
+        ['q', 'lat', 'lon', 'bbox'].forEach(function (name) {
+          var input = state && state.querySelector('[name="' + name + '"]');
+          if (input && input.value) parts.push(encodeURIComponent(name) + '=' + encodeURIComponent(input.value));
+        });
+        var url = '/search' + (parts.length ? '?' + parts.join('&') : '');
+        root.querySelectorAll('[data-search-clear]').forEach(function (link) {
+          link.setAttribute('href', url);
+          link.setAttribute('hx-get', url);
+        });
+      },
+      sortChanged: function (e) {
+        this.syncSearchState();
+        e.target.form.requestSubmit();
+      },
       locate: function () {
         var self = this;
         if (!navigator.geolocation) { return; }

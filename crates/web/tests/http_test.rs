@@ -19,6 +19,11 @@ async fn test_app() -> axum::Router {
         .expect("test config builds every provider")
 }
 
+fn scoped_test_app(db: Db) -> axum::Router {
+    bikesnest_web::app_router(std::sync::Arc::new(test_config()), db)
+        .expect("test config builds every provider")
+}
+
 /// GET and return only the response headers (for security-header asserts).
 async fn get_headers(uri: &str) -> HeaderMap {
     let app = test_app().await;
@@ -386,6 +391,106 @@ async fn search_renders_committed_fixture_rows_with_filters(tx: &mut TestTx) {
         .execute(&pool().await)
         .await
         .unwrap();
+}
+
+#[db_test]
+async fn search_accepts_repeated_checkbox_filters_and_rejects_duplicate_scalars(tx: &mut TestTx) {
+    use bikesnest_domain::ParkingType;
+
+    let db = tx.db().await;
+    let mut conn = db.acquire().await.unwrap();
+    ParkingBuilder::new()
+        .with_name("Repeated filters match")
+        .with_type(ParkingType::Rack)
+        .with_security("cctv", 1)
+        .with_security("well_lit", 1)
+        .at(-33.920_000, -70.620_000)
+        .create(&mut conn)
+        .await
+        .unwrap();
+    ParkingBuilder::new()
+        .with_name("Missing lighting")
+        .with_type(ParkingType::Indoor)
+        .with_security("cctv", 1)
+        .at(-33.920_200, -70.620_000)
+        .create(&mut conn)
+        .await
+        .unwrap();
+    ParkingBuilder::new()
+        .with_name("Wrong type")
+        .with_type(ParkingType::Locker)
+        .with_security("cctv", 1)
+        .with_security("well_lit", 1)
+        .at(-33.920_400, -70.620_000)
+        .create(&mut conn)
+        .await
+        .unwrap();
+    drop(conn);
+
+    let app = scoped_test_app(db);
+    for query in [
+        "type=rack&type=indoor&security=cctv&security=well_lit",
+        "type=rack,indoor&security=cctv,well_lit",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/search?lat=-33.920000&lon=-70.620000&radius=1000&{query}"
+                    ))
+                    .header("Accept-Language", "en")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "query: {query}");
+        let body =
+            String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+                .to_string();
+        assert!(
+            body.contains("Repeated filters match"),
+            "query: {query}\n{body}"
+        );
+        assert!(!body.contains("Missing lighting"), "query: {query}\n{body}");
+        assert!(!body.contains("Wrong type"), "query: {query}\n{body}");
+    }
+
+    for (language, message, fragment) in [
+        (
+            "en",
+            "That search link is invalid. Check it and try again.",
+            false,
+        ),
+        (
+            "pt-BR",
+            "Esse link de busca é inválido. Confira e tente novamente.",
+            true,
+        ),
+    ] {
+        let mut request = Request::builder()
+            .uri("/search?lat=-33.920000&lat=-33.920001&lon=-70.620000")
+            .header("Accept-Language", language);
+        if fragment {
+            request = request
+                .header("HX-Request", "true")
+                .header("HX-Target", "results")
+                .header("HX-Request-Type", "partial");
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body =
+            String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+                .to_string();
+        assert!(body.contains(message), "localized malformed-query message");
+        assert_eq!(body.contains("<html"), !fragment, "response shape");
+        assert!(!body.contains("bad search query"), "no parser detail leaks");
+    }
 }
 
 /// Stored-XSS regression: a user-controlled `name`/`address` containing

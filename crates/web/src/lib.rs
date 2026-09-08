@@ -358,8 +358,8 @@ impl SearchPageVm {
     fn open_now_checked(&self) -> bool {
         self.form.open_now == "true"
     }
-    fn q_set(&self) -> bool {
-        !self.form.q.is_empty()
+    fn clear_filters_url(&self) -> String {
+        self.form.clear_filters_url()
     }
     fn radius_is(&self, m: u32) -> bool {
         self.form.radius == Some(m)

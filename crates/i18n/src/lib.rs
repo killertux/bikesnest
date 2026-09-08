@@ -729,6 +729,10 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
             "Type a destination (or use your location) to find parking nearby.",
             "Digite um destino (ou use sua localização) para encontrar vagas por perto.",
         ),
+        "search.invalid" => (
+            "That search link is invalid. Check it and try again.",
+            "Esse link de busca é inválido. Confira e tente novamente.",
+        ),
         "search.geocode_unavailable" => (
             "The location service is temporarily unavailable. Try again in a moment.",
             "O serviço de localização está temporariamente indisponível. Tente novamente em instantes.",

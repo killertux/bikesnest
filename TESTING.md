@@ -58,6 +58,9 @@ loopback ephemeral port, and never contacts external providers:
 ```bash
 TEST_DATABASE_URL=postgres://bikesnest:bikesnest@localhost:5432/bikesnest_test \
   cargo test -p bikesnest-web --test csrf_browser_test --locked -- --ignored
+
+TEST_DATABASE_URL=postgres://bikesnest:bikesnest@localhost:5432/bikesnest_test \
+  cargo test -p bikesnest-web --test search_browser_test --locked -- --ignored
 ```
 
 It is explicitly ignored in ordinary workspace runs because spawning a browser

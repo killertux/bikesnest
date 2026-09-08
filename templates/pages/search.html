@@ -22,6 +22,7 @@
       id="search-form"
       action="/search" method="get"
       hx-get="/search" hx-target="#results" hx-swap="innerHTML"
+      hx-sync="#results:replace"
       hx-push-url="true" hx-indicator="#results-indicator"
       role="search"
       class="search-query mt-6 flex flex-col items-stretch gap-2 rounded-2xl border border-border bg-surface p-2 shadow-[0_8px_24px_oklch(20%_0.02_240/0.04)] md:flex-row md:items-center"
@@ -107,12 +108,12 @@
           <svg aria-hidden="true" class="h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.1 5.5 9.9 3.8 4 6v15l5.9-2.2 4.2 1.7 5.9-2.3V3.7Z" /><path d="M9.9 3.8v15" /><path d="M14.1 5.5v15" /></svg>
           <span x-text="mapOpen ? '{{ tr.t("search.map.hide") }}' : '{{ tr.t("search.map.show") }}'">{{ tr.t("search.map.show") }}</span>
         </button>
-        <form action="/search" method="get" hx-get="/search" hx-target="#results" hx-swap="innerHTML" hx-push-url="true" hx-indicator="#results-indicator" class="flex items-center gap-2.5">
+        <form id="search-sort-form" action="/search" method="get" hx-get="/search" hx-target="#results" hx-swap="innerHTML" hx-sync="#results:replace" hx-push-url="true" hx-indicator="#results-indicator" @submit="syncSearchState" class="flex items-center gap-2.5">
           <span id="search-sort-state" hidden>{% call state::hidden(form, false, true, false, false, false) %}</span>
           <label class="flex items-center gap-2 text-sm text-muted">
             {{ tr.t("search.sort.label") }}
             <select
-              name="sort" @change="submitSort"
+              name="sort" @change="sortChanged"
               class="h-9 max-w-[75%] flex-1 rounded-lg border border-border bg-surface px-2.5 text-sm font-medium text-fg focus:border-accent md:max-w-52 md:flex-none"
             >
               <option value="recommended" {% if sort_is("recommended") || sort_none() %}selected{% endif %}>{{ tr.t("search.sort.recommended") }}</option>
@@ -135,13 +136,15 @@
     <div id="search-filter-panel" x-show="filtersOpen" class="search-filter-panel mt-4 rounded-2xl border border-border bg-surface p-6 [&_label]:min-h-7 [&_fieldset]:min-w-0">
       <div class="flex items-center justify-between">
         <h2 class="font-display text-sm font-semibold uppercase tracking-wide text-muted">{{ tr.t("search.filters.results") }}</h2>
-        <a href="/search{% if q_set() %}?q={{ form.q|urlencode }}{% endif %}" class="text-sm font-medium text-accent-strong hover:text-accent-dark">{{ tr.t("search.filters.clear") }}</a>
+        <a data-search-clear href="{{ clear_filters_url() }}" hx-get="{{ clear_filters_url() }}" hx-target="#results" hx-swap="innerHTML" hx-sync="#results:replace" hx-push-url="true" hx-indicator="#results-indicator" @click="clearSearchState" class="text-sm font-medium text-accent-strong hover:text-accent-dark">{{ tr.t("search.filters.clear") }}</a>
       </div>
       <form
         action="/search" method="get"
-        hx-get="/search" hx-target="#results" hx-swap="innerHTML"
-        hx-trigger="change from:input[type='checkbox'], change from:input[type='radio'], change from:select"
+        id="search-filter-form"
+        hx-get="/search" hx-target="#results" hx-swap="innerHTML" hx-sync="#results:replace"
+        hx-trigger="change"
         hx-push-url="true" hx-indicator="#results-indicator"
+        @change="syncSearchState" @submit="syncSearchState"
         class="mt-5 grid gap-6 sm:grid-cols-2 xl:grid-cols-4"
       >
         <span id="search-filter-state" hidden>{% call state::hidden(form, false, false, true, false, false) %}</span>
@@ -230,8 +233,10 @@
               <form
                 x-show="moved" x-cloak
                 action="/search" method="get"
-                hx-get="/search" hx-target="#results" hx-swap="innerHTML"
+                id="search-browse-form"
+                hx-get="/search" hx-target="#results" hx-swap="innerHTML" hx-sync="#results:replace"
                 hx-push-url="true" hx-indicator="#results-indicator"
+                @submit="syncSearchState"
                 class="absolute inset-x-0 bottom-3 flex justify-center"
               >
                 <span id="search-browse-state" hidden>{% call state::browse(form) %}</span>
@@ -265,7 +270,7 @@
              every re-search. #}
           <script type="application/json" id="search-data">{{ results.map_json|safe }}</script>
           <!-- HTMX loading overlay -->
-          <div id="results-indicator" class="htmx-indicator absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-[oklch(98%_0.004_240_/_0.7)]" aria-hidden="true">
+          <div id="results-indicator" class="htmx-indicator pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-[oklch(98%_0.004_240_/_0.7)]" aria-hidden="true">
             <span class="inline-flex items-center gap-2.5 rounded-xl border border-border bg-surface px-4 py-2.5 text-sm font-medium text-fg shadow-pop">{{ tr.t("search.updating") }}</span>
           </div>
           <div id="results" role="list" aria-label="{{ tr.t("search.results_aria") }}" class="space-y-4">

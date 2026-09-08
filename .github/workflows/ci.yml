@@ -123,6 +123,8 @@ jobs:
         run: cargo test --workspace --locked
       - name: Test rendered CSRF lifecycle in Chromium
         run: cargo test -p bikesnest-web --test csrf_browser_test --locked -- --ignored
+      - name: Test rendered search synchronization in Chromium
+        run: cargo test -p bikesnest-web --test search_browser_test --locked -- --ignored
 
   frontend-assets:
     name: Frontend assets
