@@ -368,6 +368,29 @@ async fn cursor_roundtrip_and_mismatched_sort_are_handled() {
     assert!(request.cursor.is_none());
 }
 
+#[test]
+fn cursor_preserves_the_exact_floating_point_sort_key() {
+    // Distance of a row at the page boundary in the SQL pagination fixture.
+    // Even one bit of rounding can include that same row on the next page.
+    let anchor = 199.775_565_459_538_63_f64;
+    for bits in (anchor.to_bits() - 4)..=(anchor.to_bits() + 4) {
+        let c = Cursor {
+            sort: bikesnest_application::Sort::Distance,
+            v: f64::from_bits(bits),
+            id: 77,
+        };
+        let decoded = Cursor::decode(&c.encode()).unwrap();
+        assert_eq!(
+            decoded.v.to_bits(),
+            bits,
+            "cursor rounded {} to {}",
+            c.v,
+            decoded.v
+        );
+        assert_eq!(decoded.id, c.id);
+    }
+}
+
 #[tokio::test]
 async fn filters_parse_from_input() {
     let input = SearchInput {
