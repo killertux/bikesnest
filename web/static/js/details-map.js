@@ -25,11 +25,10 @@
 
   function initOne(el) {
     var provider = window.BikesNestMapProvider;
-    if (!el || !provider || el.dataset.initialized) return;
+    if (!el || !provider || el._bnMap) return;
     var lat = num(el.dataset.lat);
     var lon = num(el.dataset.lon);
     if (lat === null || lon === null) return;
-    el.dataset.initialized = "1";
 
     // The optional "before" point. Absent for the details page, and absent for
     // a location that had no coordinates before the proposal.
@@ -42,7 +41,9 @@
       zoom: 17,
       navigation: true,
     });
+    window.BikesNestMaps.track(el, map);
     map.onLoad(function () {
+      if (!el.isConnected) return;
       if (hasFrom) {
         addMarker(map, fromLon, fromLat, "marker marker-before", el.dataset.currentLabel);
       }
@@ -71,6 +72,7 @@
     }).catch(function () { /* The rest of the page remains usable. */ });
   }
 
+  document.addEventListener("bikesnest:maps-ready", init);
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", init);
   } else {

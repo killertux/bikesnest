@@ -23,6 +23,16 @@ below), so a repository's error-classification logging is visible with:
 RUST_LOG=info cargo test -- --nocapture
 ```
 
+## Browser navigation regressions
+
+`npm ci && npx playwright install chromium && npm run test:browser` runs
+Chromium against a local fixture server using the real layout asset declarations,
+map-page manifests, htmx, Alpine and consumer scripts. External map services are
+stubbed with delayed responses; no database, account or API key is needed.
+The suite covers mobile menus, history navigation, every map consumer and
+provider configuration, and retry after an asset failure. CI installs Chromium
+with its system dependencies and runs these tests in the Frontend assets job.
+
 ## The four layers
 
 | Layer | Where | Kind | Needs DB? |

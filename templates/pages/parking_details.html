@@ -428,6 +428,13 @@
 {% endblock %}
 
 {% block scripts %}
+<template data-map-assets>
+{% if layout.uses_maplibre() %}
+<link rel="stylesheet" href="{{ layout.asset("vendor/maplibre-gl.css") }}">
+{% else if layout.uses_mapbox() %}
+<link rel="stylesheet" href="{{ layout.asset("vendor/mapbox-gl.css") }}">
+{% endif %}
+<link rel="stylesheet" href="{{ layout.asset("css/map.css") }}">
 {% if layout.uses_maplibre() %}
 <script src="{{ layout.asset("vendor/maplibre-gl.js") }}"></script>
 <script src="{{ layout.asset("js/map-provider-maplibre.js") }}"></script>
@@ -438,4 +445,5 @@
 <script src="{{ layout.asset("js/map-provider-google.js") }}"></script>
 {% endif %}
 <script src="{{ layout.asset("js/details-map.js") }}"></script>
+</template>
 {% endblock %}

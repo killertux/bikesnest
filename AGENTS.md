@@ -45,6 +45,7 @@ that data. Bilingual (en + pt-BR). Works on mobile and desktop browsers.
 | Database schema | `migrations/` (numbered `NNNN_*.sql`, forward-only) |
 | Templates | `templates/` (`layouts/`, `pages/`, `components/`, `partials/`) |
 | Frontend assets | `web/static/` (`css/`, `js/`, `vendor/`, `img/`) |
+| Browser navigation / lazy map lifecycle | `web/static/js/navigation.js`; map pages declare `template[data-map-assets]`; browser regressions in `tests/browser/` |
 | Tailwind entry / build | `web/static/css/input.css`, `package.json` scripts (`build:css`, `watch:css`, `build:assets`) |
 | Legal page text | `policies/{privacy,terms,cookies}.{pt-BR,en}.md` |
 | Test harness & builders | `crates/test-support/src/`, `crates/test-macros/src/` |

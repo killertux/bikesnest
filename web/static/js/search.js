@@ -259,6 +259,7 @@
 
     if (!st.map) {
       st.map = provider.createMap(mapEl, { center: center, zoom: zoom, navigation: true });
+      window.BikesNestMaps.track(mapEl, st.map);
       var recenter = document.getElementById("recenter");
       if (recenter) {
         recenter.addEventListener("click", function () {
@@ -277,6 +278,7 @@
         publishBounds(mapEl, st.map);
       });
       st.map.onLoad(function () {
+        if (!mapEl.isConnected) return;
         renderMarkers(st.map, st, readData() || data, labels);
         if (bbox) {
           st.ignoreMove++;
@@ -336,21 +338,17 @@
       else init();
     });
     ro.observe(mapEl);
+    window.BikesNestMaps.observe(mapEl, ro);
   }
 
-  // Bind delegated + HTMX listeners exactly once. A boosted navigation swaps
-  // <body> and re-runs this file, so the guard is what stops the handlers from
-  // stacking up. These sit on `document`, which no swap replaces, and they
-  // re-resolve #map on every call — so none of them can hold a stale map.
+  // Bind once. The navigation lifecycle signals readiness after both page
+  // and results-fragment swaps; each callback resolves the current container.
   if (!window.__bnSearchBound) {
     window.__bnSearchBound = true;
+    document.addEventListener("bikesnest:maps-ready", init);
     document.addEventListener("click", function (e) {
       var card = e.target.closest("[data-parking-id]");
       if (card) select(Number(card.dataset.parkingId));
-    });
-    // Re-render markers after an HTMX results-fragment swap (htmx 4 event).
-    document.addEventListener("htmx:after:swap", function () {
-      setTimeout(init, 0);
     });
     /* The panel was shown or hidden. `x-show` flips `display` as part of the
      * same task, so the size is only real on the next frame — hence the

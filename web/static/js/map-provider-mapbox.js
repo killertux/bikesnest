@@ -91,6 +91,8 @@
   };
   MapboxAdapter.prototype.resize = function () { this.raw.resize(); };
 
+  MapboxAdapter.prototype.destroy = function () { this.raw.remove(); };
+
   window.BikesNestMapProvider = {
     name: "mapbox",
     ready: function () {

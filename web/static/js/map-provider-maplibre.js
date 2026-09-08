@@ -91,6 +91,8 @@
   };
   MapLibreAdapter.prototype.resize = function () { this.raw.resize(); };
 
+  MapLibreAdapter.prototype.destroy = function () { this.raw.remove(); };
+
   window.BikesNestMapProvider = {
     name: "maplibre",
     ready: function () {
