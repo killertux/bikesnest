@@ -396,8 +396,8 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
             "Transparência sem expor pessoas",
         ),
         "collab.privacy_body" => (
-            "Only vote totals are public. Authors appear as anonymous unless they choose to show a public name. This preview uses no real contributor identities.",
-            "Apenas os totais de votos são públicos. Autores aparecem como anônimos, a menos que escolham exibir um nome público. Esta prévia não usa identidades reais.",
+            "Only vote totals are public. Authors can hide their public name in account settings. This preview uses no real contributor identities.",
+            "Apenas os totais de votos são públicos. Autores podem ocultar seu nome público nas configurações da conta. Esta prévia não usa identidades reais.",
         ),
         "collab.editor_help" => (
             "Change only what needs updating. You’ll review the differences before sharing.",
@@ -543,13 +543,58 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "collab.sample_price" => ("R$ 5 / hour", "R$ 5 / hora"),
         "collab.sample_hours" => ("08:00–20:00", "08:00–20:00"),
         "collab.anonymous" => ("Anonymous cyclist", "Ciclista anônimo"),
+        "account.explore" => ("Explore the map", "Explorar o mapa"),
+        "account.welcome" => ("Good to see you here", "Que bom ter você por aqui"),
+        "account.cyclist" => ("Cyclist", "Ciclista"),
+        "account.intro" => (
+            "Your saved spots, your contributions, and a better map for everyone.",
+            "Seus locais favoritos, suas contribuições e um mapa melhor para todo mundo.",
+        ),
+        "account.favorites_desc" => (
+            "Keep your go-to parking spots close.",
+            "Seus lugares de sempre, fáceis de encontrar.",
+        ),
+        "account.contributions_desc" => (
+            "See what you’ve added to the community map.",
+            "Veja o que você já compartilhou no mapa.",
+        ),
+        "account.community" => ("You in the community", "Você na comunidade"),
+        "account.visibility_title" => (
+            "A name behind every contribution",
+            "Suas contribuições, do seu jeito",
+        ),
+        "account.visibility_intro" => (
+            "Let other cyclists see who helped. You choose whether your name appears.",
+            "Mostre a outros ciclistas quem ajudou. Você escolhe se seu nome aparece.",
+        ),
+        "account.email_desc" => (
+            "Update where we can reach you.",
+            "Atualize seu endereço de contato.",
+        ),
+        "account.password_desc" => ("Manage how you sign in.", "Cuide do acesso à sua conta."),
+        "account.privacy_desc" => (
+            "Export your data or manage privacy requests.",
+            "Exporte seus dados ou gerencie solicitações.",
+        ),
+        "auth.name_visibility_hint" => (
+            "Your display name appears on new reviews and change proposals by default. You can turn this off in your account before contributing. Your email is never shown as your public name.",
+            "Seu nome aparece em novas avaliações e propostas de alteração por padrão. Você pode desativar isso na sua conta antes de contribuir. Seu e-mail nunca é exibido como nome público.",
+        ),
+        "account.attribution.summary" => (
+            "On for new accounts. Turn off and save to hide your name from past and future contributions. Your email stays private.",
+            "Ativado para novas contas. Desative e salve para ocultar seu nome das contribuições anteriores e futuras. Seu e-mail continua privado.",
+        ),
+        "account.attribution.details" => (
+            "How name visibility works",
+            "Como funciona a visibilidade do nome",
+        ),
         "account.attribution.label" => (
             "Show my display name on new reviews and proposals",
             "Mostrar meu nome em novas avaliações e propostas",
         ),
         "account.attribution.help" => (
-            "Off by default. Your display name will be visible to everyone on new contributions only; old anonymous contributions stay anonymous, even if edited. Turning this off removes your name from existing contributions and does not restore it if enabled again. If you have no display name, you remain anonymous. Voter identities are never shown.",
-            "Desativado por padrão. Seu nome ficará visível para todos apenas em novas contribuições; contribuições antigas anônimas continuam anônimas, mesmo se editadas. Desativar remove seu nome das contribuições existentes, sem restaurá-lo se você ativar novamente. Sem um nome definido, você continua anônimo. A identidade de quem votou nunca é exibida.",
+            "On by default for new accounts. Turn this off to contribute anonymously. Your name appears on new reviews and change proposals; old anonymous contributions stay anonymous, even if edited. Turning this off removes your name from existing contributions and does not restore it if enabled again. If you have no display name, you remain anonymous. Voter identities are never shown.",
+            "Ativado por padrão para novas contas. Desative para contribuir anonimamente. Seu nome aparece em novas avaliações e propostas de alteração; contribuições antigas anônimas continuam anônimas, mesmo se editadas. Desativar remove seu nome das contribuições existentes, sem restaurá-lo se você ativar novamente. Sem um nome definido, você continua anônimo. A identidade de quem votou nunca é exibida.",
         ),
         "account.attribution.save" => (
             "Save privacy preference",

@@ -29,7 +29,7 @@ Ao enviar Conteúdo, você declara e garante que:
 
 ### 3.3 Licença que você nos concede
 
-Você mantém a titularidade do seu Conteúdo. Para que o serviço funcione, você nos concede uma licença **mundial, não exclusiva, gratuita, irrevogável e por prazo indeterminado** para hospedar, armazenar, reproduzir, adaptar (redimensionar, recortar, gerar miniaturas e remover metadados), publicar, exibir e distribuir o Conteúdo como parte do BikesNest e de seu acervo colaborativo, inclusive após a exclusão da sua conta. Você concorda que suas contribuições sejam exibidas **sem indicação de autoria** (de forma anônima), e que permaneçam no acervo, anonimizadas, depois que sua conta for excluída.
+Você mantém a titularidade do seu Conteúdo. Para que o serviço funcione, você nos concede uma licença **mundial, não exclusiva, gratuita, irrevogável e por prazo indeterminado** para hospedar, armazenar, reproduzir, adaptar (redimensionar, recortar, gerar miniaturas e remover metadados), publicar, exibir e distribuir o Conteúdo como parte do BikesNest e de seu acervo colaborativo, inclusive após a exclusão da sua conta. Seu nome de exibição aparece em novas avaliações e propostas de alteração conforme a configuração de visibilidade da sua conta, ativada por padrão para novas contas e que pode ser desativada a qualquer momento. Contribuições anteriores anônimas continuam anônimas. As contribuições permanecem no acervo, anonimizadas, depois que sua conta for excluída. Veja na [Política de Privacidade](/privacy) como funciona a visibilidade do nome.
 
 ### 3.4 Indenização
 

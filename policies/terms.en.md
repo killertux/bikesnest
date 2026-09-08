@@ -29,7 +29,7 @@ By submitting Content you represent and warrant that:
 
 ### 3.3 Licence you grant us
 
-You keep ownership of your Content. So that the service can operate, you grant us a **worldwide, non-exclusive, royalty-free, irrevocable licence of indefinite duration** to host, store, reproduce, adapt (resize, crop, generate thumbnails and strip metadata), publish, display and distribute the Content as part of BikesNest and its community dataset, including after your account is deleted. You agree that your contributions are displayed **without attribution** (anonymously) and that they remain in the dataset, anonymised, after your account is deleted.
+You keep ownership of your Content. So that the service can operate, you grant us a **worldwide, non-exclusive, royalty-free, irrevocable licence of indefinite duration** to host, store, reproduce, adapt (resize, crop, generate thumbnails and strip metadata), publish, display and distribute the Content as part of BikesNest and its community dataset, including after your account is deleted. Your display name appears on new reviews and change proposals according to your account visibility setting, which is on by default for new accounts and can be turned off at any time. Earlier anonymous contributions stay anonymous. Contributions remain in the dataset, anonymised, after your account is deleted. See the [Privacy Policy](/privacy) for how name visibility works.
 
 ### 3.4 Indemnity
 
