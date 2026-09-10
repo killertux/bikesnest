@@ -9,6 +9,7 @@
 |---|---|---|---|
 | password-reset token | 1 hour | `expires_at` + retention purge | technical default |
 | email-verification token | 24 hours | `expires_at` + retention purge | technical default |
+| transactional-mail recipient/link payload | until terminal delivery outcome, account deletion, or first successful retention sweep after token expiry | immediate terminal/deletion redaction; daily retention sweep for expired pending/retrying rows | token usability ends at its database `expires_at`; payload erasure can be delayed while jobs/retention are disabled or unavailable |
 | session | 30 days idle / 90-day absolute cap | cookie Max-Age + `expires_at` + purge | technical default |
 | "I parked here" | 90 days | `expires_at` + purge (and on deletion) | technical default |
 | temporary privacy exports | 24 hours | `expires_at` + purge | technical default |
@@ -71,6 +72,19 @@ fails if a metadata key appears that has not been classified.
   `cargo run -p bikesnest-web -- retention` (schedule it daily; see
   `docs/deployment.md`). The same steps run as the recurring `retention`
   background job.
+- Mail delivery locks the account row, validates the exact account, purpose,
+  recipient, token hash and database expiry, and holds that lock through the
+  bounded provider call. If deletion commits first, even a worker's preclaimed
+  in-memory payload is rejected. If the provider accepts first, deletion waits;
+  that already-accepted external copy cannot be recalled. A timeout or lost
+  database connection can leave the external acceptance outcome ambiguous, so
+  this is not a distributed exactly-once guarantee.
+- Terminal mail jobs retain only lifecycle metadata and a bounded error code;
+  recipient/link JSON is cleared. Account deletion clears it in every queue
+  state. Expired active rows are cleared by the next successful retention run,
+  normally within the daily schedule, but no wall-clock erasure bound applies
+  during an outage or when workers are disabled. Database backups are not
+  rewritten: copies age out under the separately approved backup policy.
 - The **orphan media sweep** lists the object store, a page at a time, under the
   `uploads/` prefix: it gates on age first, then probes the database in batches
   for keys a photo row still references, and deletes what is aged and

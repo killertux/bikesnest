@@ -78,7 +78,7 @@ pub fn job_services(
             repo.clone(),
             config.jobs.history_retention_days,
         )),
-        Box::new(SendEmailHandler::new(email)),
+        Box::new(SendEmailHandler::new(db.clone(), email)),
     ];
     let recurring = vec![
         RecurringKind {

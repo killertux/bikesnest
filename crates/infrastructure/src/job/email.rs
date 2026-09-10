@@ -13,6 +13,8 @@
 //! before sending) drops mail instead, and a duplicate verification link is
 //! the better failure.
 
+use crate::Db;
+use crate::email::token_hash_from_link;
 use async_trait::async_trait;
 use bikesnest_application::{
     EmailMessage, EmailProvider, JOB_EMAIL_SEND, JobError, JobHandler, JobPayload,
@@ -20,12 +22,13 @@ use bikesnest_application::{
 use std::sync::Arc;
 
 pub struct SendEmailHandler {
+    db: Db,
     provider: Arc<dyn EmailProvider>,
 }
 
 impl SendEmailHandler {
-    pub fn new(provider: Arc<dyn EmailProvider>) -> Self {
-        Self { provider }
+    pub fn new(db: Db, provider: Arc<dyn EmailProvider>) -> Self {
+        Self { db, provider }
     }
 }
 
@@ -37,29 +40,90 @@ impl JobHandler for SendEmailHandler {
 
     async fn run(&self, payload: &JobPayload) -> Result<(), JobError> {
         let msg = decode(payload)?;
-        self.provider.send(&msg).await.map_err(|e| {
-            JobError::Failed(format!(
-                "sending {} to {} failed: {e}",
-                msg.kind.code(),
-                msg.recipient_domain()
-            ))
-        })
+        let token_hash = token_hash_from_link(msg.kind.link())
+            .ok_or_else(|| JobError::Permanent("mail link is invalid".into()))?;
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|_| JobError::Failed("mail lifecycle database unavailable".into()))?;
+        let mut tx = conn
+            .begin()
+            .await
+            .map_err(|_| JobError::Failed("mail lifecycle database unavailable".into()))?;
+        // Longer than the bounded provider call, so PostgreSQL cannot release
+        // the account lock while a healthy delivery is in flight.
+        sqlx::query("SET LOCAL idle_in_transaction_session_timeout = '15s'")
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| JobError::Failed("mail lifecycle database unavailable".into()))?;
+        let state: Option<String> =
+            sqlx::query_scalar("SELECT account_state::text FROM users WHERE id = $1 FOR UPDATE")
+                .bind(msg.account_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|_| JobError::Failed("mail lifecycle database unavailable".into()))?;
+        let eligible = match (msg.kind.code(), state.as_deref()) {
+            ("verify", Some("PENDING_EMAIL_VERIFICATION" | "ACTIVE")) => {
+                sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM email_verification_tokens WHERE token_hash=$1 AND user_id=$2 AND email=$3 AND used_at IS NULL AND expires_at > clock_timestamp())")
+                    .bind(&token_hash).bind(msg.account_id).bind(&msg.to).fetch_one(&mut *tx).await
+            }
+            ("change", Some("ACTIVE")) => {
+                sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM email_verification_tokens WHERE token_hash=$1 AND user_id=$2 AND email=$3 AND used_at IS NULL AND expires_at > clock_timestamp())")
+                    .bind(&token_hash).bind(msg.account_id).bind(&msg.to).fetch_one(&mut *tx).await
+            }
+            ("reset", Some("PENDING_EMAIL_VERIFICATION" | "ACTIVE")) => {
+                sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM password_reset_tokens t JOIN users u ON u.id=t.user_id WHERE t.token_hash=$1 AND t.user_id=$2 AND u.email=$3 AND t.used_at IS NULL AND t.expires_at > clock_timestamp())")
+                    .bind(&token_hash).bind(msg.account_id).bind(&msg.to).fetch_one(&mut *tx).await
+            }
+            _ => Ok(false),
+        }.map_err(|_| JobError::Failed("mail lifecycle database unavailable".into()))?;
+        if !eligible {
+            tx.rollback()
+                .await
+                .map_err(|_| JobError::Failed("mail lifecycle database unavailable".into()))?;
+            return Err(JobError::Permanent(
+                "mail credential is no longer deliverable".into(),
+            ));
+        }
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(10), self.provider.send(&msg))
+                .await;
+        match result {
+            Ok(Ok(())) => tx.commit().await.map_err(|_| {
+                JobError::Failed("mail delivery outcome could not be recorded".into())
+            }),
+            Ok(Err(_)) => {
+                tx.rollback()
+                    .await
+                    .map_err(|_| JobError::Failed("mail lifecycle database unavailable".into()))?;
+                Err(JobError::Failed(format!(
+                    "{} mail provider failed",
+                    msg.kind.code()
+                )))
+            }
+            Err(_) => {
+                tx.rollback()
+                    .await
+                    .map_err(|_| JobError::Failed("mail lifecycle database unavailable".into()))?;
+                Err(JobError::Failed(
+                    "mail provider timed out; delivery outcome unknown".into(),
+                ))
+            }
+        }
     }
 
     /// A dead-lettered email is a user who is stuck: no verification link, no
     /// password reset. Log it at `error!` so it is alertable — with the message
-    /// kind and the recipient's *domain* only. The address itself is personal
-    /// data and the link is a live credential; neither belongs in a log line.
-    async fn on_dead_letter(&self, payload: &JobPayload, error: &str) {
+    /// allowlisted message kind only. The address, domain, provider response
+    /// and link are untrusted or personal; none belongs in this log line.
+    async fn on_dead_letter(&self, payload: &JobPayload, _error: &str) {
         match decode(payload) {
             Ok(msg) => tracing::error!(
                 kind = msg.kind.code(),
-                recipient_domain = msg.recipient_domain(),
-                locale = msg.locale.as_str(),
-                error,
                 "transactional email dead-lettered; the recipient never got it"
             ),
-            Err(_) => tracing::error!(error, "email.send dead-lettered with an unreadable payload"),
+            Err(_) => tracing::error!("email.send dead-lettered with an unreadable payload"),
         }
     }
 }
@@ -68,69 +132,16 @@ impl JobHandler for SendEmailHandler {
 /// another version of the app (or by hand): permanent, not retryable.
 fn decode(payload: &JobPayload) -> Result<EmailMessage, JobError> {
     serde_json::from_value(payload.clone())
-        .map_err(|e| JobError::Permanent(format!("unreadable email.send payload: {e}")))
+        .map_err(|_| JobError::Permanent("unreadable email.send payload".into()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::email::FakeEmailProvider;
-    use bikesnest_application::{EmailError, EmailKind};
-    use bikesnest_domain::LocaleCode;
-
-    fn payload(locale: LocaleCode) -> JobPayload {
-        serde_json::to_value(EmailMessage::new(
-            "ada@example.com",
-            locale,
-            EmailKind::VerifyEmail {
-                link: "https://bikesnest.test/verify-email?token=t".into(),
-            },
-        ))
-        .unwrap()
-    }
-
-    /// A provider that always fails, to check the error classification.
-    struct BrokenProvider;
-    #[async_trait]
-    impl EmailProvider for BrokenProvider {
-        async fn send(&self, _msg: &EmailMessage) -> Result<(), EmailError> {
-            Err(EmailError::Unavailable)
-        }
-    }
-
-    #[tokio::test]
-    async fn runs_the_payload_through_the_provider_in_its_locale() {
-        let fake = FakeEmailProvider::with_root(None);
-        let handler = SendEmailHandler::new(Arc::new(fake.clone()));
-        handler.run(&payload(LocaleCode::PtBr)).await.unwrap();
-
-        let sent = fake.emails();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].locale, "pt-BR");
-        assert_eq!(sent[0].subject, "Confirme seu e-mail no BikesNest");
-    }
-
-    #[tokio::test]
-    async fn a_provider_failure_is_transient_so_the_queue_retries() {
-        let handler = SendEmailHandler::new(Arc::new(BrokenProvider));
-        let err = handler.run(&payload(LocaleCode::En)).await.unwrap_err();
-        assert!(matches!(err, JobError::Failed(_)), "{err:?}");
-        // The error text names the kind and the domain, never the address.
-        let text = err.to_string();
-        assert!(
-            text.contains("verify") && text.contains("example.com"),
-            "{text}"
-        );
-        assert!(!text.contains("ada@"), "the address must not reach a log");
-    }
-
-    #[tokio::test]
-    async fn an_unreadable_payload_is_permanent_so_it_is_not_retried() {
-        let handler = SendEmailHandler::new(Arc::new(FakeEmailProvider::with_root(None)));
-        let err = handler
-            .run(&serde_json::json!({"to": "a@example.com"}))
-            .await
-            .unwrap_err();
+    #[test]
+    fn unreadable_payload_errors_are_bounded_and_secret_free() {
+        let err = decode(&serde_json::json!({"locale": "SECRET-MARKER"})).unwrap_err();
         assert!(matches!(err, JobError::Permanent(_)), "{err:?}");
+        assert_eq!(err.to_string(), "unreadable email.send payload");
     }
 }

@@ -112,18 +112,17 @@ pub fn app_router_with<H: PasswordHasher + Clone + 'static>(
         config.freshness,
     );
     // Transactional mail leaves the request path when there is a worker to
-    // pick it up: `JOBS_ENABLED=true` (the default) queues an `email.send` job,
-    // so a slow ESP cannot hold a registration open or fail it after the
-    // account row exists. With the worker disabled nothing would ever claim
-    // that row, so the same port sends inline instead — queuing it would be
-    // indistinguishable from dropping the mail.
+    // pick it up: `JOBS_ENABLED=true` (the default) queues an `email.send` job
+    // in a transaction separate from the auth transition. With the worker
+    // disabled nothing would claim that row, so the same port sends inline and
+    // provider latency/failure remains on the request path.
     let email_queue: Box<dyn EmailQueue> = if config.jobs.enabled {
         Box::new(JobEmailQueue::new(
             bikesnest_infrastructure::SqlxJobRepository::new(db.clone()),
             config.jobs.max_attempts,
         ))
     } else {
-        Box::new(InlineEmailQueue::new(email))
+        Box::new(InlineEmailQueue::new(db.clone(), email))
     };
     let auth_service = AuthService::new(
         Box::new(SqlxAccountRepository::new(db.clone())),

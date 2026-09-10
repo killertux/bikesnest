@@ -68,15 +68,14 @@ impl EmailProvider for ResendEmailProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| EmailError::Unexpected(e.to_string()))?;
+            .map_err(|_| EmailError::Unavailable)?;
 
         if res.status().is_success() {
             Ok(())
         } else {
             let status = res.status();
-            let text = res.text().await.unwrap_or_default();
             Err(EmailError::Unexpected(format!(
-                "resend API {status}: {text}"
+                "resend API status {status}"
             )))
         }
     }

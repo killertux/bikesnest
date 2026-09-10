@@ -26,6 +26,8 @@ pub enum JobRepoError {
     ReconciliationDeferred(String),
     #[error("recurring bootstrap incomplete for {0:?}")]
     BootstrapIncomplete(Vec<String>),
+    #[error("mail credential is not eligible for delivery")]
+    InvalidMailCredential,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +51,17 @@ pub struct ClaimedJob {
     pub max_attempts: i32,
     /// `{"every_seconds":N}` / `{"cron":"…"}` when recurring, else `NULL`.
     pub schedule: Option<Value>,
+}
+
+pub struct MailEnqueue<'a> {
+    pub payload: &'a JobPayload,
+    pub account_id: i64,
+    pub token_hash: &'a str,
+    pub purpose: &'a str,
+    pub recipient: &'a str,
+    pub run_at: DateTime<Utc>,
+    pub max_attempts: i32,
+    pub idempotency_key: &'a str,
 }
 
 /// A job-queue handle bound to the application's PostgreSQL pool.
@@ -216,6 +229,59 @@ impl SqlxJobRepository {
         Ok(id)
     }
 
+    /// Lock and validate the account/token, then insert account-linked mail
+    /// and its non-secret lifecycle metadata in one transaction. The token hash is safe for equality checks; the raw token
+    /// remains only in the short-lived payload until a terminal outcome.
+    pub async fn enqueue_mail(&self, mail: MailEnqueue<'_>) -> Result<Option<i64>, JobRepoError> {
+        let MailEnqueue {
+            payload,
+            account_id,
+            token_hash,
+            purpose,
+            recipient,
+            run_at,
+            max_attempts,
+            idempotency_key,
+        } = mail;
+        let mut conn = self.db.acquire().await?;
+        let mut tx = conn.begin().await?;
+        let state: Option<String> =
+            sqlx::query_scalar("SELECT account_state FROM users WHERE id=$1 FOR UPDATE")
+                .bind(account_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let expires_at: Option<DateTime<Utc>> = match (purpose, state.as_deref()) {
+            ("verify", Some("PENDING_EMAIL_VERIFICATION" | "ACTIVE"))
+            | ("change", Some("ACTIVE")) => sqlx::query_scalar("SELECT expires_at FROM email_verification_tokens WHERE token_hash=$1 AND user_id=$2 AND email=$3 AND used_at IS NULL AND expires_at>clock_timestamp()")
+                .bind(token_hash).bind(account_id).bind(recipient).fetch_optional(&mut *tx).await?,
+            ("reset", Some("PENDING_EMAIL_VERIFICATION" | "ACTIVE")) => sqlx::query_scalar("SELECT t.expires_at FROM password_reset_tokens t JOIN users u ON u.id=t.user_id WHERE t.token_hash=$1 AND t.user_id=$2 AND u.email=$3 AND t.used_at IS NULL AND t.expires_at>clock_timestamp()")
+                .bind(token_hash).bind(account_id).bind(recipient).fetch_optional(&mut *tx).await?,
+            _ => None,
+        };
+        let Some(expires_at) = expires_at else {
+            return Err(JobRepoError::InvalidMailCredential);
+        };
+        let id = sqlx::query_scalar::<_, i64>(
+            r#"INSERT INTO background_job
+               (kind, payload, run_at, max_attempts, idempotency_key,
+                mail_account_id, mail_token_hash, mail_purpose, mail_token_expires_at)
+               VALUES ('email.send', $1, $2, $3, $4, $5, $6, $7, $8)
+               ON CONFLICT (idempotency_key) DO NOTHING RETURNING id"#,
+        )
+        .bind(payload)
+        .bind(run_at)
+        .bind(max_attempts)
+        .bind(idempotency_key)
+        .bind(account_id)
+        .bind(token_hash)
+        .bind(purpose)
+        .bind(expires_at)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
     /// Atomically claim up to `batch` due, unleased `pending` jobs for this
     /// worker, giving each a lease of `lease_ttl`. Returns the claimed rows.
     ///
@@ -364,6 +430,8 @@ impl SqlxJobRepository {
                 r#"
                 UPDATE background_job
                 SET state = 'succeeded', finished_at = $2,
+                    payload = CASE WHEN kind = 'email.send' THEN '{}'::jsonb ELSE payload END,
+                    payload_redacted_at = CASE WHEN kind = 'email.send' THEN COALESCE(payload_redacted_at,now()) ELSE payload_redacted_at END,
                     claimed_by = NULL, lease_expires_at = NULL, heartbeat_at = NULL,
                     started_at = NULL, updated_at = now()
                 WHERE id = $1 AND claimed_by = $3
@@ -417,6 +485,8 @@ impl SqlxJobRepository {
             r#"
             UPDATE background_job
             SET state = 'failed', finished_at = now(), last_error = $2,
+                payload = CASE WHEN kind = 'email.send' THEN '{}'::jsonb ELSE payload END,
+                payload_redacted_at = CASE WHEN kind = 'email.send' THEN COALESCE(payload_redacted_at,now()) ELSE payload_redacted_at END,
                 claimed_by = NULL, lease_expires_at = NULL, heartbeat_at = NULL, updated_at = now()
             WHERE id = $1 AND claimed_by = $3
             "#,

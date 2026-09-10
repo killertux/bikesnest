@@ -478,11 +478,13 @@ impl AuthService {
     /// provider renders both from the catalog when it sends.
     fn verification_email(
         &self,
+        account_id: UserId,
         to: &UserEmail,
         locale: LocaleCode,
         token: &VerificationToken,
     ) -> EmailMessage {
-        EmailMessage::new(
+        EmailMessage::linked(
+            account_id,
             to.as_str(),
             locale,
             EmailKind::VerifyEmail {
@@ -494,11 +496,13 @@ impl AuthService {
     /// Describe the "confirm your new address" email of an email change.
     fn change_email_message(
         &self,
+        account_id: UserId,
         to: &UserEmail,
         locale: LocaleCode,
         token: &VerificationToken,
     ) -> EmailMessage {
-        EmailMessage::new(
+        EmailMessage::linked(
+            account_id,
             to.as_str(),
             locale,
             EmailKind::ConfirmEmailChange {
@@ -510,11 +514,13 @@ impl AuthService {
     /// Describe the password-reset email for a token link.
     fn reset_email(
         &self,
+        account_id: UserId,
         to: &UserEmail,
         locale: LocaleCode,
         token: &VerificationToken,
     ) -> EmailMessage {
-        EmailMessage::new(
+        EmailMessage::linked(
+            account_id,
             to.as_str(),
             locale,
             EmailKind::ResetPassword {
@@ -598,17 +604,16 @@ impl AuthService {
         if !issued {
             return Ok(());
         }
-        // Hand the mail to the queue, never to a provider: a slow or broken
-        // ESP can no longer hold this request open, nor fail it *after* the
-        // account and token exist. The durable queue is one INSERT into the
-        // same database that just wrote those two rows, but not in the same
-        // transaction — the repository ports expose none — so a crash in
-        // between can still leave an account with no mail queued. That is
+        // Hand the mail to the configured queue. With the durable queue, a
+        // slow provider is off the request path; with workers disabled, the
+        // queue implementation delivers inline. Account/token creation and
+        // durable enqueue are separate transactions, so a crash or admission
+        // failure can leave an account with no mail queued. That is
         // recoverable by design: the address is unverified, and "resend
-        // verification" issues a fresh token. An enqueue *error* fails the
-        // whole registration, so nobody is told to watch an empty inbox.
+        // verification" issues a fresh token. An enqueue error is returned to
+        // the request even though the already-committed account remains.
         self.email
-            .enqueue(self.verification_email(&email, locale, &token))
+            .enqueue(self.verification_email(user_id, &email, locale, &token))
             .await?;
         self.audit
             .record(AuditEvent::success(
@@ -709,7 +714,7 @@ impl AuthService {
             return Ok(());
         }
         self.email
-            .enqueue(self.verification_email(email, user.locale, &token))
+            .enqueue(self.verification_email(user.id, email, user.locale, &token))
             .await?;
         Ok(())
     }
@@ -878,7 +883,7 @@ impl AuthService {
             return Ok(());
         }
         self.email
-            .enqueue(self.reset_email(email, user.locale, &token))
+            .enqueue(self.reset_email(user.id, email, user.locale, &token))
             .await?;
         Ok(())
     }
@@ -998,7 +1003,7 @@ impl AuthService {
             return Err(AuthError::InvalidCredentials);
         }
         self.email
-            .enqueue(self.change_email_message(new_email, user.locale, &token))
+            .enqueue(self.change_email_message(user.id, new_email, user.locale, &token))
             .await?;
         self.audit
             .record(AuditEvent::success(

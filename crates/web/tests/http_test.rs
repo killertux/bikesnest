@@ -7115,7 +7115,10 @@ async fn with_the_worker_enabled_registration_queues_the_email(_tx: &mut TestTx)
 
     // Drain it the way the worker would.
     bikesnest_application::JobHandler::run(
-        &SendEmailHandler::new(std::sync::Arc::new(mail.clone())),
+        &SendEmailHandler::new(
+            Db::from_pool(pool().await),
+            std::sync::Arc::new(mail.clone()),
+        ),
         &payload,
     )
     .await

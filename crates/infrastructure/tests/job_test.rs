@@ -13,6 +13,28 @@ use bikesnest_test_support::{db_test, pool};
 use chrono::{Duration, Utc};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
+use tracing_subscriber::{Layer, layer::SubscriberExt};
+
+#[derive(Clone)]
+struct CaptureLayer(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+struct FieldVisitor(String);
+impl tracing::field::Visit for FieldVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.push_str(field.name());
+        self.0.push_str(&format!("={value:?};"));
+    }
+}
+impl<S: tracing::Subscriber> Layer<S> for CaptureLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut visitor = FieldVisitor(String::new());
+        event.record(&mut visitor);
+        self.0.lock().unwrap().push(visitor.0);
+    }
+}
 
 async fn db() -> Db {
     Db::from_pool(pool().await)
@@ -509,7 +531,7 @@ use async_trait::async_trait;
 use bikesnest_application::{
     EmailError, EmailKind, EmailMessage, EmailProvider, EmailQueue, JobError, JobHandler,
 };
-use bikesnest_domain::LocaleCode;
+use bikesnest_domain::{LocaleCode, UserId, VerificationToken};
 use bikesnest_infrastructure::email::idempotency_key;
 use bikesnest_infrastructure::{FakeEmailProvider, JobEmailQueue, SendEmailHandler};
 use std::sync::Arc;
@@ -524,37 +546,58 @@ fn unique_token(tag: &str) -> String {
     format!("emailtest-{tag}-{nanos}")
 }
 
-fn verify_message(token: &str) -> EmailMessage {
-    EmailMessage::new(
-        "ada@example.com",
+async fn verify_message(tag: &str, db: &Db) -> EmailMessage {
+    use sha2::{Digest, Sha256};
+    let bytes: [u8; 32] = Sha256::digest(tag.as_bytes()).into();
+    let token = VerificationToken::new(bytes);
+    let email = format!("mail-{tag}@example.com");
+    let mut conn = db.acquire().await.unwrap();
+    let user_id: i64 = sqlx::query_scalar(
+        "INSERT INTO users(email, account_state, email_verified_at) VALUES($1, 'ACTIVE', now()) RETURNING id"
+    ).bind(&email).fetch_one(&mut *conn).await.unwrap();
+    let token_hash: String = Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    sqlx::query("INSERT INTO email_verification_tokens(token_hash,user_id,email,expires_at) VALUES($1,$2,$3,now()+interval '1 hour')")
+        .bind(token_hash).bind(user_id).bind(&email).execute(&mut *conn).await.unwrap();
+    EmailMessage::linked(
+        UserId(user_id),
+        email,
         LocaleCode::PtBr,
         EmailKind::VerifyEmail {
-            link: format!("http://localhost:8080/verify-email?token={token}"),
+            link: format!(
+                "http://localhost:8080/verify-email?token={}",
+                token.to_base64url()
+            ),
         },
     )
 }
 
-async fn row_for_key(key: &str) -> Option<(i64, serde_json::Value, i32)> {
+async fn row_for_key(key: &str, db: &Db) -> Option<(i64, serde_json::Value, i32)> {
+    let mut conn = db.acquire().await.unwrap();
     sqlx::query_as(
         "SELECT id, payload, max_attempts FROM background_job WHERE idempotency_key = $1",
     )
     .bind(key)
-    .fetch_optional(&pool().await)
+    .fetch_optional(&mut *conn)
     .await
     .unwrap()
 }
 
-async fn delete_job(id: i64) {
+async fn delete_job(id: i64, db: &Db) {
+    let mut conn = db.acquire().await.unwrap();
     sqlx::query("DELETE FROM background_job WHERE id = $1")
         .bind(id)
-        .execute(&pool().await)
+        .execute(&mut *conn)
         .await
         .unwrap();
 }
 
 /// Simulate a claim with a direct `UPDATE` rather than calling `claim` — which
 /// is not scoped by kind and would race the other tests in this file.
-async fn simulate_claim(id: i64, worker: &str, attempt: i32) {
+async fn simulate_claim(id: i64, worker: &str, attempt: i32, db: &Db) {
+    let mut conn = db.acquire().await.unwrap();
     sqlx::query(
         "UPDATE background_job SET state='running', claimed_by=$2,
             lease_expires_at=now()+interval '60 seconds', attempts=$3 WHERE id=$1",
@@ -562,7 +605,7 @@ async fn simulate_claim(id: i64, worker: &str, attempt: i32) {
     .bind(id)
     .bind(worker)
     .bind(attempt)
-    .execute(&pool().await)
+    .execute(&mut *conn)
     .await
     .unwrap();
 }
@@ -572,18 +615,286 @@ struct BrokenProvider;
 #[async_trait]
 impl EmailProvider for BrokenProvider {
     async fn send(&self, _msg: &EmailMessage) -> Result<(), EmailError> {
-        Err(EmailError::Unavailable)
+        Err(EmailError::Unexpected(
+            "SECRET-PROVIDER-BODY token=LEAK ada@example.com".into(),
+        ))
     }
 }
 
-/// The idempotency key is what stops a double-submitted form (or a retried
-/// request) from mailing the same verification link twice: the second enqueue
-/// collapses onto the existing row. A *fresh* token is a different message and
-/// must still get its own job.
+#[derive(Clone, Copy, Debug)]
+enum MailPurpose {
+    Verify,
+    Reset,
+    Change,
+}
+
+impl MailPurpose {
+    const ALL: [Self; 3] = [Self::Verify, Self::Reset, Self::Change];
+
+    fn code(self) -> &'static str {
+        match self {
+            Self::Verify => "verify",
+            Self::Reset => "reset",
+            Self::Change => "change",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum InvalidCredential {
+    AccountState,
+    TokenHash,
+    Recipient,
+    Used,
+    Expired,
+}
+
+impl InvalidCredential {
+    const ALL: [Self; 5] = [
+        Self::AccountState,
+        Self::TokenHash,
+        Self::Recipient,
+        Self::Used,
+        Self::Expired,
+    ];
+}
+
+async fn lifecycle_message(db: &Db, purpose: MailPurpose, case: &str) -> (EmailMessage, String) {
+    use sha2::{Digest, Sha256};
+
+    let token_bytes: [u8; 32] = Sha256::digest(case.as_bytes()).into();
+    let token = VerificationToken::new(token_bytes);
+    let token_hash: String = Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let email = format!("mail-{case}@example.com");
+    let mut conn = db.acquire().await.unwrap();
+    let user_id: i64 = sqlx::query_scalar(
+        "INSERT INTO users(email,account_state,email_verified_at) VALUES($1,'ACTIVE',now()) RETURNING id",
+    )
+    .bind(&email)
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    match purpose {
+        MailPurpose::Verify | MailPurpose::Change => {
+            sqlx::query("INSERT INTO email_verification_tokens(token_hash,user_id,email,expires_at) VALUES($1,$2,$3,now()+interval '1 hour')")
+                .bind(&token_hash)
+                .bind(user_id)
+                .bind(&email)
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+        }
+        MailPurpose::Reset => {
+            sqlx::query("INSERT INTO password_reset_tokens(token_hash,user_id,expires_at) VALUES($1,$2,now()+interval '1 hour')")
+                .bind(&token_hash)
+                .bind(user_id)
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+        }
+    }
+    let link = format!(
+        "https://x/{}?token={}",
+        if matches!(purpose, MailPurpose::Reset) {
+            "password-reset/new"
+        } else {
+            "verify-email"
+        },
+        token.to_base64url()
+    );
+    let kind = match purpose {
+        MailPurpose::Verify => EmailKind::VerifyEmail { link },
+        MailPurpose::Reset => EmailKind::ResetPassword { link },
+        MailPurpose::Change => EmailKind::ConfirmEmailChange { link },
+    };
+    (
+        EmailMessage::linked(UserId(user_id), email, LocaleCode::En, kind),
+        token_hash,
+    )
+}
+
+async fn invalidate_credential(
+    db: &Db,
+    purpose: MailPurpose,
+    invalid: InvalidCredential,
+    msg: &mut EmailMessage,
+    token_hash: &str,
+) {
+    let mut conn = db.acquire().await.unwrap();
+    match invalid {
+        InvalidCredential::AccountState => {
+            sqlx::query("UPDATE users SET account_state='SUSPENDED' WHERE id=$1")
+                .bind(msg.account_id)
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+        }
+        InvalidCredential::TokenHash => {
+            let token = VerificationToken::new([0xfe; 32]);
+            let link = format!(
+                "https://x/{}?token={}",
+                if matches!(purpose, MailPurpose::Reset) {
+                    "password-reset/new"
+                } else {
+                    "verify-email"
+                },
+                token.to_base64url()
+            );
+            msg.kind = match purpose {
+                MailPurpose::Verify => EmailKind::VerifyEmail { link },
+                MailPurpose::Reset => EmailKind::ResetPassword { link },
+                MailPurpose::Change => EmailKind::ConfirmEmailChange { link },
+            };
+        }
+        InvalidCredential::Recipient => msg.to = format!("wrong-{}@example.com", msg.account_id),
+        InvalidCredential::Used => {
+            let table = if matches!(purpose, MailPurpose::Reset) {
+                "password_reset_tokens"
+            } else {
+                "email_verification_tokens"
+            };
+            sqlx::query(&format!(
+                "UPDATE {table} SET used_at=now() WHERE token_hash=$1"
+            ))
+            .bind(token_hash)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        }
+        InvalidCredential::Expired => {
+            let table = if matches!(purpose, MailPurpose::Reset) {
+                "password_reset_tokens"
+            } else {
+                "email_verification_tokens"
+            };
+            sqlx::query(&format!(
+                "UPDATE {table} SET expires_at=now()-interval '1 second' WHERE token_hash=$1"
+            ))
+            .bind(token_hash)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        }
+    }
+}
+
 #[db_test]
-async fn queueing_one_message_twice_creates_a_single_job(_tx: &mut bikesnest_test_support::TestTx) {
-    let queue = JobEmailQueue::new(repo().await, 3);
-    let msg = verify_message(&unique_token("dedupe"));
+async fn mail_handler_and_inline_queue_enforce_exact_token_lifecycle(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    use bikesnest_infrastructure::InlineEmailQueue;
+    let db = tx.db().await;
+    for purpose in MailPurpose::ALL {
+        for inline in [false, true] {
+            let case = format!("positive-{}-{inline}", purpose.code());
+            let (msg, _) = lifecycle_message(&db, purpose, &case).await;
+            let provider = FakeEmailProvider::with_root(None);
+            if inline {
+                InlineEmailQueue::new(db.clone(), Arc::new(provider.clone()))
+                    .enqueue(msg)
+                    .await
+                    .unwrap();
+            } else {
+                SendEmailHandler::new(db.clone(), Arc::new(provider.clone()))
+                    .run(&serde_json::to_value(msg).unwrap())
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(provider.emails().len(), 1, "{purpose:?}, inline={inline}");
+        }
+
+        for invalid in InvalidCredential::ALL {
+            for inline in [false, true] {
+                let case = format!("negative-{}-{invalid:?}-{inline}", purpose.code());
+                let (mut msg, token_hash) = lifecycle_message(&db, purpose, &case).await;
+                invalidate_credential(&db, purpose, invalid, &mut msg, &token_hash).await;
+                let provider = FakeEmailProvider::with_root(None);
+                let rejected = if inline {
+                    InlineEmailQueue::new(db.clone(), Arc::new(provider.clone()))
+                        .enqueue(msg)
+                        .await
+                        .is_err()
+                } else {
+                    matches!(
+                        SendEmailHandler::new(db.clone(), Arc::new(provider.clone()))
+                            .run(&serde_json::to_value(msg).unwrap())
+                            .await,
+                        Err(JobError::Permanent(_))
+                    )
+                };
+                assert!(rejected, "{purpose:?}/{invalid:?}, inline={inline}");
+                assert!(provider.emails().is_empty(), "{purpose:?}/{invalid:?}");
+            }
+        }
+    }
+}
+
+#[db_test]
+async fn queue_admission_enforces_every_purpose_and_credential_gate(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let queue = JobEmailQueue::new(SqlxJobRepository::new(db.clone()), 3);
+    for purpose in MailPurpose::ALL {
+        let (msg, _) = lifecycle_message(&db, purpose, &format!("admit-{}", purpose.code())).await;
+        queue.enqueue(msg).await.unwrap();
+
+        for invalid in InvalidCredential::ALL {
+            let case = format!("reject-{}-{invalid:?}", purpose.code());
+            let (mut msg, token_hash) = lifecycle_message(&db, purpose, &case).await;
+            invalidate_credential(&db, purpose, invalid, &mut msg, &token_hash).await;
+            assert!(queue.enqueue(msg).await.is_err(), "{purpose:?}/{invalid:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn queue_admission_database_error_tracing_excludes_hostile_recipient_data() {
+    let marker = "HOSTILE-RECIPIENT-MARKER.invalid";
+    let token = VerificationToken::new([0xab; 32]);
+    let msg = EmailMessage::linked(
+        UserId(77),
+        format!("ada@{marker}"),
+        LocaleCode::En,
+        EmailKind::ResetPassword {
+            link: format!(
+                "https://x/password-reset/new?token={}",
+                token.to_base64url()
+            ),
+        },
+    );
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://closed:closed@127.0.0.1:1/closed")
+        .unwrap();
+    pool.close().await;
+    let queue = JobEmailQueue::new(SqlxJobRepository::new(Db::from_pool(pool)), 1);
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(CaptureLayer(events.clone()));
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    assert!(queue.enqueue(msg).await.is_err());
+    let captured = events.lock().unwrap().join("\n");
+    assert!(captured.contains("kind=\"reset\""), "{captured}");
+    assert!(
+        captured.contains("reason=\"database_unavailable\""),
+        "{captured}"
+    );
+    assert!(!captured.contains(marker), "{captured}");
+    assert!(!captured.contains("closed@"), "{captured}");
+}
+
+/// The idempotency key deduplicates queue admission for a double-submitted form
+/// or retried request. It does not promise exactly-once provider delivery. A
+/// *fresh* token is a different message and must still get its own job.
+#[db_test]
+async fn queueing_one_message_twice_creates_a_single_job(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
+    let jobs = SqlxJobRepository::new(db.clone());
+    let queue = JobEmailQueue::new(jobs.clone(), 3);
+    let msg = verify_message(&unique_token("dedupe"), &db).await;
 
     queue.enqueue(msg.clone()).await.unwrap();
     queue.enqueue(msg.clone()).await.unwrap();
@@ -592,57 +903,72 @@ async fn queueing_one_message_twice_creates_a_single_job(_tx: &mut bikesnest_tes
     let n: i64 =
         sqlx::query_scalar("SELECT count(*) FROM background_job WHERE idempotency_key = $1")
             .bind(&key)
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
     assert_eq!(n, 1, "the same token must never be queued twice");
 
     // Running that single job delivers exactly one message, rendered in the
     // locale the payload carries.
-    let (id, payload, max_attempts) = row_for_key(&key).await.expect("queued row");
+    let (id, payload, max_attempts) = row_for_key(&key, &db).await.expect("queued row");
     assert_eq!(
         max_attempts, 3,
         "the row carries the configured attempt budget"
     );
     let mail = FakeEmailProvider::with_root(None);
-    SendEmailHandler::new(Arc::new(mail.clone()))
+    SendEmailHandler::new(db.clone(), Arc::new(mail.clone()))
         .run(&payload)
         .await
         .unwrap();
     assert_eq!(mail.emails().len(), 1);
     assert_eq!(mail.emails()[0].subject, "Confirme seu e-mail no BikesNest");
+    simulate_claim(id, "worker-mail-success", 1, &db).await;
+    jobs.finish_success(id, "worker-mail-success", None, Utc::now())
+        .await
+        .unwrap();
+    let (terminal_payload, redacted_at): (serde_json::Value, Option<chrono::DateTime<Utc>>) =
+        sqlx::query_as("SELECT payload,payload_redacted_at FROM background_job WHERE id=$1")
+            .bind(id)
+            .fetch_one(&mut *db.acquire().await.unwrap())
+            .await
+            .unwrap();
+    assert_eq!(terminal_payload, serde_json::json!({}));
+    assert!(redacted_at.is_some());
 
     // A re-send issues a new token → a new job, not a swallowed duplicate.
-    let resend = verify_message(&unique_token("dedupe-resend"));
+    let resend = verify_message(&unique_token("dedupe-resend"), &db).await;
     queue.enqueue(resend.clone()).await.unwrap();
     let resend_key = idempotency_key(&resend);
     assert_ne!(resend_key, key);
-    let (resend_id, _, _) = row_for_key(&resend_key).await.expect("second job queued");
+    let (resend_id, _, _) = row_for_key(&resend_key, &db)
+        .await
+        .expect("second job queued");
 
-    delete_job(id).await;
-    delete_job(resend_id).await;
+    delete_job(id, &db).await;
+    delete_job(resend_id, &db).await;
 }
 
 /// A provider outage is transient: the job is retried while its budget lasts
-/// and dead-lettered when it runs out. The stored error names the message kind
-/// and the recipient's domain — never the address, never the link.
+/// and dead-lettered when it runs out. The stored error is a bounded
+/// classification and never copies provider text, an address, or a link.
 #[db_test]
 async fn a_failing_email_send_is_retried_then_dead_lettered(
-    _tx: &mut bikesnest_test_support::TestTx,
+    tx: &mut bikesnest_test_support::TestTx,
 ) {
+    let db = tx.db().await;
     // A deliberately small budget (production's default is 5).
-    let jobs = repo().await;
+    let jobs = SqlxJobRepository::new(db.clone());
     let queue = JobEmailQueue::new(jobs.clone(), 2);
-    let msg = verify_message(&unique_token("deadletter"));
+    let msg = verify_message(&unique_token("deadletter"), &db).await;
     queue.enqueue(msg.clone()).await.unwrap();
 
     let key = idempotency_key(&msg);
-    let (id, payload, max_attempts) = row_for_key(&key).await.expect("queued row");
+    let (id, payload, max_attempts) = row_for_key(&key, &db).await.expect("queued row");
     assert_eq!(max_attempts, 2);
-    let handler = SendEmailHandler::new(Arc::new(BrokenProvider));
+    let handler = SendEmailHandler::new(db.clone(), Arc::new(BrokenProvider));
 
     // Attempt 1 of 2 → within budget → requeued with the error recorded.
-    simulate_claim(id, "worker-mail", 1).await;
+    simulate_claim(id, "worker-mail", 1, &db).await;
     let first = handler.run(&payload).await.unwrap_err();
     assert!(
         matches!(first, JobError::Failed(_)),
@@ -655,37 +981,56 @@ async fn a_failing_email_send_is_retried_then_dead_lettered(
     let (state, attempts): (String, i32) =
         sqlx::query_as("SELECT state, attempts FROM background_job WHERE id = $1")
             .bind(id)
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
     assert_eq!(state, "pending", "still retryable");
     assert_eq!(attempts, 1);
 
     // Attempt 2 == the budget → the worker dead-letters instead of retrying.
-    simulate_claim(id, "worker-mail", 2).await;
+    simulate_claim(id, "worker-mail", 2, &db).await;
     let last = handler.run(&payload).await.unwrap_err();
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(CaptureLayer(events.clone()));
+    let _guard = tracing::subscriber::set_default(subscriber);
     handler.on_dead_letter(&payload, &last.to_string()).await;
     jobs.fail(id, "worker-mail", &last.to_string())
         .await
         .unwrap();
 
-    let (state, finished, last_error): (String, Option<chrono::DateTime<Utc>>, Option<String>) =
-        sqlx::query_as("SELECT state, finished_at, last_error FROM background_job WHERE id = $1")
+    type TerminalMailRow = (
+        String,
+        Option<chrono::DateTime<Utc>>,
+        Option<String>,
+        serde_json::Value,
+        Option<chrono::DateTime<Utc>>,
+    );
+    let (state, finished, last_error, terminal_payload, redacted_at): TerminalMailRow =
+        sqlx::query_as("SELECT state, finished_at, last_error, payload, payload_redacted_at FROM background_job WHERE id = $1")
             .bind(id)
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
     assert_eq!(state, "failed", "a spent budget dead-letters the job");
     assert!(finished.is_some());
+    assert_eq!(terminal_payload, serde_json::json!({}));
+    assert!(redacted_at.is_some());
     let recorded = last_error.unwrap_or_default();
+    assert_eq!(recorded, "job failed: verify mail provider failed");
     assert!(
-        recorded.contains("verify") && recorded.contains("example.com"),
-        "the dead-letter row must say what failed and to which domain: {recorded}"
-    );
-    assert!(
-        !recorded.contains("ada@") && !recorded.contains("token="),
+        !recorded.contains("ada@")
+            && !recorded.contains("token=")
+            && !recorded.contains("example.com"),
         "no address and no live link in a stored error: {recorded}"
     );
+    assert!(!recorded.contains("SECRET-PROVIDER-BODY"));
+    let captured = events.lock().unwrap().join("\n");
+    assert!(
+        !captured.contains("SECRET-PROVIDER-BODY")
+            && !captured.contains("ada@example.com")
+            && !captured.contains("token="),
+        "{captured}"
+    );
 
-    delete_job(id).await;
+    delete_job(id, &db).await;
 }

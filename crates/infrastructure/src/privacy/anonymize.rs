@@ -51,12 +51,17 @@ impl AnonymizationRepository for SqlxAnonymizationRepository {
         // True only when the deleting user IS an ADMIN *and* no other ADMIN exists.
         // A non-admin must never be blocked by the last-admin guard even if the
         // system happens to have zero admins.
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("anonymize.is_last_admin", e))?;
         let res = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM user_roles WHERE role = 'ADMIN' AND user_id = $1)\
              AND (SELECT count(*) FROM user_roles WHERE role = 'ADMIN' AND user_id <> $1) = 0",
         )
         .bind(user_id.0)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *conn)
         .await
         .map_err(|e| db_err("anonymize.is_last_admin", e))?;
         Ok(res)
@@ -67,9 +72,12 @@ impl AnonymizationRepository for SqlxAnonymizationRepository {
         user_id: UserId,
         now: DateTime<Utc>,
     ) -> Result<AnonymizationReport, PrivacyError> {
-        let mut tx = self
+        let mut conn = self
             .db
-            .pool()
+            .acquire()
+            .await
+            .map_err(|e| db_err("anonymize.anonymize", e))?;
+        let mut tx = conn
             .begin()
             .await
             .map_err(|e| db_err("anonymize.anonymize", e))?;
@@ -168,6 +176,22 @@ impl AnonymizationRepository for SqlxAnonymizationRepository {
             .await
             .map_err(|e| db_err("anonymize.anonymize", e))?
             .rows_affected();
+        // The users-row update above is the serialization point shared with
+        // delivery. Redact every durable copy, including terminal history;
+        // cancel pending/running work and release any lease. A worker holding
+        // a preclaimed payload must still pass the account/token checks after
+        // this transaction commits and therefore cannot send it.
+        sqlx::query(
+            r#"UPDATE background_job
+               SET payload='{}'::jsonb,
+                   state=CASE WHEN state IN ('pending','running') THEN 'failed' ELSE state END,
+                   last_error=CASE WHEN state IN ('pending','running','failed') THEN 'account deleted; mail cancelled' ELSE NULL END,
+                   finished_at=CASE WHEN state IN ('pending','running') THEN COALESCE(finished_at,$2) ELSE finished_at END,
+                   claimed_by=NULL, lease_expires_at=NULL, heartbeat_at=NULL,
+                   payload_redacted_at=COALESCE(payload_redacted_at,$2), updated_at=now()
+               WHERE kind='email.send' AND mail_account_id=$1"#,
+        ).bind(user_id.0).bind(now).execute(&mut *tx).await
+            .map_err(|e| db_err("anonymize.anonymize", e))?;
         // Parked-here is personal activity → deleted.
         let parked_here =
             sqlx::query("DELETE FROM verification WHERE user_id = $1 AND kind = 'parked_here'")

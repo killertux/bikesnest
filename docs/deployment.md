@@ -348,25 +348,34 @@ retention is healthy.
 
 ## 5d. Transactional email goes through the queue
 
-Verification, password-reset and e-mail-change messages are **queued, not sent
-inline**. A request writes one `email.send` job (a single INSERT, in the same
-database as the account and token rows) and returns; the worker delivers it with
-the queue's retry budget (`JOBS_MAX_ATTEMPTS`), exponential backoff and
-dead-lettering. A slow or failing relay/ESP therefore cannot hold an HTTP
-request open, and cannot fail a registration *after* the account already exists.
+With `JOBS_ENABLED=true`, verification, password-reset and e-mail-change
+messages are queued rather than sent inline. After the auth transition commits,
+the request separately validates the account/token and inserts an `email.send`
+job; these are not yet one atomic transaction. An enqueue failure is returned
+even though an already-created account or token can remain without a queued
+message. Re-send is the current recovery path; B06b owns the transactional
+outbox correction. Once admitted, the worker uses the configured retry budget
+(`JOBS_MAX_ATTEMPTS`), exponential backoff and dead-lettering, keeping provider
+latency off the request path.
 
 - **Language.** The message carries the recipient's locale (`users.locale`, set
   at registration from the page's language and updated by the header language
   toggle for signed-in users). Subject and body are rendered from the message
   catalog *at send time* — pt-BR and en, never a hard-coded English string.
-- **No double sends.** Each job is enqueued under `email:{kind}:{sha256(link)}`,
-  so a retried or double-submitted request collapses onto the existing row. A
-  genuine re-send issues a new token, hence a new link and a new job.
-- **Dead letters.** An exhausted job logs at `error!` with the message kind and
-  the recipient's *domain* only (never the address, never the link) and stays in
-  `background_job` as `failed` with `last_error` until `jobs.gc` removes it.
+- **Admission deduplication, at-least-once delivery.** Each job is enqueued under
+  `email:{kind}:{sha256(link)}`, so repeated admission for the same token
+  collapses onto the existing row. A genuine re-send issues a new token and a
+  new job. This does not guarantee one provider delivery: lease expiry or an
+  ambiguous provider response can result in a duplicate send.
+- **Dead letters.** An exhausted job logs only the allowlisted message kind and
+  stores a bounded error classification. Its recipient/link payload is cleared
+  immediately; lifecycle metadata remains until `jobs.gc` removes the row.
   Alert on that log line: it means someone is stuck without a verification or
   reset link and needs a re-send.
+- **Deletion boundary.** Delivery and anonymization serialize on the account
+  row. Deletion-first cancels even preclaimed mail; provider-acceptance-first is
+  already outside the application's recall boundary. Provider timeout or a
+  lost database connection remains an ambiguous at-least-once outcome.
 - **`JOBS_ENABLED=false`.** No worker runs, so nothing would ever claim an
   `email.send` row. The app detects this at wiring time and sends **inline** on
   the request path instead (same provider, same localized rendering) — mail is
@@ -374,7 +383,23 @@ request open, and cannot fail a registration *after* the account already exists.
   is back on the user's request. Prefer leaving the worker on; if you run
   web-only instances, make sure at least one instance (or a dedicated worker
   deployment) has `JOBS_ENABLED=true`. Startup validation needs no new rule
-  here: both wirings deliver, so neither is a misconfiguration.
+  here: inline delivery uses the same account/token validation and lock-through-
+  provider boundary as the worker.
+
+Migration 0026 adds nullable mail lifecycle columns. During upgrade it redacts
+all legacy `email.send` payloads because those rows cannot be safely linked to
+an account/token. Pending/running legacy rows are cancelled as failed; existing
+succeeded/failed history keeps its terminal state. Unrelated jobs are untouched.
+The migration is forward-only. Rolling back application code after it runs is
+not supported for mail delivery: old code cannot interpret redacted legacy rows
+or maintain the new lifecycle contract. This migration overrides the generic
+rolling sequence below: first stop and drain every old worker and old inline
+mail-producing web instance, then start only the new version and let it migrate.
+Otherwise an old worker could retain a raw preclaimed snapshot after the
+database row is scrubbed. On failure, pause mail and forward-fix. Restoring a
+backup can resurrect erased data and lose intervening writes; it is only a
+separately approved disaster-recovery action and requires erasure
+reconciliation. Backup expiry, not this migration, removes historical copies.
 
 ## 6. Rolling deploy + rollback
 

@@ -64,24 +64,54 @@ impl RetentionRepository for SqlxRetentionRepository {
         &self,
         now: DateTime<Utc>,
     ) -> Result<u64, PrivacyError> {
-        let res = sqlx::query("DELETE FROM password_reset_tokens WHERE expires_at < $1")
-            .bind(now)
-            .execute(self.db.pool())
+        let mut conn = self
+            .db
+            .acquire()
             .await
             .map_err(|e| db_err("retention.purge_expired_password_reset_tokens", e))?;
-        Ok(res.rows_affected())
+        let count: i64 = sqlx::query_scalar(r#"
+            WITH scrub AS (
+              UPDATE background_job SET payload='{}'::jsonb,
+                state=CASE WHEN state IN ('pending','running') THEN 'failed' ELSE state END,
+                last_error=CASE WHEN state IN ('pending','running','failed') THEN 'mail credential expired' ELSE NULL END,
+                finished_at=CASE WHEN state IN ('pending','running') THEN COALESCE(finished_at,$1) ELSE finished_at END,
+                claimed_by=NULL, lease_expires_at=NULL, heartbeat_at=NULL,
+                payload_redacted_at=COALESCE(payload_redacted_at,$1), updated_at=now()
+              WHERE kind='email.send' AND mail_purpose='reset' AND mail_token_expires_at < $1
+            ), deleted AS (DELETE FROM password_reset_tokens WHERE expires_at < $1 RETURNING 1)
+            SELECT count(*) FROM deleted"#)
+            .bind(now)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| db_err("retention.purge_expired_password_reset_tokens", e))?;
+        Ok(count as u64)
     }
 
     async fn purge_expired_email_verification_tokens(
         &self,
         now: DateTime<Utc>,
     ) -> Result<u64, PrivacyError> {
-        let res = sqlx::query("DELETE FROM email_verification_tokens WHERE expires_at < $1")
-            .bind(now)
-            .execute(self.db.pool())
+        let mut conn = self
+            .db
+            .acquire()
             .await
             .map_err(|e| db_err("retention.purge_expired_email_verification_tokens", e))?;
-        Ok(res.rows_affected())
+        let count: i64 = sqlx::query_scalar(r#"
+            WITH scrub AS (
+              UPDATE background_job SET payload='{}'::jsonb,
+                state=CASE WHEN state IN ('pending','running') THEN 'failed' ELSE state END,
+                last_error=CASE WHEN state IN ('pending','running','failed') THEN 'mail credential expired' ELSE NULL END,
+                finished_at=CASE WHEN state IN ('pending','running') THEN COALESCE(finished_at,$1) ELSE finished_at END,
+                claimed_by=NULL, lease_expires_at=NULL, heartbeat_at=NULL,
+                payload_redacted_at=COALESCE(payload_redacted_at,$1), updated_at=now()
+              WHERE kind='email.send' AND mail_purpose IN ('verify','change') AND mail_token_expires_at < $1
+            ), deleted AS (DELETE FROM email_verification_tokens WHERE expires_at < $1 RETURNING 1)
+            SELECT count(*) FROM deleted"#)
+            .bind(now)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| db_err("retention.purge_expired_email_verification_tokens", e))?;
+        Ok(count as u64)
     }
 
     async fn purge_expired_sessions(&self, now: DateTime<Utc>) -> Result<u64, PrivacyError> {

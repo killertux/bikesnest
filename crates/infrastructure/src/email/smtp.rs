@@ -77,7 +77,7 @@ impl SmtpEmailProvider {
             .to(to)
             .subject(rendered.subject)
             .body(rendered.text)
-            .map_err(|e| EmailError::Unexpected(e.to_string()))
+            .map_err(|_| EmailError::Unexpected("could not build SMTP message".into()))
     }
 }
 
@@ -90,7 +90,7 @@ fn build_mailer(
 ) -> Result<Mailer, EmailError> {
     let builder = if tls {
         AsyncSmtpTransport::<Tokio1Executor>::relay(&host)
-            .map_err(|e| EmailError::Unexpected(e.to_string()))?
+            .map_err(|_| EmailError::Unexpected("invalid SMTP relay configuration".into()))?
     } else {
         AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&host)
     };
@@ -110,7 +110,7 @@ impl EmailProvider for SmtpEmailProvider {
         self.mailer
             .send(message)
             .await
-            .map_err(|e| EmailError::Unexpected(e.to_string()))?;
+            .map_err(|_| EmailError::Unavailable)?;
         Ok(())
     }
 }

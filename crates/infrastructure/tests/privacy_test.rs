@@ -15,8 +15,28 @@ use bikesnest_infrastructure::{
     AUDIT_METADATA_KEYS, Db, SqlxAnonymizationRepository, SqlxAuditLog, SqlxExportRepository,
     SqlxPolicyReader, SqlxRetentionRepository,
 };
-use bikesnest_test_support::{ParkingBuilder, TestObjectStorage, UserBuilder, db_test, pool};
+use bikesnest_test_support::{
+    ParkingBuilder, TestObjectStorage, UserBuilder, db_test, pool, run_isolated_database_test,
+};
 use chrono::{DateTime, Duration, Utc};
+
+#[derive(Clone)]
+struct BlockingMailProvider {
+    entered: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl bikesnest_application::EmailProvider for BlockingMailProvider {
+    async fn send(
+        &self,
+        _msg: &bikesnest_application::EmailMessage,
+    ) -> Result<(), bikesnest_application::EmailError> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(())
+    }
+}
 
 async fn db() -> Db {
     Db::from_pool(pool().await)
@@ -61,6 +81,298 @@ fn af(t: impl AsRef<str>) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(t.as_ref())
         .unwrap()
         .with_timezone(&Utc)
+}
+
+#[test]
+fn mail_lifecycle_upgrade_redacts_legacy_rows_without_rewriting_terminal_history() {
+    run_isolated_database_test(|pool: sqlx::PgPool| async move {
+        sqlx::raw_sql("DROP INDEX background_job_mail_account_idx; ALTER TABLE background_job DROP COLUMN payload_redacted_at, DROP COLUMN mail_purpose, DROP COLUMN mail_token_expires_at, DROP COLUMN mail_token_hash, DROP COLUMN mail_account_id")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO background_job(kind,payload,state,finished_at,claimed_by,lease_expires_at) SELECT 'email.send','{\"secret\":\"TOKEN\"}',state,CASE WHEN state IN ('succeeded','failed') THEN now() END,CASE WHEN state='running' THEN 'old-worker' END,CASE WHEN state='running' THEN now()+interval '1 minute' END FROM unnest(ARRAY['pending','running','succeeded','failed']) state")
+            .execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO background_job(kind,payload) VALUES('unrelated','{\"keep\":true}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/0026_mail_job_lifecycle.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let rows: Vec<(String, serde_json::Value, Option<String>)> = sqlx::query_as("SELECT state,payload,claimed_by FROM background_job WHERE kind='email.send' ORDER BY id")
+            .fetch_all(&pool).await.unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+            vec!["failed", "failed", "succeeded", "failed"]
+        );
+        assert!(
+            rows.iter()
+                .all(|r| r.1 == serde_json::json!({}) && r.2.is_none())
+        );
+        let unrelated: serde_json::Value =
+            sqlx::query_scalar("SELECT payload FROM background_job WHERE kind='unrelated'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(unrelated, serde_json::json!({"keep":true}));
+    });
+}
+
+#[test]
+fn provider_acceptance_and_deletion_serialize_on_the_account() {
+    use bikesnest_application::{EmailKind, EmailMessage, EmailQueue, JobHandler};
+    use bikesnest_domain::{LocaleCode, VerificationToken};
+    use bikesnest_infrastructure::{JobEmailQueue, SendEmailHandler, SqlxJobRepository};
+    use sha2::{Digest, Sha256};
+    use sqlx::Acquire as _;
+    use std::sync::Arc;
+
+    run_isolated_database_test(|pool: sqlx::PgPool| async move {
+        let email = "mail-delete-race@example.com".to_string();
+        let user_id: i64 = sqlx::query_scalar("INSERT INTO users(email,account_state,email_verified_at) VALUES($1,'ACTIVE',now()) RETURNING id")
+        .bind(&email).fetch_one(&pool).await.unwrap();
+        let token = VerificationToken::new([73; 32]);
+        let token_hash: String = Sha256::digest(token.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        sqlx::query("INSERT INTO email_verification_tokens(token_hash,user_id,email,expires_at) VALUES($1,$2,$3,now()+interval '1 hour')")
+        .bind(token_hash).bind(user_id).bind(&email).execute(&pool).await.unwrap();
+
+        let msg = EmailMessage::linked(
+            UserId(user_id),
+            &email,
+            LocaleCode::En,
+            EmailKind::VerifyEmail {
+                link: format!(
+                    "https://bikesnest.test/verify-email?token={}",
+                    token.to_base64url()
+                ),
+            },
+        );
+        let payload = serde_json::to_value(msg).unwrap();
+        let stale_snapshot = payload.clone();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let handler = SendEmailHandler::new(
+            Db::from_pool(pool.clone()),
+            Arc::new(BlockingMailProvider {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+        );
+        let send = tokio::spawn(async move { handler.run(&payload).await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+
+        let uid = UserId(user_id);
+        let delete_db = Db::from_pool(pool.clone());
+        let mut deletion = tokio::spawn(async move {
+            SqlxAnonymizationRepository::new(delete_db)
+                .anonymize(uid, Utc::now())
+                .await
+        });
+        let observed_lock = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock'")
+                .fetch_one(&pool).await.unwrap();
+            if waiting > 0 { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await;
+        assert!(
+            observed_lock.is_ok(),
+            "PostgreSQL must observe deletion waiting on the account lock"
+        );
+        release.notify_one();
+        send.await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), &mut deletion)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let state: String = sqlx::query_scalar("SELECT account_state FROM users WHERE id=$1")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "DELETED");
+        let fake = bikesnest_infrastructure::FakeEmailProvider::with_root(None);
+        let stale_handler =
+            SendEmailHandler::new(Db::from_pool(pool.clone()), Arc::new(fake.clone()));
+        let stale = stale_handler.run(&stale_snapshot).await.unwrap_err();
+        assert!(matches!(
+            stale,
+            bikesnest_application::JobError::Permanent(_)
+        ));
+        assert!(
+            fake.emails().is_empty(),
+            "a preclaimed payload cannot send after deletion commits"
+        );
+
+        let enqueue_email = "mail-enqueue-delete@example.com";
+        let enqueue_uid: i64 = sqlx::query_scalar("INSERT INTO users(email,account_state,email_verified_at) VALUES($1,'ACTIVE',now()) RETURNING id")
+        .bind(enqueue_email).fetch_one(&pool).await.unwrap();
+        let enqueue_token = VerificationToken::new([74; 32]);
+        let enqueue_hash: String = Sha256::digest(enqueue_token.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        sqlx::query("INSERT INTO email_verification_tokens(token_hash,user_id,email,expires_at) VALUES($1,$2,$3,now()+interval '1 hour')")
+        .bind(&enqueue_hash).bind(enqueue_uid).bind(enqueue_email).execute(&pool).await.unwrap();
+        let enqueue_msg = EmailMessage::linked(
+            UserId(enqueue_uid),
+            enqueue_email,
+            LocaleCode::En,
+            EmailKind::VerifyEmail {
+                link: format!(
+                    "https://bikesnest.test/verify-email?token={}",
+                    enqueue_token.to_base64url()
+                ),
+            },
+        );
+        let mut deleting = pool.acquire().await.unwrap();
+        let mut deleting_tx = deleting.begin().await.unwrap();
+        sqlx::query("UPDATE users SET account_state='DELETED',deleted_at=now() WHERE id=$1")
+            .bind(enqueue_uid)
+            .execute(&mut *deleting_tx)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM email_verification_tokens WHERE user_id=$1")
+            .bind(enqueue_uid)
+            .execute(&mut *deleting_tx)
+            .await
+            .unwrap();
+        let queue = JobEmailQueue::new(SqlxJobRepository::new(Db::from_pool(pool.clone())), 3);
+        let mut enqueue = tokio::spawn(async move { queue.enqueue(enqueue_msg).await });
+        let enqueue_wait = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock'")
+                .fetch_one(&pool).await.unwrap();
+            if waiting > 0 { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await;
+        assert!(
+            enqueue_wait.is_ok(),
+            "enqueue must wait for the deletion account lock"
+        );
+        deleting_tx.commit().await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), &mut enqueue)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        let queued: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM background_job WHERE mail_account_id=$1")
+                .bind(enqueue_uid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            queued, 0,
+            "deletion-first admission cannot create a new secret payload"
+        );
+    });
+}
+
+#[db_test]
+async fn anonymization_redacts_every_mail_state_without_touching_other_jobs(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let user = UserBuilder::new()
+        .with_email("scoped-mail-delete@example.com")
+        .create(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    let ids: Vec<i64> = sqlx::query_scalar(r#"INSERT INTO background_job
+      (kind,payload,state,mail_account_id,mail_token_hash,mail_purpose,mail_token_expires_at,finished_at,claimed_by,lease_expires_at)
+      SELECT 'email.send','{"secret":"TOKEN"}',state,$1,'hash','verify',now()+interval '1 hour',
+       CASE WHEN state IN ('succeeded','failed') THEN now() END,
+       CASE WHEN state='running' THEN 'worker' END,
+       CASE WHEN state='running' THEN now()+interval '1 minute' END
+      FROM unnest(ARRAY['pending','running','succeeded','failed']) state RETURNING id"#)
+        .bind(user.id.0).fetch_all(&mut *db.acquire().await.unwrap()).await.unwrap();
+    let other: i64 = sqlx::query_scalar("INSERT INTO background_job(kind,payload) VALUES('test.scoped.other','{\"keep\":true}') RETURNING id")
+        .fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
+    SqlxAnonymizationRepository::new(db.clone())
+        .anonymize(user.id, Utc::now())
+        .await
+        .unwrap();
+    let mut conn = db.acquire().await.unwrap();
+    type MailStateRow = (
+        String,
+        serde_json::Value,
+        Option<String>,
+        Option<DateTime<Utc>>,
+    );
+    let rows: Vec<MailStateRow> = sqlx::query_as(
+        "SELECT state,payload,claimed_by,payload_redacted_at FROM background_job WHERE id=ANY($1) ORDER BY id")
+        .bind(&ids).fetch_all(&mut *conn).await.unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+        vec!["failed", "failed", "succeeded", "failed"]
+    );
+    assert!(
+        rows.iter()
+            .all(|r| r.1 == serde_json::json!({}) && r.2.is_none() && r.3.is_some())
+    );
+    let kept: serde_json::Value =
+        sqlx::query_scalar("SELECT payload FROM background_job WHERE id=$1")
+            .bind(other)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+    assert_eq!(kept, serde_json::json!({"keep":true}));
+}
+
+#[test]
+fn retention_redacts_only_expired_mail_payloads() {
+    run_isolated_database_test(|pool: sqlx::PgPool| async move {
+        let db = Db::from_pool(pool.clone());
+        let now = Utc::now();
+        let ids: Vec<i64>=sqlx::query_scalar("INSERT INTO background_job(kind,payload,mail_token_hash,mail_purpose,mail_token_expires_at) VALUES ('email.send','{\"secret\":\"expired\"}','expired','reset',$1),('email.send','{\"secret\":\"valid\"}','valid','reset',$2) RETURNING id")
+        .bind(now-Duration::hours(1)).bind(now+Duration::hours(1)).fetch_all(&mut *db.acquire().await.unwrap()).await.unwrap();
+        let user_id:i64=sqlx::query_scalar("INSERT INTO users(email,account_state) VALUES('scoped-mail-expiry@example.com','ACTIVE') RETURNING id")
+        .fetch_one(&pool).await.unwrap();
+        sqlx::query("UPDATE background_job SET mail_account_id=$1 WHERE id=ANY($2)")
+            .bind(user_id)
+            .bind(&ids)
+            .execute(&mut *db.acquire().await.unwrap())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO password_reset_tokens(token_hash,user_id,expires_at) VALUES('expired',$1,$2),('valid',$1,$3)")
+        .bind(user_id).bind(now-Duration::hours(1)).bind(now+Duration::hours(1)).execute(&pool).await.unwrap();
+        SqlxRetentionRepository::new(
+            db.clone(),
+            RetentionPolicy::default(),
+            std::sync::Arc::new(TestObjectStorage::new()),
+        )
+        .purge_expired_password_reset_tokens(now)
+        .await
+        .unwrap();
+        let mut conn = db.acquire().await.unwrap();
+        let rows: Vec<(String, serde_json::Value, Option<DateTime<Utc>>)> = sqlx::query_as(
+        "SELECT state,payload,payload_redacted_at FROM background_job WHERE id=ANY($1) ORDER BY id",
+    )
+    .bind(&ids)
+    .fetch_all(&mut *conn)
+    .await
+    .unwrap();
+        assert_eq!(rows[0].0, "failed");
+        assert_eq!(rows[0].1, serde_json::json!({}));
+        assert!(rows[0].2.is_some());
+        assert_eq!(rows[1].0, "pending");
+        assert_ne!(rows[1].1, serde_json::json!({}));
+        assert!(rows[1].2.is_none());
+    });
 }
 
 #[db_test]
@@ -254,7 +566,6 @@ async fn anonymize_scrubs_identity_and_nulls_attribution(tx: &mut bikesnest_test
         "INSERT INTO privacy_request (user_id, kind, state, details) VALUES ($1, 'deletion', 'OPEN', '{}')",
     )
     .bind(uid).execute(tx.executor()).await.unwrap();
-
     tx.commit_fixture().await;
 
     let now = Utc::now();

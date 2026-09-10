@@ -7,15 +7,15 @@
 //!
 //! Two ports, deliberately separate:
 //!
-//! - [`EmailQueue`] is what use cases call. It hands the message off durably
-//!   (an `email.send` row on the job queue) and returns immediately, so a slow
-//!   or failing provider can never hold an HTTP request open or half-succeed a
-//!   registration.
+//! - [`EmailQueue`] is what use cases call. The durable implementation writes
+//!   an `email.send` row and returns before provider delivery; that enqueue is
+//!   currently separate from the preceding auth transaction. The inline
+//!   implementation keeps provider delivery on the request path.
 //! - [`EmailProvider`] is what actually talks to a relay/ESP. Only the job
 //!   handler (and the inline queue used when the worker is disabled) calls it.
 
 use async_trait::async_trait;
-use bikesnest_domain::LocaleCode;
+use bikesnest_domain::{LocaleCode, UserId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
@@ -28,7 +28,7 @@ pub enum EmailError {
 
 /// Which transactional message this is. The variant chooses the catalog keys;
 /// its payload carries the one thing that varies, the single-use link.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EmailKind {
     /// Registration (and re-send): confirm the address on a pending account.
@@ -37,6 +37,15 @@ pub enum EmailKind {
     ResetPassword { link: String },
     /// Email change: confirm the *new* address before it becomes canonical.
     ConfirmEmailChange { link: String },
+}
+
+impl std::fmt::Debug for EmailKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmailKind")
+            .field("code", &self.code())
+            .field("link", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl EmailKind {
@@ -66,8 +75,9 @@ impl EmailKind {
 /// This is also the `email.send` job payload, hence the serde derives. The
 /// recipient is a plain `String` because a queued payload is round-tripped
 /// through JSON, and the address was already validated when it was accepted.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmailMessage {
+    pub account_id: i64,
     pub to: String,
     #[serde(with = "locale_code")]
     pub locale: LocaleCode,
@@ -77,20 +87,31 @@ pub struct EmailMessage {
 
 impl EmailMessage {
     pub fn new(to: impl Into<String>, locale: LocaleCode, kind: EmailKind) -> Self {
+        Self::linked(UserId(0), to, locale, kind)
+    }
+
+    pub fn linked(
+        account_id: UserId,
+        to: impl Into<String>,
+        locale: LocaleCode,
+        kind: EmailKind,
+    ) -> Self {
         Self {
+            account_id: account_id.0,
             to: to.into(),
             locale,
             kind,
         }
     }
+}
 
-    /// The recipient's domain — the only part of an address safe to log
-    /// (an email address is personal data; its provider is not).
-    pub fn recipient_domain(&self) -> &str {
-        self.to
-            .rsplit_once('@')
-            .map(|(_, d)| d)
-            .unwrap_or("unknown")
+impl std::fmt::Debug for EmailMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmailMessage")
+            .field("account_id", &self.account_id)
+            .field("locale", &self.locale.as_str())
+            .field("kind", &self.kind.code())
+            .finish()
     }
 }
 
@@ -106,8 +127,7 @@ mod locale_code {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<LocaleCode, D::Error> {
         let raw = String::deserialize(d)?;
-        LocaleCode::parse(&raw)
-            .ok_or_else(|| serde::de::Error::custom(format!("unknown locale code: {raw}")))
+        LocaleCode::parse(&raw).ok_or_else(|| serde::de::Error::custom("unknown locale code"))
     }
 }
 
@@ -136,7 +156,8 @@ mod tests {
 
     #[test]
     fn message_round_trips_through_the_job_payload() {
-        let msg = EmailMessage::new(
+        let msg = EmailMessage::linked(
+            UserId(7),
             "ada@example.com",
             LocaleCode::PtBr,
             EmailKind::VerifyEmail {
@@ -151,13 +172,13 @@ mod tests {
     }
 
     #[test]
-    fn only_the_recipient_domain_is_loggable() {
-        let msg = EmailMessage::new(
+    fn purpose_code_is_a_bounded_diagnostic() {
+        let msg = EmailMessage::linked(
+            UserId(7),
             "ada@example.com",
             LocaleCode::En,
             EmailKind::ResetPassword { link: "x".into() },
         );
-        assert_eq!(msg.recipient_domain(), "example.com");
         assert_eq!(msg.kind.code(), "reset");
     }
 
@@ -169,6 +190,25 @@ mod tests {
             "kind": "verify_email",
             "link": "x",
         });
-        assert!(serde_json::from_value::<EmailMessage>(json).is_err());
+        let error = serde_json::from_value::<EmailMessage>(json)
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("fr"));
+    }
+
+    #[test]
+    fn debug_output_redacts_recipient_and_link() {
+        let marker = "SECRET-MARKER.invalid";
+        let msg = EmailMessage::linked(
+            UserId(9),
+            format!("ada@{marker}"),
+            LocaleCode::En,
+            EmailKind::ResetPassword {
+                link: format!("https://x/?token={marker}"),
+            },
+        );
+        let debug = format!("{msg:?}");
+        assert!(!debug.contains(marker));
+        assert!(debug.contains("reset"));
     }
 }

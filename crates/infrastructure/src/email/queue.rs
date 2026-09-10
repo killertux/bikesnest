@@ -1,30 +1,35 @@
 //! `EmailQueue` implementations: durable (via the job queue) and inline.
 //!
-//! [`JobEmailQueue`] is the one production wants. `enqueue` is a single INSERT
-//! into `background_job` — the same database the account and token rows were
-//! just written to — after which the request is done. Delivery, retries with
-//! backoff and dead-lettering are the worker's business, so a slow or broken
-//! ESP can neither hold an HTTP request open nor fail a registration that has
-//! already created an account.
+//! [`JobEmailQueue`] is the durable implementation. It validates the current
+//! account/token and inserts `background_job` in its own transaction, after the
+//! caller's auth transition has committed. Provider delivery, retries and
+//! dead-lettering then happen outside the request path. The composition root
+//! preserves this non-atomic seam for now.
 //!
 //! [`InlineEmailQueue`] sends on the spot. It exists for two reasons: tests
 //! that want the message without running a worker, and deployments with
 //! `JOBS_ENABLED=false` — where nothing would ever claim an `email.send` row,
 //! so queuing the mail would be the same as dropping it.
 
+use crate::Db;
 use crate::auth::hash::sha256_hex;
-use crate::job::repo::SqlxJobRepository;
+use crate::email::token_hash_from_link;
+use crate::job::{
+    email::SendEmailHandler,
+    repo::{MailEnqueue, SqlxJobRepository},
+};
 use async_trait::async_trait;
-use bikesnest_application::{EmailError, EmailMessage, EmailProvider, EmailQueue, JOB_EMAIL_SEND};
+use bikesnest_application::{EmailError, EmailMessage, EmailProvider, EmailQueue, JobHandler};
 use std::sync::Arc;
 
 /// Enqueue-time idempotency key for one message: `email:{kind}:{sha256(link)}`.
 ///
 /// The link embeds the single-use token, so the key identifies exactly "this
 /// message about this token". A retried enqueue of the same token — a
-/// double-submitted form, a retried request — collapses onto the existing row
-/// instead of mailing the user twice; a *fresh* token (a real re-send) has a
-/// different link and is therefore a different job.
+/// double-submitted form, a retried request — collapses onto the existing row.
+/// This deduplicates queue admission, not provider delivery: lease expiry or an
+/// ambiguous provider outcome can still cause an at-least-once duplicate. A
+/// *fresh* token (a real re-send) has a different link and therefore a new job.
 pub fn idempotency_key(msg: &EmailMessage) -> String {
     format!(
         "email:{}:{}",
@@ -50,25 +55,34 @@ impl JobEmailQueue {
 impl EmailQueue for JobEmailQueue {
     async fn enqueue(&self, msg: EmailMessage) -> Result<(), EmailError> {
         let payload = serde_json::to_value(&msg)
-            .map_err(|e| EmailError::Unexpected(format!("email payload: {e}")))?;
+            .map_err(|_| EmailError::Unexpected("email payload encoding failed".into()))?;
         let key = idempotency_key(&msg);
+        let token_hash = token_hash_from_link(msg.kind.link())
+            .ok_or_else(|| EmailError::Unexpected("email token reference missing".into()))?;
         let queued = self
             .jobs
-            .enqueue(
-                JOB_EMAIL_SEND,
-                &payload,
-                chrono::Utc::now(),
-                Some(self.max_attempts),
-                Some(&key),
-            )
+            .enqueue_mail(MailEnqueue {
+                payload: &payload,
+                account_id: msg.account_id,
+                token_hash: &token_hash,
+                purpose: msg.kind.code(),
+                recipient: &msg.to,
+                run_at: chrono::Utc::now(),
+                max_attempts: self.max_attempts,
+                idempotency_key: &key,
+            })
             .await
             .map_err(|e| {
                 // The caller turns this into a failed request: better than
                 // telling someone to check an inbox nothing will arrive in.
+                let reason = match e {
+                    crate::job::JobRepoError::InvalidMailCredential => "invalid_credential",
+                    crate::job::JobRepoError::Db(_) => "database_unavailable",
+                    _ => "queue_error",
+                };
                 tracing::error!(
                     kind = msg.kind.code(),
-                    recipient_domain = msg.recipient_domain(),
-                    error = %e,
+                    reason,
                     "could not queue transactional email"
                 );
                 EmailError::Unavailable
@@ -90,19 +104,28 @@ impl EmailQueue for JobEmailQueue {
 /// that run without the background worker.
 #[derive(Clone)]
 pub struct InlineEmailQueue {
-    provider: Arc<dyn EmailProvider>,
+    handler: Arc<SendEmailHandler>,
 }
 
 impl InlineEmailQueue {
-    pub fn new(provider: Arc<dyn EmailProvider>) -> Self {
-        Self { provider }
+    pub fn new(db: Db, provider: Arc<dyn EmailProvider>) -> Self {
+        Self {
+            handler: Arc::new(SendEmailHandler::new(db, provider)),
+        }
     }
 }
 
 #[async_trait]
 impl EmailQueue for InlineEmailQueue {
     async fn enqueue(&self, msg: EmailMessage) -> Result<(), EmailError> {
-        self.provider.send(&msg).await
+        let payload = serde_json::to_value(msg)
+            .map_err(|_| EmailError::Unexpected("email payload encoding failed".into()))?;
+        self.handler.run(&payload).await.map_err(|e| match e {
+            bikesnest_application::JobError::Failed(_) => EmailError::Unavailable,
+            bikesnest_application::JobError::Permanent(_) => {
+                EmailError::Unexpected("mail credential is no longer deliverable".into())
+            }
+        })
     }
 }
 
@@ -113,7 +136,12 @@ mod tests {
     use bikesnest_domain::LocaleCode;
 
     fn msg(kind: EmailKind) -> EmailMessage {
-        EmailMessage::new("ada@example.com", LocaleCode::PtBr, kind)
+        EmailMessage::linked(
+            bikesnest_domain::UserId(7),
+            "ada@example.com",
+            LocaleCode::PtBr,
+            kind,
+        )
     }
 
     #[test]

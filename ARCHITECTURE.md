@@ -149,6 +149,16 @@ The adapters: `Sqlx*` repositories for every persistence port, `Config::from_env
 Providers are selected from environment variables in `config.rs` and wired into
 the router in `crates/web/src/wiring.rs` — the one module that names them.
 
+Transactional mail jobs carry canonical account, token-hash, purpose and token-
+expiry metadata. Queue admission, delayed delivery and account anonymization
+serialize on the `users` row. Delivery revalidates the exact unused,
+unexpired token and recipient while holding that lock through a bounded provider
+call; terminal outcomes, deletion and the expiry-retention sweep redact the
+recipient/link payload. Provider acceptance is the external recall boundary,
+not a distributed exactly-once guarantee. The same lifecycle columns and
+`enqueue_mail` operation are the outbox seam for making auth transition plus
+enqueue atomic in the subsequent batch.
+
 ### Web (`crates/web`)
 
 `main.rs` loads env, connects the DB, runs migrations, optionally starts the
