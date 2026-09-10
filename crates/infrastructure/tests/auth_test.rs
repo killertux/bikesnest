@@ -4,18 +4,552 @@
 //! them up explicitly. New sequential repository regressions inject `tx.db()`
 //! and rely on the harness's automatic outer rollback.
 
-use bikesnest_application::{AccountRepository, AuditEvent, AuditLog, SessionStore, TokenStore};
+use bikesnest_application::{
+    AccountRepository, AuditEvent, AuditLog, AuthOutbox, EmailKind, EmailMessage, NewAccount,
+    SessionStore, TokenStore,
+};
 use bikesnest_domain::{
-    AccountState, AuthenticationProvider, CsrfToken, Role, SessionId, UserEmail, VerificationToken,
+    AccountState, AuthenticationProvider, CsrfToken, LocaleCode, Role, SessionId, UserEmail,
+    UserId, VerificationToken,
 };
 use bikesnest_infrastructure::{
-    Db, SqlxAccountRepository, SqlxAuditLog, SqlxSessionStore, SqlxTokenStore,
+    Db, SqlxAccountRepository, SqlxAuditLog, SqlxAuthOutbox, SqlxSessionStore, SqlxTokenStore,
 };
 use bikesnest_test_support::{db_test, pool, run_isolated_database_test};
 use chrono::{DateTime, Duration, Utc};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn verification_message(
+    account_id: UserId,
+    email: &str,
+    token: &VerificationToken,
+) -> EmailMessage {
+    EmailMessage::linked(
+        account_id,
+        email,
+        LocaleCode::En,
+        EmailKind::VerifyEmail {
+            link: format!(
+                "https://bikesnest.test/verify-email?token={}",
+                token.to_base64url()
+            ),
+        },
+    )
+}
+
+#[db_test]
+async fn registration_outbox_insert_failure_rolls_back_every_row(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let email = UserEmail::parse("atomic-register-fail@bikesnest.test").unwrap();
+    let token = VerificationToken::new([0x91; 32]);
+    let mut setup = db.acquire().await.unwrap();
+    sqlx::raw_sql("CREATE FUNCTION pg_temp.fail_auth_outbox() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected outbox failure'; END $$; CREATE TRIGGER fail_auth_outbox BEFORE INSERT ON background_job FOR EACH ROW EXECUTE FUNCTION pg_temp.fail_auth_outbox()")
+        .execute(&mut *setup).await.unwrap();
+    drop(setup);
+    let outbox = SqlxAuthOutbox::new(db.clone(), 3);
+    let result = outbox
+        .register(
+            NewAccount {
+                email: &email,
+                display_name: Some("Atomic"),
+                password_hash: "hash",
+                state: AccountState::PendingEmailVerification,
+                locale: LocaleCode::En,
+            },
+            &token,
+            Utc::now(),
+            verification_message(UserId(0), email.as_str(), &token),
+        )
+        .await;
+    assert!(result.is_err());
+    let mut conn = db.acquire().await.unwrap();
+    let counts: (i64,i64,i64,i64) = sqlx::query_as("SELECT (SELECT count(*) FROM users WHERE email=$1),(SELECT count(*) FROM email_verification_tokens t JOIN users u ON u.id=t.user_id WHERE u.email=$1),(SELECT count(*) FROM background_job WHERE payload->>'to'=$1),(SELECT count(*) FROM audit_events WHERE action='auth.register' AND target_id IN (SELECT id::text FROM users WHERE email=$1))")
+        .bind(email.as_str()).fetch_one(&mut *conn).await.unwrap();
+    assert_eq!(counts, (0, 0, 0, 0));
+}
+
+#[db_test]
+async fn registration_commits_account_token_outbox_and_audit_together(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let email = UserEmail::parse("atomic-register-ok@bikesnest.test").unwrap();
+    let token = VerificationToken::new([0x92; 32]);
+    let admitted = SqlxAuthOutbox::new(db.clone(), 3)
+        .register(
+            NewAccount {
+                email: &email,
+                display_name: None,
+                password_hash: "hash",
+                state: AccountState::PendingEmailVerification,
+                locale: LocaleCode::En,
+            },
+            &token,
+            Utc::now(),
+            verification_message(UserId(0), email.as_str(), &token),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(admitted.job_id > 0);
+    let row: (String,String,String,i64) = sqlx::query_as("SELECT u.account_state::text,t.email,j.mail_purpose,j.mail_account_id FROM users u JOIN email_verification_tokens t ON t.user_id=u.id JOIN background_job j ON j.mail_account_id=u.id WHERE u.email=$1")
+        .bind(email.as_str()).fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
+    assert_eq!(row.0, "PENDING_EMAIL_VERIFICATION");
+    assert_eq!(row.1, email.as_str());
+    assert_eq!(row.2, "verify");
+    assert_eq!(row.3, admitted.message.account_id);
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events WHERE actor_user_id=$1 AND action='auth.register'",
+    )
+    .bind(row.3)
+    .fetch_one(&mut *db.acquire().await.unwrap())
+    .await
+    .unwrap();
+    assert_eq!(audits, 1);
+}
+
+#[db_test]
+async fn registration_retry_recovers_or_repairs_without_overwriting_account(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let email = UserEmail::parse("atomic-register-retry@bikesnest.test").unwrap();
+    let first = VerificationToken::new([0x93; 32]);
+    let outbox = SqlxAuthOutbox::new(db.clone(), 3);
+    let new = || NewAccount {
+        email: &email,
+        display_name: None,
+        password_hash: "original-hash",
+        state: AccountState::PendingEmailVerification,
+        locale: LocaleCode::En,
+    };
+    let admitted = outbox
+        .register(
+            new(),
+            &first,
+            Utc::now(),
+            verification_message(UserId(0), email.as_str(), &first),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let retry = VerificationToken::new([0x94; 32]);
+    let recovered = outbox
+        .register(
+            NewAccount {
+                email: &email,
+                display_name: Some("overwrite"),
+                password_hash: "replacement-hash",
+                state: AccountState::PendingEmailVerification,
+                locale: LocaleCode::PtBr,
+            },
+            &retry,
+            Utc::now(),
+            verification_message(UserId(0), email.as_str(), &retry),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.job_id, admitted.job_id);
+    assert_eq!(recovered.message, admitted.message);
+    let identity:(String,String)=sqlx::query_as("SELECT credential_hash,u.locale FROM authentication_identities i JOIN users u ON u.id=i.user_id WHERE u.email=$1 AND i.provider='password'").bind(email.as_str()).fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
+    assert_eq!(identity, ("original-hash".into(), "en".into()));
+    sqlx::query("UPDATE background_job SET state='pending',attempts=max_attempts WHERE id=$1")
+        .bind(admitted.job_id)
+        .execute(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    let repaired = outbox
+        .register(
+            NewAccount {
+                email: &email,
+                display_name: None,
+                password_hash: "replacement-hash",
+                state: AccountState::PendingEmailVerification,
+                locale: LocaleCode::PtBr,
+            },
+            &retry,
+            Utc::now(),
+            verification_message(UserId(0), email.as_str(), &retry),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(repaired.job_id, admitted.job_id);
+    assert_eq!(repaired.message.locale, LocaleCode::En);
+    let exhausted: (String, serde_json::Value) =
+        sqlx::query_as("SELECT state,payload FROM background_job WHERE id=$1")
+            .bind(admitted.job_id)
+            .fetch_one(&mut *db.acquire().await.unwrap())
+            .await
+            .unwrap();
+    assert_eq!(exhausted, ("failed".into(), serde_json::json!({})));
+    let counts:(i64,i64)=sqlx::query_as("SELECT (SELECT count(*) FROM users WHERE email=$1),(SELECT count(*) FROM authentication_identities i JOIN users u ON u.id=i.user_id WHERE u.email=$1)").bind(email.as_str()).fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
+    assert_eq!(counts, (1, 1));
+}
+
+#[derive(Clone, Copy)]
+enum RecoveryState {
+    Expired,
+    Missing,
+    Succeeded,
+    Failed,
+    ActiveRunning,
+    ActiveRunningExhausted,
+}
+
+async fn registration_recovery_case(
+    tx: &mut bikesnest_test_support::TestTx,
+    suffix: &str,
+    state: RecoveryState,
+) {
+    let db = tx.db().await;
+    let email = UserEmail::parse(&format!("recovery-{suffix}@bikesnest.test")).unwrap();
+    let first = VerificationToken::new([suffix.as_bytes()[0]; 32]);
+    let outbox = SqlxAuthOutbox::new(db.clone(), 3);
+    let admitted = outbox
+        .register(
+            NewAccount {
+                email: &email,
+                display_name: Some("Original name"),
+                password_hash: "original-hash",
+                state: AccountState::PendingEmailVerification,
+                locale: LocaleCode::En,
+            },
+            &first,
+            Utc::now(),
+            verification_message(UserId(0), email.as_str(), &first),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let account_before: (i64, Option<String>, String, String) = sqlx::query_as(
+        "SELECT u.id,u.display_name,u.locale,i.credential_hash FROM users u JOIN authentication_identities i ON i.user_id=u.id AND i.provider='password' WHERE u.email=$1",
+    )
+    .bind(email.as_str())
+    .fetch_one(&mut *db.acquire().await.unwrap())
+    .await
+    .unwrap();
+
+    let mutation = match state {
+        RecoveryState::Expired => {
+            sqlx::query("UPDATE email_verification_tokens SET expires_at=clock_timestamp()-interval '1 second' WHERE token_hash=(SELECT mail_token_hash FROM background_job WHERE id=$1)")
+                .bind(admitted.job_id).execute(&mut *db.acquire().await.unwrap()).await.unwrap();
+            "UPDATE background_job SET mail_token_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1"
+        }
+        RecoveryState::Missing => "DELETE FROM background_job WHERE id=$1",
+        RecoveryState::Succeeded => {
+            "UPDATE background_job SET state='succeeded',finished_at=clock_timestamp() WHERE id=$1"
+        }
+        RecoveryState::Failed => {
+            "UPDATE background_job SET state='failed',finished_at=clock_timestamp(),payload='{}' WHERE id=$1"
+        }
+        RecoveryState::ActiveRunning => {
+            "UPDATE background_job SET state='running',attempts=1,claimed_by='matrix-owner',lease_expires_at=clock_timestamp()+interval '5 minutes' WHERE id=$1"
+        }
+        RecoveryState::ActiveRunningExhausted => {
+            "UPDATE background_job SET state='running',attempts=max_attempts,claimed_by='matrix-owner',lease_expires_at=clock_timestamp()+interval '5 minutes' WHERE id=$1"
+        }
+    };
+    sqlx::query(mutation)
+        .bind(admitted.job_id)
+        .execute(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+
+    let old_token_before: (String, String, DateTime<Utc>, Option<DateTime<Utc>>) =
+        sqlx::query_as("SELECT token_hash,email,expires_at,used_at FROM email_verification_tokens WHERE user_id=$1")
+            .bind(account_before.0)
+            .fetch_one(&mut *db.acquire().await.unwrap())
+            .await
+            .unwrap();
+    let old_job_before: Option<(i64, String, i32, i32, serde_json::Value, Option<String>)> =
+        sqlx::query_as("SELECT id,state,attempts,max_attempts,payload,claimed_by FROM background_job WHERE id=$1")
+            .bind(admitted.job_id)
+            .fetch_optional(&mut *db.acquire().await.unwrap())
+            .await
+            .unwrap();
+
+    let second = VerificationToken::new([suffix.as_bytes()[0].wrapping_add(1); 32]);
+    let recovered = outbox
+        .register(
+            NewAccount {
+                email: &email,
+                display_name: Some("Must not overwrite"),
+                password_hash: "must-not-overwrite",
+                state: AccountState::PendingEmailVerification,
+                locale: LocaleCode::PtBr,
+            },
+            &second,
+            Utc::now(),
+            verification_message(UserId(0), email.as_str(), &second),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    let account_after: (i64, Option<String>, String, String) = sqlx::query_as(
+        "SELECT u.id,u.display_name,u.locale,i.credential_hash FROM users u JOIN authentication_identities i ON i.user_id=u.id AND i.provider='password' WHERE u.email=$1",
+    )
+    .bind(email.as_str())
+    .fetch_one(&mut *db.acquire().await.unwrap())
+    .await
+    .unwrap();
+    assert_eq!(account_after, account_before);
+    let old_token_after: (String, String, DateTime<Utc>, Option<DateTime<Utc>>) =
+        sqlx::query_as("SELECT token_hash,email,expires_at,used_at FROM email_verification_tokens WHERE token_hash=$1")
+            .bind(&old_token_before.0)
+            .fetch_one(&mut *db.acquire().await.unwrap())
+            .await
+            .unwrap();
+    assert_eq!(old_token_after, old_token_before);
+
+    if matches!(
+        state,
+        RecoveryState::ActiveRunning | RecoveryState::ActiveRunningExhausted
+    ) {
+        assert_eq!(recovered.job_id, admitted.job_id);
+        assert_eq!(recovered.message, admitted.message);
+        let old_job_after = sqlx::query_as("SELECT id,state,attempts,max_attempts,payload,claimed_by FROM background_job WHERE id=$1")
+            .bind(admitted.job_id).fetch_optional(&mut *db.acquire().await.unwrap()).await.unwrap();
+        assert_eq!(old_job_after, old_job_before);
+        let token_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM email_verification_tokens WHERE user_id=$1")
+                .bind(account_before.0)
+                .fetch_one(&mut *db.acquire().await.unwrap())
+                .await
+                .unwrap();
+        assert_eq!(token_count, 1);
+    } else {
+        assert_ne!(recovered.job_id, admitted.job_id);
+        assert_eq!(recovered.message.account_id, account_before.0);
+        assert_eq!(recovered.message.locale, LocaleCode::En);
+        let new_row: (String, String, i64, String) = sqlx::query_as("SELECT t.token_hash,t.email,j.id,j.state FROM email_verification_tokens t JOIN background_job j ON j.mail_token_hash=t.token_hash WHERE j.id=$1")
+            .bind(recovered.job_id).fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
+        assert_ne!(new_row.0, old_token_before.0);
+        assert_eq!(new_row.1, email.as_str());
+        assert_eq!(new_row.2, recovered.job_id);
+        assert_eq!(new_row.3, "pending");
+        let old_job_after = sqlx::query_as("SELECT id,state,attempts,max_attempts,payload,claimed_by FROM background_job WHERE id=$1")
+            .bind(admitted.job_id).fetch_optional(&mut *db.acquire().await.unwrap()).await.unwrap();
+        assert_eq!(old_job_after, old_job_before);
+    }
+}
+
+#[db_test]
+async fn registration_recovery_repairs_expired_work(tx: &mut bikesnest_test_support::TestTx) {
+    registration_recovery_case(tx, "expired", RecoveryState::Expired).await;
+}
+#[db_test]
+async fn registration_recovery_repairs_missing_work(tx: &mut bikesnest_test_support::TestTx) {
+    registration_recovery_case(tx, "missing", RecoveryState::Missing).await;
+}
+#[db_test]
+async fn registration_recovery_repairs_succeeded_work(tx: &mut bikesnest_test_support::TestTx) {
+    registration_recovery_case(tx, "succeeded", RecoveryState::Succeeded).await;
+}
+#[db_test]
+async fn registration_recovery_repairs_failed_work(tx: &mut bikesnest_test_support::TestTx) {
+    registration_recovery_case(tx, "failed", RecoveryState::Failed).await;
+}
+#[db_test]
+async fn registration_recovery_preserves_active_running_work(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    registration_recovery_case(tx, "active", RecoveryState::ActiveRunning).await;
+}
+#[db_test]
+async fn registration_recovery_preserves_active_exhausted_work(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    registration_recovery_case(tx, "exhausted", RecoveryState::ActiveRunningExhausted).await;
+}
+
+#[db_test]
+async fn auth_mail_admission_failure_rolls_back_each_token_transition(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let repo = SqlxAccountRepository::new(db.clone());
+    let active_email = UserEmail::parse("atomic-mail-active@bikesnest.test").unwrap();
+    let active = repo
+        .create(NewAccount {
+            email: &active_email,
+            display_name: None,
+            password_hash: "hash",
+            state: AccountState::Active,
+            locale: LocaleCode::En,
+        })
+        .await
+        .unwrap();
+    let pending_email = UserEmail::parse("atomic-mail-pending@bikesnest.test").unwrap();
+    let pending = repo
+        .create(NewAccount {
+            email: &pending_email,
+            display_name: None,
+            password_hash: "hash",
+            state: AccountState::PendingEmailVerification,
+            locale: LocaleCode::En,
+        })
+        .await
+        .unwrap();
+    let mut setup = db.acquire().await.unwrap();
+    sqlx::raw_sql("CREATE FUNCTION pg_temp.fail_auth_mail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected mail failure'; END $$; CREATE TRIGGER fail_auth_mail BEFORE INSERT ON background_job FOR EACH ROW EXECUTE FUNCTION pg_temp.fail_auth_mail()").execute(&mut *setup).await.unwrap();
+    drop(setup);
+    let outbox = SqlxAuthOutbox::new(db.clone(), 3);
+    let verify = VerificationToken::new([0xa1; 32]);
+    assert!(
+        outbox
+            .issue_verification(
+                pending,
+                pending_email.as_str(),
+                &verify,
+                Utc::now(),
+                AccountState::PendingEmailVerification,
+                verification_message(pending, pending_email.as_str(), &verify),
+                None
+            )
+            .await
+            .is_err()
+    );
+    let reset = VerificationToken::new([0xa2; 32]);
+    let reset_msg = EmailMessage::linked(
+        active,
+        active_email.as_str(),
+        LocaleCode::En,
+        EmailKind::ResetPassword {
+            link: format!(
+                "https://bikesnest.test/password-reset/new?token={}",
+                reset.to_base64url()
+            ),
+        },
+    );
+    assert!(
+        outbox
+            .issue_reset(active, &reset, Utc::now(), reset_msg)
+            .await
+            .is_err()
+    );
+    let change = VerificationToken::new([0xa3; 32]);
+    let changed = "atomic-mail-new@bikesnest.test";
+    let change_msg = EmailMessage::linked(
+        active,
+        changed,
+        LocaleCode::En,
+        EmailKind::ConfirmEmailChange {
+            link: format!(
+                "https://bikesnest.test/verify-email?token={}",
+                change.to_base64url()
+            ),
+        },
+    );
+    assert!(
+        outbox
+            .issue_verification(
+                active,
+                changed,
+                &change,
+                Utc::now(),
+                AccountState::Active,
+                change_msg,
+                Some("auth.email_change_requested")
+            )
+            .await
+            .is_err()
+    );
+    let counts:(i64,i64,i64)=sqlx::query_as("SELECT (SELECT count(*) FROM email_verification_tokens WHERE user_id=ANY($1)),(SELECT count(*) FROM password_reset_tokens WHERE user_id=ANY($1)),(SELECT count(*) FROM background_job WHERE mail_account_id=ANY($1))").bind([active.0,pending.0]).fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
+    assert_eq!(counts, (0, 0, 0));
+    let audits:i64=sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE actor_user_id=$1 AND action='auth.email_change_requested'").bind(active.0).fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
+    assert_eq!(audits, 0);
+}
+
+#[db_test]
+async fn registration_final_audit_failure_rolls_back_account_token_and_job(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let audits_before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE action='auth.register'")
+            .fetch_one(&mut *db.acquire().await.unwrap())
+            .await
+            .unwrap();
+    sqlx::raw_sql("CREATE FUNCTION pg_temp.fail_register_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected final audit failure'; END $$; CREATE TRIGGER fail_register_audit BEFORE INSERT ON audit_events FOR EACH ROW WHEN (NEW.action='auth.register') EXECUTE FUNCTION pg_temp.fail_register_audit()")
+        .execute(&mut *db.acquire().await.unwrap()).await.unwrap();
+    let email = UserEmail::parse("late-audit-register@bikesnest.test").unwrap();
+    let token = VerificationToken::new([0xd1; 32]);
+    let result = SqlxAuthOutbox::new(db.clone(), 3)
+        .register(
+            NewAccount {
+                email: &email,
+                display_name: Some("Late audit"),
+                password_hash: "hash",
+                state: AccountState::PendingEmailVerification,
+                locale: LocaleCode::En,
+            },
+            &token,
+            Utc::now(),
+            verification_message(UserId(0), email.as_str(), &token),
+        )
+        .await;
+    assert!(result.is_err());
+    let counts: (i64, i64, i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM users WHERE email=$1),(SELECT count(*) FROM email_verification_tokens t JOIN users u ON u.id=t.user_id WHERE u.email=$1),(SELECT count(*) FROM background_job WHERE payload->>'to'=$1),(SELECT count(*) FROM audit_events WHERE action='auth.register')")
+        .bind(email.as_str()).fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
+    assert_eq!(counts, (0, 0, 0, audits_before));
+}
+
+#[db_test]
+async fn email_change_final_audit_failure_rolls_back_token_and_job(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let original = UserEmail::parse("late-audit-change@bikesnest.test").unwrap();
+    let account = SqlxAccountRepository::new(db.clone())
+        .create(NewAccount {
+            email: &original,
+            display_name: Some("Original"),
+            password_hash: "original-hash",
+            state: AccountState::Active,
+            locale: LocaleCode::En,
+        })
+        .await
+        .unwrap();
+    let account_before: (String, Option<String>, String) =
+        sqlx::query_as("SELECT email,display_name,locale FROM users WHERE id=$1")
+            .bind(account.0)
+            .fetch_one(&mut *db.acquire().await.unwrap())
+            .await
+            .unwrap();
+    sqlx::raw_sql("CREATE FUNCTION pg_temp.fail_change_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected final audit failure'; END $$; CREATE TRIGGER fail_change_audit BEFORE INSERT ON audit_events FOR EACH ROW WHEN (NEW.action='auth.email_change_requested') EXECUTE FUNCTION pg_temp.fail_change_audit()")
+        .execute(&mut *db.acquire().await.unwrap()).await.unwrap();
+    let token = VerificationToken::new([0xd2; 32]);
+    let changed = "late-audit-new@bikesnest.test";
+    let result = SqlxAuthOutbox::new(db.clone(), 3)
+        .issue_verification(
+            account,
+            changed,
+            &token,
+            Utc::now(),
+            AccountState::Active,
+            verification_message(account, changed, &token),
+            Some("auth.email_change_requested"),
+        )
+        .await;
+    assert!(result.is_err());
+    let account_after: (String, Option<String>, String) =
+        sqlx::query_as("SELECT email,display_name,locale FROM users WHERE id=$1")
+            .bind(account.0)
+            .fetch_one(&mut *db.acquire().await.unwrap())
+            .await
+            .unwrap();
+    assert_eq!(account_after, account_before);
+    let counts: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM email_verification_tokens WHERE user_id=$1),(SELECT count(*) FROM background_job WHERE mail_account_id=$1),(SELECT count(*) FROM audit_events WHERE actor_user_id=$1 AND action='auth.email_change_requested')")
+        .bind(account.0).fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
+    assert_eq!(counts, (0, 0, 0));
+}
 
 fn unique_email(label: &str) -> String {
     let n = SEQ.fetch_add(1, Ordering::Relaxed);

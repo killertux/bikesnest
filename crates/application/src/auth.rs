@@ -3,7 +3,7 @@
 //! calls [`AuthService`] for every auth/account/role action.
 
 use crate::audit::{AuditEvent, AuditLog};
-use crate::email::{EmailKind, EmailMessage, EmailQueue};
+use crate::email::{EmailKind, EmailMessage};
 use crate::rate_limit::{RateLimitError, RateLimiter};
 use async_trait::async_trait;
 use bikesnest_domain::{
@@ -145,6 +145,48 @@ pub struct NewAccount<'a> {
     /// verification mail — and every later message, sent by a background job
     /// with no request in scope — is written in it.
     pub locale: LocaleCode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmittedAuthMail {
+    pub job_id: i64,
+    pub message: EmailMessage,
+}
+
+#[async_trait]
+pub trait AuthOutbox: Send + Sync {
+    async fn register(
+        &self,
+        new: NewAccount<'_>,
+        token: &VerificationToken,
+        at: DateTime<Utc>,
+        message: EmailMessage,
+    ) -> Result<Option<AdmittedAuthMail>, AuthError>;
+    // The explicit transition inputs keep the atomic persistence port from
+    // accepting partially populated or ambiguous verification commands.
+    #[allow(clippy::too_many_arguments)]
+    async fn issue_verification(
+        &self,
+        user_id: UserId,
+        email: &str,
+        token: &VerificationToken,
+        at: DateTime<Utc>,
+        expected_state: AccountState,
+        message: EmailMessage,
+        audit_action: Option<&'static str>,
+    ) -> Result<Option<AdmittedAuthMail>, AuthError>;
+    async fn issue_reset(
+        &self,
+        user_id: UserId,
+        token: &VerificationToken,
+        at: DateTime<Utc>,
+        message: EmailMessage,
+    ) -> Result<Option<AdmittedAuthMail>, AuthError>;
+}
+
+#[async_trait]
+pub trait AuthMailDispatcher: Send + Sync {
+    async fn dispatch(&self, mail: AdmittedAuthMail) -> Result<(), AuthError>;
 }
 
 /// Activity counters the admin user list shows next to each account, so a
@@ -414,7 +456,8 @@ pub struct AuthService {
     hasher: Box<dyn PasswordHasher>,
     tokens_gen: Box<dyn TokenGenerator>,
     clock: Box<dyn Clock>,
-    email: Box<dyn EmailQueue>,
+    outbox: Box<dyn AuthOutbox>,
+    mail_dispatcher: Box<dyn AuthMailDispatcher>,
     oauth: Box<dyn OAuthProvider>,
     rate_limiter: Box<dyn RateLimiter>,
     audit: Box<dyn AuditLog>,
@@ -431,7 +474,8 @@ impl AuthService {
         hasher: Box<dyn PasswordHasher>,
         tokens_gen: Box<dyn TokenGenerator>,
         clock: Box<dyn Clock>,
-        email: Box<dyn EmailQueue>,
+        outbox: Box<dyn AuthOutbox>,
+        mail_dispatcher: Box<dyn AuthMailDispatcher>,
         oauth: Box<dyn OAuthProvider>,
         rate_limiter: Box<dyn RateLimiter>,
         audit: Box<dyn AuditLog>,
@@ -444,7 +488,8 @@ impl AuthService {
             hasher,
             tokens_gen,
             clock,
-            email,
+            outbox,
+            mail_dispatcher,
             oauth,
             rate_limiter,
             audit,
@@ -547,8 +592,9 @@ impl AuthService {
     // -----------------------------------------------------------------------
 
     /// Register an account. Returning `Ok` whether the email is taken or not
-    /// (no-existence-leak): the email is only sent for a *fresh* signup,
-    /// but the caller renders the same "check your inbox" either way.
+    /// (no-existence-leak). A pending account may resume its already-admitted
+    /// delivery or receive a repaired token/outbox; other existing states stay
+    /// neutral and the caller renders the same response either way.
     pub async fn register(
         &self,
         ip: &str,
@@ -569,60 +615,30 @@ impl AuthService {
         let password = Password::new(raw_password);
 
         let now = self.now();
-        // Identical path whether or not the email is taken. If taken, we
-        // send no email but still return success — and still burn the same
-        // argon2 time, so a timing oracle cannot distinguish an existing
-        // account (mirrors the login DUMMY_HASH).
-        if self.accounts.find_by_email(&email).await?.is_some() {
-            let _ = self.hasher.verify(&password, DUMMY_HASH).await?;
-            return Ok(());
-        }
-
+        // Always pay the same hash cost. The outbox transaction authoritatively
+        // decides whether this is a new account or neutral recovery; no
+        // precheck can race into creating a dummy credential.
         let hash = self.hasher.hash(&password).await?;
-        let user_id = self
-            .accounts
-            .create(NewAccount {
-                email: &email,
-                display_name,
-                password_hash: &hash,
-                state: AccountState::PendingEmailVerification,
-                locale,
-            })
-            .await?;
-
         let token = VerificationToken::new(self.tokens_gen.generate());
-        let issued = self
-            .tokens
-            .issue_verification(
-                user_id,
-                email.as_str(),
+        let message = self.verification_email(UserId(0), &email, locale, &token);
+        if let Some(mail) = self
+            .outbox
+            .register(
+                NewAccount {
+                    email: &email,
+                    display_name,
+                    password_hash: &hash,
+                    state: AccountState::PendingEmailVerification,
+                    locale,
+                },
                 &token,
                 now,
-                AccountState::PendingEmailVerification,
+                message,
             )
-            .await?;
-        if !issued {
-            return Ok(());
+            .await?
+        {
+            self.mail_dispatcher.dispatch(mail).await?;
         }
-        // Hand the mail to the configured queue. With the durable queue, a
-        // slow provider is off the request path; with workers disabled, the
-        // queue implementation delivers inline. Account/token creation and
-        // durable enqueue are separate transactions, so a crash or admission
-        // failure can leave an account with no mail queued. That is
-        // recoverable by design: the address is unverified, and "resend
-        // verification" issues a fresh token. An enqueue error is returned to
-        // the request even though the already-committed account remains.
-        self.email
-            .enqueue(self.verification_email(user_id, &email, locale, &token))
-            .await?;
-        self.audit
-            .record(AuditEvent::success(
-                Some(user_id),
-                "auth.register",
-                "user",
-                user_id.0.to_string(),
-            ))
-            .await?;
         Ok(())
     }
 
@@ -700,22 +716,22 @@ impl AuthService {
         .await?;
 
         let token = VerificationToken::new(self.tokens_gen.generate());
-        let issued = self
-            .tokens
+        let message = self.verification_email(user.id, email, user.locale, &token);
+        let admitted = self
+            .outbox
             .issue_verification(
                 user.id,
                 email.as_str(),
                 &token,
                 self.now(),
                 AccountState::PendingEmailVerification,
+                message,
+                None,
             )
             .await?;
-        if !issued {
-            return Ok(());
+        if let Some(mail) = admitted {
+            self.mail_dispatcher.dispatch(mail).await?;
         }
-        self.email
-            .enqueue(self.verification_email(user.id, email, user.locale, &token))
-            .await?;
         Ok(())
     }
 
@@ -879,12 +895,14 @@ impl AuthService {
             return Ok(());
         }
         let token = VerificationToken::new(self.tokens_gen.generate());
-        if !self.tokens.issue_reset(user.id, &token, self.now()).await? {
-            return Ok(());
+        let message = self.reset_email(user.id, email, user.locale, &token);
+        if let Some(mail) = self
+            .outbox
+            .issue_reset(user.id, &token, self.now(), message)
+            .await?
+        {
+            self.mail_dispatcher.dispatch(mail).await?;
         }
-        self.email
-            .enqueue(self.reset_email(user.id, email, user.locale, &token))
-            .await?;
         Ok(())
     }
 
@@ -989,30 +1007,23 @@ impl AuthService {
             return Err(AuthError::EmailTaken);
         }
         let token = VerificationToken::new(self.tokens_gen.generate());
-        if !self
-            .tokens
+        let message = self.change_email_message(user.id, new_email, user.locale, &token);
+        let Some(mail) = self
+            .outbox
             .issue_verification(
                 user_id,
                 new_email.as_str(),
                 &token,
                 self.now(),
                 AccountState::Active,
+                message,
+                Some("auth.email_change_requested"),
             )
             .await?
-        {
+        else {
             return Err(AuthError::InvalidCredentials);
-        }
-        self.email
-            .enqueue(self.change_email_message(user.id, new_email, user.locale, &token))
-            .await?;
-        self.audit
-            .record(AuditEvent::success(
-                Some(user_id),
-                "auth.email_change_requested",
-                "user",
-                user_id.0.to_string(),
-            ))
-            .await?;
+        };
+        self.mail_dispatcher.dispatch(mail).await?;
         Ok(())
     }
 

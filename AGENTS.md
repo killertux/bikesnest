@@ -39,7 +39,7 @@ that data. Bilingual (en + pt-BR). Works on mobile and desktop browsers.
 |---|---|
 | Cargo workspace definition | `Cargo.toml` (workspace members + shared deps + lints) |
 | Pure domain rules & value objects | `crates/domain/src/` (`parking.rs`, `community.rs`, `auth.rs`, `moderation.rs`, `photo.rs`, `privacy.rs`, `hours.rs`, `freshness.rs`, `lib.rs`) |
-| Use cases + ports (traits) | `crates/application/src/` (`search.rs`, `community.rs`, `auth.rs`, `moderation.rs`, `photo.rs`, `privacy.rs`, `jobs.rs`, `ports.rs`, …) |
+| Use cases + ports (traits) | `crates/application/src/` (`search.rs`, `community.rs`, `auth.rs` including `AuthOutbox`/post-commit mail dispatch, `moderation.rs`, `photo.rs`, `privacy.rs`, `jobs.rs`, `ports.rs`, …) |
 | SQLx persistence & providers | `crates/infrastructure/src/` (`db.rs`, `config.rs`, `storage.rs`, `geocoding.rs`, `devdata.rs`, `probe.rs`, plus `auth/`, `community/`, `email/`, `job/`, `moderation/`, `parking/`, `photo/`, `privacy/`, `timezone/`) |
 | HTTP server, routes, handlers, view models | `crates/web/src/` (`main.rs` entry point, `wiring.rs` composition root, `state.rs` `AppState`, `routes/` one module per slice — `mod.rs` route table, `public`, `search`, `details`, `auth`, `community`, `reviews`, `photo`, `moderation`, `admin`, `privacy`, `legal`, `common`, `errors` — `lib.rs` templates/view models, `i18n.rs`, `auth.rs`, `security.rs`, `observability.rs`, `markdown.rs`, `view.rs`) |
 | Database schema | `migrations/` (numbered `NNNN_*.sql`, forward-only) |
@@ -106,6 +106,10 @@ npm run build:css                        # Tailwind → web/static/css/app.css
   a claim with a plain `UPDATE`) must use `SqlxJobRepository::claim_kinds` with
   a kind unique to that test, not the unscoped `claim` — see "Job-queue test
   isolation" in `TESTING.md`.
+- **Auth mail is one outbox transaction:** registration, verification resend,
+  reset request and email-change request use `AuthOutbox`; do not split their
+  account/token/audit/job writes or call a provider inside that transaction.
+  Worker-disabled compatibility exact-claims only the admitted job afterward.
 - **New fragment endpoints** need the `is_fragment_request` tests (a request
   without the htmx fragment headers gets a 303 to the whole page, not a bare
   partial — see the `p3_fragment_endpoints_*`/`moderation_fragment_endpoints_*`

@@ -3,10 +3,11 @@
 
 use async_trait::async_trait;
 use bikesnest_application::{
-    AccountRepository, AuditEvent, AuditLog, AuthError, AuthService, AuthenticatedUser, Clock,
-    EmailError, EmailKind, EmailMessage, EmailQueue, EmailVerificationOutcome, IdentityRecord,
-    LoginOutcome, NewAccount, OAuthProvider, PasswordHasher, RateLimitError, RateLimiter, Session,
-    SessionStore, TokenGenerator, TokenStore, UserActivity, UserSearch,
+    AccountRepository, AdmittedAuthMail, AuditEvent, AuditLog, AuthError, AuthMailDispatcher,
+    AuthOutbox, AuthService, AuthenticatedUser, Clock, EmailKind, EmailMessage,
+    EmailVerificationOutcome, IdentityRecord, LoginOutcome, NewAccount, OAuthProvider,
+    PasswordHasher, RateLimitError, RateLimiter, Session, SessionStore, TokenGenerator, TokenStore,
+    UserActivity, UserSearch,
 };
 use bikesnest_domain::{
     AccountState, AuthenticationProvider, CsrfToken, LocaleCode, Password, ProviderIdentity, Role,
@@ -33,6 +34,8 @@ struct FakeDb {
     /// delivered: `AuthService` can no longer reach a provider at all, which is
     /// the point — a broken ESP cannot fail a registration any more.
     emails: Vec<EmailMessage>,
+    outbox: Vec<AdmittedAuthMail>,
+    dispatched: Vec<i64>,
     /// Set to make `FakeQueue::enqueue` fail, standing in for "the database
     /// that holds the job queue is unreachable".
     queue_broken: bool,
@@ -673,20 +676,155 @@ impl Clock for FakeClock {
     }
 }
 
-// --- EmailQueue (records the handed-off messages; never delivers) ---
+// --- Atomic auth outbox + post-commit dispatcher ---
 #[derive(Clone)]
 struct FakeQueue {
     db: Arc<Mutex<FakeDb>>,
 }
 #[async_trait]
-impl EmailQueue for FakeQueue {
-    async fn enqueue(&self, msg: EmailMessage) -> Result<(), EmailError> {
+impl AuthMailDispatcher for FakeQueue {
+    async fn dispatch(&self, mail: AdmittedAuthMail) -> Result<(), AuthError> {
         let mut db = self.db.lock().unwrap();
         if db.queue_broken {
-            return Err(EmailError::Unavailable);
+            return Err(AuthError::Unavailable);
         }
-        db.emails.push(msg);
+        if !db.dispatched.contains(&mail.job_id) {
+            db.emails.push(mail.message);
+            db.dispatched.push(mail.job_id);
+        }
         Ok(())
+    }
+}
+
+#[async_trait]
+impl AuthOutbox for FakeRepo {
+    async fn register(
+        &self,
+        new: NewAccount<'_>,
+        token: &VerificationToken,
+        _at: DateTime<Utc>,
+        mut message: EmailMessage,
+    ) -> Result<Option<AdmittedAuthMail>, AuthError> {
+        let mut db = self.db.lock().unwrap();
+        if db.queue_broken {
+            return Err(AuthError::Unavailable);
+        }
+        if let Some(id) = db
+            .users
+            .iter()
+            .find(|u| u.email == *new.email)
+            .map(|u| u.id)
+        {
+            return Ok(db
+                .outbox
+                .iter()
+                .rev()
+                .find(|mail| {
+                    mail.message.account_id == id.0 && !db.dispatched.contains(&mail.job_id)
+                })
+                .cloned());
+        }
+        db.next_id += 1;
+        let id = UserId(db.next_id);
+        let mut user = User::new(id, new.email.clone(), new.display_name.map(str::to_string));
+        user.account_state = new.state;
+        user.locale = new.locale;
+        db.users.push(user);
+        db.identities.push(IdentityRecord {
+            id: id.0,
+            user_id: id,
+            provider: AuthenticationProvider::Password,
+            provider_subject: new.email.as_str().into(),
+            credential_hash: Some(new.password_hash.into()),
+        });
+        db.verification
+            .push((token.to_hex(), id, new.email.as_str().into(), false));
+        db.audits.push(AuditEvent::success(
+            Some(id),
+            "auth.register",
+            "user",
+            id.0.to_string(),
+        ));
+        message.account_id = id.0;
+        let mail = AdmittedAuthMail {
+            job_id: id.0,
+            message,
+        };
+        db.outbox.push(mail.clone());
+        Ok(Some(mail))
+    }
+
+    async fn issue_verification(
+        &self,
+        user_id: UserId,
+        email: &str,
+        token: &VerificationToken,
+        _at: DateTime<Utc>,
+        expected_state: AccountState,
+        message: EmailMessage,
+        audit_action: Option<&'static str>,
+    ) -> Result<Option<AdmittedAuthMail>, AuthError> {
+        let mut db = self.db.lock().unwrap();
+        if db.queue_broken {
+            return Err(AuthError::Unavailable);
+        }
+        if !db
+            .users
+            .iter()
+            .any(|u| u.id == user_id && u.account_state == expected_state)
+        {
+            return Ok(None);
+        }
+        db.verification
+            .push((token.to_hex(), user_id, email.into(), false));
+        if let Some(action) = audit_action {
+            db.audits.push(AuditEvent::success(
+                Some(user_id),
+                action,
+                "user",
+                user_id.0.to_string(),
+            ));
+        }
+        db.next_id += 1;
+        let mail = AdmittedAuthMail {
+            job_id: db.next_id,
+            message,
+        };
+        db.outbox.push(mail.clone());
+        Ok(Some(mail))
+    }
+
+    async fn issue_reset(
+        &self,
+        user_id: UserId,
+        token: &VerificationToken,
+        at: DateTime<Utc>,
+        message: EmailMessage,
+    ) -> Result<Option<AdmittedAuthMail>, AuthError> {
+        let mut db = self.db.lock().unwrap();
+        if db.queue_broken {
+            return Err(AuthError::Unavailable);
+        }
+        if !db
+            .users
+            .iter()
+            .any(|u| u.id == user_id && u.account_state.can_log_in())
+        {
+            return Ok(None);
+        }
+        db.reset.push((
+            token.to_hex(),
+            user_id,
+            at + chrono::Duration::hours(1),
+            false,
+        ));
+        db.next_id += 1;
+        let mail = AdmittedAuthMail {
+            job_id: db.next_id,
+            message,
+        };
+        db.outbox.push(mail.clone());
+        Ok(Some(mail))
     }
 }
 
@@ -770,6 +908,7 @@ fn make_service(db: Arc<Mutex<FakeDb>>) -> AuthService {
             n: Arc::new(Mutex::new(0)),
         }),
         Box::new(FakeClock::new(Utc::now())),
+        Box::new(repo.clone()),
         Box::new(FakeQueue { db: db.clone() }),
         Box::new(FakeOauth {
             email: "oauth.user@example.com".into(),
@@ -936,9 +1075,7 @@ async fn register_does_not_wait_on_delivery() {
     );
 }
 
-/// If the hand-off itself fails there is nothing to recover from later, so the
-/// registration fails too: telling someone to check their inbox when no message
-/// exists (and none ever will) is worse than asking them to try again.
+/// Admission failure rolls back the whole registration aggregate.
 #[tokio::test]
 async fn a_failing_queue_fails_the_registration() {
     let db = Arc::new(Mutex::new(FakeDb::default()));
@@ -956,17 +1093,12 @@ async fn a_failing_queue_fails_the_registration() {
         .await
         .unwrap_err();
 
-    assert_eq!(err, AuthError::Internal);
+    assert_eq!(err, AuthError::Unavailable);
     assert!(db.lock().unwrap().emails.is_empty());
-    // The account and token rows were already written when the enqueue failed
-    // (the repository ports expose no shared transaction). That is recoverable
-    // and left deliberately visible: the address is unverified, so "resend
-    // verification" issues a fresh token and queues a fresh message.
-    assert_eq!(db.lock().unwrap().users.len(), 1);
-    assert_eq!(
-        db.lock().unwrap().users[0].account_state,
-        AccountState::PendingEmailVerification
-    );
+    assert!(db.lock().unwrap().users.is_empty());
+    assert!(db.lock().unwrap().verification.is_empty());
+    assert!(db.lock().unwrap().outbox.is_empty());
+    assert!(db.lock().unwrap().audits.is_empty());
 }
 
 /// A resend, a reset and an email change all happen without a page being

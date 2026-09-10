@@ -529,11 +529,14 @@ async fn cancelling_the_token_stops_an_idle_worker(_tx: &mut bikesnest_test_supp
 
 use async_trait::async_trait;
 use bikesnest_application::{
-    EmailError, EmailKind, EmailMessage, EmailProvider, EmailQueue, JobError, JobHandler,
+    AdmittedAuthMail, AuthMailDispatcher, EmailError, EmailKind, EmailMessage, EmailProvider,
+    EmailQueue, JobError, JobHandler,
 };
 use bikesnest_domain::{LocaleCode, UserId, VerificationToken};
 use bikesnest_infrastructure::email::idempotency_key;
-use bikesnest_infrastructure::{FakeEmailProvider, JobEmailQueue, SendEmailHandler};
+use bikesnest_infrastructure::{
+    FakeEmailProvider, InlineAuthMailDispatcher, JobEmailQueue, SendEmailHandler,
+};
 use std::sync::Arc;
 
 /// A token nothing else in the suite (or a previous run) can collide with:
@@ -618,6 +621,14 @@ impl EmailProvider for BrokenProvider {
         Err(EmailError::Unexpected(
             "SECRET-PROVIDER-BODY token=LEAK ada@example.com".into(),
         ))
+    }
+}
+
+struct PermanentProvider;
+#[async_trait]
+impl EmailProvider for PermanentProvider {
+    async fn send(&self, _msg: &EmailMessage) -> Result<(), EmailError> {
+        Err(EmailError::Permanent)
     }
 }
 
@@ -1033,4 +1044,114 @@ async fn a_failing_email_send_is_retried_then_dead_lettered(
     );
 
     delete_job(id, &db).await;
+}
+
+#[db_test]
+async fn inline_dispatch_persists_backoff_then_retries_only_the_admitted_job(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let jobs = SqlxJobRepository::new(db.clone());
+    let queue = JobEmailQueue::new(jobs, 3);
+    let msg = verify_message(&unique_token("inline-retry"), &db).await;
+    queue.enqueue(msg.clone()).await.unwrap();
+    let (id, _, _) = row_for_key(&idempotency_key(&msg), &db).await.unwrap();
+    let admitted = AdmittedAuthMail {
+        job_id: id,
+        message: msg,
+    };
+    let broken = InlineAuthMailDispatcher::new(db.clone(), Arc::new(BrokenProvider));
+    assert_eq!(
+        broken.dispatch(admitted.clone()).await.unwrap_err(),
+        bikesnest_application::AuthError::Unavailable
+    );
+    let attempts: i32 = sqlx::query_scalar("SELECT attempts FROM background_job WHERE id=$1")
+        .bind(id)
+        .fetch_one(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(attempts, 1);
+    assert!(broken.dispatch(admitted.clone()).await.is_err());
+    let attempts_again: i32 = sqlx::query_scalar("SELECT attempts FROM background_job WHERE id=$1")
+        .bind(id)
+        .fetch_one(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        attempts_again, 1,
+        "inline HTTP retry must honor persisted backoff"
+    );
+    sqlx::query(
+        "UPDATE background_job SET run_at=clock_timestamp()-interval '1 second' WHERE id=$1",
+    )
+    .bind(id)
+    .execute(&mut *db.acquire().await.unwrap())
+    .await
+    .unwrap();
+    let delivered = FakeEmailProvider::with_root(None);
+    InlineAuthMailDispatcher::new(db.clone(), Arc::new(delivered.clone()))
+        .dispatch(admitted)
+        .await
+        .unwrap();
+    assert_eq!(delivered.emails().len(), 1);
+    let terminal: (String, serde_json::Value) =
+        sqlx::query_as("SELECT state,payload FROM background_job WHERE id=$1")
+            .bind(id)
+            .fetch_one(&mut *db.acquire().await.unwrap())
+            .await
+            .unwrap();
+    assert_eq!(terminal, ("succeeded".into(), serde_json::json!({})));
+}
+
+#[db_test]
+async fn inline_dispatch_dead_letters_permanent_provider_rejection_immediately(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let queue = JobEmailQueue::new(SqlxJobRepository::new(db.clone()), 5);
+    let msg = verify_message(&unique_token("inline-permanent"), &db).await;
+    queue.enqueue(msg.clone()).await.unwrap();
+    let (id, _, _) = row_for_key(&idempotency_key(&msg), &db).await.unwrap();
+    let error = InlineAuthMailDispatcher::new(db.clone(), Arc::new(PermanentProvider))
+        .dispatch(AdmittedAuthMail {
+            job_id: id,
+            message: msg,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error, bikesnest_application::AuthError::Internal);
+    let row: (String, i32, serde_json::Value) =
+        sqlx::query_as("SELECT state,attempts,payload FROM background_job WHERE id=$1")
+            .bind(id)
+            .fetch_one(&mut *db.acquire().await.unwrap())
+            .await
+            .unwrap();
+    assert_eq!(row, ("failed".into(), 1, serde_json::json!({})));
+}
+
+#[db_test]
+async fn inline_dispatch_does_not_duplicate_an_active_lease(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let queue = JobEmailQueue::new(SqlxJobRepository::new(db.clone()), 3);
+    let msg = verify_message(&unique_token("inline-active"), &db).await;
+    queue.enqueue(msg.clone()).await.unwrap();
+    let (id, _, _) = row_for_key(&idempotency_key(&msg), &db).await.unwrap();
+    simulate_claim(id, "already-sending", 1, &db).await;
+    let provider = FakeEmailProvider::with_root(None);
+    InlineAuthMailDispatcher::new(db.clone(), Arc::new(provider.clone()))
+        .dispatch(AdmittedAuthMail {
+            job_id: id,
+            message: msg,
+        })
+        .await
+        .unwrap();
+    assert!(provider.emails().is_empty());
+    let owner: String = sqlx::query_scalar("SELECT claimed_by FROM background_job WHERE id=$1")
+        .bind(id)
+        .fetch_one(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(owner, "already-sending");
 }

@@ -3,8 +3,9 @@
 //! [`JobEmailQueue`] is the durable implementation. It validates the current
 //! account/token and inserts `background_job` in its own transaction, after the
 //! caller's auth transition has committed. Provider delivery, retries and
-//! dead-lettering then happen outside the request path. The composition root
-//! preserves this non-atomic seam for now.
+//! dead-lettering then happen outside the request path. Authentication uses
+//! its narrower transactional outbox port; this generic queue remains for
+//! non-aggregate callers and direct queue tests.
 //!
 //! [`InlineEmailQueue`] sends on the spot. It exists for two reasons: tests
 //! that want the message without running a worker, and deployments with
@@ -19,7 +20,10 @@ use crate::job::{
     repo::{MailEnqueue, SqlxJobRepository},
 };
 use async_trait::async_trait;
-use bikesnest_application::{EmailError, EmailMessage, EmailProvider, EmailQueue, JobHandler};
+use bikesnest_application::{
+    AdmittedAuthMail, AuthError, AuthMailDispatcher, EmailError, EmailMessage, EmailProvider,
+    EmailQueue, JobHandler,
+};
 use std::sync::Arc;
 
 /// Enqueue-time idempotency key for one message: `email:{kind}:{sha256(link)}`.
@@ -43,6 +47,104 @@ pub fn idempotency_key(msg: &EmailMessage) -> String {
 pub struct JobEmailQueue {
     jobs: SqlxJobRepository,
     max_attempts: i32,
+}
+
+#[derive(Clone, Default)]
+pub struct DurableAuthMailDispatcher;
+
+#[async_trait]
+impl AuthMailDispatcher for DurableAuthMailDispatcher {
+    async fn dispatch(&self, _mail: AdmittedAuthMail) -> Result<(), AuthError> {
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct InlineAuthMailDispatcher {
+    jobs: SqlxJobRepository,
+    handler: Arc<SendEmailHandler>,
+}
+
+impl InlineAuthMailDispatcher {
+    pub fn new(db: Db, provider: Arc<dyn EmailProvider>) -> Self {
+        Self {
+            jobs: SqlxJobRepository::new(db.clone()),
+            handler: Arc::new(SendEmailHandler::new(db, provider)),
+        }
+    }
+}
+
+#[async_trait]
+impl AuthMailDispatcher for InlineAuthMailDispatcher {
+    async fn dispatch(&self, mail: AdmittedAuthMail) -> Result<(), AuthError> {
+        static INLINE_CLAIM_SEQUENCE: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let sequence = INLINE_CLAIM_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let owner = format!(
+            "inline-{}-{}-{nonce}-{sequence}",
+            std::process::id(),
+            mail.job_id
+        );
+        let Some(job) = self
+            .jobs
+            .claim_id(mail.job_id, &owner, std::time::Duration::from_secs(30))
+            .await
+            .map_err(|_| AuthError::Unavailable)?
+        else {
+            return match self.jobs.mail_dispatch_state(mail.job_id).await {
+                Ok(Some((state, _, _))) if state == "succeeded" => Ok(()),
+                Ok(Some((state, _, active))) if state == "running" && active => Ok(()),
+                Ok(Some((state, due, _))) if state == "pending" && !due => {
+                    Err(AuthError::Unavailable)
+                }
+                Ok(Some(_)) => Err(AuthError::Internal),
+                Ok(None) => Err(AuthError::Internal),
+                Err(_) => Err(AuthError::Unavailable),
+            };
+        };
+        match self.handler.run(&job.payload).await {
+            Ok(()) => self
+                .jobs
+                .finish_success(job.id, &owner, None, chrono::Utc::now())
+                .await
+                .map_err(|_| AuthError::Unavailable)?,
+            Err(bikesnest_application::JobError::Permanent(error)) => {
+                self.handler.on_dead_letter(&job.payload, &error).await;
+                self.jobs
+                    .fail(job.id, &owner, &error)
+                    .await
+                    .map_err(|_| AuthError::Unavailable)?;
+                return Err(AuthError::Internal);
+            }
+            Err(error) if job.attempts < job.max_attempts => {
+                self.jobs
+                    .retry(
+                        job.id,
+                        &owner,
+                        &error.to_string(),
+                        chrono::Utc::now() + chrono::Duration::seconds(2),
+                    )
+                    .await
+                    .map_err(|_| AuthError::Unavailable)?;
+                return Err(AuthError::Unavailable);
+            }
+            Err(error) => {
+                self.handler
+                    .on_dead_letter(&job.payload, &error.to_string())
+                    .await;
+                self.jobs
+                    .fail(job.id, &owner, &error.to_string())
+                    .await
+                    .map_err(|_| AuthError::Unavailable)?;
+                return Err(AuthError::Internal);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl JobEmailQueue {

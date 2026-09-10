@@ -348,13 +348,14 @@ retention is healthy.
 
 ## 5d. Transactional email goes through the queue
 
-With `JOBS_ENABLED=true`, verification, password-reset and e-mail-change
-messages are queued rather than sent inline. After the auth transition commits,
-the request separately validates the account/token and inserts an `email.send`
-job; these are not yet one atomic transaction. An enqueue failure is returned
-even though an already-created account or token can remain without a queued
-message. Re-send is the current recovery path; B06b owns the transactional
-outbox correction. Once admitted, the worker uses the configured retry budget
+Registration, verification resend, password-reset request and e-mail-change
+request each commit the account/token transition, audit where applicable, and
+account-linked `email.send` row in one database transaction. Admission failure
+rolls the complete transition back. A registration retry for a pending account
+reuses valid queued work (including an active lease), or creates a fresh token
+and job when the former credential/outbox is absent or expired; it never
+overwrites the existing password, display name or locale. Once admitted, the
+worker uses the configured retry budget
 (`JOBS_MAX_ATTEMPTS`), exponential backoff and dead-lettering, keeping provider
 latency off the request path.
 
@@ -367,6 +368,16 @@ latency off the request path.
   collapses onto the existing row. A genuine re-send issues a new token and a
   new job. This does not guarantee one provider delivery: lease expiry or an
   ambiguous provider response can result in a duplicate send.
+- **Provider replay semantics.** Resend receives the same bounded outbox key in
+  `Idempotency-Key`. Resend documents a
+  [24-hour retention window](https://resend.com/docs/dashboard/emails/idempotency-keys),
+  so this lowers duplicate risk only within that provider window. Its
+  [error reference](https://www.resend.com/docs/api-reference/errors) defines
+  `invalid_idempotent_request` as permanent while
+  `concurrent_idempotent_requests` is retried later. The
+  message is rendered at send time, so catalog/from changes during retries can
+  conflict with the original provider payload. SMTP has no portable
+  idempotency key and remains explicitly at-least-once.
 - **Dead letters.** An exhausted job logs only the allowlisted message kind and
   stores a bounded error classification. Its recipient/link payload is cleared
   immediately; lifecycle metadata remains until `jobs.gc` removes the row.
@@ -376,15 +387,16 @@ latency off the request path.
   row. Deletion-first cancels even preclaimed mail; provider-acceptance-first is
   already outside the application's recall boundary. Provider timeout or a
   lost database connection remains an ambiguous at-least-once outcome.
-- **`JOBS_ENABLED=false`.** No worker runs, so nothing would ever claim an
-  `email.send` row. The app detects this at wiring time and sends **inline** on
-  the request path instead (same provider, same localized rendering) — mail is
-  never silently queued into a void. The trade-off returns with it: a slow ESP
-  is back on the user's request. Prefer leaving the worker on; if you run
+- **`JOBS_ENABLED=false`.** The auth transition still commits its outbox row,
+  then the request exact-claims only that row and delivers it inline. Success
+  is terminal/redacted; transient failure persists backoff and returns an
+  unavailable response, and a request retry cannot bypass that backoff.
+  Permanent rejection dead-letters immediately. The trade-off is that provider
+  latency is on the request. Prefer leaving the worker on; if you run
   web-only instances, make sure at least one instance (or a dedicated worker
   deployment) has `JOBS_ENABLED=true`. Startup validation needs no new rule
-  here: inline delivery uses the same account/token validation and lock-through-
-  provider boundary as the worker.
+  here: inline delivery uses the same account/token validation, lease ownership
+  and lock-through-provider boundary as the worker.
 
 Migration 0026 adds nullable mail lifecycle columns. During upgrade it redacts
 all legacy `email.send` payloads because those rows cannot be safely linked to

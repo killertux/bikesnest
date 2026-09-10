@@ -21,8 +21,8 @@ pub mod timezone;
 pub use auth::{
     AUDIT_METADATA_KEYS, Argon2PasswordHasher, FakeOAuthProvider, InMemoryRateLimiter,
     RealTokenGenerator, SeedOutcome, SharedRateLimiter, SqlxAccountRepository, SqlxAuditLog,
-    SqlxSessionStore, SqlxTokenStore, SystemClock, ValKeyRateLimiter, rate_limiter_from_config,
-    seed_admin,
+    SqlxAuthOutbox, SqlxSessionStore, SqlxTokenStore, SystemClock, ValKeyRateLimiter,
+    rate_limiter_from_config, seed_admin,
 };
 pub use community::{
     SqlxContributionHistoryReader, SqlxFavoriteRepository, SqlxParkingContributionRepository,
@@ -36,9 +36,9 @@ pub use config::{
 pub use db::Db;
 pub use db_error::{DbFailure, classify, classify_and_log, classify_code};
 pub use email::{
-    APP_NAME, CapturedEmail, FakeEmailProvider, InlineEmailQueue, JobEmailQueue, RenderedEmail,
-    ResendEmailProvider, SmtpEmailProvider, from_config as email_from_config,
-    render as render_email,
+    APP_NAME, CapturedEmail, DurableAuthMailDispatcher, FakeEmailProvider,
+    InlineAuthMailDispatcher, InlineEmailQueue, JobEmailQueue, RenderedEmail, ResendEmailProvider,
+    SmtpEmailProvider, from_config as email_from_config, render as render_email,
 };
 pub use fresh_seed::{FreshSeedResetError, reset_all_data};
 pub use geocoding::{

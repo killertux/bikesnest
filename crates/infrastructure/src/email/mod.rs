@@ -14,7 +14,10 @@ pub mod smtp;
 pub mod templates;
 
 pub use fake::{CapturedEmail, FakeEmailProvider};
-pub use queue::{InlineEmailQueue, JobEmailQueue, idempotency_key};
+pub use queue::{
+    DurableAuthMailDispatcher, InlineAuthMailDispatcher, InlineEmailQueue, JobEmailQueue,
+    idempotency_key,
+};
 pub use resend::ResendEmailProvider;
 pub use smtp::SmtpEmailProvider;
 pub use templates::{APP_NAME, RenderedEmail, render};

@@ -155,9 +155,11 @@ serialize on the `users` row. Delivery revalidates the exact unused,
 unexpired token and recipient while holding that lock through a bounded provider
 call; terminal outcomes, deletion and the expiry-retention sweep redact the
 recipient/link payload. Provider acceptance is the external recall boundary,
-not a distributed exactly-once guarantee. The same lifecycle columns and
-`enqueue_mail` operation are the outbox seam for making auth transition plus
-enqueue atomic in the subsequent batch.
+not a distributed exactly-once guarantee. Registration, resend, reset request
+and email-change request use one `AuthOutbox` port whose SQL adapter commits the
+auth transition, applicable audit and lifecycle row together. Post-commit
+dispatch either leaves that row for the worker or exact-claims it for inline
+compatibility; provider I/O never occurs inside the auth transaction.
 
 ### Web (`crates/web`)
 

@@ -24,6 +24,8 @@ pub enum EmailError {
     Unavailable,
     #[error("mail provider error: {0}")]
     Unexpected(String),
+    #[error("mail provider permanently rejected the request")]
+    Permanent,
 }
 
 /// Which transactional message this is. The variant chooses the catalog keys;
@@ -148,6 +150,15 @@ pub trait EmailQueue: Send + Sync {
 #[async_trait]
 pub trait EmailProvider: Send + Sync {
     async fn send(&self, msg: &EmailMessage) -> Result<(), EmailError>;
+    /// Provider-supported replay key. SMTP implementations deliberately fall
+    /// back to `send`: SMTP has no portable idempotency contract.
+    async fn send_idempotent(
+        &self,
+        msg: &EmailMessage,
+        _idempotency_key: &str,
+    ) -> Result<(), EmailError> {
+        self.send(msg).await
+    }
 }
 
 #[cfg(test)]

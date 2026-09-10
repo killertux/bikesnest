@@ -13,22 +13,24 @@ use std::sync::Arc;
 
 use axum::{Router, middleware};
 use bikesnest_application::{
-    AuthService, CheckReadiness, ContributionDeps, ContributionService, EmailProvider, EmailQueue,
-    GetParkingDetails, ModerationDeps, ModerationService, ObjectStorage, PasswordHasher, PhotoDeps,
-    PhotoService, PrivacyDeps, PrivacyService, RateLimiter, SearchParking,
+    AuthMailDispatcher, AuthService, CheckReadiness, ContributionDeps, ContributionService,
+    EmailProvider, GetParkingDetails, ModerationDeps, ModerationService, ObjectStorage,
+    PasswordHasher, PhotoDeps, PhotoService, PrivacyDeps, PrivacyService, RateLimiter,
+    SearchParking,
 };
 use bikesnest_infrastructure::probe::SqlxDatabaseProbe;
 use bikesnest_infrastructure::{
-    Argon2PasswordHasher, Config, ConfigError, Db, FakeOAuthProvider, InlineEmailQueue,
-    JobEmailQueue, LocalImageProcessor, OfflineTimezoneResolver, RealTokenGenerator,
+    Argon2PasswordHasher, Config, ConfigError, Db, DurableAuthMailDispatcher, FakeOAuthProvider,
+    InlineAuthMailDispatcher, LocalImageProcessor, OfflineTimezoneResolver, RealTokenGenerator,
     S3ObjectStorage, SharedGeocoder, SharedObjectStorage, SharedRateLimiter, SqlxAccountRepository,
-    SqlxAnonymizationRepository, SqlxAuditLog, SqlxAuditLogReader, SqlxContributionHistoryReader,
-    SqlxExportRepository, SqlxFavoriteRepository, SqlxModerationRepository,
-    SqlxParkingContributionRepository, SqlxParkingDetailsReader, SqlxParkingPhotoReader,
-    SqlxParkingSearchReader, SqlxPhotoRepository, SqlxPolicyReader, SqlxPrivacyRequestRepository,
-    SqlxReportRepository, SqlxReviewPhotosReader, SqlxReviewRepository, SqlxSessionStore,
-    SqlxSitemapReader, SqlxTokenStore, SqlxVerificationRepository, SystemClock,
-    caching_geocoder_from_config, email_from_config, rate_limiter_from_config,
+    SqlxAnonymizationRepository, SqlxAuditLog, SqlxAuditLogReader, SqlxAuthOutbox,
+    SqlxContributionHistoryReader, SqlxExportRepository, SqlxFavoriteRepository,
+    SqlxModerationRepository, SqlxParkingContributionRepository, SqlxParkingDetailsReader,
+    SqlxParkingPhotoReader, SqlxParkingSearchReader, SqlxPhotoRepository, SqlxPolicyReader,
+    SqlxPrivacyRequestRepository, SqlxReportRepository, SqlxReviewPhotosReader,
+    SqlxReviewRepository, SqlxSessionStore, SqlxSitemapReader, SqlxTokenStore,
+    SqlxVerificationRepository, SystemClock, caching_geocoder_from_config, email_from_config,
+    rate_limiter_from_config,
 };
 use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 
@@ -111,18 +113,13 @@ pub fn app_router_with<H: PasswordHasher + Clone + 'static>(
         Box::new(SqlxParkingDetailsReader::new(db.clone())),
         config.freshness,
     );
-    // Transactional mail leaves the request path when there is a worker to
-    // pick it up: `JOBS_ENABLED=true` (the default) queues an `email.send` job
-    // in a transaction separate from the auth transition. With the worker
-    // disabled nothing would claim that row, so the same port sends inline and
-    // provider latency/failure remains on the request path.
-    let email_queue: Box<dyn EmailQueue> = if config.jobs.enabled {
-        Box::new(JobEmailQueue::new(
-            bikesnest_infrastructure::SqlxJobRepository::new(db.clone()),
-            config.jobs.max_attempts,
-        ))
+    // Auth changes always commit with their outbox row. Worker-enabled web
+    // returns after that commit; worker-disabled compatibility exact-claims
+    // only the just-admitted row and delivers it post-commit.
+    let mail_dispatcher: Box<dyn AuthMailDispatcher> = if config.jobs.enabled {
+        Box::new(DurableAuthMailDispatcher)
     } else {
-        Box::new(InlineEmailQueue::new(db.clone(), email))
+        Box::new(InlineAuthMailDispatcher::new(db.clone(), email))
     };
     let auth_service = AuthService::new(
         Box::new(SqlxAccountRepository::new(db.clone())),
@@ -131,7 +128,8 @@ pub fn app_router_with<H: PasswordHasher + Clone + 'static>(
         Box::new(hasher.clone()), // password hasher (Argon2 in prod, fast fake in tests)
         Box::new(RealTokenGenerator),
         Box::new(SystemClock),
-        email_queue,
+        Box::new(SqlxAuthOutbox::new(db.clone(), config.jobs.max_attempts)),
+        mail_dispatcher,
         Box::new(oauth),
         Box::new(SharedRateLimiter::new(rate_limiter.clone())), // shared ValKey store
         Box::new(SqlxAuditLog::new(db.clone())),

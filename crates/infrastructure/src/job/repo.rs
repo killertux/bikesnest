@@ -64,6 +64,35 @@ pub struct MailEnqueue<'a> {
     pub idempotency_key: &'a str,
 }
 
+pub(crate) async fn enqueue_mail_on(
+    conn: &mut sqlx::PgConnection,
+    mail: MailEnqueue<'_>,
+) -> Result<Option<i64>, JobRepoError> {
+    let state: Option<String> =
+        sqlx::query_scalar("SELECT account_state FROM users WHERE id=$1 FOR UPDATE")
+            .bind(mail.account_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let expires_at: Option<DateTime<Utc>> = match (mail.purpose, state.as_deref()) {
+        ("verify", Some("PENDING_EMAIL_VERIFICATION" | "ACTIVE"))
+        | ("change", Some("ACTIVE")) => sqlx::query_scalar("SELECT expires_at FROM email_verification_tokens WHERE token_hash=$1 AND user_id=$2 AND email=$3 AND used_at IS NULL AND expires_at>clock_timestamp()")
+            .bind(mail.token_hash).bind(mail.account_id).bind(mail.recipient).fetch_optional(&mut *conn).await?,
+        ("reset", Some("PENDING_EMAIL_VERIFICATION" | "ACTIVE")) => sqlx::query_scalar("SELECT t.expires_at FROM password_reset_tokens t JOIN users u ON u.id=t.user_id WHERE t.token_hash=$1 AND t.user_id=$2 AND u.email=$3 AND t.used_at IS NULL AND t.expires_at>clock_timestamp()")
+            .bind(mail.token_hash).bind(mail.account_id).bind(mail.recipient).fetch_optional(&mut *conn).await?,
+        _ => None,
+    };
+    let Some(expires_at) = expires_at else {
+        return Err(JobRepoError::InvalidMailCredential);
+    };
+    Ok(sqlx::query_scalar(r#"INSERT INTO background_job
+        (kind,payload,run_at,max_attempts,idempotency_key,mail_account_id,mail_token_hash,mail_purpose,mail_token_expires_at)
+        VALUES('email.send',$1,$2,$3,$4,$5,$6,$7,$8)
+        ON CONFLICT(idempotency_key) DO NOTHING RETURNING id"#)
+        .bind(mail.payload).bind(mail.run_at).bind(mail.max_attempts).bind(mail.idempotency_key)
+        .bind(mail.account_id).bind(mail.token_hash).bind(mail.purpose).bind(expires_at)
+        .fetch_optional(conn).await?)
+}
+
 /// A job-queue handle bound to the application's PostgreSQL pool.
 #[derive(Clone)]
 pub struct SqlxJobRepository {
@@ -71,6 +100,41 @@ pub struct SqlxJobRepository {
 }
 
 impl SqlxJobRepository {
+    pub async fn claim_id(
+        &self,
+        id: i64,
+        worker_id: &str,
+        lease_ttl: std::time::Duration,
+    ) -> Result<Option<ClaimedJob>, JobRepoError> {
+        let lease_ms = i64::try_from(lease_ttl.as_millis()).unwrap_or(i64::MAX);
+        Ok(sqlx::query_as(
+            r#"UPDATE background_job SET state='running',claimed_by=$2,
+               lease_expires_at=clock_timestamp()+($3*interval '1 millisecond'),
+               heartbeat_at=clock_timestamp(),started_at=COALESCE(started_at,clock_timestamp()),
+               attempts=attempts+1,updated_at=clock_timestamp()
+               WHERE id=$1 AND kind='email.send' AND run_at<=clock_timestamp()
+                 AND attempts<max_attempts AND
+                 (state='pending' OR (state='running' AND lease_expires_at<=clock_timestamp()))
+               RETURNING id,kind,payload,attempts,max_attempts,schedule"#,
+        )
+        .bind(id)
+        .bind(worker_id)
+        .bind(lease_ms)
+        .fetch_optional(&mut *self.db.acquire().await?)
+        .await?)
+    }
+
+    pub async fn mail_dispatch_state(
+        &self,
+        id: i64,
+    ) -> Result<Option<(String, bool, bool)>, JobRepoError> {
+        Ok(sqlx::query_as(
+            "SELECT state,run_at<=clock_timestamp(),state='running' AND lease_expires_at>clock_timestamp() FROM background_job WHERE id=$1 AND kind='email.send'",
+        )
+        .bind(id)
+        .fetch_optional(&mut *self.db.acquire().await?)
+        .await?)
+    }
     pub fn new(db: Db) -> Self {
         Self { db }
     }
@@ -233,51 +297,9 @@ impl SqlxJobRepository {
     /// and its non-secret lifecycle metadata in one transaction. The token hash is safe for equality checks; the raw token
     /// remains only in the short-lived payload until a terminal outcome.
     pub async fn enqueue_mail(&self, mail: MailEnqueue<'_>) -> Result<Option<i64>, JobRepoError> {
-        let MailEnqueue {
-            payload,
-            account_id,
-            token_hash,
-            purpose,
-            recipient,
-            run_at,
-            max_attempts,
-            idempotency_key,
-        } = mail;
         let mut conn = self.db.acquire().await?;
         let mut tx = conn.begin().await?;
-        let state: Option<String> =
-            sqlx::query_scalar("SELECT account_state FROM users WHERE id=$1 FOR UPDATE")
-                .bind(account_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let expires_at: Option<DateTime<Utc>> = match (purpose, state.as_deref()) {
-            ("verify", Some("PENDING_EMAIL_VERIFICATION" | "ACTIVE"))
-            | ("change", Some("ACTIVE")) => sqlx::query_scalar("SELECT expires_at FROM email_verification_tokens WHERE token_hash=$1 AND user_id=$2 AND email=$3 AND used_at IS NULL AND expires_at>clock_timestamp()")
-                .bind(token_hash).bind(account_id).bind(recipient).fetch_optional(&mut *tx).await?,
-            ("reset", Some("PENDING_EMAIL_VERIFICATION" | "ACTIVE")) => sqlx::query_scalar("SELECT t.expires_at FROM password_reset_tokens t JOIN users u ON u.id=t.user_id WHERE t.token_hash=$1 AND t.user_id=$2 AND u.email=$3 AND t.used_at IS NULL AND t.expires_at>clock_timestamp()")
-                .bind(token_hash).bind(account_id).bind(recipient).fetch_optional(&mut *tx).await?,
-            _ => None,
-        };
-        let Some(expires_at) = expires_at else {
-            return Err(JobRepoError::InvalidMailCredential);
-        };
-        let id = sqlx::query_scalar::<_, i64>(
-            r#"INSERT INTO background_job
-               (kind, payload, run_at, max_attempts, idempotency_key,
-                mail_account_id, mail_token_hash, mail_purpose, mail_token_expires_at)
-               VALUES ('email.send', $1, $2, $3, $4, $5, $6, $7, $8)
-               ON CONFLICT (idempotency_key) DO NOTHING RETURNING id"#,
-        )
-        .bind(payload)
-        .bind(run_at)
-        .bind(max_attempts)
-        .bind(idempotency_key)
-        .bind(account_id)
-        .bind(token_hash)
-        .bind(purpose)
-        .bind(expires_at)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let id = enqueue_mail_on(&mut tx, mail).await?;
         tx.commit().await?;
         Ok(id)
     }

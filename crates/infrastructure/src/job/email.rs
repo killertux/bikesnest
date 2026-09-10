@@ -86,13 +86,25 @@ impl JobHandler for SendEmailHandler {
                 "mail credential is no longer deliverable".into(),
             ));
         }
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(10), self.provider.send(&msg))
-                .await;
+        let delivery_key = crate::email::idempotency_key(&msg);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.provider.send_idempotent(&msg, &delivery_key),
+        )
+        .await;
         match result {
             Ok(Ok(())) => tx.commit().await.map_err(|_| {
                 JobError::Failed("mail delivery outcome could not be recorded".into())
             }),
+            Ok(Err(bikesnest_application::EmailError::Permanent)) => {
+                tx.rollback()
+                    .await
+                    .map_err(|_| JobError::Failed("mail lifecycle database unavailable".into()))?;
+                Err(JobError::Permanent(format!(
+                    "{} mail provider permanently rejected request",
+                    msg.kind.code()
+                )))
+            }
             Ok(Err(_)) => {
                 tx.rollback()
                     .await
