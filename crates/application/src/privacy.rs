@@ -1207,6 +1207,14 @@ mod tests {
         async fn suspend_and_revoke_security_tokens(&self, _i: UserId) -> Result<(), AuthError> {
             Ok(())
         }
+        async fn complete_password_reset(
+            &self,
+            _token: &bikesnest_domain::VerificationToken,
+            _password_hash: &str,
+            _at: DateTime<Utc>,
+        ) -> Result<Option<UserId>, AuthError> {
+            Ok(None)
+        }
         async fn set_password(&self, _i: UserId, _h: &str) -> Result<(), AuthError> {
             Ok(())
         }

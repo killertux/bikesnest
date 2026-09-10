@@ -441,6 +441,110 @@ impl AccountRepository for SqlxAccountRepository {
         Ok(())
     }
 
+    async fn complete_password_reset(
+        &self,
+        token: &bikesnest_domain::VerificationToken,
+        password_hash: &str,
+        at: DateTime<Utc>,
+    ) -> Result<Option<UserId>, AuthError> {
+        let token_hash = sha256_hex(token.as_bytes());
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("account.complete_password_reset", e))?;
+        let mut tx = conn
+            .begin()
+            .await
+            .map_err(|e| db_err("account.complete_password_reset", e))?;
+        let Some(user_id) = sqlx::query_scalar::<_, i64>(
+            "SELECT user_id FROM password_reset_tokens
+             WHERE token_hash = $1 AND used_at IS NULL
+               AND expires_at > GREATEST($2, clock_timestamp())",
+        )
+        .bind(&token_hash)
+        .bind(at)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| db_err("account.complete_password_reset", e))?
+        else {
+            return Ok(None);
+        };
+        let eligible = sqlx::query_scalar::<_, bool>(
+            "SELECT account_state IN ('PENDING_EMAIL_VERIFICATION', 'ACTIVE')
+             FROM users WHERE id = $1 FOR UPDATE",
+        )
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| db_err("account.complete_password_reset", e))?
+        .unwrap_or(false);
+        if !eligible {
+            return Ok(None);
+        }
+        let consumed = sqlx::query(
+            "UPDATE password_reset_tokens SET used_at = $2
+             WHERE token_hash = $1 AND user_id = $3
+               AND used_at IS NULL
+               AND expires_at > GREATEST($2, clock_timestamp())",
+        )
+        .bind(&token_hash)
+        .bind(at)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| db_err("account.complete_password_reset", e))?
+        .rows_affected();
+        if consumed != 1 {
+            return Ok(None);
+        }
+        let updated = sqlx::query(
+            "UPDATE authentication_identities SET credential_hash = $2
+             WHERE user_id = $1 AND provider = 'password'",
+        )
+        .bind(user_id)
+        .bind(password_hash)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| db_err("account.complete_password_reset", e))?
+        .rows_affected();
+        if updated != 1 {
+            return Err(AuthError::Internal);
+        }
+        sqlx::query(
+            "UPDATE sessions SET revoked_at = $2
+             WHERE user_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(user_id)
+        .bind(at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| db_err("account.complete_password_reset", e))?;
+        sqlx::query(
+            "UPDATE password_reset_tokens SET used_at = $2
+             WHERE user_id = $1 AND used_at IS NULL",
+        )
+        .bind(user_id)
+        .bind(at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| db_err("account.complete_password_reset", e))?;
+        sqlx::query(
+            "INSERT INTO audit_events
+                (actor_user_id, action, target_type, target_id, result, metadata)
+             VALUES ($1, 'auth.password_changed', 'user', $2, 'success', '{}'::jsonb)",
+        )
+        .bind(user_id)
+        .bind(user_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| db_err("account.complete_password_reset", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| db_err("account.complete_password_reset", e))?;
+        Ok(Some(UserId(user_id)))
+    }
+
     async fn set_password(&self, id: UserId, hash: &str) -> Result<(), AuthError> {
         sqlx::query(
             "UPDATE authentication_identities SET credential_hash = $2

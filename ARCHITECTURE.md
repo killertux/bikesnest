@@ -310,7 +310,8 @@ Key modeling notes:
   transactions become savepoints. Production still uses the ordinary pool.
   Test-support awaits outer rollback (including after panic) and invalidates
   surviving handles. This is not a substitute for multi-connection race tests;
-  see `TESTING.md` for the incremental adapter migration.
+  those use a separately created disposable database through the bounded
+  isolated runner described in `TESTING.md`.
 
 - **Security:** strict CSP (nonce-free, Alpine CSP build), security headers,
   CSRF synchronizer token, HttpOnly/Secure/SameSite=Lax sessions hashed at

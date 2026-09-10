@@ -27,7 +27,8 @@ struct FakeDb {
     identities: Vec<IdentityRecord>,
     sessions: Vec<(String, Session)>, // keyed by raw session id hex
     verification: Vec<(String, UserId, String, bool)>, // (token hex, user, email, used)
-    reset: Vec<(String, UserId, bool)>,
+    reset: Vec<(String, UserId, DateTime<Utc>, bool)>,
+    audits: Vec<AuditEvent>,
     /// What the use cases handed to the email *queue*. Nothing here was
     /// delivered: `AuthService` can no longer reach a provider at all, which is
     /// the point — a broken ESP cannot fail a registration any more.
@@ -35,6 +36,7 @@ struct FakeDb {
     /// Set to make `FakeQueue::enqueue` fail, standing in for "the database
     /// that holds the job queue is unreachable".
     queue_broken: bool,
+    hash_broken: bool,
     next_id: i64,
 }
 
@@ -206,12 +208,61 @@ impl AccountRepository for FakeRepo {
                 *used = true;
             }
         }
-        for (_, user_id, used) in &mut db.reset {
+        for (_, user_id, _, used) in &mut db.reset {
             if *user_id == id {
                 *used = true;
             }
         }
         Ok(())
+    }
+    async fn complete_password_reset(
+        &self,
+        token: &VerificationToken,
+        password_hash: &str,
+        at: DateTime<Utc>,
+    ) -> Result<Option<UserId>, AuthError> {
+        let mut db = self.db.lock().unwrap();
+        let key = token.to_hex();
+        let Some((_, user_id, _, _)) = db
+            .reset
+            .iter()
+            .find(|(candidate, _, expires_at, used)| {
+                *candidate == key && !*used && *expires_at > at
+            })
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        if !db
+            .users
+            .iter()
+            .any(|user| user.id == user_id && user.account_state.can_log_in())
+        {
+            return Ok(None);
+        }
+        let Some(identity) = db.identities.iter_mut().find(|identity| {
+            identity.user_id == user_id && identity.provider == AuthenticationProvider::Password
+        }) else {
+            return Err(AuthError::Internal);
+        };
+        identity.credential_hash = Some(password_hash.to_string());
+        for (_, session) in &mut db.sessions {
+            if session.user_id == user_id {
+                session.revoked_at = Some(Utc::now());
+            }
+        }
+        for (_, reset_user_id, _, used) in &mut db.reset {
+            if *reset_user_id == user_id {
+                *used = true;
+            }
+        }
+        db.audits.push(AuditEvent::success(
+            Some(user_id),
+            "auth.password_changed",
+            "user",
+            user_id.0.to_string(),
+        ));
+        Ok(Some(user_id))
     }
     async fn link_identity(
         &self,
@@ -502,7 +553,7 @@ impl TokenStore for FakeRepo {
         &self,
         user_id: UserId,
         raw: &VerificationToken,
-        _now: DateTime<Utc>,
+        now: DateTime<Utc>,
     ) -> Result<bool, AuthError> {
         let mut db = self.db.lock().unwrap();
         if !db
@@ -512,17 +563,26 @@ impl TokenStore for FakeRepo {
         {
             return Ok(false);
         }
-        db.reset.push((raw.to_hex(), user_id, false));
+        db.reset.push((
+            raw.to_hex(),
+            user_id,
+            now + chrono::Duration::hours(1),
+            false,
+        ));
         Ok(true)
     }
     async fn consume_reset(
         &self,
         raw: &VerificationToken,
-        _now: DateTime<Utc>,
+        now: DateTime<Utc>,
     ) -> Result<Option<UserId>, AuthError> {
         let mut db = self.db.lock().unwrap();
         let key = raw.to_hex();
-        if let Some((_, u, used)) = db.reset.iter_mut().find(|(k, _, used)| *k == key && !*used) {
+        if let Some((_, u, _, used)) = db
+            .reset
+            .iter_mut()
+            .find(|(k, _, expires_at, used)| *k == key && !*used && *expires_at > now)
+        {
             *used = true;
             return Ok(Some(*u));
         }
@@ -532,10 +592,15 @@ impl TokenStore for FakeRepo {
 
 // --- PasswordHasher ---
 #[derive(Clone)]
-struct FakeHasher;
+struct FakeHasher {
+    db: Arc<Mutex<FakeDb>>,
+}
 #[async_trait]
 impl PasswordHasher for FakeHasher {
     async fn hash(&self, pw: &Password) -> Result<String, AuthError> {
+        if self.db.lock().unwrap().hash_broken {
+            return Err(AuthError::Internal);
+        }
         Ok(format!("h:{}", pw.as_str()))
     }
     async fn verify(&self, pw: &Password, hash: &str) -> Result<bool, AuthError> {
@@ -643,10 +708,13 @@ impl RateLimiter for FakeRate {
 
 // --- AuditLog ---
 #[derive(Clone)]
-struct FakeAudit;
+struct FakeAudit {
+    db: Arc<Mutex<FakeDb>>,
+}
 #[async_trait]
 impl AuditLog for FakeAudit {
-    async fn record(&self, _event: AuditEvent) -> Result<(), bikesnest_application::AuditError> {
+    async fn record(&self, event: AuditEvent) -> Result<(), bikesnest_application::AuditError> {
+        self.db.lock().unwrap().audits.push(event);
         Ok(())
     }
 }
@@ -663,7 +731,7 @@ fn make_service(db: Arc<Mutex<FakeDb>>) -> AuthService {
         Box::new(repo.clone()),
         Box::new(repo.clone()),
         Box::new(repo.clone()),
-        Box::new(FakeHasher),
+        Box::new(FakeHasher { db: db.clone() }),
         Box::new(FakeTokens {
             n: Arc::new(Mutex::new(0)),
         }),
@@ -676,7 +744,7 @@ fn make_service(db: Arc<Mutex<FakeDb>>) -> AuthService {
         Box::new(FakeRate {
             buckets: Arc::new(Mutex::new(HashMap::new())),
         }),
-        Box::new(FakeAudit),
+        Box::new(FakeAudit { db }),
         BASE.to_string(),
     )
 }
@@ -1066,6 +1134,159 @@ async fn reset_password_revokes_all_sessions() {
         auth.resolve_session(&session).await.unwrap().is_none(),
         "old session revoked after reset"
     );
+}
+
+#[tokio::test]
+async fn oauth_only_account_gets_no_password_reset_token_or_email() {
+    let db = Arc::new(Mutex::new(FakeDb::default()));
+    let email = UserEmail::parse("oauth-only@example.com").unwrap();
+    let mut user = User::new(UserId(1), email.clone(), None);
+    user.account_state = AccountState::Active;
+    db.lock().unwrap().users.push(user);
+    let auth = make_service(db.clone());
+
+    auth.request_password_reset("1.1.1.1", &email)
+        .await
+        .unwrap();
+
+    let db = db.lock().unwrap();
+    assert!(db.reset.is_empty());
+    assert!(db.emails.is_empty());
+}
+
+#[tokio::test]
+async fn weak_password_and_hash_failure_leave_reset_token_usable() {
+    let db = Arc::new(Mutex::new(FakeDb::default()));
+    seed_active_user(&db, "reset-retry@example.com", "correct");
+    let auth = make_service(db.clone());
+    auth.request_password_reset(
+        "1.1.1.1",
+        &UserEmail::parse("reset-retry@example.com").unwrap(),
+    )
+    .await
+    .unwrap();
+    let token = find_token(&db, "/password-reset/new");
+
+    assert!(matches!(
+        auth.reset_password(&token, "short").await,
+        Err(AuthError::WeakPassword)
+    ));
+    assert!(!db.lock().unwrap().reset[0].3);
+    assert!(db.lock().unwrap().audits.is_empty());
+
+    db.lock().unwrap().hash_broken = true;
+    assert_eq!(
+        auth.reset_password(&token, "replacement-password").await,
+        Err(AuthError::Internal)
+    );
+    assert!(!db.lock().unwrap().reset[0].3);
+    assert!(db.lock().unwrap().audits.is_empty());
+
+    db.lock().unwrap().hash_broken = false;
+    auth.reset_password(&token, "replacement-password")
+        .await
+        .unwrap();
+    assert!(db.lock().unwrap().reset[0].3);
+    let db = db.lock().unwrap();
+    let events: Vec<_> = db
+        .audits
+        .iter()
+        .filter(|event| event.action == "auth.password_changed")
+        .collect();
+    assert_eq!(events.len(), 1);
+    let event = events[0];
+    assert_eq!(event.actor_user_id, Some(db.users[0].id));
+    assert_eq!(event.target_type, "user");
+    assert_eq!(event.target_id, db.users[0].id.0.to_string());
+    assert_eq!(event.result, "success");
+    assert_eq!(event.metadata, serde_json::json!({}));
+}
+
+#[tokio::test]
+async fn expired_reset_preserves_credential_session_token_and_audit_state() {
+    let db = Arc::new(Mutex::new(FakeDb::default()));
+    let user_id = seed_active_user(&db, "expired-reset@example.com", "correct");
+    let auth = make_service(db.clone());
+    let login = auth
+        .login("1.1.1.1", "expired-reset@example.com", "correct")
+        .await
+        .unwrap();
+    auth.request_password_reset(
+        "1.1.1.1",
+        &UserEmail::parse("expired-reset@example.com").unwrap(),
+    )
+    .await
+    .unwrap();
+    db.lock().unwrap().reset[0].2 = Utc::now() - chrono::Duration::seconds(1);
+    let audits_before = db.lock().unwrap().audits.len();
+
+    assert_eq!(
+        auth.reset_password(
+            &find_token(&db, "/password-reset/new"),
+            "replacement-password"
+        )
+        .await,
+        Err(AuthError::TokenInvalid)
+    );
+
+    let db = db.lock().unwrap();
+    assert_eq!(
+        db.identities
+            .iter()
+            .find(|identity| identity.user_id == user_id)
+            .unwrap()
+            .credential_hash
+            .as_deref(),
+        Some("h:correct")
+    );
+    assert!(
+        db.sessions
+            .iter()
+            .find(|(raw, _)| *raw == login.session.to_hex())
+            .unwrap()
+            .1
+            .revoked_at
+            .is_none()
+    );
+    assert!(!db.reset[0].3);
+    assert_eq!(db.audits.len(), audits_before);
+}
+
+#[tokio::test]
+async fn successful_reset_invalidates_competing_tokens_without_changing_account_state() {
+    for state in [AccountState::PendingEmailVerification, AccountState::Active] {
+        let db = Arc::new(Mutex::new(FakeDb::default()));
+        seed_active_user(&db, "competing-reset@example.com", "correct");
+        db.lock().unwrap().users[0].account_state = state;
+        let auth = make_service(db.clone());
+        let email = UserEmail::parse("competing-reset@example.com").unwrap();
+        auth.request_password_reset("1.1.1.1", &email)
+            .await
+            .unwrap();
+        let first = find_token(&db, "/password-reset/new");
+        auth.request_password_reset("2.2.2.2", &email)
+            .await
+            .unwrap();
+        let second = find_token(&db, "/password-reset/new");
+
+        auth.reset_password(&first, "replacement-password")
+            .await
+            .unwrap();
+        assert_eq!(
+            auth.reset_password(&second, "another-password").await,
+            Err(AuthError::TokenInvalid)
+        );
+        assert_eq!(db.lock().unwrap().users[0].account_state, state);
+        assert_eq!(
+            db.lock()
+                .unwrap()
+                .audits
+                .iter()
+                .filter(|event| event.action == "auth.password_changed")
+                .count(),
+            1
+        );
+    }
 }
 
 #[tokio::test]

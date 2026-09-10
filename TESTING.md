@@ -148,6 +148,22 @@ concurrent transactions, snapshot visibility between connections, or lock races.
 Those tests need a dedicated isolated database and real connections; do not
 serialize them on a scoped `Db` and claim concurrency coverage.
 
+### Isolated multi-connection race tests
+
+`run_isolated_database_test` creates a uniquely named `bikesnest_test_race_*`
+database on the same loopback server as the already validated
+`TEST_DATABASE_URL`, migrates it, and supplies a small real pool to an async
+test closure. Use it only when independent transactions and actual lock waits
+are the behavior under test. The configured test role must have `CREATEDB`.
+
+The runner records whether its exact generated database was created, awaits a
+bounded pool close, force-drops only that database after success, setup failure,
+or panic, and then propagates the panic. It never drops the configured shared
+test database or reuses an existing name. A process kill cannot run cleanup;
+the timestamp/PID/counter name makes such leftovers identifiable for manual
+removal. Test tasks must still be joined or canceled and transaction locks
+released before their closure returns.
+
 Regression examples: `infrastructure/tests/transaction_scope_test.rs` verifies
 repository commit isolation, failed-savepoint recovery, outer rollback after
 success/panic, and invalidation of surviving clones. `public_attribution_test.rs`

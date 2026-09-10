@@ -11,7 +11,7 @@ use bikesnest_domain::{
 use bikesnest_infrastructure::{
     Db, SqlxAccountRepository, SqlxAuditLog, SqlxSessionStore, SqlxTokenStore,
 };
-use bikesnest_test_support::{db_test, pool};
+use bikesnest_test_support::{db_test, pool, run_isolated_database_test};
 use chrono::{Duration, Utc};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -24,6 +24,51 @@ fn unique_email(label: &str) -> String {
 
 fn marker_email(label: &str) -> String {
     unique_email(label)
+}
+
+async fn assert_exact_password_reset_audit(db: &Db, user_id: bikesnest_domain::UserId, count: i64) {
+    let mut conn = db.acquire().await.unwrap();
+    let rows: Vec<(
+        Option<i64>,
+        String,
+        String,
+        String,
+        String,
+        serde_json::Value,
+    )> = sqlx::query_as(
+        "SELECT actor_user_id, action, target_type, target_id, result, metadata
+             FROM audit_events WHERE actor_user_id = $1 AND action = 'auth.password_changed'",
+    )
+    .bind(user_id.0)
+    .fetch_all(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(rows.len() as i64, count);
+    for row in rows {
+        assert_eq!(
+            row,
+            (
+                Some(user_id.0),
+                "auth.password_changed".to_string(),
+                "user".to_string(),
+                user_id.0.to_string(),
+                "success".to_string(),
+                serde_json::json!({}),
+            )
+        );
+    }
+}
+
+async fn assert_unused_reset_count(db: &Db, user_id: bikesnest_domain::UserId, expected: i64) {
+    let mut conn = db.acquire().await.unwrap();
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM password_reset_tokens WHERE user_id = $1 AND used_at IS NULL",
+    )
+    .bind(user_id.0)
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(count, expected);
 }
 
 async fn cleanup_user(email: &str) {
@@ -610,6 +655,543 @@ async fn failed_email_confirmation_rolls_back_token_consumption(
 }
 
 #[db_test]
+async fn password_reset_atomically_updates_credential_revokes_sessions_and_competitors(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    for state in [AccountState::PendingEmailVerification, AccountState::Active] {
+        let db = tx.db().await;
+        let accounts = SqlxAccountRepository::new(db.clone());
+        let tokens = SqlxTokenStore::new(db.clone());
+        let sessions = SqlxSessionStore::new(db.clone());
+        let email = UserEmail::parse(&unique_email("reset-atomic")).unwrap();
+        let user_id = accounts
+            .create(bikesnest_application::NewAccount {
+                email: &email,
+                display_name: None,
+                password_hash: "old-hash",
+                state,
+                locale: bikesnest_domain::LocaleCode::PtBr,
+            })
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let first = VerificationToken::new([121 + state as u8; 32]);
+        let competing = VerificationToken::new([123 + state as u8; 32]);
+        assert!(tokens.issue_reset(user_id, &first, now).await.unwrap());
+        assert!(tokens.issue_reset(user_id, &competing, now).await.unwrap());
+        let session = SessionId::new([125 + state as u8; 32]);
+        sessions
+            .create(user_id, &session, &CsrfToken::new([127; 32]), now)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            accounts
+                .complete_password_reset(&first, "new-hash", now)
+                .await
+                .unwrap(),
+            Some(user_id)
+        );
+        assert_eq!(
+            accounts
+                .find_by_id(user_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .account_state,
+            state
+        );
+        assert_eq!(
+            accounts
+                .find_identity(AuthenticationProvider::Password, email.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .credential_hash
+                .as_deref(),
+            Some("new-hash")
+        );
+        assert!(sessions.resolve(&session, now).await.unwrap().is_none());
+        assert!(
+            tokens
+                .consume_reset(&competing, now)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_exact_password_reset_audit(&db, user_id, 1).await;
+        assert!(
+            accounts
+                .complete_password_reset(&first, "later-hash", now)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_exact_password_reset_audit(&db, user_id, 1).await;
+    }
+}
+
+#[db_test]
+async fn password_reset_rejects_expired_and_blocked_accounts_without_state_change(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    for (index, state) in [AccountState::Suspended, AccountState::Deleted]
+        .into_iter()
+        .enumerate()
+    {
+        let db = tx.db().await;
+        let accounts = SqlxAccountRepository::new(db.clone());
+        let tokens = SqlxTokenStore::new(db.clone());
+        let sessions = SqlxSessionStore::new(db.clone());
+        let email = UserEmail::parse(&unique_email("reset-blocked")).unwrap();
+        let user_id = accounts
+            .create(bikesnest_application::NewAccount {
+                email: &email,
+                display_name: None,
+                password_hash: "old-hash",
+                state: AccountState::Active,
+                locale: bikesnest_domain::LocaleCode::PtBr,
+            })
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let token = VerificationToken::new([141 + index as u8; 32]);
+        let competing = VerificationToken::new([145 + index as u8; 32]);
+        assert!(tokens.issue_reset(user_id, &token, now).await.unwrap());
+        assert!(tokens.issue_reset(user_id, &competing, now).await.unwrap());
+        let session = SessionId::new([147 + index as u8; 32]);
+        sessions
+            .create(user_id, &session, &CsrfToken::new([149; 32]), now)
+            .await
+            .unwrap();
+        accounts.set_state(user_id, state).await.unwrap();
+
+        assert!(
+            accounts
+                .complete_password_reset(&token, "new-hash", now)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            accounts
+                .find_by_id(user_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .account_state,
+            state
+        );
+        assert_eq!(
+            accounts
+                .find_identity(AuthenticationProvider::Password, email.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .credential_hash
+                .as_deref(),
+            Some("old-hash")
+        );
+        assert!(sessions.resolve(&session, now).await.unwrap().is_some());
+        assert_unused_reset_count(&db, user_id, 2).await;
+        assert_exact_password_reset_audit(&db, user_id, 0).await;
+        accounts
+            .set_state(user_id, AccountState::Active)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokens.consume_reset(&token, now).await.unwrap(),
+            Some(user_id)
+        );
+        assert_eq!(
+            tokens.consume_reset(&competing, now).await.unwrap(),
+            Some(user_id)
+        );
+    }
+
+    let db = tx.db().await;
+    let accounts = SqlxAccountRepository::new(db.clone());
+    let tokens = SqlxTokenStore::new(db.clone());
+    let sessions = SqlxSessionStore::new(db.clone());
+    let email = UserEmail::parse(&unique_email("reset-expired")).unwrap();
+    let user_id = accounts
+        .create(bikesnest_application::NewAccount {
+            email: &email,
+            display_name: None,
+            password_hash: "old-hash",
+            state: AccountState::Active,
+            locale: bikesnest_domain::LocaleCode::PtBr,
+        })
+        .await
+        .unwrap();
+    let now = Utc::now();
+    let expired = VerificationToken::new([151; 32]);
+    let expired_competing = VerificationToken::new([153; 32]);
+    assert!(tokens.issue_reset(user_id, &expired, now).await.unwrap());
+    assert!(
+        tokens
+            .issue_reset(user_id, &expired_competing, now)
+            .await
+            .unwrap()
+    );
+    let expired_session = SessionId::new([154; 32]);
+    sessions
+        .create(user_id, &expired_session, &CsrfToken::new([155; 32]), now)
+        .await
+        .unwrap();
+    assert!(
+        accounts
+            .complete_password_reset(&expired, "new-hash", now + Duration::hours(2))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        accounts
+            .find_identity(AuthenticationProvider::Password, email.as_str())
+            .await
+            .unwrap()
+            .unwrap()
+            .credential_hash
+            .as_deref(),
+        Some("old-hash")
+    );
+    assert!(
+        sessions
+            .resolve(&expired_session, now)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        tokens.consume_reset(&expired_competing, now).await.unwrap(),
+        Some(user_id)
+    );
+    assert_unused_reset_count(&db, user_id, 1).await;
+    assert_exact_password_reset_audit(&db, user_id, 0).await;
+
+    let oauth_email = UserEmail::parse(&unique_email("reset-no-password")).unwrap();
+    let oauth_user = accounts
+        .create(bikesnest_application::NewAccount {
+            email: &oauth_email,
+            display_name: None,
+            password_hash: "",
+            state: AccountState::Active,
+            locale: bikesnest_domain::LocaleCode::PtBr,
+        })
+        .await
+        .unwrap();
+    let no_identity = VerificationToken::new([152; 32]);
+    let no_identity_competing = VerificationToken::new([156; 32]);
+    assert!(
+        tokens
+            .issue_reset(oauth_user, &no_identity, now)
+            .await
+            .unwrap()
+    );
+    assert!(
+        tokens
+            .issue_reset(oauth_user, &no_identity_competing, now)
+            .await
+            .unwrap()
+    );
+    let no_identity_session = SessionId::new([157; 32]);
+    sessions
+        .create(
+            oauth_user,
+            &no_identity_session,
+            &CsrfToken::new([158; 32]),
+            now,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        accounts
+            .complete_password_reset(&no_identity, "new-hash", now)
+            .await,
+        Err(bikesnest_application::AuthError::Internal)
+    );
+    assert_unused_reset_count(&db, oauth_user, 2).await;
+    assert_eq!(
+        tokens.consume_reset(&no_identity, now).await.unwrap(),
+        Some(oauth_user)
+    );
+    assert_eq!(
+        tokens
+            .consume_reset(&no_identity_competing, now)
+            .await
+            .unwrap(),
+        Some(oauth_user)
+    );
+    assert!(
+        sessions
+            .resolve(&no_identity_session, now)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        accounts
+            .find_identity(AuthenticationProvider::Password, oauth_email.as_str())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_exact_password_reset_audit(&db, oauth_user, 0).await;
+}
+
+#[db_test]
+async fn final_audit_failure_rolls_back_the_entire_password_reset(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let accounts = SqlxAccountRepository::new(db.clone());
+    let tokens = SqlxTokenStore::new(db.clone());
+    let sessions = SqlxSessionStore::new(db.clone());
+    let email = UserEmail::parse(&unique_email("reset-rollback")).unwrap();
+    let user_id = accounts
+        .create(bikesnest_application::NewAccount {
+            email: &email,
+            display_name: None,
+            password_hash: "old-hash",
+            state: AccountState::Active,
+            locale: bikesnest_domain::LocaleCode::PtBr,
+        })
+        .await
+        .unwrap();
+    let now = Utc::now();
+    let token = VerificationToken::new([161; 32]);
+    let competing = VerificationToken::new([164; 32]);
+    assert!(tokens.issue_reset(user_id, &token, now).await.unwrap());
+    assert!(tokens.issue_reset(user_id, &competing, now).await.unwrap());
+    let session = SessionId::new([162; 32]);
+    sessions
+        .create(user_id, &session, &CsrfToken::new([163; 32]), now)
+        .await
+        .unwrap();
+    {
+        let mut conn = db.acquire().await.unwrap();
+        sqlx::query(
+            "CREATE TEMP TABLE audit_events (
+                actor_user_id BIGINT, action TEXT, target_type TEXT, target_id TEXT,
+                result TEXT CHECK (false), metadata JSONB
+             ) ON COMMIT PRESERVE ROWS",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        accounts
+            .complete_password_reset(&token, "new-hash", now)
+            .await,
+        Err(bikesnest_application::AuthError::Internal)
+    );
+    assert_eq!(
+        accounts
+            .find_identity(AuthenticationProvider::Password, email.as_str())
+            .await
+            .unwrap()
+            .unwrap()
+            .credential_hash
+            .as_deref(),
+        Some("old-hash")
+    );
+    assert!(sessions.resolve(&session, now).await.unwrap().is_some());
+    {
+        let mut conn = db.acquire().await.unwrap();
+        let unused: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM password_reset_tokens
+             WHERE user_id = $1 AND used_at IS NULL",
+        )
+        .bind(user_id.0)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(unused, 2, "both reset credentials must roll back");
+    }
+    {
+        let mut conn = db.acquire().await.unwrap();
+        sqlx::query("DROP TABLE pg_temp.audit_events")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+    }
+    assert_exact_password_reset_audit(&db, user_id, 0).await;
+    assert_eq!(
+        accounts
+            .complete_password_reset(&token, "new-hash", now)
+            .await
+            .unwrap(),
+        Some(user_id)
+    );
+    assert!(sessions.resolve(&session, now).await.unwrap().is_none());
+    assert!(
+        tokens
+            .consume_reset(&competing, now)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_exact_password_reset_audit(&db, user_id, 1).await;
+}
+
+#[test]
+fn reset_expiring_during_account_lock_wait_is_rejected() {
+    run_isolated_database_test(|pool: sqlx::PgPool| async move {
+        let db = Db::from_pool(pool.clone());
+        let accounts = SqlxAccountRepository::new(db.clone());
+        let tokens = SqlxTokenStore::new(db.clone());
+        let sessions = SqlxSessionStore::new(db.clone());
+        let email = UserEmail::parse(&unique_email("reset-lock-expiry")).unwrap();
+        let user_id = accounts
+            .create(bikesnest_application::NewAccount {
+                email: &email,
+                display_name: None,
+                password_hash: "old-hash",
+                state: AccountState::Active,
+                locale: bikesnest_domain::LocaleCode::PtBr,
+            })
+            .await
+            .unwrap();
+        let supplied_at = Utc::now();
+        let token = VerificationToken::new([171; 32]);
+        let competing = VerificationToken::new([172; 32]);
+        assert!(
+            tokens
+                .issue_reset(user_id, &token, supplied_at)
+                .await
+                .unwrap()
+        );
+        assert!(
+            tokens
+                .issue_reset(user_id, &competing, supplied_at)
+                .await
+                .unwrap()
+        );
+        let session = SessionId::new([173; 32]);
+        sessions
+            .create(user_id, &session, &CsrfToken::new([174; 32]), supplied_at)
+            .await
+            .unwrap();
+
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+            .bind(user_id.0)
+            .fetch_one(&mut *blocker)
+            .await
+            .unwrap();
+        // The reset first observes the original one-hour deadline, then waits
+        // on this account lock. Shorten the deadline inside the blocker so the
+        // committed deadline is already past when the waiter resumes.
+        sqlx::query(
+            "UPDATE password_reset_tokens
+             SET expires_at = clock_timestamp() + interval '300 milliseconds'
+             WHERE user_id = $1",
+        )
+        .bind(user_id.0)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+
+        let reset_accounts = SqlxAccountRepository::new(db.clone());
+        let reset_task = tokio::spawn(async move {
+            reset_accounts
+                .complete_password_reset(&token, "new-hash", supplied_at)
+                .await
+        });
+        let mut observed_wait = false;
+        for _ in 0..50 {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                    SELECT 1 FROM pg_stat_activity
+                    WHERE datname = current_database() AND wait_event_type = 'Lock'
+                )",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if waiting {
+                observed_wait = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            observed_wait,
+            "reset transaction never reached the account lock"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        blocker.commit().await.unwrap();
+
+        assert!(reset_task.await.unwrap().unwrap().is_none());
+        assert_eq!(
+            accounts
+                .find_identity(AuthenticationProvider::Password, email.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .credential_hash
+                .as_deref(),
+            Some("old-hash")
+        );
+        assert!(
+            sessions
+                .resolve(&session, Utc::now())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let unused: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM password_reset_tokens
+             WHERE user_id = $1 AND used_at IS NULL",
+        )
+        .bind(user_id.0)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(unused, 2);
+        assert_exact_password_reset_audit(&db, user_id, 0).await;
+    });
+}
+
+#[test]
+fn isolated_database_helper_cleans_up_after_panic() {
+    let created_name = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let name_from_test = created_name.clone();
+    let panic = std::panic::catch_unwind(|| {
+        run_isolated_database_test(|pool: sqlx::PgPool| async move {
+            let name: String = sqlx::query_scalar("SELECT current_database()")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            *name_from_test.lock().unwrap() = Some(name);
+            panic!("intentional isolated-helper cleanup test");
+        });
+    });
+    assert!(panic.is_err());
+    let dropped_name = created_name.lock().unwrap().clone().unwrap();
+
+    let successfully_dropped = run_isolated_database_test(|_| async move {});
+    run_isolated_database_test(|pool: sqlx::PgPool| async move {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                SELECT 1 FROM pg_database WHERE datname = ANY($1)
+             )",
+        )
+        .bind(vec![dropped_name, successfully_dropped])
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            !exists,
+            "successful and panicking helper databases must be gone"
+        );
+    });
+}
+
+#[db_test]
 async fn audit_insert_round_trip(_tx: &mut bikesnest_test_support::TestTx) {
     let db = Db::from_pool(pool().await);
     let audit = SqlxAuditLog::new(db);
@@ -644,7 +1226,7 @@ async fn audit_insert_round_trip(_tx: &mut bikesnest_test_support::TestTx) {
 }
 
 /// `resolve` runs on every authenticated request, so its `last_seen_at` write
-/// is throttled to at most once per five minutes (WP7). The 30-day idle window
+/// is throttled to at most once per five minutes. The 30-day idle window
 /// is unaffected: the column may lag by five minutes, which is immaterial
 /// against 30 days.
 #[db_test]
@@ -714,7 +1296,7 @@ async fn resolve_throttles_the_last_seen_write(_tx: &mut bikesnest_test_support:
 }
 
 // ---------------------------------------------------------------------------
-// WP13 — the admin user list is a searched, bounded page with batched
+// The admin user list is a searched, bounded page with batched
 // counters, instead of "load every account and render it".
 // ---------------------------------------------------------------------------
 
@@ -723,7 +1305,7 @@ async fn search_users_matches_email_or_name_and_pages_by_keyset(
     _tx: &mut bikesnest_test_support::TestTx,
 ) {
     let repo = SqlxAccountRepository::new(Db::from_pool(pool().await));
-    let needle = format!("wp13needle{}", std::process::id());
+    let needle = format!("adminneedle{}", std::process::id());
     let mut ids = Vec::new();
     let mut emails = Vec::new();
     for n in 0..3 {
@@ -733,7 +1315,7 @@ async fn search_users_matches_email_or_name_and_pages_by_keyset(
         let id = repo
             .create(bikesnest_application::NewAccount {
                 email: &eu,
-                display_name: Some(&format!("Wp13 Person {n}")),
+                display_name: Some(&format!("Admin Person {n}")),
                 password_hash: "$argon2id$test",
                 state: AccountState::Active,
                 locale: bikesnest_domain::LocaleCode::PtBr,
@@ -776,7 +1358,7 @@ async fn search_users_matches_email_or_name_and_pages_by_keyset(
     // Matching on the display name works too.
     let by_name = repo
         .search_users(bikesnest_application::UserSearch {
-            query: Some("Wp13 Person 1"),
+            query: Some("Admin Person 1"),
             after_id: None,
             limit: 50,
         })
@@ -809,7 +1391,7 @@ async fn search_users_matches_email_or_name_and_pages_by_keyset(
     );
 
     // `_` matches only a literal underscore: the wildcards are escaped.
-    let underscore = search(Some("wp13_eedle"), None, 50).await.unwrap();
+    let underscore = search(Some("admin_eedle"), None, 50).await.unwrap();
     assert!(
         underscore.is_empty(),
         "`_` is escaped, so it does not match any character"
@@ -821,7 +1403,7 @@ async fn search_users_matches_email_or_name_and_pages_by_keyset(
     let under = UserEmail::parse(&under_email).unwrap();
     repo.create(bikesnest_application::NewAccount {
         email: &under,
-        display_name: Some("Wp13 Under_score"),
+        display_name: Some("Admin Under_score"),
         password_hash: "$argon2id$test",
         state: AccountState::Active,
         locale: bikesnest_domain::LocaleCode::PtBr,
@@ -836,7 +1418,7 @@ async fn search_users_matches_email_or_name_and_pages_by_keyset(
     let labels = repo.labels_for(&[ids[0], ids[1], -1]).await.unwrap();
     assert_eq!(labels.len(), 2, "an unknown id is simply absent");
     assert!(
-        labels[&ids[0]].starts_with("Wp13 Person"),
+        labels[&ids[0]].starts_with("Admin Person"),
         "the label prefers the display name: {:?}",
         labels[&ids[0]]
     );
@@ -878,7 +1460,7 @@ async fn activity_for_reports_last_seen_and_a_contribution_total(
     _tx: &mut bikesnest_test_support::TestTx,
 ) {
     let repo = SqlxAccountRepository::new(Db::from_pool(pool().await));
-    let email = marker_email("wp13-activity");
+    let email = marker_email("admin-activity");
     cleanup_user(&email).await;
     let eu = UserEmail::parse(&email).unwrap();
     let id = repo
@@ -906,7 +1488,7 @@ async fn activity_for_reports_last_seen_and_a_contribution_total(
         "INSERT INTO sessions (token_hash, user_id, csrf_token, last_seen_at, expires_at) \
          VALUES ($1, $2, 'csrf', $3, $4)",
     )
-    .bind(format!("wp13-hash-{id}"))
+    .bind(format!("admin-hash-{id}"))
     .bind(id)
     .bind(seen)
     .bind(Utc::now() + Duration::days(1))
@@ -916,12 +1498,12 @@ async fn activity_for_reports_last_seen_and_a_contribution_total(
     let (loc,): (i64,) = sqlx::query_as(
         "INSERT INTO parking_location \
            (name, address, parking_type, cost_kind, location, timezone, moderation_state, creator_id, seed_key) \
-         VALUES ('WP13 Activity', 'Rua X', 'rack', 'unknown', \
+         VALUES ('Admin Activity', 'Rua X', 'rack', 'unknown', \
                  ST_SetSRID(ST_MakePoint(-49.27, -25.43), 4326)::geography, \
                  'America/Sao_Paulo', 'ACTIVE', $1, $2) RETURNING id",
     )
     .bind(id)
-    .bind(format!("wp13-activity-{id}"))
+    .bind(format!("admin-activity-{id}"))
     .fetch_one(&pool().await)
     .await
     .unwrap();

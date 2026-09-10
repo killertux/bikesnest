@@ -193,6 +193,17 @@ pub trait AccountRepository: Send + Sync {
     /// outstanding verification and password-reset tokens while holding the
     /// account row lock.
     async fn suspend_and_revoke_security_tokens(&self, id: UserId) -> Result<(), AuthError>;
+    /// Atomically consume one valid reset token, replace the password, revoke
+    /// every session, invalidate competing reset tokens, and write the
+    /// password-changed audit event. Implementations
+    /// must lock the account before changing any of those rows and must reject
+    /// suspended or deleted accounts without consuming the token.
+    async fn complete_password_reset(
+        &self,
+        token: &VerificationToken,
+        password_hash: &str,
+        at: DateTime<Utc>,
+    ) -> Result<Option<UserId>, AuthError>;
     async fn set_password(&self, id: UserId, hash: &str) -> Result<(), AuthError>;
     /// Persist the account's reading language (the header language toggle, for
     /// a signed-in user). Transactional email is rendered from this value.
@@ -849,6 +860,14 @@ impl AuthService {
         if !user.account_state.can_log_in() {
             return Ok(());
         }
+        if self
+            .accounts
+            .find_identity(AuthenticationProvider::Password, email.as_str())
+            .await?
+            .is_none()
+        {
+            return Ok(());
+        }
         let token = VerificationToken::new(self.tokens_gen.generate());
         if !self.tokens.issue_reset(user.id, &token, self.now()).await? {
             return Ok(());
@@ -866,27 +885,19 @@ impl AuthService {
         raw_token: &str,
         raw_password: &str,
     ) -> Result<(), AuthError> {
-        let now = self.now();
         let token = decode_token(raw_token).ok_or(AuthError::TokenInvalid)?;
-        let Some(user_id) = self.tokens.consume_reset(&token, now).await? else {
-            return Err(AuthError::TokenInvalid);
-        };
         self.password_policy.validate(raw_password)?;
         let hash = self.hasher.hash(&Password::new(raw_password)).await?;
-        self.accounts.set_password(user_id, &hash).await?;
-        // Revoke every session; on the reset flow the caller is not signed in,
-        // so there is no session to keep.
-        self.sessions
-            .revoke_all_for_user_except(user_id, &SessionId::new([0u8; 32]))
-            .await?;
-        self.audit
-            .record(AuditEvent::success(
-                Some(user_id),
-                "auth.password_changed",
-                "user",
-                user_id.0.to_string(),
-            ))
-            .await?;
+        // Expiry is judged after the potentially slow password hash, at the
+        // instant the atomic persistence transition begins.
+        let now = self.now();
+        let Some(_) = self
+            .accounts
+            .complete_password_reset(&token, &hash, now)
+            .await?
+        else {
+            return Err(AuthError::TokenInvalid);
+        };
         Ok(())
     }
 

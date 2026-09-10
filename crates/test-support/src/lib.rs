@@ -8,7 +8,7 @@
 //! - Domain-rich builders.
 
 use sqlx::postgres::{PgPoolOptions, Postgres};
-use sqlx::{PgPool, Transaction};
+use sqlx::{Connection, PgConnection, PgPool, Transaction};
 use std::str::FromStr;
 use tokio::sync::OnceCell;
 
@@ -131,6 +131,92 @@ fn database_url() -> String {
     database_url_from_value(value.as_deref()).unwrap_or_else(|error| panic!("{}", error.message()))
 }
 
+fn is_loopback_test_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+/// Run a real multi-connection test in its own migrated disposable database.
+///
+/// The configured test role needs `CREATEDB`. Cleanup is awaited after success
+/// and panic, but a process kill can still leave the uniquely named database
+/// behind for an operator to remove.
+pub fn run_isolated_database_test(f: impl AsyncFnOnce(PgPool)) -> String {
+    let base_url = database_url();
+    let base_options = sqlx::postgres::PgConnectOptions::from_str(&base_url)
+        .unwrap_or_else(|_| panic!("test-support: invalid validated test database URL"));
+    assert!(
+        is_loopback_test_host(base_options.get_host()),
+        "test-support: isolated databases require a loopback TEST_DATABASE_URL"
+    );
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("test-support: system clock before Unix epoch")
+        .as_nanos();
+    let name = format!(
+        "bikesnest_test_race_{}_{}_{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        nonce,
+    );
+    assert!(name.len() <= 63 && is_disposable_test_database_name(&name));
+
+    let mut admin = shared_runtime().block_on(async {
+        PgConnection::connect_with(&base_options)
+            .await
+            .unwrap_or_else(|_| panic!("test-support: cannot connect to isolated-test server"))
+    });
+    shared_runtime().block_on(async {
+        sqlx::query(&format!("CREATE DATABASE \"{name}\""))
+            .execute(&mut admin)
+            .await
+            .unwrap_or_else(|_| {
+                panic!("test-support: cannot create isolated test database (CREATEDB required)")
+            });
+    });
+    let isolated_options = base_options.clone().database(&name);
+    let pool_result = shared_runtime().block_on(async {
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect_with(isolated_options)
+            .await
+            .map_err(|_| "connect")?;
+        if sqlx::migrate!("../../migrations").run(&pool).await.is_err() {
+            pool.close().await;
+            return Err("migrate");
+        }
+        Ok(pool)
+    });
+    let result = match pool_result {
+        Ok(pool) => {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                shared_runtime().block_on(f(pool.clone()));
+            }));
+            let _ = shared_runtime().block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), pool.close()).await
+            });
+            result
+        }
+        Err(stage) => Err(
+            Box::new(format!("test-support: isolated database {stage} failed"))
+                as Box<dyn std::any::Any + Send>,
+        ),
+    };
+    shared_runtime().block_on(async {
+        let drop_result = sqlx::query(&format!("DROP DATABASE \"{name}\" WITH (FORCE)"))
+            .execute(&mut admin)
+            .await;
+        assert!(
+            drop_result.is_ok(),
+            "test-support: isolated database cleanup failed"
+        );
+    });
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+    name
+}
+
 /// The configuration the HTTP tests build their router from: a development
 /// config with every provider on its fake, pointed at the test database. Tests
 /// override individual fields rather than touching the process environment.
@@ -155,7 +241,10 @@ async fn connect_and_migrate() -> PgPool {
 
 #[cfg(test)]
 mod test_database_target_tests {
-    use super::{TestDatabaseTargetError, database_url_from_value, validate_test_database_url};
+    use super::{
+        TestDatabaseTargetError, database_url_from_value, is_loopback_test_host,
+        validate_test_database_url,
+    };
 
     #[test]
     fn missing_test_database_url_is_rejected() {
@@ -218,6 +307,16 @@ mod test_database_target_tests {
                 Ok(()),
                 "{database_url}"
             );
+        }
+    }
+
+    #[test]
+    fn isolated_database_hosts_are_loopback_only() {
+        for host in ["localhost", "127.0.0.1", "::1"] {
+            assert!(is_loopback_test_host(host));
+        }
+        for host in ["db", "postgres.example.com", "10.0.0.1"] {
+            assert!(!is_loopback_test_host(host));
         }
     }
 }
