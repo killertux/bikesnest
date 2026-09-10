@@ -189,10 +189,15 @@ pub trait AccountRepository: Send + Sync {
         token: &VerificationToken,
         at: DateTime<Utc>,
     ) -> Result<Option<EmailVerificationOutcome>, AuthError>;
-    /// Atomically suspend the account and revoke its sessions plus all
-    /// outstanding verification and password-reset tokens while holding the
-    /// account row lock.
-    async fn suspend_and_revoke_security_tokens(&self, id: UserId) -> Result<(), AuthError>;
+    /// Atomically suspend an eligible account, revoke its sessions plus all
+    /// outstanding verification and password-reset tokens, and write the
+    /// administrator audit event while holding the account row lock. Deleted
+    /// and already-suspended accounts are unchanged and return `false`.
+    async fn suspend_by_admin(&self, id: UserId, actor: UserId) -> Result<bool, AuthError>;
+    /// Atomically restore only a suspended account and write its administrator
+    /// audit event. A verified account becomes active; an unverified account
+    /// returns to pending email verification. Other states are unchanged.
+    async fn restore_by_admin(&self, id: UserId, actor: UserId) -> Result<bool, AuthError>;
     /// Atomically consume one valid reset token, replace the password, revoke
     /// every session, invalidate competing reset tokens, and write the
     /// password-changed audit event. Implementations
@@ -1209,21 +1214,11 @@ impl AuthService {
         if !actor.has_role(Role::Admin) {
             return Err(AuthError::Unauthorized);
         }
-        self.accounts
-            .suspend_and_revoke_security_tokens(target)
-            .await?;
-        self.audit
-            .record(AuditEvent::success(
-                Some(actor.id),
-                "user.suspended",
-                "user",
-                target.0.to_string(),
-            ))
-            .await?;
+        self.accounts.suspend_by_admin(target, actor.id).await?;
         Ok(())
     }
 
-    /// Restore a suspended account to `Active`, audit.
+    /// Restore a suspended account to its verification-appropriate state.
     pub async fn restore_user(
         &self,
         actor: &AuthenticatedUser,
@@ -1232,17 +1227,7 @@ impl AuthService {
         if !actor.has_role(Role::Admin) {
             return Err(AuthError::Unauthorized);
         }
-        self.accounts
-            .set_state(target, AccountState::Active)
-            .await?;
-        self.audit
-            .record(AuditEvent::success(
-                Some(actor.id),
-                "user.restored",
-                "user",
-                target.0.to_string(),
-            ))
-            .await?;
+        self.accounts.restore_by_admin(target, actor.id).await?;
         Ok(())
     }
 

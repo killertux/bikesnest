@@ -12,7 +12,7 @@ use bikesnest_infrastructure::{
     Db, SqlxAccountRepository, SqlxAuditLog, SqlxSessionStore, SqlxTokenStore,
 };
 use bikesnest_test_support::{db_test, pool, run_isolated_database_test};
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -24,6 +24,35 @@ fn unique_email(label: &str) -> String {
 
 fn marker_email(label: &str) -> String {
     unique_email(label)
+}
+
+async fn persisted_account_state(
+    db: &Db,
+    user_id: bikesnest_domain::UserId,
+) -> (
+    String,
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+    DateTime<Utc>,
+) {
+    sqlx::query_as(
+        "SELECT account_state, suspended_at, deleted_at, updated_at FROM users WHERE id = $1",
+    )
+    .bind(user_id.0)
+    .fetch_one(&mut *db.acquire().await.unwrap())
+    .await
+    .unwrap()
+}
+
+async fn unused_verification_tokens(db: &Db, user_id: bikesnest_domain::UserId) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM email_verification_tokens
+         WHERE user_id = $1 AND used_at IS NULL",
+    )
+    .bind(user_id.0)
+    .fetch_one(&mut *db.acquire().await.unwrap())
+    .await
+    .unwrap()
 }
 
 async fn assert_exact_password_reset_audit(db: &Db, user_id: bikesnest_domain::UserId, count: i64) {
@@ -559,14 +588,8 @@ async fn suspension_revokes_security_tokens_and_sessions_across_restore(
         .await
         .unwrap();
 
-    accounts
-        .suspend_and_revoke_security_tokens(user_id)
-        .await
-        .unwrap();
-    accounts
-        .set_state(user_id, AccountState::Active)
-        .await
-        .unwrap();
+    accounts.suspend_by_admin(user_id, user_id).await.unwrap();
+    accounts.restore_by_admin(user_id, user_id).await.unwrap();
 
     assert!(
         accounts
@@ -580,7 +603,304 @@ async fn suspension_revokes_security_tokens_and_sessions_across_restore(
     assert!(sessions.resolve(&session, now).await.unwrap().is_none());
     let user = accounts.find_by_id(user_id).await.unwrap().unwrap();
     assert!(user.email_verified_at.is_none());
-    assert_eq!(user.account_state, AccountState::Active);
+    assert_eq!(user.account_state, AccountState::PendingEmailVerification);
+}
+
+#[db_test]
+async fn administrator_account_transition_state_matrix_and_exact_audits(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let accounts = SqlxAccountRepository::new(db.clone());
+    let create = |label: &'static str, state| {
+        let accounts = &accounts;
+        async move {
+            let email = UserEmail::parse(&unique_email(label)).unwrap();
+            accounts
+                .create(bikesnest_application::NewAccount {
+                    email: &email,
+                    display_name: None,
+                    password_hash: "hash",
+                    state,
+                    locale: bikesnest_domain::LocaleCode::PtBr,
+                })
+                .await
+                .unwrap()
+        }
+    };
+    let actor = create("state-actor", AccountState::Active).await;
+    let active = create("state-active", AccountState::Active).await;
+    let pending = create("state-pending", AccountState::PendingEmailVerification).await;
+    let suspended_verified = create("state-suspended-verified", AccountState::Suspended).await;
+    let suspended_unverified = create("state-suspended-unverified", AccountState::Suspended).await;
+    let deleted = create("state-deleted", AccountState::Deleted).await;
+    accounts
+        .mark_email_verified(active, Utc::now())
+        .await
+        .unwrap();
+    accounts
+        .mark_email_verified(suspended_verified, Utc::now())
+        .await
+        .unwrap();
+    for (index, id) in [
+        active,
+        pending,
+        suspended_verified,
+        suspended_unverified,
+        deleted,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        sqlx::query(
+            "UPDATE users SET suspended_at = TIMESTAMPTZ '1990-01-01 00:00:00+00'
+                    + ($2 * interval '1 day'),
+                 updated_at = TIMESTAMPTZ '1991-01-01 00:00:00+00'
+                    + ($2 * interval '1 day')
+             WHERE id = $1",
+        )
+        .bind(id.0)
+        .bind(index as i32)
+        .execute(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    }
+    let active_before_noop = persisted_account_state(&db, active).await;
+    let pending_before_noop = persisted_account_state(&db, pending).await;
+    let deleted_before_noop = persisted_account_state(&db, deleted).await;
+
+    assert!(!accounts.restore_by_admin(active, actor).await.unwrap());
+    assert!(!accounts.restore_by_admin(pending, actor).await.unwrap());
+    assert!(!accounts.suspend_by_admin(deleted, actor).await.unwrap());
+    assert!(!accounts.restore_by_admin(deleted, actor).await.unwrap());
+    assert_eq!(
+        persisted_account_state(&db, active).await,
+        active_before_noop
+    );
+    assert_eq!(
+        persisted_account_state(&db, pending).await,
+        pending_before_noop
+    );
+    assert_eq!(
+        persisted_account_state(&db, deleted).await,
+        deleted_before_noop
+    );
+    assert!(
+        !accounts
+            .restore_by_admin(bikesnest_domain::UserId(-1), actor)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !accounts
+            .suspend_by_admin(bikesnest_domain::UserId(-1), actor)
+            .await
+            .unwrap()
+    );
+
+    assert!(accounts.suspend_by_admin(active, actor).await.unwrap());
+    let active_suspended_before_noop = persisted_account_state(&db, active).await;
+    assert!(!accounts.suspend_by_admin(active, actor).await.unwrap());
+    assert_eq!(
+        persisted_account_state(&db, active).await,
+        active_suspended_before_noop
+    );
+    assert!(accounts.restore_by_admin(active, actor).await.unwrap());
+    assert!(accounts.suspend_by_admin(pending, actor).await.unwrap());
+    assert!(accounts.restore_by_admin(pending, actor).await.unwrap());
+    assert!(
+        accounts
+            .restore_by_admin(suspended_verified, actor)
+            .await
+            .unwrap()
+    );
+    assert!(
+        accounts
+            .restore_by_admin(suspended_unverified, actor)
+            .await
+            .unwrap()
+    );
+
+    for (id, expected) in [
+        (active, AccountState::Active),
+        (pending, AccountState::PendingEmailVerification),
+        (suspended_verified, AccountState::Active),
+        (suspended_unverified, AccountState::PendingEmailVerification),
+        (deleted, AccountState::Deleted),
+    ] {
+        assert_eq!(
+            accounts
+                .find_by_id(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .account_state,
+            expected
+        );
+    }
+    let rows: Vec<(
+        Option<i64>,
+        String,
+        String,
+        String,
+        String,
+        serde_json::Value,
+    )> = sqlx::query_as(
+        "SELECT actor_user_id, action, target_type, target_id, result, metadata
+         FROM audit_events
+         WHERE action IN ('user.suspended', 'user.restored')
+           AND target_id = ANY($1)
+         ORDER BY id",
+    )
+    .bind(vec![
+        active.0.to_string(),
+        pending.0.to_string(),
+        suspended_verified.0.to_string(),
+        suspended_unverified.0.to_string(),
+        deleted.0.to_string(),
+        "-1".to_string(),
+    ])
+    .fetch_all(&mut *db.acquire().await.unwrap())
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 6, "only six real transitions are audited");
+    assert_eq!(
+        rows.iter().filter(|row| row.1 == "user.suspended").count(),
+        2
+    );
+    assert_eq!(
+        rows.iter().filter(|row| row.1 == "user.restored").count(),
+        4
+    );
+    assert!(rows.iter().all(|row| {
+        row.0 == Some(actor.0)
+            && row.2 == "user"
+            && row.4 == "success"
+            && row.5 == serde_json::json!({})
+            && row.3 != deleted.0.to_string()
+            && row.3 != "-1"
+    }));
+}
+
+#[db_test]
+async fn administrator_transition_audit_failure_rolls_back_state_and_revocations(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let accounts = SqlxAccountRepository::new(db.clone());
+    let tokens = SqlxTokenStore::new(db.clone());
+    let sessions = SqlxSessionStore::new(db.clone());
+    let actor_email = UserEmail::parse(&unique_email("transition-rollback-actor")).unwrap();
+    let actor = accounts
+        .create(bikesnest_application::NewAccount {
+            email: &actor_email,
+            display_name: None,
+            password_hash: "hash",
+            state: AccountState::Active,
+            locale: bikesnest_domain::LocaleCode::PtBr,
+        })
+        .await
+        .unwrap();
+    let email = UserEmail::parse(&unique_email("transition-rollback-target")).unwrap();
+    let target = accounts
+        .create(bikesnest_application::NewAccount {
+            email: &email,
+            display_name: None,
+            password_hash: "hash",
+            state: AccountState::Active,
+            locale: bikesnest_domain::LocaleCode::PtBr,
+        })
+        .await
+        .unwrap();
+    accounts
+        .mark_email_verified(target, Utc::now())
+        .await
+        .unwrap();
+    let now = Utc::now();
+    let reset = VerificationToken::new([191; 32]);
+    assert!(tokens.issue_reset(target, &reset, now).await.unwrap());
+    let verification = VerificationToken::new([194; 32]);
+    assert!(
+        tokens
+            .issue_verification(
+                target,
+                email.as_str(),
+                &verification,
+                now,
+                AccountState::Active,
+            )
+            .await
+            .unwrap()
+    );
+    let session = SessionId::new([192; 32]);
+    sessions
+        .create(target, &session, &CsrfToken::new([193; 32]), now)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE users SET suspended_at = TIMESTAMPTZ '2001-02-03 04:05:06+00',
+             updated_at = TIMESTAMPTZ '2002-03-04 05:06:07+00' WHERE id = $1",
+    )
+    .bind(target.0)
+    .execute(&mut *db.acquire().await.unwrap())
+    .await
+    .unwrap();
+    let before_failed_suspend = persisted_account_state(&db, target).await;
+    {
+        let mut conn = db.acquire().await.unwrap();
+        sqlx::query(
+            "CREATE TEMP TABLE audit_events (
+                actor_user_id BIGINT, action TEXT, target_type TEXT, target_id TEXT,
+                result TEXT CHECK (false), metadata JSONB
+             ) ON COMMIT PRESERVE ROWS",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        accounts.suspend_by_admin(target, actor).await,
+        Err(bikesnest_application::AuthError::Internal)
+    );
+    assert_eq!(
+        persisted_account_state(&db, target).await,
+        before_failed_suspend
+    );
+    assert!(sessions.resolve(&session, now).await.unwrap().is_some());
+    assert_eq!(unused_verification_tokens(&db, target).await, 1);
+    assert_eq!(
+        tokens.consume_reset(&reset, now).await.unwrap(),
+        Some(target)
+    );
+    {
+        let mut conn = db.acquire().await.unwrap();
+        sqlx::query("DROP TABLE pg_temp.audit_events")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+    }
+    assert!(accounts.suspend_by_admin(target, actor).await.unwrap());
+    let suspended = persisted_account_state(&db, target).await;
+    assert_eq!(suspended.0, "SUSPENDED");
+    assert!(suspended.1.is_some());
+    {
+        let mut conn = db.acquire().await.unwrap();
+        sqlx::query(
+            "CREATE TEMP TABLE audit_events (
+                actor_user_id BIGINT, action TEXT, target_type TEXT, target_id TEXT,
+                result TEXT CHECK (false), metadata JSONB
+             ) ON COMMIT PRESERVE ROWS",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        accounts.restore_by_admin(target, actor).await,
+        Err(bikesnest_application::AuthError::Internal)
+    );
+    assert_eq!(persisted_account_state(&db, target).await, suspended);
+    assert_eq!(unused_verification_tokens(&db, target).await, 0);
 }
 
 #[db_test]
@@ -1153,6 +1473,149 @@ fn reset_expiring_during_account_lock_wait_is_rejected() {
         .unwrap();
         assert_eq!(unused, 2);
         assert_exact_password_reset_audit(&db, user_id, 0).await;
+    });
+}
+
+#[test]
+fn committed_deletion_wins_against_waiting_admin_transitions() {
+    run_isolated_database_test(|pool: sqlx::PgPool| async move {
+        let db = Db::from_pool(pool.clone());
+        let accounts = SqlxAccountRepository::new(db.clone());
+        let tokens = SqlxTokenStore::new(db.clone());
+        let sessions = SqlxSessionStore::new(db.clone());
+        let actor_email = UserEmail::parse(&unique_email("delete-race-actor")).unwrap();
+        let actor = accounts
+            .create(bikesnest_application::NewAccount {
+                email: &actor_email,
+                display_name: None,
+                password_hash: "hash",
+                state: AccountState::Active,
+                locale: bikesnest_domain::LocaleCode::PtBr,
+            })
+            .await
+            .unwrap();
+
+        for (label, initial_state, operation) in [
+            ("delete-race-suspend", AccountState::Active, "suspend"),
+            ("delete-race-restore", AccountState::Suspended, "restore"),
+        ] {
+            let email = UserEmail::parse(&unique_email(label)).unwrap();
+            let target = accounts
+                .create(bikesnest_application::NewAccount {
+                    email: &email,
+                    display_name: None,
+                    password_hash: "hash",
+                    state: AccountState::Active,
+                    locale: bikesnest_domain::LocaleCode::PtBr,
+                })
+                .await
+                .unwrap();
+            let now = Utc::now();
+            let marker = if operation == "suspend" { 201 } else { 204 };
+            let reset = VerificationToken::new([marker; 32]);
+            assert!(tokens.issue_reset(target, &reset, now).await.unwrap());
+            let verification = VerificationToken::new([marker + 3; 32]);
+            assert!(
+                tokens
+                    .issue_verification(
+                        target,
+                        email.as_str(),
+                        &verification,
+                        now,
+                        AccountState::Active,
+                    )
+                    .await
+                    .unwrap()
+            );
+            let session = SessionId::new([marker + 1; 32]);
+            sessions
+                .create(target, &session, &CsrfToken::new([marker + 2; 32]), now)
+                .await
+                .unwrap();
+            if initial_state == AccountState::Suspended {
+                accounts.set_state(target, initial_state).await.unwrap();
+            }
+            let mut deletion = pool.begin().await.unwrap();
+            // This narrowly simulates the canonical deletion-state write under
+            // the same users-row lock; it is not a privacy-repository test.
+            sqlx::query(
+                "UPDATE users SET account_state = 'DELETED',
+                     suspended_at = TIMESTAMPTZ '2003-04-05 06:07:08+00',
+                     deleted_at = TIMESTAMPTZ '2004-05-06 07:08:09+00',
+                     updated_at = TIMESTAMPTZ '2005-06-07 08:09:10+00'
+                 WHERE id = $1",
+            )
+            .bind(target.0)
+            .execute(&mut *deletion)
+            .await
+            .unwrap();
+            let waiter_repo = SqlxAccountRepository::new(db.clone());
+            let waiter = tokio::spawn(async move {
+                if operation == "suspend" {
+                    waiter_repo.suspend_by_admin(target, actor).await
+                } else {
+                    waiter_repo.restore_by_admin(target, actor).await
+                }
+            });
+            let mut observed_wait = false;
+            for _ in 0..50 {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM pg_stat_activity
+                        WHERE datname = current_database() AND wait_event_type = 'Lock'
+                    )",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                if waiting {
+                    observed_wait = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(observed_wait, "{operation} never waited on deletion");
+            deletion.commit().await.unwrap();
+            let committed_deletion = persisted_account_state(&db, target).await;
+            assert!(!waiter.await.unwrap().unwrap());
+            assert_eq!(
+                persisted_account_state(&db, target).await,
+                committed_deletion
+            );
+            assert_eq!(committed_deletion.0, "DELETED");
+            assert_eq!(
+                committed_deletion.1,
+                Some("2003-04-05T06:07:08Z".parse::<DateTime<Utc>>().unwrap())
+            );
+            assert_eq!(
+                committed_deletion.2,
+                Some("2004-05-06T07:08:09Z".parse::<DateTime<Utc>>().unwrap())
+            );
+            assert_eq!(
+                committed_deletion.3,
+                "2005-06-07T08:09:10Z".parse::<DateTime<Utc>>().unwrap()
+            );
+            assert!(sessions.resolve(&session, now).await.unwrap().is_some());
+            assert_eq!(unused_verification_tokens(&db, target).await, 1);
+            assert_eq!(
+                tokens.consume_reset(&reset, now).await.unwrap(),
+                Some(target)
+            );
+            let audits: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM audit_events
+                 WHERE target_id = $1 AND action = $2",
+            )
+            .bind(target.0.to_string())
+            .bind(if operation == "suspend" {
+                "user.suspended"
+            } else {
+                "user.restored"
+            })
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(audits, 0);
+        }
     });
 }
 

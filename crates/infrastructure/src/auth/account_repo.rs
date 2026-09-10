@@ -389,7 +389,7 @@ impl AccountRepository for SqlxAccountRepository {
         }))
     }
 
-    async fn suspend_and_revoke_security_tokens(&self, id: UserId) -> Result<(), AuthError> {
+    async fn suspend_by_admin(&self, id: UserId, actor: UserId) -> Result<bool, AuthError> {
         let mut conn = self
             .db
             .acquire()
@@ -399,19 +399,30 @@ impl AccountRepository for SqlxAccountRepository {
             .begin()
             .await
             .map_err(|e| db_err("account.suspend", e))?;
-        sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
-            .bind(id.0)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| db_err("account.suspend", e))?;
-        sqlx::query(
+        let state = sqlx::query_scalar::<_, String>(
+            "SELECT account_state FROM users WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| db_err("account.suspend", e))?;
+        if !matches!(
+            state.as_deref(),
+            Some("ACTIVE" | "PENDING_EMAIL_VERIFICATION")
+        ) {
+            return Ok(false);
+        }
+        let updated = sqlx::query(
             "UPDATE users SET account_state = 'SUSPENDED', suspended_at = now(), updated_at = now()
-             WHERE id = $1",
+             WHERE id = $1 AND account_state IN ('ACTIVE', 'PENDING_EMAIL_VERIFICATION')",
         )
         .bind(id.0)
         .execute(&mut *tx)
         .await
         .map_err(|e| db_err("account.suspend", e))?;
+        if updated.rows_affected() != 1 {
+            return Ok(false);
+        }
         sqlx::query(
             "UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
         )
@@ -435,10 +446,60 @@ impl AccountRepository for SqlxAccountRepository {
         .execute(&mut *tx)
         .await
         .map_err(|e| db_err("account.suspend", e))?;
+        sqlx::query(
+            "INSERT INTO audit_events
+                (actor_user_id, action, target_type, target_id, result, metadata)
+             VALUES ($1, 'user.suspended', 'user', $2, 'success', '{}'::jsonb)",
+        )
+        .bind(actor.0)
+        .bind(id.0.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| db_err("account.suspend", e))?;
         tx.commit()
             .await
             .map_err(|e| db_err("account.suspend", e))?;
-        Ok(())
+        Ok(true)
+    }
+
+    async fn restore_by_admin(&self, id: UserId, actor: UserId) -> Result<bool, AuthError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("account.restore", e))?;
+        let mut tx = conn
+            .begin()
+            .await
+            .map_err(|e| db_err("account.restore", e))?;
+        let updated = sqlx::query(
+            "UPDATE users
+             SET account_state = CASE WHEN email_verified_at IS NULL
+                     THEN 'PENDING_EMAIL_VERIFICATION' ELSE 'ACTIVE' END,
+                 suspended_at = NULL, updated_at = now()
+             WHERE id = $1 AND account_state = 'SUSPENDED'",
+        )
+        .bind(id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| db_err("account.restore", e))?;
+        if updated.rows_affected() != 1 {
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO audit_events
+                (actor_user_id, action, target_type, target_id, result, metadata)
+             VALUES ($1, 'user.restored', 'user', $2, 'success', '{}'::jsonb)",
+        )
+        .bind(actor.0)
+        .bind(id.0.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| db_err("account.restore", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| db_err("account.restore", e))?;
+        Ok(true)
     }
 
     async fn complete_password_reset(

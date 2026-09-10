@@ -1204,8 +1204,11 @@ mod tests {
         ) -> Result<Option<crate::auth::EmailVerificationOutcome>, AuthError> {
             Ok(None)
         }
-        async fn suspend_and_revoke_security_tokens(&self, _i: UserId) -> Result<(), AuthError> {
-            Ok(())
+        async fn suspend_by_admin(&self, _i: UserId, _a: UserId) -> Result<bool, AuthError> {
+            Ok(false)
+        }
+        async fn restore_by_admin(&self, _i: UserId, _a: UserId) -> Result<bool, AuthError> {
+            Ok(false)
         }
         async fn complete_password_reset(
             &self,

@@ -193,11 +193,18 @@ impl AccountRepository for FakeRepo {
             email_changed: changed,
         }))
     }
-    async fn suspend_and_revoke_security_tokens(&self, id: UserId) -> Result<(), AuthError> {
+    async fn suspend_by_admin(&self, id: UserId, actor: UserId) -> Result<bool, AuthError> {
         let mut db = self.db.lock().unwrap();
-        if let Some(user) = db.users.iter_mut().find(|u| u.id == id) {
-            user.account_state = AccountState::Suspended;
+        let Some(user) = db.users.iter_mut().find(|u| u.id == id) else {
+            return Ok(false);
+        };
+        if !matches!(
+            user.account_state,
+            AccountState::Active | AccountState::PendingEmailVerification
+        ) {
+            return Ok(false);
         }
+        user.account_state = AccountState::Suspended;
         for (_, session) in &mut db.sessions {
             if session.user_id == id {
                 session.revoked_at = Some(Utc::now());
@@ -213,7 +220,34 @@ impl AccountRepository for FakeRepo {
                 *used = true;
             }
         }
-        Ok(())
+        db.audits.push(AuditEvent::success(
+            Some(actor),
+            "user.suspended",
+            "user",
+            id.0.to_string(),
+        ));
+        Ok(true)
+    }
+    async fn restore_by_admin(&self, id: UserId, actor: UserId) -> Result<bool, AuthError> {
+        let mut db = self.db.lock().unwrap();
+        let Some(user) = db.users.iter_mut().find(|u| u.id == id) else {
+            return Ok(false);
+        };
+        if user.account_state != AccountState::Suspended {
+            return Ok(false);
+        }
+        user.account_state = if user.email_verified_at.is_some() {
+            AccountState::Active
+        } else {
+            AccountState::PendingEmailVerification
+        };
+        db.audits.push(AuditEvent::success(
+            Some(actor),
+            "user.restored",
+            "user",
+            id.0.to_string(),
+        ));
+        Ok(true)
     }
     async fn complete_password_reset(
         &self,
@@ -1108,9 +1142,87 @@ async fn suspension_revokes_old_tokens_even_after_restore() {
     );
     assert_eq!(
         db.lock().unwrap().users[0].account_state,
-        AccountState::Active
+        AccountState::PendingEmailVerification
     );
     assert!(db.lock().unwrap().users[0].email_verified_at.is_none());
+}
+
+#[tokio::test]
+async fn administrator_account_transitions_preserve_deleted_and_verification_states() {
+    let db = Arc::new(Mutex::new(FakeDb::default()));
+    let auth = make_service(db.clone());
+    let admin_id = seed_user_with_roles(&db, "state-admin@example.com", vec![Role::Admin]);
+    let admin = actor_for(&db, admin_id);
+    let verified = seed_active_user(&db, "state-verified@example.com", "password");
+    let pending = seed_active_user(&db, "state-pending@example.com", "password");
+    let deleted = seed_active_user(&db, "state-deleted@example.com", "password");
+    {
+        let mut locked = db.lock().unwrap();
+        locked
+            .users
+            .iter_mut()
+            .find(|user| user.id == verified)
+            .unwrap()
+            .email_verified_at = Some(Utc::now());
+        locked
+            .users
+            .iter_mut()
+            .find(|user| user.id == deleted)
+            .unwrap()
+            .account_state = AccountState::Deleted;
+    }
+
+    auth.suspend_user(&admin, verified).await.unwrap();
+    auth.suspend_user(&admin, pending).await.unwrap();
+    auth.suspend_user(&admin, deleted).await.unwrap();
+    auth.restore_user(&admin, verified).await.unwrap();
+    auth.restore_user(&admin, pending).await.unwrap();
+    auth.restore_user(&admin, deleted).await.unwrap();
+
+    let locked = db.lock().unwrap();
+    assert_eq!(
+        locked
+            .users
+            .iter()
+            .find(|u| u.id == verified)
+            .unwrap()
+            .account_state,
+        AccountState::Active
+    );
+    assert_eq!(
+        locked
+            .users
+            .iter()
+            .find(|u| u.id == pending)
+            .unwrap()
+            .account_state,
+        AccountState::PendingEmailVerification
+    );
+    assert_eq!(
+        locked
+            .users
+            .iter()
+            .find(|u| u.id == deleted)
+            .unwrap()
+            .account_state,
+        AccountState::Deleted
+    );
+    assert_eq!(
+        locked
+            .audits
+            .iter()
+            .filter(|event| event.action == "user.suspended")
+            .count(),
+        2
+    );
+    assert_eq!(
+        locked
+            .audits
+            .iter()
+            .filter(|event| event.action == "user.restored")
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]
