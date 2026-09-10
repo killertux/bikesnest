@@ -125,7 +125,9 @@ pub async fn security_headers(
     next: Next,
 ) -> Response {
     let path_is_private = is_private_path(req.uri().path());
+    let path_is_static = req.uri().path().starts_with("/static/");
     let mut res = next.run(req).await;
+    let response_is_success = res.status().is_success();
     let head = res.headers_mut();
     head.insert(
         "X-Content-Type-Options",
@@ -154,6 +156,16 @@ pub async fn security_headers(
         head.insert(
             "Strict-Transport-Security",
             HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        );
+    }
+    // Dynamic pages embed a per-session CSRF token, including otherwise-public
+    // pages and styled errors. Responses and redirects may also vary by auth.
+    // Preserve explicit caching only for successful static assets. Everything
+    // dynamic, plus static misses/errors, is private and never stored.
+    if !path_is_static || !response_is_success {
+        head.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
         );
     }
     // Private data must never be indexed. Also enforced in robots.txt.

@@ -20,6 +20,11 @@ the release binary and `web/static/`. Templates and migrations are **embedded**
 configured store (`S3_*` env). Media is served via **direct S3 presigned GET
 URLs** (the browser hits the bucket; the app is not a media proxy).
 
+The shipped htmx 4.0.0 network-restores browser history and does not implement
+a localStorage history snapshot cache. That is a pinned-library property guarded
+by the browser suite, not an HTML configuration attribute; rerun that suite when
+upgrading the vendored htmx asset.
+
 Build is reproducible because `Cargo.lock` is committed and the toolchain is
 pinned by the base image tag. No `DATABASE_URL`, no offline cache, no build-time
 DB.
@@ -45,7 +50,7 @@ All knobs are documented in `.env.example`; production sets them as real secrets
 | `TLS_ON` | set `true` to emit HSTS behind a real TLS terminator |
 | `VALKEY_URL` | **Rate limiter:** single node, e.g. `valkey://valkey:6379`. Shared across auth/photo/contribution/moderation, survives restarts, aggregates across instances |
 | `VALKEY_CLUSTER_URLS` | comma-separated node URLs → **cluster** mode (wins over `VALKEY_URL`) |
-| `RATE_LIMIT_FAIL_OPEN` | `true` (default) → a ValKey outage **allows** requests (goes fail-open); `false` → **denies** (429s the rate-limited endpoints) |
+| `RATE_LIMIT_FAIL_OPEN` | `true` (default) lets general traffic fail open; credential-sensitive auth always fails closed. `false` fails closed everywhere |
 | `JOBS_RUN_WORKER` / `JOBS_DURABLE_ENQUEUE` | independently run a worker and leave auth mail for durable delivery (both default true). Legacy `JOBS_ENABLED` sets both only when the new names are absent |
 | `JOBS_POLL_INTERVAL_MS` / `JOBS_BATCH_SIZE` / `JOBS_LEASE_TTL_MS` | queue poll cadence, maximum concurrent attempts, and lease length (defaults 5000 / 4 / 600000) |
 | `JOBS_HANDLER_TIMEOUT_MS` / `JOBS_SHUTDOWN_GRACE_MS` | attempt deadline and bounded shutdown drain (defaults 300000 / 30000) |
@@ -276,12 +281,12 @@ restarts. The app picks the backend from env (no code change):
 correct under concurrency, including in cluster mode (the script touches a
 single key, so it stays within one hash slot).
 
-**Failure mode — fail open by default.** `Check` on a ValKey outage returns
-*allow* and logs a `warn!` (`RATE_LIMIT_FAIL_OPEN=true`), so a ValKey outage
-degrades brute-force protection without taking the site down (the application
-maps any `RateLimitError` to 429 — fail closed — which would 429 every
-rate-limited endpoint during an outage). Set `RATE_LIMIT_FAIL_OPEN=false` to
-fail closed instead (stricter, but an outage 429s auth/photo/moderation).
+**Failure mode.** Every ValKey check has a 500 ms total deadline and emits only
+an allowlisted reason/policy warning on degradation. Credential-sensitive auth
+checks fail closed (the application maps the error to its existing limited
+response). With `RATE_LIMIT_FAIL_OPEN=true`, other limited traffic is allowed
+so a store outage does not take down unrelated contributions/photos. Set it to
+false to fail closed for every limited endpoint.
 
 **Docker compose:** the dev stack runs a single-node ValKey
 (`docker-compose.yml`, `valkey` service, wired as `VALKEY_URL`). For cluster

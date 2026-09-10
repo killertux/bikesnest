@@ -337,10 +337,18 @@ Key modeling notes:
 - **Security:** strict CSP (nonce-free, Alpine CSP build), security headers,
   CSRF synchronizer token, HttpOnly/Secure/SameSite=Lax sessions hashed at
   rest, argon2id passwords, deny-by-default authorization, server-side
-  self-resolve guard on reports. See `crates/web/src/security.rs`.
+  self-resolve guard on reports. Dynamic responses are `private, no-store`
+  because even public HTML embeds a per-session CSRF token. The pinned and
+  shipped htmx 4.0.0 network-restores history and does not implement a
+  localStorage snapshot cache; the installed-library browser regression guards
+  that version-dependent property. Only successful static assets retain
+  explicit cacheable policies. See `crates/web/src/security.rs`.
 - **Observability:** `APP_ENV=production` → JSON structured logs; PII-free.
-- **Rate limiting:** sliding-window via ValKey (Lua atomic, fail-open by
-  default), shared across auth/photo/contribution/moderation.
+- **Rate limiting:** sliding-window via ValKey (Lua atomic, bounded provider
+  deadline). General traffic may follow the configured fail-open policy;
+  credential-sensitive auth uses the port's explicit fail-closed check, with
+  allowlisted degradation logging that excludes bucket keys/provider errors;
+  one store remains shared across auth/photo/contribution/moderation.
 - **i18n:** all user-facing strings in the catalog; the domain exposes codes
   (e.g. security feature codes), the web layer maps them to localized labels.
 - **Background jobs:** Postgres queue with independent durable-admission and

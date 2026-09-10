@@ -79,6 +79,7 @@ async fn readyz_returns_ready_with_real_database(_tx: &mut TestTx) {
 #[db_test]
 async fn security_headers_present_on_public_page(_tx: &mut TestTx) {
     let headers = get_headers("/").await;
+    assert_eq!(headers["cache-control"], "private, no-store");
     assert_eq!(headers["x-content-type-options"], "nosniff");
     assert_eq!(
         headers["referrer-policy"],
@@ -95,6 +96,7 @@ async fn security_headers_present_on_private_page(_tx: &mut TestTx) {
     let headers = get_headers("/login").await;
     assert_eq!(headers["x-content-type-options"], "nosniff");
     assert!(headers.contains_key("content-security-policy"));
+    assert_eq!(headers["cache-control"], "private, no-store");
 }
 
 #[db_test]
@@ -301,6 +303,7 @@ async fn htmx_request_gets_fragment_without_full_page(_tx: &mut TestTx) {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["cache-control"], "private, no-store");
     let body = res.into_body().collect().await.unwrap().to_bytes();
     let html = String::from_utf8_lossy(&body);
     assert!(
@@ -311,6 +314,26 @@ async fn htmx_request_gets_fragment_without_full_page(_tx: &mut TestTx) {
         html.contains("search-data"),
         "fragment still embeds map data"
     );
+}
+
+#[db_test]
+async fn dynamic_cache_policy_covers_auth_tokens_privacy_errors_and_redirects(_tx: &mut TestTx) {
+    for path in [
+        "/",
+        "/login",
+        "/register",
+        "/verify-email?token=invalid",
+        "/password-reset/new?token=invalid",
+        "/account",
+        "/account/privacy",
+        "/admin/users",
+        "/moderation",
+        "/definitely-missing",
+        "/static/definitely-missing.css",
+    ] {
+        let headers = get_headers(path).await;
+        assert_eq!(headers["cache-control"], "private, no-store", "{path}");
+    }
 }
 
 #[db_test]
@@ -922,6 +945,11 @@ async fn get_c(app: &axum::Router, uri: &str, cookie: Option<&str>) -> (StatusCo
         .oneshot(b.body(Body::empty()).unwrap())
         .await
         .unwrap();
+    assert_eq!(
+        res.headers()["cache-control"],
+        "private, no-store",
+        "dynamic GET {uri} must not be cached"
+    );
     let status = res.status();
     let body = res.into_body().collect().await.unwrap().to_bytes();
     (status, String::from_utf8_lossy(&body).to_string())
@@ -1041,6 +1069,11 @@ async fn post_form_h(
         .oneshot(b.body(Body::from(body)).unwrap())
         .await
         .unwrap();
+    assert_eq!(
+        res.headers()["cache-control"],
+        "private, no-store",
+        "dynamic POST {uri} must not be cached"
+    );
     let set_cookie = res
         .headers()
         .get("set-cookie")

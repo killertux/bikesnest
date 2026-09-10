@@ -190,6 +190,22 @@ test('failed provider download can retry on a later navigation', async () => {
   await page.close();
 });
 
+test('pinned htmx network-restores without a localStorage history snapshot', async () => {
+  const page = await browser.newPage();
+  await page.goto(origin + '/plain/google');
+  await navigate(page, 'details');
+  assert.equal(await page.evaluate(() => localStorage.getItem('htmx-history-cache')), null);
+  const [restoreRequest] = await Promise.all([
+    page.waitForRequest(request => request.url() === origin + '/plain/google'),
+    page.goBack(),
+  ]);
+  assert.equal(restoreRequest.url(), origin + '/plain/google');
+  await page.waitForURL('**/plain/google');
+  await page.waitForFunction(() => document.querySelector('h1').textContent === 'plain');
+  assert.equal(await page.evaluate(() => localStorage.getItem('htmx-history-cache')), null);
+  await page.close();
+});
+
 test('fragment morphs retain Alpine visibility and remain interactive', async () => {
   const page = await browser.newPage();
   await page.goto(origin + '/plain/google');

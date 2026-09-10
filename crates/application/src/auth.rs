@@ -580,7 +580,11 @@ impl AuthService {
         limit: u32,
         window: std::time::Duration,
     ) -> Result<(), AuthError> {
-        if self.rate_limiter.check(key, limit, window).await? {
+        if self
+            .rate_limiter
+            .check_sensitive(key, limit, window)
+            .await?
+        {
             Ok(())
         } else {
             Err(AuthError::RateLimited)
