@@ -99,10 +99,11 @@ npm run build:css                        # Tailwind → web/static/css/app.css
   a test in `crates/web/tests/http_test.rs` fails if one of them names a
   repository, a pool or a concrete adapter, and another fails if any file in
   `crates/web/src` passes 1200 lines.
-- **Background jobs** are a Postgres-backed queue (`background_job` table)
-  with an in-process worker; handlers live in `crates/infrastructure/src/job/`
-  and implement `bikesnest_application::JobHandler`. Set `JOBS_ENABLED=false` for
-  web-only instances. A test that claims jobs directly (rather than simulating
+- **Background jobs** are a Postgres-backed queue (`background_job` table).
+  Handlers live in `crates/infrastructure/src/job/` and implement
+  `bikesnest_application::JobHandler`. `JOBS_DURABLE_ENQUEUE` controls durable
+  mail handoff independently from `JOBS_RUN_WORKER`; `bikesnest-web worker`
+  runs without binding HTTP. A test that claims jobs directly (rather than simulating
   a claim with a plain `UPDATE`) must use `SqlxJobRepository::claim_kinds` with
   a kind unique to that test, not the unscoped `claim` — see "Job-queue test
   isolation" in `TESTING.md`.

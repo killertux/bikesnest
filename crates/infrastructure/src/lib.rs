@@ -46,9 +46,9 @@ pub use geocoding::{
     MapboxGeocoder, SharedGeocoder, caching_geocoder_from_config, geocoder_from_config,
 };
 pub use job::{
-    ClaimedJob, JOBS_GC_RECURRING_KEY, JobRegistry, JobServices, RETENTION_RECURRING_KEY,
-    RecurringKind, RecurringRegistrationOutcome, SendEmailHandler, SqlxJobRepository, Worker,
-    WorkerDiagnostics, job_services,
+    ClaimedJob, JOBS_GC_RECURRING_KEY, JobRegistry, JobRepoError, JobServices,
+    RETENTION_RECURRING_KEY, RecurringKind, RecurringRegistrationOutcome, SendEmailHandler,
+    SqlxJobRepository, Worker, WorkerDiagnostics, job_services,
 };
 pub use moderation::{SqlxAuditLogReader, SqlxModerationRepository, SqlxReportRepository};
 pub use parking::{

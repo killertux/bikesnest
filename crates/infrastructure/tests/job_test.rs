@@ -9,11 +9,129 @@
 //! disjointness property, which holds regardless of concurrent claims.
 
 use bikesnest_infrastructure::{Db, JobConfig, JobRegistry, SqlxJobRepository, Worker};
-use bikesnest_test_support::{db_test, pool};
+use bikesnest_test_support::{db_test, pool, run_isolated_database_test};
 use chrono::{Duration, Utc};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{Layer, layer::SubscriberExt};
+
+const CAPACITY_KIND: &str = "jobtest.worker-capacity";
+const PANIC_KIND: &str = "jobtest.worker-panic";
+const TIMEOUT_KIND: &str = "jobtest.worker-timeout";
+const OUTCOME_KIND: &str = "jobtest.worker-outcome";
+const HEARTBEAT_KIND: &str = "jobtest.worker-heartbeat";
+const SHUTDOWN_KIND: &str = "jobtest.worker-shutdown";
+const RETRY_OUTCOME_KIND: &str = "jobtest.worker-retry-outcome";
+const DEAD_OUTCOME_KIND: &str = "jobtest.worker-dead-outcome";
+const HOOK_PANIC_KIND: &str = "jobtest.worker-hook-panic";
+const HOOK_TIMEOUT_KIND: &str = "jobtest.worker-hook-timeout";
+
+struct BlockingHandler {
+    kind: &'static str,
+    started: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    gate: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+struct ActiveGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl bikesnest_application::JobHandler for BlockingHandler {
+    fn kind(&self) -> &'static str {
+        self.kind
+    }
+    async fn run(&self, _: &serde_json::Value) -> Result<(), bikesnest_application::JobError> {
+        self.started
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let active = self
+            .active
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let _active_guard = ActiveGuard(self.active.clone());
+        self.peak
+            .fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+        let permit = self.gate.acquire().await.unwrap();
+        permit.forget();
+        Ok(())
+    }
+}
+
+struct PanicHandler;
+#[async_trait::async_trait]
+impl bikesnest_application::JobHandler for PanicHandler {
+    fn kind(&self) -> &'static str {
+        PANIC_KIND
+    }
+    async fn run(&self, _: &serde_json::Value) -> Result<(), bikesnest_application::JobError> {
+        panic!("test panic payload is emitted by Rust's standard panic hook")
+    }
+}
+
+struct SuccessHandler;
+#[async_trait::async_trait]
+impl bikesnest_application::JobHandler for SuccessHandler {
+    fn kind(&self) -> &'static str {
+        OUTCOME_KIND
+    }
+    async fn run(&self, _: &serde_json::Value) -> Result<(), bikesnest_application::JobError> {
+        Ok(())
+    }
+}
+
+struct FailureHandler {
+    kind: &'static str,
+    permanent: bool,
+}
+#[async_trait::async_trait]
+impl bikesnest_application::JobHandler for FailureHandler {
+    fn kind(&self) -> &'static str {
+        self.kind
+    }
+    async fn run(&self, _: &serde_json::Value) -> Result<(), bikesnest_application::JobError> {
+        if self.permanent {
+            Err(bikesnest_application::JobError::Permanent(
+                "bounded failure".into(),
+            ))
+        } else {
+            Err(bikesnest_application::JobError::Failed(
+                "bounded failure".into(),
+            ))
+        }
+    }
+}
+
+enum HookMode {
+    Panic,
+    Timeout,
+}
+struct HookHandler {
+    kind: &'static str,
+    mode: HookMode,
+}
+#[async_trait::async_trait]
+impl bikesnest_application::JobHandler for HookHandler {
+    fn kind(&self) -> &'static str {
+        self.kind
+    }
+    async fn run(&self, _: &serde_json::Value) -> Result<(), bikesnest_application::JobError> {
+        Err(bikesnest_application::JobError::Permanent(
+            "bounded failure".into(),
+        ))
+    }
+    async fn on_dead_letter(&self, _: &serde_json::Value, _: &str) {
+        match self.mode {
+            HookMode::Panic => panic!("test hook panic"),
+            HookMode::Timeout => std::future::pending().await,
+        }
+    }
+}
 
 #[derive(Clone)]
 struct CaptureLayer(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
@@ -134,7 +252,7 @@ async fn finish_success_reschedules_recurring(_tx: &mut bikesnest_test_support::
         .unwrap();
     // Claim + mark the row as recurring.
     sqlx::query(
-        "UPDATE background_job SET state='running', claimed_by='w', schedule='{\"every_seconds\": 60}'::jsonb, attempts=1 WHERE id=$1",
+        "UPDATE background_job SET state='running', claimed_by='w', lease_expires_at=clock_timestamp()+interval '60 seconds', schedule='{\"every_seconds\": 60}'::jsonb, attempts=1 WHERE id=$1",
     )
     .bind(id)
     .execute(&pool().await)
@@ -166,7 +284,7 @@ async fn retry_then_dead_letter(_tx: &mut bikesnest_test_support::TestTx) {
         .unwrap()
         .unwrap();
     sqlx::query(
-        "UPDATE background_job SET state='running', claimed_by='w', attempts=1 WHERE id=$1",
+        "UPDATE background_job SET state='running', claimed_by='w', lease_expires_at=clock_timestamp()+interval '60 seconds', attempts=1 WHERE id=$1",
     )
     .bind(id)
     .execute(&pool().await)
@@ -187,7 +305,7 @@ async fn retry_then_dead_letter(_tx: &mut bikesnest_test_support::TestTx) {
 
     // Attempt 2 == max(2) → dead-letter (state failed, finished_at set).
     sqlx::query(
-        "UPDATE background_job SET state='running', claimed_by='w', attempts=2 WHERE id=$1",
+        "UPDATE background_job SET state='running', claimed_by='w', lease_expires_at=clock_timestamp()+interval '60 seconds', attempts=2 WHERE id=$1",
     )
     .bind(id)
     .execute(&pool().await)
@@ -439,7 +557,9 @@ async fn claim_reclaims_a_crashed_workers_running_job(_tx: &mut bikesnest_test_s
 }
 
 #[db_test]
-async fn finish_success_is_a_noop_for_the_wrong_claimant(_tx: &mut bikesnest_test_support::TestTx) {
+async fn finish_success_reports_lost_ownership_for_the_wrong_claimant(
+    _tx: &mut bikesnest_test_support::TestTx,
+) {
     let r = repo().await;
     let now = Utc::now();
     let id = r
@@ -459,7 +579,10 @@ async fn finish_success_is_a_noop_for_the_wrong_claimant(_tx: &mut bikesnest_tes
     .unwrap();
 
     // The zombie worker-a wakes up and tries to finish its stale claim.
-    r.finish_success(id, "worker-a", None, now).await.unwrap();
+    assert!(matches!(
+        r.finish_success(id, "worker-a", None, now).await,
+        Err(bikesnest_infrastructure::JobRepoError::LostOwnership(lost)) if lost == id
+    ));
 
     let (state, claimed_by): (String, Option<String>) =
         sqlx::query_as("SELECT state, claimed_by FROM background_job WHERE id=$1")
@@ -521,6 +644,516 @@ async fn cancelling_the_token_stops_an_idle_worker(_tx: &mut bikesnest_test_supp
     .await
     .unwrap();
     assert_eq!(running, 0, "a stopped worker must leave no job running");
+}
+
+async fn wait_for_count(counter: &std::sync::atomic::AtomicUsize, expected: usize) {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while counter.load(std::sync::atomic::Ordering::SeqCst) < expected {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[test]
+fn worker_claims_only_capacity_and_heartbeats_every_active_lease() {
+    run_isolated_database_test(|pool: sqlx::PgPool| async move {
+        let repo = SqlxJobRepository::new(Db::from_pool(pool.clone()));
+        repo.enqueue(CAPACITY_KIND, &json!({}), Utc::now(), Some(3), None)
+            .await
+            .unwrap();
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let registry = std::sync::Arc::new(JobRegistry::new(
+            vec![Box::new(BlockingHandler {
+                kind: CAPACITY_KIND,
+                started: started.clone(),
+                active: active.clone(),
+                peak: peak.clone(),
+                gate: gate.clone(),
+            })],
+            vec![],
+        ));
+        let config = JobConfig {
+            batch_size: 2,
+            poll_interval: std::time::Duration::from_millis(5),
+            lease_ttl: std::time::Duration::from_millis(120),
+            handler_timeout: std::time::Duration::from_secs(5),
+            ..JobConfig::default()
+        };
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(
+            Worker::new(repo.clone(), registry, config)
+                .run_kinds(shutdown.clone(), vec![CAPACITY_KIND.into()]),
+        );
+        wait_for_count(&started, 1).await;
+        // Arrival while one long handler occupies only half the capacity must be
+        // observed on the poll cadence, not wait for that handler to finish.
+        repo.enqueue(CAPACITY_KIND, &json!({}), Utc::now(), Some(3), None)
+            .await
+            .unwrap();
+        wait_for_count(&started, 2).await;
+        repo.enqueue(CAPACITY_KIND, &json!({}), Utc::now(), Some(3), None)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let states:(i64,i64,i64)=sqlx::query_as("SELECT count(*) FILTER(WHERE state='running'),count(*) FILTER(WHERE state='pending'),count(*) FILTER(WHERE state='running' AND lease_expires_at>clock_timestamp()) FROM background_job WHERE kind=$1").bind(CAPACITY_KIND).fetch_one(&pool).await.unwrap();
+        assert_eq!(states, (2, 1, 2));
+        assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 2);
+        gate.add_permits(3);
+        wait_for_count(&started, 3).await;
+        shutdown.cancel();
+        task.await.unwrap();
+    });
+}
+
+#[test]
+fn worker_contains_panics_and_persists_a_bounded_retry() {
+    run_isolated_database_test(|pool: sqlx::PgPool| async move {
+        let repo = SqlxJobRepository::new(Db::from_pool(pool.clone()));
+        let id = repo
+            .enqueue(PANIC_KIND, &json!({}), Utc::now(), Some(3), None)
+            .await
+            .unwrap()
+            .unwrap();
+        let registry = std::sync::Arc::new(JobRegistry::new(vec![Box::new(PanicHandler)], vec![]));
+        let config = JobConfig {
+            batch_size: 1,
+            poll_interval: std::time::Duration::from_millis(5),
+            lease_ttl: std::time::Duration::from_secs(2),
+            ..JobConfig::default()
+        };
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(
+            Worker::new(repo, registry, config)
+                .run_kinds(shutdown.clone(), vec![PANIC_KIND.into()]),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let row: (String, Option<String>) =
+                    sqlx::query_as("SELECT state,last_error FROM background_job WHERE id=$1")
+                        .bind(id)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                if row.0 == "pending" && row.1.is_some() {
+                    assert_eq!(row.1.as_deref(), Some("handler task panicked"));
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        shutdown.cancel();
+        task.await.unwrap();
+    });
+}
+
+#[test]
+fn worker_times_out_and_does_not_detach_the_handler() {
+    run_isolated_database_test(|pool: sqlx::PgPool| async move {
+        let repo = SqlxJobRepository::new(Db::from_pool(pool.clone()));
+        let id = repo
+            .enqueue(TIMEOUT_KIND, &json!({}), Utc::now(), Some(3), None)
+            .await
+            .unwrap()
+            .unwrap();
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let registry = std::sync::Arc::new(JobRegistry::new(
+            vec![Box::new(BlockingHandler {
+                kind: TIMEOUT_KIND,
+                started: started.clone(),
+                active: active.clone(),
+                peak,
+                gate,
+            })],
+            vec![],
+        ));
+        let config = JobConfig {
+            batch_size: 1,
+            poll_interval: std::time::Duration::from_secs(5),
+            lease_ttl: std::time::Duration::from_secs(2),
+            handler_timeout: std::time::Duration::from_millis(50),
+            ..JobConfig::default()
+        };
+        let worker = Worker::new(repo, registry, config);
+        let diagnostics = worker.diagnostics();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(worker.run_kinds(shutdown.clone(), vec![TIMEOUT_KIND.into()]));
+        wait_for_count(&started, 1).await;
+        let row = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let row: (String, Option<String>) =
+                    sqlx::query_as("SELECT state,last_error FROM background_job WHERE id=$1")
+                        .bind(id)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                if row.0 == "pending" {
+                    break row;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(row.0, "pending");
+        assert_eq!(row.1.as_deref(), Some("handler timed out"));
+        assert_eq!(active.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(diagnostics.observable_failures(), 0);
+        shutdown.cancel();
+        task.await.unwrap();
+    });
+}
+
+#[test]
+fn expired_and_reclaimed_leases_fence_every_stale_write() {
+    run_isolated_database_test(|pool: sqlx::PgPool| async move {
+        let query_pool = pool.clone();
+        let repo = SqlxJobRepository::new(Db::from_pool(pool));
+        let id = repo
+            .enqueue(OUTCOME_KIND, &json!({}), Utc::now(), Some(3), None)
+            .await
+            .unwrap()
+            .unwrap();
+        let first = repo
+            .claim_kinds(
+                1,
+                "first",
+                std::time::Duration::from_millis(30),
+                &[OUTCOME_KIND],
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(matches!(
+            repo.heartbeat(id, &first.owner, std::time::Duration::from_secs(1))
+                .await,
+            Err(bikesnest_infrastructure::JobRepoError::LostOwnership(_))
+        ));
+        assert!(matches!(
+            repo.finish_success(id, &first.owner, None, Utc::now())
+                .await,
+            Err(bikesnest_infrastructure::JobRepoError::LostOwnership(_))
+        ));
+        let second = repo
+            .claim_kinds(
+                1,
+                "second",
+                std::time::Duration::from_secs(1),
+                &[OUTCOME_KIND],
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_ne!(first.owner, second.owner);
+        assert!(matches!(
+            repo.retry(id, &first.owner, "stale", Utc::now()).await,
+            Err(bikesnest_infrastructure::JobRepoError::LostOwnership(_))
+        ));
+        assert!(matches!(
+            repo.fail(id, &first.owner, "stale").await,
+            Err(bikesnest_infrastructure::JobRepoError::LostOwnership(_))
+        ));
+        repo.finish_success(id, &second.owner, None, Utc::now())
+            .await
+            .unwrap();
+        let state: String = sqlx::query_scalar("SELECT state FROM background_job WHERE id=$1")
+            .bind(id)
+            .fetch_one(&query_pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "succeeded");
+    });
+}
+
+#[db_test]
+async fn outcome_write_failure_is_observable_and_not_reported_as_success(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let repo = SqlxJobRepository::new(db.clone());
+    let id = repo
+        .enqueue(OUTCOME_KIND, &json!({}), Utc::now(), Some(3), None)
+        .await
+        .unwrap()
+        .unwrap();
+    let claimed = repo
+        .claim_kinds(
+            1,
+            "outcome-owner",
+            std::time::Duration::from_secs(5),
+            &[OUTCOME_KIND],
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    sqlx::raw_sql("CREATE FUNCTION pg_temp.fail_job_outcome() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$; CREATE TRIGGER fail_job_outcome BEFORE UPDATE ON background_job FOR EACH ROW WHEN (NEW.state='succeeded') EXECUTE FUNCTION pg_temp.fail_job_outcome()")
+        .execute(&mut *db.acquire().await.unwrap()).await.unwrap();
+    let worker = Worker::new(
+        repo,
+        std::sync::Arc::new(JobRegistry::new(vec![Box::new(SuccessHandler)], vec![])),
+        JobConfig::default(),
+    );
+    let diagnostics = worker.diagnostics();
+    worker.process_claimed(claimed).await;
+    assert_eq!(diagnostics.observable_failures(), 1);
+    let state: String = sqlx::query_scalar("SELECT state FROM background_job WHERE id=$1")
+        .bind(id)
+        .fetch_one(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(state, "running");
+}
+
+async fn failed_outcome_write_case(
+    tx: &mut bikesnest_test_support::TestTx,
+    kind: &'static str,
+    handler: Box<dyn bikesnest_application::JobHandler>,
+    terminal_state: &'static str,
+) {
+    let db = tx.db().await;
+    let repo = SqlxJobRepository::new(db.clone());
+    let id = repo
+        .enqueue(kind, &json!({}), Utc::now(), Some(3), None)
+        .await
+        .unwrap()
+        .unwrap();
+    let claimed = repo
+        .claim_kinds(
+            1,
+            "failed-outcome-owner",
+            std::time::Duration::from_secs(5),
+            &[kind],
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let sql = format!(
+        "CREATE FUNCTION pg_temp.skip_job_outcome() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$; CREATE TRIGGER skip_job_outcome BEFORE UPDATE ON background_job FOR EACH ROW WHEN (NEW.state='{terminal_state}') EXECUTE FUNCTION pg_temp.skip_job_outcome()"
+    );
+    sqlx::raw_sql(&sql)
+        .execute(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    let worker = Worker::new(
+        repo,
+        std::sync::Arc::new(JobRegistry::new(vec![handler], vec![])),
+        JobConfig::default(),
+    );
+    let diagnostics = worker.diagnostics();
+    worker.process_claimed(claimed).await;
+    assert_eq!(diagnostics.observable_failures(), 1);
+    let state: String = sqlx::query_scalar("SELECT state FROM background_job WHERE id=$1")
+        .bind(id)
+        .fetch_one(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(state, "running");
+}
+
+#[db_test]
+async fn retry_outcome_write_failure_is_observable(tx: &mut bikesnest_test_support::TestTx) {
+    failed_outcome_write_case(
+        tx,
+        RETRY_OUTCOME_KIND,
+        Box::new(FailureHandler {
+            kind: RETRY_OUTCOME_KIND,
+            permanent: false,
+        }),
+        "pending",
+    )
+    .await;
+}
+
+#[db_test]
+async fn dead_letter_outcome_write_failure_is_observable(tx: &mut bikesnest_test_support::TestTx) {
+    failed_outcome_write_case(
+        tx,
+        DEAD_OUTCOME_KIND,
+        Box::new(FailureHandler {
+            kind: DEAD_OUTCOME_KIND,
+            permanent: true,
+        }),
+        "failed",
+    )
+    .await;
+}
+
+async fn hook_failure_case(
+    tx: &mut bikesnest_test_support::TestTx,
+    kind: &'static str,
+    mode: HookMode,
+) {
+    let db = tx.db().await;
+    let repo = SqlxJobRepository::new(db.clone());
+    let id = repo
+        .enqueue(kind, &json!({}), Utc::now(), Some(3), None)
+        .await
+        .unwrap()
+        .unwrap();
+    let claimed = repo
+        .claim_kinds(1, "hook-owner", std::time::Duration::from_secs(5), &[kind])
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let config = JobConfig {
+        handler_timeout: std::time::Duration::from_millis(30),
+        ..JobConfig::default()
+    };
+    let worker = Worker::new(
+        repo,
+        std::sync::Arc::new(JobRegistry::new(
+            vec![Box::new(HookHandler { kind, mode })],
+            vec![],
+        )),
+        config,
+    );
+    let diagnostics = worker.diagnostics();
+    worker.process_claimed(claimed).await;
+    assert_eq!(diagnostics.observable_failures(), 1);
+    let state: String = sqlx::query_scalar("SELECT state FROM background_job WHERE id=$1")
+        .bind(id)
+        .fetch_one(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(state, "failed");
+}
+
+#[db_test]
+async fn dead_letter_hook_panic_is_contained(tx: &mut bikesnest_test_support::TestTx) {
+    hook_failure_case(tx, HOOK_PANIC_KIND, HookMode::Panic).await;
+}
+
+#[db_test]
+async fn dead_letter_hook_timeout_is_contained(tx: &mut bikesnest_test_support::TestTx) {
+    hook_failure_case(tx, HOOK_TIMEOUT_KIND, HookMode::Timeout).await;
+}
+
+#[test]
+fn heartbeat_ownership_loss_cancels_the_active_handler() {
+    run_isolated_database_test(|pool: sqlx::PgPool| async move {
+        let repo = SqlxJobRepository::new(Db::from_pool(pool.clone()));
+        let id = repo
+            .enqueue(HEARTBEAT_KIND, &json!({}), Utc::now(), Some(3), None)
+            .await
+            .unwrap()
+            .unwrap();
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let registry = std::sync::Arc::new(JobRegistry::new(
+            vec![Box::new(BlockingHandler {
+                kind: HEARTBEAT_KIND,
+                started: started.clone(),
+                active: active.clone(),
+                peak,
+                gate,
+            })],
+            vec![],
+        ));
+        let config = JobConfig {
+            batch_size: 1,
+            poll_interval: std::time::Duration::from_secs(5),
+            lease_ttl: std::time::Duration::from_millis(90),
+            handler_timeout: std::time::Duration::from_secs(5),
+            ..JobConfig::default()
+        };
+        let worker = Worker::new(repo, registry, config);
+        let diagnostics = worker.diagnostics();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(worker.run_kinds(shutdown.clone(), vec![HEARTBEAT_KIND.into()]));
+        wait_for_count(&started, 1).await;
+        sqlx::query("UPDATE background_job SET claimed_by='replacement-owner' WHERE id=$1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while active.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(diagnostics.observable_failures(), 1);
+        shutdown.cancel();
+        task.await.unwrap();
+    });
+}
+
+#[test]
+fn shutdown_grace_cancels_and_drains_handler_and_heartbeat_children() {
+    run_isolated_database_test(|pool: sqlx::PgPool| async move {
+        let repo = SqlxJobRepository::new(Db::from_pool(pool.clone()));
+        let id = repo
+            .enqueue(SHUTDOWN_KIND, &json!({}), Utc::now(), Some(3), None)
+            .await
+            .unwrap()
+            .unwrap();
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let registry = std::sync::Arc::new(JobRegistry::new(
+            vec![Box::new(BlockingHandler {
+                kind: SHUTDOWN_KIND,
+                started: started.clone(),
+                active: active.clone(),
+                peak,
+                gate,
+            })],
+            vec![],
+        ));
+        let config = JobConfig {
+            batch_size: 1,
+            poll_interval: std::time::Duration::from_secs(5),
+            lease_ttl: std::time::Duration::from_secs(2),
+            handler_timeout: std::time::Duration::from_secs(10),
+            shutdown_grace: std::time::Duration::from_millis(50),
+            ..JobConfig::default()
+        };
+        let worker = Worker::new(repo, registry, config);
+        let diagnostics = worker.diagnostics();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(worker.run_kinds(shutdown.clone(), vec![SHUTDOWN_KIND.into()]));
+        wait_for_count(&started, 1).await;
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(diagnostics.observable_failures(), 1);
+        let heartbeat: Option<chrono::DateTime<Utc>> =
+            sqlx::query_scalar("SELECT heartbeat_at FROM background_job WHERE id=$1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let after: Option<chrono::DateTime<Utc>> =
+            sqlx::query_scalar("SELECT heartbeat_at FROM background_job WHERE id=$1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(after, heartbeat);
+    });
 }
 
 // ---------------------------------------------------------------------------

@@ -27,7 +27,7 @@ pub struct RecurringKind {
 
 /// Maps a job `kind` → its handler, plus the always-on recurring kinds.
 pub struct JobRegistry {
-    handlers: HashMap<String, Box<dyn JobHandler>>,
+    handlers: HashMap<String, Arc<dyn JobHandler>>,
     recurring: Vec<RecurringKind>,
 }
 
@@ -35,7 +35,7 @@ impl JobRegistry {
     pub fn new(handlers: Vec<Box<dyn JobHandler>>, recurring: Vec<RecurringKind>) -> Self {
         let map = handlers
             .into_iter()
-            .map(|h| (h.kind().to_string(), h))
+            .map(|h| (h.kind().to_string(), Arc::from(h)))
             .collect();
         Self {
             handlers: map,
@@ -43,8 +43,8 @@ impl JobRegistry {
         }
     }
 
-    pub fn get(&self, kind: &str) -> Option<&dyn JobHandler> {
-        self.handlers.get(kind).map(|b| b.as_ref())
+    pub fn get(&self, kind: &str) -> Option<Arc<dyn JobHandler>> {
+        self.handlers.get(kind).cloned()
     }
 
     pub fn recurring(&self) -> &[RecurringKind] {
@@ -62,8 +62,7 @@ pub struct JobServices {
 /// retention (backed by `RetentionJob`), `jobs.gc` and `email.send`.
 ///
 /// `email` is the same provider instance the router holds, so a deployment
-/// running with `JOBS_ENABLED=false` (where the inline `EmailQueue` sends on
-/// the request path) and one running with the worker talk to one configured
+/// running with explicit inline delivery and one running with the worker talk to one configured
 /// relay/ESP, not two.
 pub fn job_services(
     db: Db,

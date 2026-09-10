@@ -300,8 +300,9 @@ Key modeling notes:
   processed derivatives are stored (the original is discarded); EXIF is
   stripped at processing time.
 - **`background_job`** stores durable one-shot + recurring jobs; an in-process
-  worker claims with `FOR UPDATE SKIP LOCKED`, retries with exponential
-  backoff, and dead-letters after `JOBS_MAX_ATTEMPTS`.
+  worker claims only free execution capacity with `FOR UPDATE SKIP LOCKED`.
+  Every active attempt has a unique fenced lease, heartbeat and deadline;
+  retries use exponential backoff and exhaust into a dead letter.
 
 ## Request lifecycle (happy path)
 
@@ -334,6 +335,8 @@ Key modeling notes:
   default), shared across auth/photo/contribution/moderation.
 - **i18n:** all user-facing strings in the catalog; the domain exposes codes
   (e.g. security feature codes), the web layer maps them to localized labels.
-- **Background jobs:** Postgres queue + in-process worker (`JOBS_ENABLED`).
+- **Background jobs:** Postgres queue with independent durable-admission and
+  worker-execution modes; the worker may run beside HTTP or via the dedicated
+  `worker` command.
 - **SEO:** `robots.txt`, `sitemap.xml`, canonical/meta/OG, `hreflang`,
   `noindex` support.

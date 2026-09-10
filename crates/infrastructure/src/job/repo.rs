@@ -9,7 +9,7 @@
 //! (at-least-once). Every post-claim update (`finish_success`, `retry`, `fail`)
 //! is scoped to `claimed_by = <the calling worker>`, so if the original
 //! (zombie) worker wakes up after its lease has already been reassigned, its
-//! stale write is a no-op instead of clobbering the new claim.
+//! stale write returns `LostOwnership` instead of clobbering the new claim.
 
 use crate::Db;
 use bikesnest_application::JobPayload;
@@ -28,6 +28,8 @@ pub enum JobRepoError {
     BootstrapIncomplete(Vec<String>),
     #[error("mail credential is not eligible for delivery")]
     InvalidMailCredential,
+    #[error("job lease ownership was lost for job {0}")]
+    LostOwnership(i64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +53,8 @@ pub struct ClaimedJob {
     pub max_attempts: i32,
     /// `{"every_seconds":N}` / `{"cron":"…"}` when recurring, else `NULL`.
     pub schedule: Option<Value>,
+    /// Unique claim token used to fence heartbeat and outcome writes.
+    pub owner: String,
 }
 
 pub struct MailEnqueue<'a> {
@@ -115,7 +119,7 @@ impl SqlxJobRepository {
                WHERE id=$1 AND kind='email.send' AND run_at<=clock_timestamp()
                  AND attempts<max_attempts AND
                  (state='pending' OR (state='running' AND lease_expires_at<=clock_timestamp()))
-               RETURNING id,kind,payload,attempts,max_attempts,schedule"#,
+               RETURNING id,kind,payload,attempts,max_attempts,schedule,claimed_by AS owner"#,
         )
         .bind(id)
         .bind(worker_id)
@@ -367,18 +371,18 @@ impl SqlxJobRepository {
             )
             UPDATE background_job j
             SET state = 'running', claimed_by = $2,
-                lease_expires_at = now() + ($3 * interval '1 second'),
+                lease_expires_at = clock_timestamp() + ($3 * interval '1 millisecond'),
                 heartbeat_at = now(), started_at = COALESCE(started_at, now()),
                 attempts = attempts + 1, updated_at = now()
             FROM candidate c
             WHERE j.id = c.id
-            RETURNING j.id, j.kind, j.payload, j.attempts, j.max_attempts, j.schedule
+            RETURNING j.id, j.kind, j.payload, j.attempts, j.max_attempts, j.schedule, j.claimed_by AS owner
             "#
         );
         let mut query = sqlx::query_as::<_, ClaimedJob>(&sql)
             .bind(batch as i64)
             .bind(worker_id)
-            .bind(lease_ttl.as_secs() as i32);
+            .bind(i64::try_from(lease_ttl.as_millis()).unwrap_or(i64::MAX));
         if let Some(kinds) = kinds {
             let owned: Vec<String> = kinds.iter().map(|k| (*k).to_string()).collect();
             query = query.bind(owned);
@@ -399,22 +403,27 @@ impl SqlxJobRepository {
         lease_ttl: std::time::Duration,
     ) -> Result<(), JobRepoError> {
         let mut conn = self.db.acquire().await?;
-        sqlx::query(
+        let result = sqlx::query(
             r#"
             UPDATE background_job
             SET heartbeat_at = now(),
-                lease_expires_at = now() + ($2 * interval '1 second'),
+                lease_expires_at = clock_timestamp() + ($2 * interval '1 millisecond'),
                 updated_at = now()
             WHERE id = $1 AND state = 'running' AND claimed_by = $3
+              AND lease_expires_at > clock_timestamp()
             "#,
         )
         .bind(id)
-        .bind(lease_ttl.as_secs() as i32)
+        .bind(i64::try_from(lease_ttl.as_millis()).unwrap_or(i64::MAX))
         .bind(worker_id)
         .execute(&mut *conn)
         .await
         .map_err(JobRepoError::Db)?;
-        Ok(())
+        if result.rows_affected() == 1 {
+            Ok(())
+        } else {
+            Err(JobRepoError::LostOwnership(id))
+        }
     }
 
     /// Mark a job successful. `next_run_at = Some(t)` reschedules a *recurring*
@@ -431,13 +440,14 @@ impl SqlxJobRepository {
     ) -> Result<(), JobRepoError> {
         let mut conn = self.db.acquire().await?;
         if let Some(next) = next_run_at {
-            sqlx::query(
+            let result = sqlx::query(
                 r#"
                 UPDATE background_job
                 SET state = 'pending', attempts = 0, run_at = $2,
                     claimed_by = NULL, lease_expires_at = NULL, heartbeat_at = NULL,
                     started_at = NULL, last_error = NULL, finished_at = $3, updated_at = now()
-                WHERE id = $1 AND claimed_by = $4
+                WHERE id = $1 AND state='running' AND claimed_by = $4
+                  AND lease_expires_at > clock_timestamp()
                 "#,
             )
             .bind(id)
@@ -447,8 +457,11 @@ impl SqlxJobRepository {
             .execute(&mut *conn)
             .await
             .map_err(JobRepoError::Db)?;
+            if result.rows_affected() != 1 {
+                return Err(JobRepoError::LostOwnership(id));
+            }
         } else {
-            sqlx::query(
+            let result = sqlx::query(
                 r#"
                 UPDATE background_job
                 SET state = 'succeeded', finished_at = $2,
@@ -456,7 +469,8 @@ impl SqlxJobRepository {
                     payload_redacted_at = CASE WHEN kind = 'email.send' THEN COALESCE(payload_redacted_at,now()) ELSE payload_redacted_at END,
                     claimed_by = NULL, lease_expires_at = NULL, heartbeat_at = NULL,
                     started_at = NULL, updated_at = now()
-                WHERE id = $1 AND claimed_by = $3
+                WHERE id = $1 AND state='running' AND claimed_by = $3
+                  AND lease_expires_at > clock_timestamp()
                 "#,
             )
             .bind(id)
@@ -465,6 +479,9 @@ impl SqlxJobRepository {
             .execute(&mut *conn)
             .await
             .map_err(JobRepoError::Db)?;
+            if result.rows_affected() != 1 {
+                return Err(JobRepoError::LostOwnership(id));
+            }
         }
         Ok(())
     }
@@ -479,13 +496,14 @@ impl SqlxJobRepository {
         run_at: DateTime<Utc>,
     ) -> Result<(), JobRepoError> {
         let mut conn = self.db.acquire().await?;
-        sqlx::query(
+        let result = sqlx::query(
             r#"
             UPDATE background_job
             SET state = 'pending', run_at = $2, last_error = $3,
                 claimed_by = NULL, lease_expires_at = NULL, heartbeat_at = NULL,
                 started_at = NULL, updated_at = now()
-            WHERE id = $1 AND claimed_by = $4
+            WHERE id = $1 AND state='running' AND claimed_by = $4
+              AND lease_expires_at > clock_timestamp()
             "#,
         )
         .bind(id)
@@ -495,7 +513,11 @@ impl SqlxJobRepository {
         .execute(&mut *conn)
         .await
         .map_err(JobRepoError::Db)?;
-        Ok(())
+        if result.rows_affected() == 1 {
+            Ok(())
+        } else {
+            Err(JobRepoError::LostOwnership(id))
+        }
     }
 
     /// Dead-letter a job: mark it `failed` with `error` for inspection. The row
@@ -503,14 +525,15 @@ impl SqlxJobRepository {
     /// [`Self::finish_success`]).
     pub async fn fail(&self, id: i64, worker_id: &str, error: &str) -> Result<(), JobRepoError> {
         let mut conn = self.db.acquire().await?;
-        sqlx::query(
+        let result = sqlx::query(
             r#"
             UPDATE background_job
             SET state = 'failed', finished_at = now(), last_error = $2,
                 payload = CASE WHEN kind = 'email.send' THEN '{}'::jsonb ELSE payload END,
                 payload_redacted_at = CASE WHEN kind = 'email.send' THEN COALESCE(payload_redacted_at,now()) ELSE payload_redacted_at END,
                 claimed_by = NULL, lease_expires_at = NULL, heartbeat_at = NULL, updated_at = now()
-            WHERE id = $1 AND claimed_by = $3
+            WHERE id = $1 AND state='running' AND claimed_by = $3
+              AND lease_expires_at > clock_timestamp()
             "#,
         )
         .bind(id)
@@ -519,7 +542,11 @@ impl SqlxJobRepository {
         .execute(&mut *conn)
         .await
         .map_err(JobRepoError::Db)?;
-        Ok(())
+        if result.rows_affected() == 1 {
+            Ok(())
+        } else {
+            Err(JobRepoError::LostOwnership(id))
+        }
     }
 
     /// Delete terminal (`succeeded`/`failed`) rows whose `finished_at` is before

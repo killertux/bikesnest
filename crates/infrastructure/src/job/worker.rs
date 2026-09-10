@@ -11,6 +11,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Sleep for `poll`, or return early the moment shutdown is signalled.
 async fn sleep_or_cancel(poll: std::time::Duration, shutdown: &CancellationToken) {
     tokio::select! {
@@ -21,24 +29,32 @@ async fn sleep_or_cancel(poll: std::time::Duration, shutdown: &CancellationToken
 
 /// Polls the job queue, claims due jobs, runs their handler, and records the
 /// outcome (success / retry / dead-letter). Spawned on the tokio runtime at
-/// startup when `JOBS_ENABLED`. One loop per instance; multiple instances are
+/// startup when worker execution is enabled. One loop per instance; multiple instances are
 /// safe because claims use `FOR UPDATE SKIP LOCKED`.
+#[derive(Clone)]
 pub struct Worker {
     repo: SqlxJobRepository,
     registry: Arc<JobRegistry>,
     config: JobConfig,
     id: String,
     bootstrap_attempts: Arc<AtomicU64>,
+    claim_sequence: Arc<AtomicU64>,
+    observable_failures: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
 pub struct WorkerDiagnostics {
     bootstrap_attempts: Arc<AtomicU64>,
+    observable_failures: Arc<AtomicU64>,
 }
 
 impl WorkerDiagnostics {
     pub fn bootstrap_attempts(&self) -> u64 {
         self.bootstrap_attempts.load(Ordering::Relaxed)
+    }
+
+    pub fn observable_failures(&self) -> u64 {
+        self.observable_failures.load(Ordering::Relaxed)
     }
 }
 
@@ -57,6 +73,8 @@ impl Worker {
             config,
             id,
             bootstrap_attempts: Arc::new(AtomicU64::new(0)),
+            claim_sequence: Arc::new(AtomicU64::new(0)),
+            observable_failures: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -64,6 +82,7 @@ impl Worker {
     pub fn diagnostics(&self) -> WorkerDiagnostics {
         WorkerDiagnostics {
             bootstrap_attempts: self.bootstrap_attempts.clone(),
+            observable_failures: self.observable_failures.clone(),
         }
     }
 
@@ -77,9 +96,9 @@ impl Worker {
     /// tokio task.
     ///
     /// Cancellation is checked between polls *and* interrupts the idle sleep,
-    /// so an idle worker returns within one poll interval at worst. A job
-    /// already in flight is always run to completion and its outcome recorded —
-    /// abandoning it would leave the row `running` until its lease expired.
+    /// so an idle worker returns promptly. Active attempts receive a bounded
+    /// natural drain, then their owned handler and heartbeat tasks are cancelled
+    /// and joined; the durable lease makes interrupted work recoverable.
     pub async fn run(self, shutdown: CancellationToken) {
         self.run_inner(shutdown, None).await;
     }
@@ -96,10 +115,16 @@ impl Worker {
         let bootstrap_retry = poll.max(std::time::Duration::from_millis(250));
         let mut bootstrapped = false;
         let mut next_bootstrap_attempt = tokio::time::Instant::now();
+        let mut active = tokio::task::JoinSet::new();
+        let force_shutdown = CancellationToken::new();
         while !shutdown.is_cancelled() {
             if !bootstrapped && tokio::time::Instant::now() >= next_bootstrap_attempt {
                 self.bootstrap_attempts.fetch_add(1, Ordering::Relaxed);
-                match self.bootstrap().await {
+                let bootstrap = tokio::select! {
+                    result = self.bootstrap() => result,
+                    _ = shutdown.cancelled() => break,
+                };
+                match bootstrap {
                     Ok(()) => bootstrapped = true,
                     Err(e) => {
                         tracing::error!(error = %e, "recurring job bootstrap failed; will retry");
@@ -107,34 +132,73 @@ impl Worker {
                     }
                 }
             }
-            let claim = if let Some(kinds) = claim_kinds.as_ref() {
-                let refs: Vec<&str> = kinds.iter().map(String::as_str).collect();
-                self.repo
-                    .claim_kinds(
-                        self.config.batch_size,
-                        &self.id,
-                        self.config.lease_ttl,
-                        &refs,
-                    )
-                    .await
-            } else {
-                self.repo
-                    .claim(self.config.batch_size, &self.id, self.config.lease_ttl)
-                    .await
-            };
-            match claim {
-                Ok(jobs) if jobs.is_empty() => sleep_or_cancel(poll, &shutdown).await,
-                Ok(jobs) => {
-                    for job in jobs {
-                        // Finish the batch we already claimed: these rows are
-                        // marked `running` and would otherwise wait out a lease.
-                        self.process_claimed(job).await;
+            while active.len() < self.config.batch_size && !shutdown.is_cancelled() {
+                let claim_owner = format!(
+                    "{}-{}",
+                    self.id,
+                    self.claim_sequence.fetch_add(1, Ordering::Relaxed)
+                );
+                let claim_future = async {
+                    if let Some(kinds) = claim_kinds.as_ref() {
+                        let refs: Vec<&str> = kinds.iter().map(String::as_str).collect();
+                        self.repo
+                            .claim_kinds(1, &claim_owner, self.config.lease_ttl, &refs)
+                            .await
+                    } else {
+                        self.repo
+                            .claim(1, &claim_owner, self.config.lease_ttl)
+                            .await
+                    }
+                };
+                let claim = tokio::select! {
+                    result = claim_future => result,
+                    _ = shutdown.cancelled() => break,
+                };
+                match claim {
+                    Ok(jobs) if jobs.is_empty() => break,
+                    Ok(jobs) => {
+                        for job in jobs {
+                            let worker = self.clone();
+                            let force = force_shutdown.child_token();
+                            active.spawn(async move {
+                                worker.process_claimed_with_shutdown(job, force).await
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "job claim failed; backing off");
+                        break;
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "job claim failed; backing off");
-                    sleep_or_cancel(poll, &shutdown).await;
+            }
+            if active.is_empty() {
+                sleep_or_cancel(poll, &shutdown).await;
+            } else {
+                tokio::select! {
+                    _ = shutdown.cancelled() => {},
+                    _ = tokio::time::sleep(poll) => {},
+                    completed = active.join_next() => {
+                        if completed.is_some_and(|result| result.is_err()) {
+                            self.note_failure("execution_task_panicked", None, None);
+                        }
+                    }
                 }
+            }
+        }
+        let drain = async { while active.join_next().await.is_some() {} };
+        if tokio::time::timeout(self.config.shutdown_grace, drain)
+            .await
+            .is_err()
+        {
+            self.note_failure("shutdown_grace_exceeded", None, None);
+            force_shutdown.cancel();
+            let forced_drain = async { while active.join_next().await.is_some() {} };
+            if tokio::time::timeout(self.config.shutdown_grace, forced_drain)
+                .await
+                .is_err()
+            {
+                active.abort_all();
+                while active.join_next().await.is_some() {}
             }
         }
         tracing::info!(worker = %self.id, "background worker stopped");
@@ -185,45 +249,111 @@ impl Worker {
     /// Claim → run → finish, wrapped in a `background_job` tracing span.
     /// Execute and persist the outcome of one repository claim.
     pub async fn process_claimed(&self, job: ClaimedJob) {
+        self.process_claimed_with_shutdown(job, CancellationToken::new())
+            .await;
+    }
+
+    async fn process_claimed_with_shutdown(&self, job: ClaimedJob, shutdown: CancellationToken) {
         let span = tracing::info_span!(
             "background_job",
             kind = %job.kind,
             id = job.id,
             attempt = job.attempts
         );
-        self.run_job(job).instrument(span).await;
+        self.run_job(job, shutdown).instrument(span).await;
     }
 
-    async fn run_job(&self, job: ClaimedJob) {
+    fn note_failure(&self, classification: &'static str, job_id: Option<i64>, kind: Option<&str>) {
+        self.observable_failures.fetch_add(1, Ordering::Relaxed);
+        tracing::error!(classification, job_id, kind, "background worker failure");
+    }
+
+    async fn run_job(&self, job: ClaimedJob, shutdown: CancellationToken) {
         let Some(handler) = self.registry.get(&job.kind) else {
             tracing::warn!(kind = job.kind, "no handler for job kind; dead-lettering");
-            let _ = self
+            if self
                 .repo
                 .fail(
                     job.id,
-                    &self.id,
+                    &job.owner,
                     &format!("no handler registered for kind '{}'", job.kind),
                 )
-                .await;
+                .await
+                .is_err()
+            {
+                self.note_failure("outcome_write_failed", Some(job.id), Some(&job.kind));
+            }
             return;
         };
 
-        let heartbeat = self.spawn_heartbeat(job.id);
-        let result = handler.run(&job.payload).await;
-        heartbeat.abort();
-
+        let execution_handler = handler.clone();
+        let payload = job.payload.clone();
+        let mut execution = tokio::spawn(async move { execution_handler.run(&payload).await });
+        let _execution_guard = AbortOnDrop(execution.abort_handle());
+        let (heartbeat_tx, mut heartbeat_rx) = tokio::sync::oneshot::channel();
+        let heartbeat = self.spawn_heartbeat(job.id, job.owner.clone(), heartbeat_tx);
+        let _heartbeat_guard = AbortOnDrop(heartbeat.abort_handle());
+        let result = tokio::select! {
+            joined = &mut execution => match joined {
+                Ok(result) => result,
+                Err(_) => Err(JobError::Failed("handler task panicked".into())),
+            },
+            _ = tokio::time::sleep(self.config.handler_timeout) => {
+                execution.abort();
+                let _ = execution.await;
+                Err(JobError::Failed("handler timed out".into()))
+            },
+            heartbeat_error = &mut heartbeat_rx => {
+                execution.abort();
+                let _ = execution.await;
+                self.note_failure("heartbeat_failed", Some(job.id), Some(&job.kind));
+                let _ = heartbeat_error;
+                return;
+            },
+            _ = shutdown.cancelled() => {
+                execution.abort();
+                let _ = execution.await;
+                heartbeat.abort();
+                let _ = heartbeat.await;
+                return;
+            }
+        };
         let now = Utc::now();
         match result {
             Ok(()) => {
                 match next_run_at(job.schedule.as_ref(), now) {
                     Ok(next) => {
-                        let _ = self.repo.finish_success(job.id, &self.id, next, now).await;
-                        tracing::info!("job succeeded (recurring={})", next.is_some());
+                        if self
+                            .repo
+                            .finish_success(job.id, &job.owner, next, now)
+                            .await
+                            .is_err()
+                        {
+                            self.note_failure(
+                                "outcome_write_failed",
+                                Some(job.id),
+                                Some(&job.kind),
+                            );
+                        } else {
+                            tracing::info!("job succeeded (recurring={})", next.is_some());
+                        }
                     }
                     // Invalid schedule → permanent (dead-letter) rather than retry.
-                    Err(e) => {
-                        let _ = self.repo.fail(job.id, &self.id, &e.to_string()).await;
-                        tracing::warn!(error = %e, "invalid schedule; dead-lettering");
+                    Err(_) => {
+                        let persisted = self
+                            .repo
+                            .fail(job.id, &job.owner, "invalid schedule")
+                            .await
+                            .is_ok();
+                        if !persisted {
+                            self.note_failure(
+                                "outcome_write_failed",
+                                Some(job.id),
+                                Some(&job.kind),
+                            );
+                        } else {
+                            tracing::warn!("invalid schedule dead-letter persisted");
+                        }
                     }
                 }
             }
@@ -231,42 +361,97 @@ impl Worker {
                 if job.attempts < job.max_attempts {
                     let delay_ms = backoff_ms(job.attempts, self.config.backoff_base_ms);
                     let run_at = now + chrono::Duration::milliseconds(delay_ms as i64);
-                    let _ = self.repo.retry(job.id, &self.id, &e, run_at).await;
-                    tracing::info!(
-                        attempt = job.attempts,
-                        backoff_ms = delay_ms,
-                        error = %e,
-                        "job failed; will retry"
-                    );
+                    let persisted = self
+                        .repo
+                        .retry(job.id, &job.owner, &e, run_at)
+                        .await
+                        .is_ok();
+                    if !persisted {
+                        self.note_failure("outcome_write_failed", Some(job.id), Some(&job.kind));
+                    } else {
+                        tracing::info!(
+                            attempt = job.attempts,
+                            backoff_ms = delay_ms,
+                            "job failed; retry persisted"
+                        );
+                    }
                 } else {
                     // Give the handler its say before the row goes terminal:
                     // only it can decode the payload (e.g. which email, to
                     // which domain) into something operators can act on.
-                    handler.on_dead_letter(&job.payload, &e).await;
-                    let _ = self.repo.fail(job.id, &self.id, &e).await;
-                    tracing::warn!(error = %e, "job exhausted attempts; dead-lettered");
+                    self.run_dead_letter_hook(
+                        handler.clone(),
+                        job.payload.clone(),
+                        e.clone(),
+                        job.id,
+                        &job.kind,
+                    )
+                    .await;
+                    if self.repo.fail(job.id, &job.owner, &e).await.is_err() {
+                        self.note_failure("outcome_write_failed", Some(job.id), Some(&job.kind));
+                    } else {
+                        tracing::warn!("job exhausted attempts; dead-letter persisted");
+                    }
                 }
             }
             Err(JobError::Permanent(e)) => {
-                handler.on_dead_letter(&job.payload, &e).await;
-                let _ = self.repo.fail(job.id, &self.id, &e).await;
-                tracing::warn!(error = %e, "job failed permanently; dead-lettered");
+                self.run_dead_letter_hook(
+                    handler,
+                    job.payload.clone(),
+                    e.clone(),
+                    job.id,
+                    &job.kind,
+                )
+                .await;
+                if self.repo.fail(job.id, &job.owner, &e).await.is_err() {
+                    self.note_failure("outcome_write_failed", Some(job.id), Some(&job.kind));
+                } else {
+                    tracing::warn!("permanent failure dead-letter persisted");
+                }
+            }
+        }
+        heartbeat.abort();
+        let _ = heartbeat.await;
+    }
+
+    async fn run_dead_letter_hook(
+        &self,
+        handler: Arc<dyn bikesnest_application::JobHandler>,
+        payload: bikesnest_application::JobPayload,
+        error: String,
+        job_id: i64,
+        kind: &str,
+    ) {
+        let mut task = tokio::spawn(async move { handler.on_dead_letter(&payload, &error).await });
+        let _guard = AbortOnDrop(task.abort_handle());
+        match tokio::time::timeout(self.config.handler_timeout, &mut task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => self.note_failure("dead_letter_hook_panicked", Some(job_id), Some(kind)),
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                self.note_failure("dead_letter_hook_timed_out", Some(job_id), Some(kind));
             }
         }
     }
 
     /// Extend a long-running job's lease every `lease_ttl / 3` so it is not
-    /// re-claimed mid-run. The heartbeat updates only `state = 'running'` rows,
-    /// so it becomes a no-op after the job finishes (and it is aborted anyway).
-    fn spawn_heartbeat(&self, id: i64) -> tokio::task::JoinHandle<()> {
+    /// re-claimed during handler and outcome finalization. Lost ownership or a
+    /// database error terminates the heartbeat and cancels handler execution.
+    fn spawn_heartbeat(
+        &self,
+        id: i64,
+        worker_id: String,
+        failed: tokio::sync::oneshot::Sender<()>,
+    ) -> tokio::task::JoinHandle<()> {
         let repo = self.repo.clone();
-        let worker_id = self.id.clone();
         let ttl = self.config.lease_ttl;
         tokio::spawn(async move {
-            let interval = std::time::Duration::from_millis((ttl.as_millis() as u64 / 3).max(500));
+            let interval = std::time::Duration::from_millis((ttl.as_millis() as u64 / 3).max(1));
             loop {
                 tokio::time::sleep(interval).await;
                 if repo.heartbeat(id, &worker_id, ttl).await.is_err() {
+                    let _ = failed.send(());
                     break;
                 }
             }

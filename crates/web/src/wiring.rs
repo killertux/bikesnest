@@ -116,7 +116,7 @@ pub fn app_router_with<H: PasswordHasher + Clone + 'static>(
     // Auth changes always commit with their outbox row. Worker-enabled web
     // returns after that commit; worker-disabled compatibility exact-claims
     // only the just-admitted row and delivers it post-commit.
-    let mail_dispatcher: Box<dyn AuthMailDispatcher> = if config.jobs.enabled {
+    let mail_dispatcher: Box<dyn AuthMailDispatcher> = if config.jobs.durable_enqueue {
         Box::new(DurableAuthMailDispatcher)
     } else {
         Box::new(InlineAuthMailDispatcher::new(db.clone(), email))

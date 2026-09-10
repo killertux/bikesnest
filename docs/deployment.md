@@ -46,8 +46,9 @@ All knobs are documented in `.env.example`; production sets them as real secrets
 | `VALKEY_URL` | **Rate limiter:** single node, e.g. `valkey://valkey:6379`. Shared across auth/photo/contribution/moderation, survives restarts, aggregates across instances |
 | `VALKEY_CLUSTER_URLS` | comma-separated node URLs → **cluster** mode (wins over `VALKEY_URL`) |
 | `RATE_LIMIT_FAIL_OPEN` | `true` (default) → a ValKey outage **allows** requests (goes fail-open); `false` → **denies** (429s the rate-limited endpoints) |
-| `JOBS_ENABLED` | **Background job queue:** `true` (default) spawns an in-process worker that claims, runs, and retries `background_job` rows; `false` for web-only instances — transactional email then sends inline on the request path instead of being queued |
-| `JOBS_POLL_INTERVAL_MS` / `JOBS_BATCH_SIZE` / `JOBS_LEASE_TTL_MS` | queue poll cadence, batch size, and lease length (defaults 5000 / 4 / 600000) |
+| `JOBS_RUN_WORKER` / `JOBS_DURABLE_ENQUEUE` | independently run a worker and leave auth mail for durable delivery (both default true). Legacy `JOBS_ENABLED` sets both only when the new names are absent |
+| `JOBS_POLL_INTERVAL_MS` / `JOBS_BATCH_SIZE` / `JOBS_LEASE_TTL_MS` | queue poll cadence, maximum concurrent attempts, and lease length (defaults 5000 / 4 / 600000) |
+| `JOBS_HANDLER_TIMEOUT_MS` / `JOBS_SHUTDOWN_GRACE_MS` | attempt deadline and bounded shutdown drain (defaults 300000 / 30000) |
 | `JOBS_MAX_ATTEMPTS` / `JOBS_BACKOFF_BASE_MS` | retry budget (default 5) and exponential-backoff base (default 2000) before dead-letter |
 | `JOBS_HISTORY_RETENTION_DAYS` | `jobs.gc` deletes `succeeded`/`failed` rows older than this (default 7) |
 | `CSP_TILE_HOSTS` / `CSP_GEOCODE_HOSTS` | extra origins allowed by the strict CSP for MapLibre tiles / browser geocoding. Required Mapbox and Google Maps origins are added automatically for their profiles |
@@ -141,7 +142,7 @@ connection — no configuration needed.
 
 `SIGTERM` (what `docker stop` / Kubernetes send) starts a graceful shutdown: the
 HTTP server stops accepting, in-flight requests drain, then the background job
-worker is given up to 30 s to finish whatever job it is running before the
+worker is given the configured shutdown grace to finish active jobs before the
 process exits. Killing the process mid-job would leave a `background_job` row in
 `state='running'` until its lease expired.
 
@@ -149,9 +150,9 @@ The container image runs the server under [tini] as PID 1
 (`ENTRYPOINT ["/usr/bin/tini", "--", "bikesnest-web"]`) so signals are forwarded
 and zombies reaped. If you run the binary some other way, make sure it receives
 `SIGTERM` directly (`docker run --init`, or `init: true` in compose, gives the
-same guarantee) and allow at least 35 s of termination grace
-(`--stop-timeout` / `terminationGracePeriodSeconds`) so the worker's 30 s budget
-is usable.
+same guarantee). Set the container termination grace above the HTTP drain plus
+twice `JOBS_SHUTDOWN_GRACE_MS`: the first worker interval permits natural
+completion and the second drains explicitly cancelled handler/heartbeat tasks.
 
 [tini]: https://github.com/krallin/tini
 
@@ -283,7 +284,7 @@ multi-node variant).
 
 The app ships a **pure-PostgreSQL job queue** — no broker. A `background_job`
 table stores durable one-shot + recurring work; an **in-process worker task**
-(started when `JOBS_ENABLED=true`, the default) claims due jobs with
+(started when `JOBS_RUN_WORKER=true`, the default) claims due jobs with
 `FOR UPDATE SKIP LOCKED`, runs their handler, and records the outcome. All job
 times are UTC.
 
@@ -299,9 +300,10 @@ times are UTC.
   needs a separate minimization and retention review before registration.
 - **At-least-once**: a worker crash leaves the job leasable; it is re-claimed
   after the lease. Handlers must be idempotent.
-- On a multi-instance deploy each instance runs its own worker; claims are safe
-  because `SKIP LOCKED` assigns disjoint rows. `JOBS_ENABLED=false` keeps an
-  instance web-only (no worker).
+- On a multi-instance deploy claims are safe because `SKIP LOCKED` assigns
+  disjoint rows. A web-only instance sets `JOBS_RUN_WORKER=false` while keeping
+  `JOBS_DURABLE_ENQUEUE=true`, and a separate `bikesnest-web worker` process
+  must share its database.
 
 The worker authoritatively registers exactly two built-ins at startup:
 
@@ -387,14 +389,15 @@ latency off the request path.
   row. Deletion-first cancels even preclaimed mail; provider-acceptance-first is
   already outside the application's recall boundary. Provider timeout or a
   lost database connection remains an ambiguous at-least-once outcome.
-- **`JOBS_ENABLED=false`.** The auth transition still commits its outbox row,
-  then the request exact-claims only that row and delivers it inline. Success
-  is terminal/redacted; transient failure persists backoff and returns an
+- **Explicit inline mode.** `JOBS_DURABLE_ENQUEUE=false` makes the auth request
+  exact-claim its committed outbox row. Legacy `JOBS_ENABLED=false` selects
+  this mode as well as disabling the local worker when neither new knob is set.
+  Success is terminal/redacted; transient failure persists backoff and returns an
   unavailable response, and a request retry cannot bypass that backoff.
   Permanent rejection dead-letters immediately. The trade-off is that provider
   latency is on the request. Prefer leaving the worker on; if you run
-  web-only instances, make sure at least one instance (or a dedicated worker
-  deployment) has `JOBS_ENABLED=true`. Startup validation needs no new rule
+  web-only instances, make sure a dedicated `bikesnest-web worker` deployment
+  shares the queue. Startup validation needs no new rule
   here: inline delivery uses the same account/token validation, lease ownership
   and lock-through-provider boundary as the worker.
 

@@ -153,7 +153,9 @@ mod tests {
     #[test]
     fn unreadable_payload_errors_are_bounded_and_secret_free() {
         let err = decode(&serde_json::json!({"locale": "SECRET-MARKER"})).unwrap_err();
-        assert!(matches!(err, JobError::Permanent(_)), "{err:?}");
-        assert_eq!(err.to_string(), "unreadable email.send payload");
+        let JobError::Permanent(classification) = err else {
+            panic!("decode must be permanent")
+        };
+        assert_eq!(classification, "unreadable email.send payload");
     }
 }

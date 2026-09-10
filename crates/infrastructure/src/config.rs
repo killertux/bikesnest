@@ -353,8 +353,12 @@ pub type ModerationConfig = bikesnest_domain::ModerationLimits;
 /// Background job queue knobs. Defaults target a single-instance dev worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JobConfig {
-    /// Spawn the in-process worker loop at startup (false for web-only instances).
+    /// Run the worker loop in the web process. `JOBS_RUN_WORKER` is preferred;
+    /// `JOBS_ENABLED` remains a compatibility alias.
     pub enabled: bool,
+    /// Leave admitted auth mail durable for a worker instead of exact-claiming
+    /// it inline after commit.
+    pub durable_enqueue: bool,
     /// How often the worker polls the queue when idle.
     pub poll_interval: Duration,
     /// How many jobs a worker claims per batch.
@@ -362,6 +366,10 @@ pub struct JobConfig {
     /// Lease length; a running job heartbeats to hold it, and a crashed worker's
     /// lease expires so another worker can re-claim.
     pub lease_ttl: Duration,
+    /// Maximum wall-clock duration of one handler attempt.
+    pub handler_timeout: Duration,
+    /// Maximum time shutdown waits for active handler/outcome tasks.
+    pub shutdown_grace: Duration,
     /// Retry budget per job (overridable per row at enqueue).
     pub max_attempts: i32,
     /// Exponential backoff base; actual delay = base * 2^(attempt-1) + jitter.
@@ -374,12 +382,38 @@ impl Default for JobConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            durable_enqueue: true,
             poll_interval: Duration::from_secs(5),
             batch_size: 4,
             lease_ttl: Duration::from_secs(600),
+            handler_timeout: Duration::from_secs(300),
+            shutdown_grace: Duration::from_secs(30),
             max_attempts: 5,
             backoff_base_ms: 2000,
             history_retention_days: 7,
+        }
+    }
+}
+
+impl JobConfig {
+    pub fn validate(&self) -> Result<(), Vec<&'static str>> {
+        let mut errors = Vec::new();
+        if self.batch_size == 0 {
+            errors.push("JOBS_BATCH_SIZE must be greater than zero");
+        }
+        if self.lease_ttl < Duration::from_millis(3) {
+            errors.push("JOBS_LEASE_TTL_MS must be at least 3");
+        }
+        if self.handler_timeout.is_zero() {
+            errors.push("JOBS_HANDLER_TIMEOUT_MS must be greater than zero");
+        }
+        if self.shutdown_grace.is_zero() {
+            errors.push("JOBS_SHUTDOWN_GRACE_MS must be greater than zero");
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
         }
     }
 }
@@ -734,6 +768,7 @@ impl Config {
             moderation: ModerationConfig::default(),
             jobs: JobConfig {
                 enabled: false,
+                durable_enqueue: false,
                 ..JobConfig::default()
             },
             policy: PolicySeedConfig {
@@ -1063,8 +1098,13 @@ fn moderation_config(env: &EnvSource<'_>) -> ModerationConfig {
 /// Job queue knobs, from env with sane single-instance defaults.
 fn job_config(env: &EnvSource<'_>) -> JobConfig {
     let d = JobConfig::default();
+    let legacy = env.bool("JOBS_ENABLED");
     JobConfig {
-        enabled: env.bool("JOBS_ENABLED").unwrap_or(d.enabled),
+        enabled: env.bool("JOBS_RUN_WORKER").or(legacy).unwrap_or(d.enabled),
+        durable_enqueue: env
+            .bool("JOBS_DURABLE_ENQUEUE")
+            .or(legacy)
+            .unwrap_or(d.durable_enqueue),
         poll_interval: env
             .u64("JOBS_POLL_INTERVAL_MS")
             .map(Duration::from_millis)
@@ -1074,6 +1114,14 @@ fn job_config(env: &EnvSource<'_>) -> JobConfig {
             .u64("JOBS_LEASE_TTL_MS")
             .map(Duration::from_millis)
             .unwrap_or(d.lease_ttl),
+        handler_timeout: env
+            .u64("JOBS_HANDLER_TIMEOUT_MS")
+            .map(Duration::from_millis)
+            .unwrap_or(d.handler_timeout),
+        shutdown_grace: env
+            .u64("JOBS_SHUTDOWN_GRACE_MS")
+            .map(Duration::from_millis)
+            .unwrap_or(d.shutdown_grace),
         max_attempts: env
             .i64("JOBS_MAX_ATTEMPTS")
             .map(|v| v as i32)
@@ -1592,7 +1640,24 @@ mod tests {
         assert_eq!(config(&[DB]).jobs, JobConfig::default());
         let cfg = config(&[DB, ("JOBS_ENABLED", "false"), ("JOBS_BATCH_SIZE", "16")]);
         assert!(!cfg.jobs.enabled);
+        assert!(!cfg.jobs.durable_enqueue);
         assert_eq!(cfg.jobs.batch_size, 16);
+        let split = config(&[
+            DB,
+            ("JOBS_ENABLED", "false"),
+            ("JOBS_RUN_WORKER", "false"),
+            ("JOBS_DURABLE_ENQUEUE", "true"),
+        ]);
+        assert!(!split.jobs.enabled);
+        assert!(split.jobs.durable_enqueue);
+        assert!(
+            JobConfig {
+                batch_size: 0,
+                ..JobConfig::default()
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]
