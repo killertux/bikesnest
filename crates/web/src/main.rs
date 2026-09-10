@@ -85,7 +85,13 @@ async fn main() {
                 eprintln!("migration error: {err}");
                 std::process::exit(1);
             });
-            match bikesnest_infrastructure::seed_admin(&db, &config.admin_seed).await {
+            match bikesnest_infrastructure::seed_admin(
+                &db,
+                &config.admin_seed,
+                config.password_hash,
+            )
+            .await
+            {
                 Ok(bikesnest_infrastructure::auth::seed::SeedOutcome::Created) => {
                     println!("admin account created");
                 }
@@ -277,7 +283,7 @@ async fn seed_full_fresh(config: &Config, db: &Db) -> Result<FullFreshSummary, S
     let parking_locations = bikesnest_infrastructure::parking::seed_mock(db, &storage, &processor)
         .await
         .map_err(|err| err.to_string())?;
-    bikesnest_infrastructure::seed_admin(db, &config.admin_seed)
+    bikesnest_infrastructure::seed_admin(db, &config.admin_seed, config.password_hash)
         .await
         .map_err(|err| err.to_string())?;
     seed_prepared_policies(db, config, &policies).await?;

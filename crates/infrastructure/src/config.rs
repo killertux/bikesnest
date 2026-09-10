@@ -350,6 +350,24 @@ pub type PhotoConfig = bikesnest_domain::PhotoLimits;
 /// Moderation limits, env-driven with the domain constants as defaults.
 pub type ModerationConfig = bikesnest_domain::ModerationLimits;
 
+/// Process-wide admission for interactive Argon2 hash and verify work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PasswordHashConfig {
+    pub concurrency: usize,
+    pub queue_capacity: usize,
+    pub admission_timeout: Duration,
+}
+
+impl Default for PasswordHashConfig {
+    fn default() -> Self {
+        Self {
+            concurrency: 2,
+            queue_capacity: 8,
+            admission_timeout: Duration::from_secs(2),
+        }
+    }
+}
+
 /// Background job queue knobs. Defaults target a single-instance dev worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JobConfig {
@@ -478,6 +496,8 @@ pub struct Config {
     pub retention: RetentionPolicy,
     /// Photo pipeline limits.
     pub photo: PhotoConfig,
+    /// Shared CPU admission for password hash and verify operations.
+    pub password_hash: PasswordHashConfig,
     /// Moderation limits.
     pub moderation: ModerationConfig,
     /// Background job queue.
@@ -566,6 +586,7 @@ impl Config {
             freshness: freshness_config(&env),
             retention: retention_config(&env),
             photo: photo_config(&env),
+            password_hash: password_hash_config(&env)?,
             moderation: moderation_config(&env),
             jobs: job_config(&env),
             policy: policy_config(&env),
@@ -765,6 +786,7 @@ impl Config {
             },
             retention: RetentionPolicy::default(),
             photo: PhotoConfig::default(),
+            password_hash: PasswordHashConfig::default(),
             moderation: ModerationConfig::default(),
             jobs: JobConfig {
                 enabled: false,
@@ -1079,6 +1101,57 @@ fn photo_config(env: &EnvSource<'_>) -> PhotoConfig {
     }
 }
 
+fn password_hash_config(env: &EnvSource<'_>) -> Result<PasswordHashConfig, ConfigError> {
+    let defaults = PasswordHashConfig::default();
+    let usize_value = |key: &'static str, fallback| -> Result<usize, ConfigError> {
+        match env.string(key) {
+            Some(value) => value
+                .parse()
+                .map_err(|_| ConfigError::invalid(key, "must be a non-negative integer")),
+            None => Ok(fallback),
+        }
+    };
+    let millis = match env.string("PASSWORD_HASH_ADMISSION_TIMEOUT_MS") {
+        Some(value) => value.parse::<u64>().map_err(|_| {
+            ConfigError::invalid(
+                "PASSWORD_HASH_ADMISSION_TIMEOUT_MS",
+                "must be a non-negative integer",
+            )
+        })?,
+        None => defaults.admission_timeout.as_millis() as u64,
+    };
+    let config = PasswordHashConfig {
+        concurrency: usize_value("PASSWORD_HASH_CONCURRENCY", defaults.concurrency)?,
+        queue_capacity: usize_value("PASSWORD_HASH_QUEUE_CAPACITY", defaults.queue_capacity)?,
+        admission_timeout: Duration::from_millis(millis),
+    };
+    if config.concurrency == 0 {
+        return Err(ConfigError::invalid(
+            "PASSWORD_HASH_CONCURRENCY",
+            "must be greater than zero",
+        ));
+    }
+    if config.admission_timeout.is_zero() {
+        return Err(ConfigError::invalid(
+            "PASSWORD_HASH_ADMISSION_TIMEOUT_MS",
+            "must be greater than zero",
+        ));
+    }
+    if config.concurrency > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err(ConfigError::invalid(
+            "PASSWORD_HASH_CONCURRENCY",
+            "exceeds the semaphore implementation limit",
+        ));
+    }
+    if config.queue_capacity > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err(ConfigError::invalid(
+            "PASSWORD_HASH_QUEUE_CAPACITY",
+            "exceeds the semaphore implementation limit",
+        ));
+    }
+    Ok(config)
+}
+
 /// Moderation limits, from env with the domain defaults.
 fn moderation_config(env: &EnvSource<'_>) -> ModerationConfig {
     let d = ModerationConfig::default();
@@ -1209,6 +1282,47 @@ mod tests {
 
     fn config(pairs: &[(&str, &str)]) -> Config {
         Config::from_lookup(&lookup(pairs)).expect("config parses")
+    }
+
+    #[test]
+    fn password_hash_admission_defaults_overrides_and_rejects_zero_capacity() {
+        assert_eq!(config(&[DB]).password_hash, PasswordHashConfig::default());
+        assert_eq!(
+            config(&[
+                DB,
+                ("PASSWORD_HASH_CONCURRENCY", "3"),
+                ("PASSWORD_HASH_QUEUE_CAPACITY", "7"),
+                ("PASSWORD_HASH_ADMISSION_TIMEOUT_MS", "125"),
+            ])
+            .password_hash,
+            PasswordHashConfig {
+                concurrency: 3,
+                queue_capacity: 7,
+                admission_timeout: Duration::from_millis(125),
+            }
+        );
+        for (key, value) in [
+            ("PASSWORD_HASH_CONCURRENCY", "0"),
+            ("PASSWORD_HASH_ADMISSION_TIMEOUT_MS", "0"),
+            ("PASSWORD_HASH_CONCURRENCY", "-1"),
+            ("PASSWORD_HASH_QUEUE_CAPACITY", "not-a-number"),
+        ] {
+            assert!(Config::from_lookup(&lookup(&[DB, (key, value)])).is_err());
+        }
+        assert_eq!(
+            config(&[DB, ("PASSWORD_HASH_QUEUE_CAPACITY", "0")])
+                .password_hash
+                .queue_capacity,
+            0
+        );
+        let too_large = usize::MAX.to_string();
+        assert!(
+            Config::from_lookup(&lookup(&[
+                DB,
+                ("PASSWORD_HASH_CONCURRENCY", too_large.as_str()),
+            ]))
+            .is_err()
+        );
     }
 
     const DB: (&str, &str) = ("DATABASE_URL", "postgres://u:p@localhost/db");

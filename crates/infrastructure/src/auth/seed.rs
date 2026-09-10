@@ -5,7 +5,7 @@
 
 use crate::Db;
 use crate::auth::{Argon2PasswordHasher, SqlxAccountRepository, SqlxAuditLog, SystemClock};
-use crate::config::AdminSeedConfig;
+use crate::config::{AdminSeedConfig, PasswordHashConfig};
 use bikesnest_application::{
     AccountRepository, AuditEvent, AuditLog, AuthError, Clock, PasswordHasher,
 };
@@ -32,7 +32,11 @@ pub enum SeedAdminError {
 /// Ensure the configured admin exists. Returns whether it was created or
 /// updated. The credentials come from the configuration parsed at startup —
 /// this never reads the process environment itself.
-pub async fn seed_admin(db: &Db, seed: &AdminSeedConfig) -> Result<SeedOutcome, SeedAdminError> {
+pub async fn seed_admin(
+    db: &Db,
+    seed: &AdminSeedConfig,
+    password_hash: PasswordHashConfig,
+) -> Result<SeedOutcome, SeedAdminError> {
     let email_raw = seed.email.as_deref().ok_or(SeedAdminError::MissingEmail)?;
     let email = UserEmail::parse(email_raw).map_err(|_| SeedAdminError::MissingEmail)?;
     let password_raw = seed
@@ -44,7 +48,7 @@ pub async fn seed_admin(db: &Db, seed: &AdminSeedConfig) -> Result<SeedOutcome, 
         .map_err(|_| SeedAdminError::MissingPassword)?;
 
     let repo = SqlxAccountRepository::new(db.clone());
-    let hasher = Argon2PasswordHasher;
+    let hasher = Argon2PasswordHasher::new(password_hash);
     let clock = SystemClock;
     let audit = SqlxAuditLog::new(db.clone());
 

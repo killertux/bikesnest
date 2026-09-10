@@ -60,7 +60,7 @@ impl RouterDeps<Argon2PasswordHasher> {
         Ok(Self {
             email: Arc::from(email_from_config(&config.email)?),
             oauth: None,
-            hasher: Argon2PasswordHasher,
+            hasher: Argon2PasswordHasher::new(config.password_hash),
             rate_limiter: rate_limiter_from_config(&config.rate_limiter)?,
             storage: Arc::new(S3ObjectStorage::from_config(&config.storage)),
         })

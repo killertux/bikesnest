@@ -43,7 +43,7 @@ Statuses: `queued`, `implementing`, `reviewing`, `changes-requested`, `accepted`
 | B06a | Sol | Mail-queue privacy and sensitive logging (`SEC-02/06`, `LEG-05` implementation) | Account-linked jobs; scrub terminal sensitive payloads; cancel/redact deletion copies; delayed/expired mail not sent; race tests; vendor error bodies cannot leak email/token; explicit retention/backups limits | accepted |
 | B06b | Sol | Transactional auth outbox and delivery semantics (`ENG-06`, email retry findings) | Account/token/outbox commit together; enqueue failure/crash retry cannot strand registration; permanent vs retryable provider failures; supported provider idempotency; no exactly-once SMTP promise | accepted |
 | B07 | Sol | Worker leases, supervision, execution modes (`ENG-04/05/08`) | Claim only active capacity; heartbeat all active leases; stale owner cannot silently complete; panic/timeouts/outcome-write failures observable; graceful shutdown; separate enqueue vs run config and worker-only command | accepted |
-| B08 | Sol | CPU admission control and cancellation (`SEC-05`, `ENG-07`) | Owned image permit lives inside blocking closure; bounded hash work/admission; cancellation/burst tests assert actual running maximum; no durable login work | queued |
+| B08 | Sol | CPU admission control and cancellation (`SEC-05`, `ENG-07`) | Owned image permit lives inside blocking closure; bounded hash work/admission; cancellation/burst tests assert actual running maximum; no durable login work | accepted |
 | B09a | Sol | Sensitive-response cache and abuse-limit hardening (security additional checks) | Auth/private/token HTML no-store, fragment/full consistency, public cache policy explicit; credential-sensitive limiter failure has bounded safe behavior and monitoring; test trusted-proxy assumptions without changing edge | queued |
 | B09b | Sol | Provider CSP hardening (`SEC-04`) | Strict nonce-based strategy verified against installed htmx and all map providers; dynamic loader propagates nonce safely; legitimate SDKs work; required eval exceptions documented; report-only rollout path | queued |
 | B10 | Terra | Map/GPS recovery, document metadata and navigation accessibility (`UX-01/02/11`, `HX-07`) | Localized loading/failure/retry, finite GPS timeout and manual destination fallback; blocked SDK/style/tiles handled; lang/title/focus/history sync; no reintroduced menu/map bugs | queued |
@@ -128,6 +128,14 @@ These remain explicit until the owner supplies evidence or approves action:
 5. Release window, migration/backfill review, exact production recurring-job reconciliation and separately approved deployment.
 
 ## Progress log
+
+- B08 gate passed: independent Sol confirms closure-owned capacity, finite shared password admission, cancellation/burst evidence, startup/seed configuration, unchanged Argon2 and interactive auth. Independent infrastructure98/98, application109/109, photo11/11, HTTP172/172, formatting/workspace check/strict Clippy/diff checks passed. Initial sandbox loopback denial was rerun with permitted test access and recorded honestly. No material findings or migration; source accepted, not deployed. B09a is next.
+
+- B08 frozen handoff sent to independent Sol reviewer: implementer reports password4/4, config1/1, image-admission2/2, infrastructure98/98, application109/109, photo11/11, HTTP172/172, workspace all-target check, strict locked Clippy, formatting and diff checks passed. Debug-process burst timing/RSS recorded with explicit non-production limitations in [B08 handoff](../reviews/remediation/B08-handoff.md). No migration. Acceptance pending.
+
+- B08 draft validation: shared hash/verify execution and finite waiter budgets, closure-owned image permits and whole-operation test guards implemented. Implementer reports infrastructure98/98, application109/109, image11/11, HTTP172/172; capacity-two real hash/image bursts observed peak2. Debug timing is explicitly non-production evidence. Final checks/handoff and independent acceptance remain pending.
+
+- B07 checkpoint: `ad5fdd6`. B08 assigned to Sol implementation for blocking image permit lifetime and bounded shared password hashing admission/cancellation. Actual running-work tests and honest measurement context required; no durable login, B09 work, production changes or shared release rebuilds.
 
 - B07 gate passed: independent Sol re-review resolved all findings, passing three consecutive full job28/28 runs, CLI3/3, supervisor2/2, formatting, strict Clippy and diff checks. Recurrence4/4 remains applicable; lead DB-free domain/application suite passed. Accepted code has no migration; operational deployment remains unauthorized. B08 is next.
 

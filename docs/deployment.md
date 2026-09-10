@@ -51,6 +51,7 @@ All knobs are documented in `.env.example`; production sets them as real secrets
 | `JOBS_HANDLER_TIMEOUT_MS` / `JOBS_SHUTDOWN_GRACE_MS` | attempt deadline and bounded shutdown drain (defaults 300000 / 30000) |
 | `JOBS_MAX_ATTEMPTS` / `JOBS_BACKOFF_BASE_MS` | retry budget (default 5) and exponential-backoff base (default 2000) before dead-letter |
 | `JOBS_HISTORY_RETENTION_DAYS` | `jobs.gc` deletes `succeeded`/`failed` rows older than this (default 7) |
+| `PASSWORD_HASH_CONCURRENCY` / `PASSWORD_HASH_QUEUE_CAPACITY` / `PASSWORD_HASH_ADMISSION_TIMEOUT_MS` | shared Argon2 hash+verify running budget, finite waiter count, and waiter deadline (defaults 2 / 8 / 2000; queue 0 disables waiting) |
 | `CSP_TILE_HOSTS` / `CSP_GEOCODE_HOSTS` | extra origins allowed by the strict CSP for MapLibre tiles / browser geocoding. Required Mapbox and Google Maps origins are added automatically for their profiles |
 | `CSP_MEDIA_HOSTS` | object-storage origin(s) allowed in the CSP `img-src` that parking photos are served from as direct pre-signed URLs (dev: `http://localhost:9000`; AWS: `https://<bucket>.s3.<region>.amazonaws.com`) |
 | `APP_ENV` | `production` → JSON structured logs (machine-parseable, forward to a log aggregator) **and the startup validation described below** |
@@ -68,6 +69,15 @@ All knobs are documented in `.env.example`; production sets them as real secrets
 | `POLICY_VERSION` / `POLICY_EFFECTIVE_AT` | version label + effective date of the policy text being seeded; bump the version whenever `policies/*.md` change |
 | `DELETED_ACCOUNT_PURGE_AFTER_DAYS` | `30` in production (decision, `docs/retention-policy.md`); `INACTIVE_ACCOUNT_ANONYMIZE_AFTER_DAYS` stays `0` |
 | `REC_*`, `FRESHNESS_*`, `PHOTO_*`, `MOD_*`, `RETENTION_*` | tuning constants (see `.env.example`) |
+
+The password default permits two simultaneous Argon2id operations. At the
+unchanged 19 MiB memory parameter this is a nominal 38 MiB working-allocation
+lower bound before allocator, thread, request, and process overhead. Eight
+waiters are deliberately cheap compared with starting eight more hashes and
+are bounded by a two-second deadline. These are conservative process defaults,
+not a production latency SLO: measure the deployed CPU and memory limit, then
+tune all three values together. Queue capacity zero is supported when immediate
+overload rejection is preferred.
 
 **Never** put secrets in the image; the `.dockerignore` excludes `.env*`.
 
