@@ -25,6 +25,7 @@ async fn test_app() -> axum::Router {
         hasher: bikesnest_test_support::TestPasswordHasher,
         rate_limiter: Box::new(bikesnest_infrastructure::InMemoryRateLimiter::new()),
         storage: std::sync::Arc::new(bikesnest_test_support::TestObjectStorage::new()),
+        detail_reads: None,
     };
     app_router_with(config, db, deps)
 }

@@ -33,9 +33,9 @@ pub use community::{
     AddParkingLocationOutcome, AttributeSummary, CommunityParkingDetails, ContributionDeps,
     ContributionError, ContributionHistoryReader, ContributionItem, ContributionService,
     DuplicateCandidate, FavoriteItem, FavoriteRepository, ListingProposal, NewParkingLocation,
-    NewProposal, NewVerification, ParkingContributionRepository, ParkingEdit, ProposalVote,
-    ProposalVoteTotals, Reason, Review, ReviewRepository, VerificationRepository,
-    recommendation_reasons,
+    NewProposal, NewVerification, ParkingContributionRepository, ParkingEdit, PendingFieldCue,
+    PendingProposalSummary, ProposalVote, ProposalVoteTotals, Reason, Review, ReviewRepository,
+    VerificationRepository, recommendation_reasons,
 };
 pub use email::{EmailError, EmailKind, EmailMessage, EmailProvider, EmailQueue};
 pub use jobs::{JOB_EMAIL_SEND, JOB_JOBS_GC, JOB_RETENTION, JobError, JobHandler, JobPayload};

@@ -11,7 +11,7 @@
   </article>
   {% endif %}
   <div class="mt-4" data-od-id="active-proposals">
-    {% if collaboration_proposals.is_empty() %}<p class="mt-2 text-sm text-muted">{{ tr.t("moderation.proposals.empty") }}</p>
+    {% if proposals_available && collaboration_proposals.is_empty() %}<p class="mt-2 text-sm text-muted">{{ tr.t("moderation.proposals.empty") }}</p>
     {% else %}<div class="mt-3 grid gap-3">{% for proposal in collaboration_proposals %}
       <article id="proposal-{{ proposal.id }}" data-od-id="proposal-card" class="scroll-mt-24 overflow-hidden rounded-xl border border-border bg-surface p-5"><div class="flex items-start justify-between gap-3"><h3 class="font-medium">{{ proposal.kind_label }}</h3><span class="rounded-full bg-bg px-2 py-1 text-xs font-medium text-muted">{% if proposal.stale %}{{ tr.t("proposal.stale.badge") }}{% else %}{{ tr.t("collab.pending") }}{% endif %}</span></div>
         <p class="mt-1 text-xs text-muted">{{ proposal.created_label }}</p>

@@ -7,15 +7,101 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use bikesnest_application::{
-    AuthService, CheckReadiness, ContributionService, FreshnessConfig, GetParkingDetails,
-    ModerationService, ObjectStorage, ParkingPhotoReader, PhotoService, PrivacyService,
-    RateLimiter, SearchParking, SitemapReader,
+    AuthService, CheckReadiness, CommunityParkingDetails, ContributionError, ContributionService,
+    FreshnessConfig, GetParkingDetails, ListingProposal, ModerationService, ObjectStorage,
+    ParkingPhotoReader, PendingProposalSummary, PhotoService, PrivacyService, RateLimiter,
+    ReaderError, SearchParking, SitemapReader, StoredPhoto,
 };
+use bikesnest_domain::{ParkingLocation, RevisionSummary, UserId};
 use bikesnest_infrastructure::probe::SqlxDatabaseProbe;
 use bikesnest_infrastructure::{CachingGeocoder, Config, GeocodeLimits, MapConfig};
 
 use crate::security::SecurityHeaders;
+
+#[async_trait]
+pub trait DetailReads: Send + Sync {
+    async fn photos_page(
+        &self,
+        id: i64,
+        limit: i64,
+    ) -> Result<(Vec<StoredPhoto>, i64), ReaderError>;
+    async fn pending_photos(&self, id: i64) -> Result<i64, ReaderError>;
+    async fn community(
+        &self,
+        location: ParkingLocation,
+        viewer: Option<UserId>,
+        after: Option<i64>,
+        limit: i64,
+    ) -> Result<CommunityParkingDetails, ContributionError>;
+    async fn summary(&self, id: i64) -> Result<PendingProposalSummary, ContributionError>;
+    async fn proposals(
+        &self,
+        id: i64,
+        after: Option<i64>,
+        limit: i64,
+    ) -> Result<(Vec<ListingProposal>, i64, bool), ContributionError>;
+    async fn history(
+        &self,
+        id: i64,
+        after: Option<i64>,
+        limit: i64,
+    ) -> Result<(Vec<RevisionSummary>, i64, bool), ContributionError>;
+}
+
+pub struct AppDetailReads {
+    pub photos: Arc<dyn ParkingPhotoReader>,
+    pub contributions: Arc<ContributionService>,
+}
+
+#[async_trait]
+impl DetailReads for AppDetailReads {
+    async fn photos_page(
+        &self,
+        id: i64,
+        limit: i64,
+    ) -> Result<(Vec<StoredPhoto>, i64), ReaderError> {
+        self.photos.photos_page(id, limit).await
+    }
+    async fn pending_photos(&self, id: i64) -> Result<i64, ReaderError> {
+        self.photos.pending_count(id).await
+    }
+    async fn community(
+        &self,
+        location: ParkingLocation,
+        viewer: Option<UserId>,
+        after: Option<i64>,
+        limit: i64,
+    ) -> Result<CommunityParkingDetails, ContributionError> {
+        self.contributions
+            .community_details_page(location, viewer, after, limit)
+            .await
+    }
+    async fn summary(&self, id: i64) -> Result<PendingProposalSummary, ContributionError> {
+        self.contributions.pending_proposal_summary(id).await
+    }
+    async fn proposals(
+        &self,
+        id: i64,
+        after: Option<i64>,
+        limit: i64,
+    ) -> Result<(Vec<ListingProposal>, i64, bool), ContributionError> {
+        self.contributions
+            .listing_proposals_page(id, after, limit)
+            .await
+    }
+    async fn history(
+        &self,
+        id: i64,
+        after: Option<i64>,
+        limit: i64,
+    ) -> Result<(Vec<RevisionSummary>, i64, bool), ContributionError> {
+        self.contributions
+            .revision_history_page(id, after, limit)
+            .await
+    }
+}
 
 /// Shared application state wired at startup. Everything configuration-derived
 /// is resolved once here — no handler reads the process environment.
@@ -33,6 +119,7 @@ pub struct AppState {
     /// That budget's size and window.
     pub geocode_limits: GeocodeLimits,
     pub details: Arc<GetParkingDetails>,
+    pub detail_reads: Arc<dyn DetailReads>,
     /* Configured freshness thresholds, used for display categorization so the
     cards honour the same tunable value as the search/detail services. */
     pub freshness: FreshnessConfig,

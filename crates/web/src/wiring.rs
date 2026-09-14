@@ -15,8 +15,8 @@ use axum::{Router, middleware};
 use bikesnest_application::{
     AuthMailDispatcher, AuthService, CheckReadiness, ContributionDeps, ContributionService,
     EmailProvider, GetParkingDetails, ModerationDeps, ModerationService, ObjectStorage,
-    PasswordHasher, PhotoDeps, PhotoService, PrivacyDeps, PrivacyService, RateLimiter,
-    SearchParking,
+    ParkingPhotoReader, PasswordHasher, PhotoDeps, PhotoService, PrivacyDeps, PrivacyService,
+    RateLimiter, SearchParking,
 };
 use bikesnest_infrastructure::probe::SqlxDatabaseProbe;
 use bikesnest_infrastructure::{
@@ -50,6 +50,7 @@ pub struct RouterDeps<H: PasswordHasher + Clone + 'static> {
     pub hasher: H,
     pub rate_limiter: Box<dyn RateLimiter>,
     pub storage: Arc<dyn ObjectStorage>,
+    pub detail_reads: Option<Arc<dyn crate::state::DetailReads>>,
 }
 
 impl RouterDeps<Argon2PasswordHasher> {
@@ -63,6 +64,7 @@ impl RouterDeps<Argon2PasswordHasher> {
             hasher: Argon2PasswordHasher::new(config.password_hash),
             rate_limiter: rate_limiter_from_config(&config.rate_limiter)?,
             storage: Arc::new(S3ObjectStorage::from_config(&config.storage)),
+            detail_reads: None,
         })
     }
 }
@@ -92,6 +94,7 @@ pub fn app_router_with<H: PasswordHasher + Clone + 'static>(
         hasher,
         rate_limiter,
         storage,
+        detail_reads,
     } = deps;
     let oauth = oauth.unwrap_or_else(|| FakeOAuthProvider::from_config(&config.fake_oauth));
     let google_oauth_enabled = config.google_oauth_enabled;
@@ -180,6 +183,14 @@ pub fn app_router_with<H: PasswordHasher + Clone + 'static>(
     });
     let policy_reader: Arc<dyn bikesnest_application::PolicyReader> =
         Arc::new(SqlxPolicyReader::new(db.clone()));
+    let photos: Arc<dyn ParkingPhotoReader> = Arc::new(SqlxParkingPhotoReader::new(db.clone()));
+    let contributions = Arc::new(contribution_service);
+    let detail_reads = detail_reads.unwrap_or_else(|| {
+        Arc::new(crate::state::AppDetailReads {
+            photos: photos.clone(),
+            contributions: contributions.clone(),
+        })
+    });
     let state = AppState {
         readiness: Arc::new(CheckReadiness::new(probe)),
         search: Arc::new(search_uc),
@@ -188,11 +199,12 @@ pub fn app_router_with<H: PasswordHasher + Clone + 'static>(
         geocode_limits: config.geocode,
         details: Arc::new(details),
         freshness: config.freshness,
-        photos: Arc::new(SqlxParkingPhotoReader::new(db.clone())),
+        photos,
+        detail_reads,
         sitemap: Arc::new(SqlxSitemapReader::new(db.clone())),
         storage: storage.clone(),
         auth: Arc::new(auth_service),
-        contributions: Arc::new(contribution_service),
+        contributions,
         photo: Arc::new(photo_service),
         moderation: Arc::new(moderation_service),
         privacy: Arc::new(privacy_service),

@@ -71,21 +71,30 @@
   <nav class="my-6 flex flex-wrap items-center gap-x-6 gap-y-1 border-b border-border text-sm" aria-label="{{ tr.t("collab.tabs") }}" data-od-id="parking-navigation">
     <a href="/parking/{{ id }}" {% if tab == "current" %}aria-current="page"{% endif %} class="inline-flex min-h-11 items-center border-b-2 py-3 {% if tab == "current" %}border-accent-strong font-semibold text-fg{% else %}border-transparent text-muted{% endif %}">{{ tr.t("profile.current") }}</a>
     <a href="/parking/{{ id }}?tab=history" {% if tab == "history" %}aria-current="page"{% endif %} class="inline-flex min-h-11 items-center border-b-2 py-3 {% if tab == "history" %}border-accent-strong font-semibold text-fg{% else %}border-transparent text-muted{% endif %}">{{ tr.t("profile.history") }}</a>
-    <a href="/parking/{{ id }}?tab=approvals" {% if tab == "approvals" %}aria-current="page"{% endif %} class="inline-flex min-h-11 items-center gap-2 border-b-2 py-3 {% if tab == "approvals" %}border-accent-strong font-semibold text-fg{% else %}border-transparent text-muted{% endif %}">{{ tr.t("profile.approvals") }} <span class="rounded-full bg-accent-soft px-2 font-mono text-xs text-accent-strong">{{ self.pending_count() }}</span></a>
+    <a href="/parking/{{ id }}?tab=approvals" {% if tab == "approvals" %}aria-current="page"{% endif %} class="inline-flex min-h-11 items-center gap-2 border-b-2 py-3 {% if tab == "approvals" %}border-accent-strong font-semibold text-fg{% else %}border-transparent text-muted{% endif %}">{{ tr.t("profile.approvals") }} {% if collaboration_summary_available %}<span class="rounded-full bg-accent-soft px-2 font-mono text-xs text-accent-strong">{{ self.pending_count() }}</span>{% endif %}</a>
     {% if can_contribute %}<a href="/parking/{{ id }}/edit" class="ml-auto inline-flex min-h-11 items-center font-medium text-accent-strong">{{ tr.t("collab.suggest") }}</a>{% endif %}
   </nav>
+  {% if !collaboration_summary_available %}<p role="status" class="mb-4 rounded-xl border border-border bg-surface p-4 text-sm text-muted">{{ tr.t("profile.data_unavailable") }}</p>{% endif %}
   {% if tab == "approvals" %}
+    {% if !proposals_available || !collaboration_summary_available %}<p role="status" class="rounded-xl border border-border bg-surface p-4 text-sm text-muted">{{ tr.t("profile.data_unavailable") }}</p>{% endif %}
     {% include "partials/listing_collaboration.html" %}
+    {% if proposals_available %}<p class="mt-4 text-sm text-muted">{{ tr.t("profile.loaded_total").replace("{shown}", collaboration_proposals.len().to_string().as_str()).replace("{total}", proposals_total.to_string().as_str()) }}</p>{% endif %}
+    {% if let Some(next) = proposals_next %}<a href="{{ next }}" class="mt-3 inline-flex min-h-11 items-center font-medium text-accent-strong">{{ tr.t("profile.load_more") }}</a>{% endif %}
   {% else if tab == "history" %}
+    {% if !history_available %}<p role="status" class="rounded-xl border border-border bg-surface p-4 text-sm text-muted">{{ tr.t("profile.data_unavailable") }}</p>{% endif %}
     {% include "partials/parking_versions.html" %}
+    {% if history_available %}<p class="mt-4 text-sm text-muted">{{ tr.t("profile.loaded_total").replace("{shown}", collaboration_history.len().to_string().as_str()).replace("{total}", history_total.to_string().as_str()) }}</p>{% endif %}
+    {% if let Some(next) = history_next %}<a href="{{ next }}" class="mt-3 inline-flex min-h-11 items-center font-medium text-accent-strong">{{ tr.t("profile.load_more") }}</a>{% endif %}
   {% else %}
+  {% if !current_content_available || !gallery_available %}<p role="status" class="mb-4 rounded-xl border border-border bg-surface p-4 text-sm text-muted">{{ tr.t("profile.data_unavailable") }}</p>{% endif %}
   <div id="listing-overview" class="parking-overview grid gap-8 lg:grid-cols-[1fr_320px]" data-listing-pane="overview">
     <div>
 
       <!-- Photo gallery -->
       <section class="parking-gallery">
         {% if pending_photos > 0 %}<a href="/parking/{{ id }}?tab=approvals#pending-photos" class="mb-2 inline-flex min-h-11 items-center text-sm font-medium text-accent-strong" data-pending-field="photos">{{ tr.t("profile.photos_pending") }} · {{ pending_photos }}</a>{% endif %}
-        {% if gallery.is_empty() %}
+        {% if !gallery_available %}
+        {% else if gallery.is_empty() %}
           <div class="rounded-2xl border border-dashed border-border bg-surface px-6 py-12 text-center">
             {% if can_contribute %}
               <p class="font-display text-base font-semibold">{{ tr.t("gallery.empty_can_upload") }}</p>
@@ -122,6 +131,7 @@
           </div>
         {% endif %}
       </section>
+      {% if gallery_available %}<p class="mt-2 text-sm text-muted">{{ tr.t("profile.loaded_total").replace("{shown}", gallery.len().to_string().as_str()).replace("{total}", gallery_total.to_string().as_str()) }}</p>{% endif %}
 
 
       <!-- Add a photo: verified users only; holds for review. -->
@@ -231,7 +241,8 @@
             {% if has_own_review %}{{ tr.t("review.edit") }}{% else %}{{ tr.t("review.write") }}{% endif %}
           </a>
         {% endif %}
-        {% if reviews.is_empty() %}
+        {% if !current_content_available %}
+        {% else if reviews.is_empty() %}
           <p class="mt-2 rounded-2xl border border-dashed border-border bg-surface px-5 py-6 text-sm text-muted">{{ tr.t("details.reviews.empty") }}</p>
         {% else %}
           <ul class="mt-3 space-y-3">
@@ -248,6 +259,7 @@
                   </div>
                 </div>
                 <p class="mt-2 text-sm text-fg">{{ r.body }}</p>
+                {% if !r.media_available %}<p role="status" class="mt-3 rounded-lg border border-border bg-bg px-3 py-2 text-sm text-muted">{{ tr.t("details.review_media_unavailable") }}</p>{% endif %}
                 {% if !r.photos.is_empty() %}
                   <div class="mt-3 flex flex-wrap gap-2">
                     {% for p in r.photos %}
@@ -261,6 +273,8 @@
             {% endfor %}
           </ul>
         {% endif %}
+        {% if current_content_available %}<p class="mt-4 text-sm text-muted">{{ tr.t("profile.loaded_total").replace("{shown}", reviews.len().to_string().as_str()).replace("{total}", reviews_total.to_string().as_str()) }}</p>{% endif %}
+        {% if let Some(next) = reviews_next %}<a href="{{ next }}#parking-reviews" class="mt-3 inline-flex min-h-11 items-center font-medium text-accent-strong">{{ tr.t("profile.load_more") }}</a>{% endif %}
       </section>
     </div>
 

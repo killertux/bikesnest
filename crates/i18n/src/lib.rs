@@ -365,6 +365,18 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         ),
         "profile.history" => ("Version history", "Versões anteriores"),
         "profile.approvals" => ("Pending approvals", "Aprovações pendentes"),
+        "profile.data_unavailable" => (
+            "This community information is temporarily unavailable. Published parking details remain available.",
+            "Estas informações da comunidade estão temporariamente indisponíveis. Os dados publicados da vaga continuam disponíveis.",
+        ),
+        "profile.loaded_total" => ("Showing {shown} of {total}", "Exibindo {shown} de {total}"),
+        "profile.load_more" => ("Show more", "Mostrar mais"),
+        "details.photo_alt" => ("Photo of {name}", "Foto de {name}"),
+        "details.review_photo_alt" => ("Review photo", "Foto da avaliação"),
+        "details.review_media_unavailable" => (
+            "Review photos are temporarily unavailable.",
+            "As fotos da avaliação estão temporariamente indisponíveis.",
+        ),
         "profile.pending" => ("Change pending", "Alteração pendente"),
         "profile.edit_details" => ("Update parking details", "Atualizar informações da vaga"),
         "profile.version" => ("Version", "Versão"),

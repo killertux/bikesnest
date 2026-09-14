@@ -7,7 +7,9 @@
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
 use bikesnest_infrastructure::Db;
-use bikesnest_test_support::{ParkingBuilder, db_test, pool, test_config};
+use bikesnest_test_support::{
+    ParkingBuilder, db_test, pool, run_isolated_database_test, test_config,
+};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
@@ -825,6 +827,504 @@ async fn parking_details_renders_full_page_and_404_for_unknown(tx: &mut TestTx) 
         .unwrap();
 }
 
+#[test]
+fn detail_tabs_skip_current_reads_and_render_current_read_failures_honestly() {
+    run_isolated_database_test(|pool| async move {
+        let db = Db::from_pool(pool);
+        let mut conn = db.acquire().await.unwrap();
+        let location = ParkingBuilder::new()
+            .with_name("B11 published facts")
+            .create(&mut conn)
+            .await
+            .unwrap();
+        let reviewer = bikesnest_test_support::UserBuilder::new()
+            .with_email("b11-invalid-review@example.com")
+            .create(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO parking_revision (location_id,version,change_kind,summary,snapshot) \
+         VALUES ($1,1,'create','created','{}'::jsonb)",
+        )
+        .bind(location.id())
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        drop(conn);
+        let app = scoped_test_app(db.clone());
+        let request = |uri: String| {
+            Request::builder()
+                .uri(uri)
+                .header("Accept-Language", "en")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let mut conn = db.acquire().await.unwrap();
+        sqlx::query(
+            "ALTER TABLE parking_proposal_vote RENAME TO parking_proposal_vote_unavailable",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        drop(conn);
+        let current_without_votes = app
+            .clone()
+            .oneshot(request(format!("/parking/{}", location.id())))
+            .await
+            .unwrap();
+        let current_without_votes = String::from_utf8_lossy(
+            &current_without_votes
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
+        )
+        .to_string();
+        assert!(
+            !current_without_votes.contains("temporarily unavailable"),
+            "current tab must not fetch detailed proposals"
+        );
+        let approvals = app
+            .clone()
+            .oneshot(request(format!("/parking/{}?tab=approvals", location.id())))
+            .await
+            .unwrap();
+        let approvals =
+            String::from_utf8_lossy(&approvals.into_body().collect().await.unwrap().to_bytes())
+                .to_string();
+        assert!(approvals.contains("temporarily unavailable"));
+        let mut conn = db.acquire().await.unwrap();
+        sqlx::query(
+            "ALTER TABLE parking_proposal_vote_unavailable RENAME TO parking_proposal_vote",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::query("ALTER TABLE review DROP CONSTRAINT review_rating_check")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO review (location_id,author_id,rating,body) VALUES ($1,$2,9,'broken')",
+        )
+        .bind(location.id())
+        .bind(reviewer.id.0)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        drop(conn);
+
+        let history = app
+            .clone()
+            .oneshot(request(format!(
+                "/parking/{}?tab=history&limit=1",
+                location.id()
+            )))
+            .await
+            .unwrap();
+        assert_eq!(history.status(), StatusCode::OK);
+        let history_body =
+            String::from_utf8_lossy(&history.into_body().collect().await.unwrap().to_bytes())
+                .to_string();
+        assert!(history_body.contains("B11 published facts"));
+        assert!(
+            !history_body.contains("temporarily unavailable"),
+            "history must not touch reviews"
+        );
+        assert!(history_body.contains("Showing 1 of 1"));
+        assert!(!history_body.contains("parking-gallery"));
+
+        let current = app
+            .oneshot(request(format!("/parking/{}", location.id())))
+            .await
+            .unwrap();
+        assert_eq!(current.status(), StatusCode::OK);
+        let current_body =
+            String::from_utf8_lossy(&current.into_body().collect().await.unwrap().to_bytes())
+                .to_string();
+        assert!(current_body.contains("B11 published facts"));
+        assert!(current_body.contains("temporarily unavailable"));
+        assert!(
+            !current_body.contains("No reviews yet — reviews arrive with community accounts."),
+            "a failed review read is not an empty review set"
+        );
+        eprintln!(
+            "B11 actual isolated HTTP bytes: history={}, current-degraded={}",
+            history_body.len(),
+            current_body.len()
+        );
+    });
+}
+
+struct CountingDetailReads {
+    calls: std::sync::Arc<std::sync::Mutex<[usize; 6]>>,
+}
+
+#[async_trait::async_trait]
+impl bikesnest_web::state::DetailReads for CountingDetailReads {
+    async fn photos_page(
+        &self,
+        _id: i64,
+        _limit: i64,
+    ) -> Result<(Vec<bikesnest_application::StoredPhoto>, i64), bikesnest_application::ReaderError>
+    {
+        self.calls.lock().unwrap()[0] += 1;
+        Ok((
+            vec![bikesnest_application::StoredPhoto {
+                key: "b11/photo.jpg".into(),
+                thumbnail_key: None,
+                content_type: "image/jpeg".into(),
+                alt: None,
+            }],
+            1,
+        ))
+    }
+    async fn pending_photos(&self, _id: i64) -> Result<i64, bikesnest_application::ReaderError> {
+        self.calls.lock().unwrap()[1] += 1;
+        Ok(0)
+    }
+    async fn community(
+        &self,
+        _location: bikesnest_domain::ParkingLocation,
+        _viewer: Option<bikesnest_domain::UserId>,
+        _after: Option<i64>,
+        _limit: i64,
+    ) -> Result<
+        bikesnest_application::CommunityParkingDetails,
+        bikesnest_application::ContributionError,
+    > {
+        self.calls.lock().unwrap()[2] += 1;
+        Err(bikesnest_application::ContributionError::Unavailable)
+    }
+    async fn summary(
+        &self,
+        _id: i64,
+    ) -> Result<
+        bikesnest_application::PendingProposalSummary,
+        bikesnest_application::ContributionError,
+    > {
+        self.calls.lock().unwrap()[3] += 1;
+        Ok(bikesnest_application::PendingProposalSummary {
+            total: 0,
+            fields: vec![],
+        })
+    }
+    async fn proposals(
+        &self,
+        _id: i64,
+        _after: Option<i64>,
+        _limit: i64,
+    ) -> Result<
+        (Vec<bikesnest_application::ListingProposal>, i64, bool),
+        bikesnest_application::ContributionError,
+    > {
+        self.calls.lock().unwrap()[4] += 1;
+        Ok((vec![], 0, false))
+    }
+    async fn history(
+        &self,
+        _id: i64,
+        _after: Option<i64>,
+        _limit: i64,
+    ) -> Result<
+        (Vec<bikesnest_domain::RevisionSummary>, i64, bool),
+        bikesnest_application::ContributionError,
+    > {
+        self.calls.lock().unwrap()[5] += 1;
+        Ok((vec![], 0, false))
+    }
+}
+
+struct MediaDetailReads;
+
+#[async_trait::async_trait]
+impl bikesnest_web::state::DetailReads for MediaDetailReads {
+    async fn photos_page(
+        &self,
+        _id: i64,
+        _limit: i64,
+    ) -> Result<(Vec<bikesnest_application::StoredPhoto>, i64), bikesnest_application::ReaderError>
+    {
+        Ok((
+            vec![bikesnest_application::StoredPhoto {
+                key: "b11/gallery-primary.jpg".into(),
+                thumbnail_key: Some("b11/gallery-thumb.jpg".into()),
+                content_type: "image/jpeg".into(),
+                alt: None,
+            }],
+            1,
+        ))
+    }
+    async fn pending_photos(&self, _id: i64) -> Result<i64, bikesnest_application::ReaderError> {
+        Ok(0)
+    }
+    async fn community(
+        &self,
+        location: bikesnest_domain::ParkingLocation,
+        _viewer: Option<bikesnest_domain::UserId>,
+        _after: Option<i64>,
+        _limit: i64,
+    ) -> Result<
+        bikesnest_application::CommunityParkingDetails,
+        bikesnest_application::ContributionError,
+    > {
+        let review = bikesnest_application::Review {
+            id: 71,
+            location_id: location.id(),
+            author: None,
+            public_author_name: None,
+            rating: bikesnest_domain::StarRating::new(5).unwrap(),
+            body: bikesnest_domain::ReviewBody::new("Approved review remains visible").unwrap(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let mut review_photos = std::collections::HashMap::new();
+        review_photos.insert(
+            review.id,
+            vec![bikesnest_application::StoredPhoto {
+                key: "b11/review-primary.jpg".into(),
+                thumbnail_key: Some("b11/review-thumb.jpg".into()),
+                content_type: "image/jpeg".into(),
+                alt: None,
+            }],
+        );
+        Ok(bikesnest_application::CommunityParkingDetails {
+            location,
+            reviews: vec![review],
+            reviews_has_more: false,
+            review_photos,
+            confidence: bikesnest_domain::Confidence::Reported,
+            disputed: false,
+            attribute_summary: vec![],
+            parked_here_count: 0,
+            is_favorited: false,
+            own_review: None,
+            own_verification: None,
+            reasons: vec![],
+        })
+    }
+    async fn summary(
+        &self,
+        _id: i64,
+    ) -> Result<
+        bikesnest_application::PendingProposalSummary,
+        bikesnest_application::ContributionError,
+    > {
+        Ok(bikesnest_application::PendingProposalSummary {
+            total: 0,
+            fields: vec![],
+        })
+    }
+    async fn proposals(
+        &self,
+        _id: i64,
+        _after: Option<i64>,
+        _limit: i64,
+    ) -> Result<
+        (Vec<bikesnest_application::ListingProposal>, i64, bool),
+        bikesnest_application::ContributionError,
+    > {
+        Ok((vec![], 0, false))
+    }
+    async fn history(
+        &self,
+        _id: i64,
+        _after: Option<i64>,
+        _limit: i64,
+    ) -> Result<
+        (Vec<bikesnest_domain::RevisionSummary>, i64, bool),
+        bikesnest_application::ContributionError,
+    > {
+        Ok((vec![], 0, false))
+    }
+}
+
+struct CountingStorage {
+    inner: bikesnest_test_support::TestObjectStorage,
+    signs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    fail_key: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl bikesnest_application::ObjectStorage for CountingStorage {
+    async fn put(
+        &self,
+        req: bikesnest_application::PutObject<'_>,
+    ) -> Result<String, bikesnest_application::StorageError> {
+        self.inner.put(req).await
+    }
+    async fn presigned_get(
+        &self,
+        key: &str,
+        ttl: std::time::Duration,
+    ) -> Result<String, bikesnest_application::StorageError> {
+        self.signs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_key.as_deref() == Some(key) {
+            return Err(bikesnest_application::StorageError::Unexpected(
+                "B11_SECRET_PROVIDER_MARKER".into(),
+            ));
+        }
+        self.inner.presigned_get(key, ttl).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), bikesnest_application::StorageError> {
+        self.inner.delete(key).await
+    }
+    async fn exists(&self, key: &str) -> Result<bool, bikesnest_application::StorageError> {
+        self.inner.exists(key).await
+    }
+    async fn list(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+    ) -> Result<bikesnest_application::ObjectPage, bikesnest_application::StorageError> {
+        self.inner.list(prefix, after).await
+    }
+}
+
+#[test]
+fn detail_tabs_count_actual_reader_calls_through_the_router() {
+    run_isolated_database_test(|pool| async move {
+        let db = Db::from_pool(pool);
+        let mut conn = db.acquire().await.unwrap();
+        let location = ParkingBuilder::new()
+            .with_name("B11 counted fixture")
+            .create(&mut conn)
+            .await
+            .unwrap();
+        drop(conn);
+        let calls = std::sync::Arc::new(std::sync::Mutex::new([0; 6]));
+        let signs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let deps = RouterDeps {
+            email: std::sync::Arc::new(FakeEmailProvider::with_root(None)),
+            oauth: None,
+            hasher: TestPasswordHasher,
+            rate_limiter: Box::new(bikesnest_infrastructure::InMemoryRateLimiter::new()),
+            storage: std::sync::Arc::new(CountingStorage {
+                inner: bikesnest_test_support::TestObjectStorage::new(),
+                signs: signs.clone(),
+                fail_key: None,
+            }),
+            detail_reads: Some(std::sync::Arc::new(CountingDetailReads {
+                calls: calls.clone(),
+            })),
+        };
+        let app = app_router_with(std::sync::Arc::new(test_config()), db, deps);
+        for (query, expected, expected_signs) in [
+            ("", [1, 1, 1, 1, 0, 0], 1),
+            ("?tab=approvals", [0, 1, 0, 1, 1, 0], 0),
+            ("?tab=history", [0, 1, 0, 1, 0, 1], 0),
+        ] {
+            *calls.lock().unwrap() = [0; 6];
+            signs.store(0, std::sync::atomic::Ordering::SeqCst);
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/parking/{}{query}", location.id()))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(*calls.lock().unwrap(), expected);
+            assert_eq!(
+                signs.load(std::sync::atomic::Ordering::SeqCst),
+                expected_signs
+            );
+        }
+    });
+}
+
+#[test]
+fn detail_media_signing_failures_are_honest_and_thumbnail_fallbacks_remain_usable() {
+    run_isolated_database_test(|pool| async move {
+        let db = Db::from_pool(pool);
+        let mut conn = db.acquire().await.unwrap();
+        let location = ParkingBuilder::new()
+            .with_name("B11 media facts remain")
+            .create(&mut conn)
+            .await
+            .unwrap();
+        drop(conn);
+
+        for (fail_key, language, unavailable, absent) in [
+            (
+                "b11/gallery-primary.jpg",
+                "en",
+                "temporarily unavailable",
+                "",
+            ),
+            ("b11/gallery-thumb.jpg", "en", "", "temporarily unavailable"),
+            (
+                "b11/review-primary.jpg",
+                "en",
+                "Review photos are temporarily unavailable.",
+                "",
+            ),
+            (
+                "b11/review-thumb.jpg",
+                "en",
+                "",
+                "Review photos are temporarily unavailable.",
+            ),
+            (
+                "b11/review-primary.jpg",
+                "pt-BR",
+                "As fotos da avaliação estão temporariamente indisponíveis.",
+                "",
+            ),
+        ] {
+            let deps = RouterDeps {
+                email: std::sync::Arc::new(FakeEmailProvider::with_root(None)),
+                oauth: None,
+                hasher: TestPasswordHasher,
+                rate_limiter: Box::new(bikesnest_infrastructure::InMemoryRateLimiter::new()),
+                storage: std::sync::Arc::new(CountingStorage {
+                    inner: bikesnest_test_support::TestObjectStorage::new(),
+                    signs: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    fail_key: Some(fail_key.into()),
+                }),
+                detail_reads: Some(std::sync::Arc::new(MediaDetailReads)),
+            };
+            let response = app_router_with(std::sync::Arc::new(test_config()), db.clone(), deps)
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/parking/{}", location.id()))
+                        .header("Accept-Language", language)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body =
+                String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+                    .to_string();
+            assert!(body.contains("B11 media facts remain"));
+            assert!(body.contains("Approved review remains visible"));
+            if !unavailable.is_empty() {
+                assert!(body.contains(unavailable), "failure={fail_key}");
+            }
+            if !absent.is_empty() {
+                assert!(!body.contains(absent), "failure={fail_key}");
+            }
+            assert!(!body.contains("B11_SECRET_PROVIDER_MARKER"));
+            assert!(!body.contains(fail_key));
+            if fail_key.ends_with("thumb.jpg") {
+                let primary = if fail_key.contains("gallery") {
+                    "gallery-primary.jpg"
+                } else {
+                    "review-primary.jpg"
+                };
+                assert!(body.matches(primary).count() >= 2, "failure={fail_key}");
+            }
+        }
+    });
+}
+
 #[db_test]
 async fn never_verified_location_shows_the_freshness_label_once(tx: &mut TestTx) {
     // Problem #4 regression: a never-verified location's freshness card must
@@ -902,6 +1402,7 @@ async fn scoped_auth_app(tx: &mut bikesnest_test_support::TestTx) -> axum::Route
         hasher: TestPasswordHasher,
         rate_limiter: Box::new(bikesnest_infrastructure::InMemoryRateLimiter::new()),
         storage: std::sync::Arc::new(bikesnest_test_support::TestObjectStorage::new()),
+        detail_reads: None,
     };
     app_router_with(std::sync::Arc::new(test_config()), tx.db().await, deps)
 }
@@ -946,6 +1447,7 @@ async fn auth_app_opts(google_oauth_enabled: bool) -> (axum::Router, FakeEmailPr
         hasher: TestPasswordHasher,
         rate_limiter: Box::new(bikesnest_infrastructure::InMemoryRateLimiter::new()),
         storage: std::sync::Arc::new(bikesnest_test_support::TestObjectStorage::new()),
+        detail_reads: None,
     };
     let app = app_router_with(std::sync::Arc::new(config), db, deps);
     (app, email)
@@ -973,6 +1475,7 @@ async fn auth_app_with_storage() -> (
         hasher: TestPasswordHasher,
         rate_limiter: Box::new(bikesnest_infrastructure::InMemoryRateLimiter::new()),
         storage: storage.clone(),
+        detail_reads: None,
     };
     let app = app_router_with(std::sync::Arc::new(config), db, deps);
     (app, email, storage)
@@ -2400,6 +2903,7 @@ async fn scoped_edit_app(
         hasher: TestPasswordHasher,
         rate_limiter: Box::new(bikesnest_infrastructure::InMemoryRateLimiter::new()),
         storage: std::sync::Arc::new(bikesnest_test_support::TestObjectStorage::new()),
+        detail_reads: None,
     };
     let app = app_router_with(std::sync::Arc::new(test_config()), db.clone(), deps);
     (db, app, format!("session_id={}", raw.to_hex()))
@@ -4523,6 +5027,7 @@ async fn a_trusted_proxys_forwarded_for_does_key_the_bucket(_tx: &mut TestTx) {
             hasher: TestPasswordHasher,
             rate_limiter: Box::new(bikesnest_infrastructure::InMemoryRateLimiter::new()),
             storage: std::sync::Arc::new(bikesnest_test_support::TestObjectStorage::new()),
+            detail_reads: None,
         },
     );
 
@@ -7223,6 +7728,7 @@ async fn with_the_worker_enabled_registration_queues_the_email(_tx: &mut TestTx)
             hasher: TestPasswordHasher,
             rate_limiter: Box::new(bikesnest_infrastructure::InMemoryRateLimiter::new()),
             storage: std::sync::Arc::new(bikesnest_test_support::TestObjectStorage::new()),
+            detail_reads: None,
         },
     );
     cleanup_user(EMAIL).await;
@@ -7305,6 +7811,7 @@ async fn auth_app_with_geocode_budget(per_ip: u32) -> (axum::Router, FakeEmailPr
         hasher: TestPasswordHasher,
         rate_limiter: Box::new(bikesnest_infrastructure::InMemoryRateLimiter::new()),
         storage: std::sync::Arc::new(bikesnest_test_support::TestObjectStorage::new()),
+        detail_reads: None,
     };
     (
         app_router_with(

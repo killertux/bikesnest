@@ -654,7 +654,7 @@ pub fn mask_email(email: &str) -> String {
 // Community view models
 // ---------------------------------------------------------------------------
 
-/// One rendered review (D3 / P3). `photos` are the review's APPROVED photos
+/// One rendered review. `photos` are the review's APPROVED photos
 /// already resolved to presigned URLs for the card's thumbnails.
 #[derive(Debug, Clone)]
 pub struct ReviewVm {
@@ -666,6 +666,9 @@ pub struct ReviewVm {
     pub author_label: String,
     pub is_own: bool,
     pub photos: Vec<PhotoVm>,
+    /// False only when approved review media exists but its primary URL could
+    /// not be signed. Review text remains independently available.
+    pub media_available: bool,
 }
 
 pub fn review_vm(
@@ -688,6 +691,7 @@ pub fn review_vm(
             .unwrap_or_else(|| t.t("collab.anonymous").to_string()),
         is_own,
         photos,
+        media_available: true,
     }
 }
 

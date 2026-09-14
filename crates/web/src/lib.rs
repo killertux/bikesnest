@@ -463,6 +463,21 @@ pub struct DetailsPage {
     pub version: i64,
     pub tab: String,
     pub pending_photos: i64,
+    pub pending_proposals_total: i64,
+    pub proposals_total: i64,
+    pub history_total: i64,
+    pub reviews_total: i64,
+    pub gallery_total: i64,
+    pub reviews_next: Option<String>,
+    pub reviews_has_more: bool,
+    pub proposals_next: Option<String>,
+    pub history_next: Option<String>,
+    pub collaboration_summary_available: bool,
+    pub current_content_available: bool,
+    pub gallery_available: bool,
+    pub proposals_available: bool,
+    pub history_available: bool,
+    pub pending_fields: Vec<(String, i64)>,
     pub published_values: Vec<profile::ProfileValueVm>,
     pub viewer_id: Option<bikesnest_domain::UserId>,
 }
@@ -568,6 +583,21 @@ impl DetailsPage {
             version: loc.version(),
             tab: "current".into(),
             pending_photos: 0,
+            pending_proposals_total: 0,
+            proposals_total: 0,
+            history_total: 0,
+            reviews_total: loc.rating().count(),
+            gallery_total: 0,
+            reviews_next: None,
+            reviews_has_more: false,
+            proposals_next: None,
+            history_next: None,
+            collaboration_summary_available: true,
+            current_content_available: true,
+            gallery_available: true,
+            proposals_available: true,
+            history_available: true,
+            pending_fields: Vec::new(),
             published_values: {
                 let mut snapshot = bikesnest_domain::ParkingEdit::from_location(loc).to_json();
                 snapshot["point"] = serde_json::json!({"lat":lat,"lon":lon});
@@ -597,9 +627,16 @@ impl DetailsPage {
         let mut reviews = Vec::with_capacity(c.reviews.len());
         for r in &c.reviews {
             let mut photos = Vec::new();
+            let mut media_available = true;
             if let Some(ps) = c.review_photos.get(&r.id) {
                 for p in ps {
                     let Some(url) = view::resolve_photo(storage, Some(&p.key)).await else {
+                        media_available = false;
+                        tracing::warn!(
+                            category = "review_media_signing_unavailable",
+                            location_id = page.id,
+                            review_id = r.id
+                        );
                         continue;
                     };
                     let thumb_url = match p.thumbnail_key.as_deref() {
@@ -611,13 +648,19 @@ impl DetailsPage {
                     photos.push(PhotoVm {
                         url,
                         thumb_url,
-                        alt: p.alt.clone().unwrap_or_else(|| "Review photo".to_string()),
+                        alt: p
+                            .alt
+                            .clone()
+                            .unwrap_or_else(|| tr.t("details.review_photo_alt").to_string()),
                     });
                 }
             }
-            reviews.push(view::review_vm(tr, r, false, photos));
+            let mut review = view::review_vm(tr, r, false, photos);
+            review.media_available = media_available;
+            reviews.push(review);
         }
         page.reviews = reviews;
+        page.reviews_has_more = c.reviews_has_more;
         page.confidence_code = c.confidence.as_code();
         page.confidence_label = view::confidence_label(tr, c.confidence).to_string();
         page.disputed = c.disputed;

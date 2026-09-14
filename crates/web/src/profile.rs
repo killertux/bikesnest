@@ -1,6 +1,6 @@
 //! Parking versions, proposal diffs, and field-level pending-change cues.
 use crate::{DetailsPage, i18n::Translator, view};
-use bikesnest_application::ListingProposal;
+use bikesnest_application::{ListingProposal, PendingProposalSummary};
 use bikesnest_domain::{
     ParkingEdit, ProposalKind, ProposalStatus, ProposedChange, RevisionSummary, SecurityState,
 };
@@ -145,6 +145,15 @@ pub fn snapshot_values(snapshot: &serde_json::Value, tr: Translator) -> Vec<Prof
 }
 
 impl DetailsPage {
+    pub fn pending_summary(mut self, summary: PendingProposalSummary) -> Self {
+        self.pending_proposals_total = summary.total;
+        self.pending_fields = summary
+            .fields
+            .into_iter()
+            .map(|cue| (cue.field, cue.proposal_id))
+            .collect();
+        self
+    }
     pub fn collaboration_proposals(mut self, proposals: Vec<ListingProposal>) -> Self {
         self.collaboration_proposals = proposals
             .iter()
@@ -249,19 +258,22 @@ impl DetailsPage {
         self
     }
     pub fn has_pending(&self, key: &str) -> bool {
-        self.collaboration_proposals
-            .iter()
-            .any(|p| !p.stale && p.changes.iter().any(|c| c.key == key))
+        self.pending_fields.iter().any(|(field, _)| field == key)
     }
     pub fn pending_count(&self) -> i64 {
-        self.collaboration_proposals.len() as i64 + self.pending_photos
+        self.pending_proposals_total + self.pending_photos
     }
     pub fn pending_url(&self, key: &str) -> String {
         let anchor = self
-            .collaboration_proposals
+            .pending_fields
             .iter()
-            .find(|p| !p.stale && p.changes.iter().any(|c| c.key == key))
-            .map(|p| format!("#proposal-{}", p.id))
+            .find(|(field, _)| field == key)
+            .and_then(|(_, id)| {
+                self.collaboration_proposals
+                    .iter()
+                    .any(|p| p.id == *id)
+                    .then(|| format!("#proposal-{id}"))
+            })
             .unwrap_or_default();
         format!("/parking/{}?tab=approvals{anchor}", self.id)
     }

@@ -41,6 +41,7 @@ fn csrf_lifecycle_in_real_browser() {
                 hasher: TestPasswordHasher,
                 rate_limiter: Box::new(InMemoryRateLimiter::new()),
                 storage: Arc::new(TestObjectStorage::new()),
+                detail_reads: None,
             },
         );
         let _server = TestServer(tokio::spawn(async move {

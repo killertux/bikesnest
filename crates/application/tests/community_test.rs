@@ -9,8 +9,8 @@ use bikesnest_application::{
     AddParkingLocationOutcome, AttributeSummary, AuthenticatedUser, Clock, ContributionDeps,
     ContributionError, ContributionHistoryReader, ContributionItem, ContributionService,
     DuplicateCandidate, FavoriteRepository, NewParkingLocation, NewVerification,
-    ParkingContributionRepository, ParkingEdit, Review, ReviewRepository, TimezoneError,
-    TimezoneResolver, VerificationRepository,
+    ParkingContributionRepository, ParkingEdit, PendingProposalSummary, Review, ReviewRepository,
+    TimezoneError, TimezoneResolver, VerificationRepository,
 };
 use bikesnest_domain::{
     AccountState, Confidence, Cost, ExistenceResult, ExistenceSignal, GeoPoint, ModerationState,
@@ -18,7 +18,7 @@ use bikesnest_domain::{
     StarRating, UserId,
 };
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 fn tz() -> chrono_tz::Tz {
@@ -124,6 +124,7 @@ struct FakeContributionRepo {
     versions: Mutex<HashMap<i64, i64>>,
     states: Mutex<HashMap<i64, ModerationState>>,
     dupes: Mutex<Vec<DuplicateCandidate>>,
+    detail_reads: Arc<Mutex<[usize; 3]>>,
 }
 impl FakeContributionRepo {
     fn new(dupes: Vec<DuplicateCandidate>) -> Self {
@@ -132,7 +133,12 @@ impl FakeContributionRepo {
             versions: Mutex::new(HashMap::new()),
             states: Mutex::new(HashMap::new()),
             dupes: Mutex::new(dupes),
+            detail_reads: Arc::new(Mutex::new([0; 3])),
         }
+    }
+
+    fn detail_reads(&self) -> Arc<Mutex<[usize; 3]>> {
+        self.detail_reads.clone()
     }
 
     /// Registers an existing location at `version` in `state`.
@@ -195,6 +201,34 @@ impl ParkingContributionRepository for FakeContributionRepo {
         _limit: i64,
     ) -> Result<Vec<bikesnest_domain::RevisionSummary>, ContributionError> {
         Ok(vec![])
+    }
+    async fn pending_proposal_summary(
+        &self,
+        _id: i64,
+    ) -> Result<PendingProposalSummary, ContributionError> {
+        self.detail_reads.lock().unwrap()[0] += 1;
+        Ok(PendingProposalSummary {
+            total: 0,
+            fields: vec![],
+        })
+    }
+    async fn listing_proposals_page(
+        &self,
+        _id: i64,
+        _after: Option<i64>,
+        _limit: i64,
+    ) -> Result<(Vec<bikesnest_application::ListingProposal>, i64, bool), ContributionError> {
+        self.detail_reads.lock().unwrap()[1] += 1;
+        Ok((vec![], 0, false))
+    }
+    async fn revision_history_page(
+        &self,
+        _id: i64,
+        _after: Option<i64>,
+        _limit: i64,
+    ) -> Result<(Vec<bikesnest_domain::RevisionSummary>, i64, bool), ContributionError> {
+        self.detail_reads.lock().unwrap()[2] += 1;
+        Ok((vec![], 0, false))
     }
     async fn duplicate_candidates(
         &self,
@@ -765,6 +799,42 @@ async fn community_details_batches_review_photos_in_one_call() {
         *calls.0.lock().unwrap(),
         1,
         "for_reviews must be called exactly once regardless of review count"
+    );
+}
+
+/// Work-count comparison for the B11 orchestration boundary. The eager count
+/// models the former handler loading both collaboration collections for every
+/// tab; the selected count is the current-tab dependency set used now.
+#[tokio::test]
+async fn selected_detail_reads_avoid_eager_proposal_and_history_collections() {
+    let repo = FakeContributionRepo::new(vec![]);
+    let counts = repo.detail_reads();
+    let svc = service(
+        Box::new(repo),
+        FakeReviewRepo::new(),
+        FakeVerificationRepo::new(),
+        FakeFavoriteRepo { favorited: false },
+    );
+    let location = location_at(1, 1).unwrap();
+
+    svc.pending_proposal_summary(1).await.unwrap();
+    svc.community_details_page(location, None, None, 20)
+        .await
+        .unwrap();
+    assert_eq!(
+        *counts.lock().unwrap(),
+        [1, 0, 0],
+        "current selected-tab work reads compact metadata but neither detailed collection"
+    );
+
+    *counts.lock().unwrap() = [0; 3];
+    svc.pending_proposal_summary(1).await.unwrap();
+    svc.listing_proposals_page(1, None, 20).await.unwrap();
+    svc.revision_history_page(1, None, 20).await.unwrap();
+    assert_eq!(
+        *counts.lock().unwrap(),
+        [1, 1, 1],
+        "simulated former eager orchestration reads both detailed collections"
     );
 }
 

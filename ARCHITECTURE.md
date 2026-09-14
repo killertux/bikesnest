@@ -203,7 +203,13 @@ catalogs; `security.rs` the headers/CSP; `observability.rs` the JSON structured
 logging; `markdown.rs` the sanitizing renderer for the legal pages.
 
 The parking profile has server-rendered Current version, Version history, and
-Pending approvals tabs. `web::profile` builds localized field diffs and saved
+Pending approvals tabs. Its `DetailReads` facade delegates to existing
+application ports but keeps route orchestration injectable: every tab reads a
+compact pending-field/photo summary, Current alone reads the bounded gallery
+and community/review page, Version history alone reads paged snapshots, and
+Pending approvals alone reads full proposal diffs. Page totals are independent
+of the loaded page size; a failed collaboration read renders an unavailable
+state while the published parking facts remain readable. `web::profile` builds localized field diffs and saved
 revision values. Field-level pending links lead to the relevant proposal;
 unapproved values never replace published facts. `listing_collaboration.html`
 renders proposal diffs and voting, while `parking_versions.html` renders saved

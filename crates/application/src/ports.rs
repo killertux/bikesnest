@@ -553,6 +553,12 @@ pub struct StoredPhoto {
 #[async_trait]
 pub trait ParkingPhotoReader: Send + Sync {
     async fn photos(&self, location_id: i64) -> Result<Vec<StoredPhoto>, ReaderError>;
+    /// Bounded gallery page plus the authoritative approved-photo total.
+    async fn photos_page(
+        &self,
+        location_id: i64,
+        limit: i64,
+    ) -> Result<(Vec<StoredPhoto>, i64), ReaderError>;
     /// Public-safe count only; pending images and uploader identities stay private.
     async fn pending_count(&self, _location_id: i64) -> Result<i64, ReaderError> {
         Ok(0)

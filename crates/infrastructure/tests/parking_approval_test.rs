@@ -129,6 +129,27 @@ async fn sixth_distinct_eligible_vote_publishes_all_fields_and_one_version(tx: &
     };
     let id = repo.create_proposal(&input).await.unwrap();
     let sibling = repo.create_proposal(&input).await.unwrap();
+    let summary = repo.pending_proposal_summary(location.id()).await.unwrap();
+    assert_eq!(summary.total, 2);
+    assert!(
+        summary.fields.iter().any(|cue| cue.field == "name"),
+        "summary={summary:?}"
+    );
+    assert!(
+        summary.fields.len() <= bikesnest_domain::SECURITY_FEATURE_CODES.len() + 9,
+        "summary output is bounded by public fields, not proposal count"
+    );
+    let (first, total, has_more) = repo
+        .listing_proposals_page(location.id(), None, 1)
+        .await
+        .unwrap();
+    assert_eq!((first.len(), total, has_more), (1, 2, true));
+    let (second, total, has_more) = repo
+        .listing_proposals_page(location.id(), Some(first[0].id), 1)
+        .await
+        .unwrap();
+    assert_eq!((second.len(), total, has_more), (1, 2, false));
+    assert!(second[0].id < first[0].id);
     assert!(matches!(
         repo.vote_on_proposal(id, proposer, ProposalVote::Approve)
             .await,
@@ -185,6 +206,22 @@ async fn sixth_distinct_eligible_vote_publishes_all_fields_and_one_version(tx: &
             .to_json(),
         edit.to_json()
     );
+    let mut follow_up = edit.clone();
+    follow_up.description = Some("A later revision".into());
+    repo.apply_edit(location.id(), 2, &follow_up, proposer, chrono::Utc::now())
+        .await
+        .unwrap();
+    let (newest, total, has_more) = repo
+        .revision_history_page(location.id(), None, 1)
+        .await
+        .unwrap();
+    assert_eq!((newest.len(), total, has_more), (1, 2, true));
+    let (older, total, has_more) = repo
+        .revision_history_page(location.id(), Some(newest[0].version), 1)
+        .await
+        .unwrap();
+    assert_eq!((older.len(), total, has_more), (1, 2, false));
+    assert!(older[0].version < newest[0].version);
     assert!(
         repo.vote_on_proposal(id, voters[5], ProposalVote::Approve)
             .await

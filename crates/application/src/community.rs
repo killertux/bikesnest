@@ -167,6 +167,18 @@ pub struct ListingProposal {
     pub proposer_id: Option<UserId>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingFieldCue {
+    pub field: String,
+    pub proposal_id: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingProposalSummary {
+    pub total: i64,
+    pub fields: Vec<PendingFieldCue>,
+}
+
 /// An advisory duplicate candidate. Non-blocking; ranked by
 /// name-similarity + address overlap.
 #[derive(Debug, Clone)]
@@ -283,6 +295,7 @@ pub struct ContributionItem {
 pub struct CommunityParkingDetails {
     pub location: ParkingLocation,
     pub reviews: Vec<Review>,
+    pub reviews_has_more: bool,
     /// Approved review photos, keyed by review id — only APPROVED render.
     pub review_photos: std::collections::HashMap<i64, Vec<StoredPhoto>>,
     pub confidence: Confidence,
@@ -357,6 +370,16 @@ pub trait ParkingContributionRepository: Send + Sync {
     ) -> Result<Vec<ListingProposal>, ContributionError> {
         Ok(Vec::new())
     }
+    async fn pending_proposal_summary(
+        &self,
+        location_id: i64,
+    ) -> Result<PendingProposalSummary, ContributionError>;
+    async fn listing_proposals_page(
+        &self,
+        location_id: i64,
+        after_id: Option<i64>,
+        limit: i64,
+    ) -> Result<(Vec<ListingProposal>, i64, bool), ContributionError>;
     /// Newest `limit` revisions (`version DESC`) — bounded, not the full
     /// history (a location edited often would otherwise return every version).
     async fn revision_history(
@@ -364,6 +387,12 @@ pub trait ParkingContributionRepository: Send + Sync {
         id: i64,
         limit: i64,
     ) -> Result<Vec<RevisionSummary>, ContributionError>;
+    async fn revision_history_page(
+        &self,
+        id: i64,
+        after_version: Option<i64>,
+        limit: i64,
+    ) -> Result<(Vec<RevisionSummary>, i64, bool), ContributionError>;
     async fn duplicate_candidates(
         &self,
         point: GeoPoint,
@@ -878,6 +907,28 @@ impl ContributionService {
             .await
     }
 
+    pub async fn pending_proposal_summary(
+        &self,
+        location_id: i64,
+    ) -> Result<PendingProposalSummary, ContributionError> {
+        self.deps
+            .contributions
+            .pending_proposal_summary(location_id)
+            .await
+    }
+
+    pub async fn listing_proposals_page(
+        &self,
+        location_id: i64,
+        after_id: Option<i64>,
+        limit: i64,
+    ) -> Result<(Vec<ListingProposal>, i64, bool), ContributionError> {
+        self.deps
+            .contributions
+            .listing_proposals_page(location_id, after_id, limit)
+            .await
+    }
+
     pub async fn revision_history(
         &self,
         location_id: i64,
@@ -885,6 +936,18 @@ impl ContributionService {
         self.deps
             .contributions
             .revision_history(location_id, 50)
+            .await
+    }
+
+    pub async fn revision_history_page(
+        &self,
+        location_id: i64,
+        after_version: Option<i64>,
+        limit: i64,
+    ) -> Result<(Vec<RevisionSummary>, i64, bool), ContributionError> {
+        self.deps
+            .contributions
+            .revision_history_page(location_id, after_version, limit)
             .await
     }
 
@@ -1026,6 +1089,17 @@ impl ContributionService {
         location: ParkingLocation,
         viewer: Option<UserId>,
     ) -> Result<CommunityParkingDetails, ContributionError> {
+        self.community_details_page(location, viewer, None, DETAILS_REVIEW_LIMIT)
+            .await
+    }
+
+    pub async fn community_details_page(
+        &self,
+        location: ParkingLocation,
+        viewer: Option<UserId>,
+        reviews_after: Option<i64>,
+        reviews_limit: i64,
+    ) -> Result<CommunityParkingDetails, ContributionError> {
         let id = location.id();
         let now = self.now();
 
@@ -1033,11 +1107,14 @@ impl ContributionService {
         // inline with no "load more" control (a
         // dedicated paginated reviews view is a separate feature, not a
         // performance fix). `list_active`'s keyset API still supports one.
-        let reviews = self
+        let page_limit = reviews_limit.clamp(1, 50);
+        let mut reviews = self
             .deps
             .reviews
-            .list_active(id, None, DETAILS_REVIEW_LIMIT)
+            .list_active(id, reviews_after, page_limit + 1)
             .await?;
+        let reviews_has_more = reviews.len() as i64 > page_limit;
+        reviews.truncate(page_limit as usize);
         let review_ids: Vec<i64> = reviews.iter().map(|r| r.id).collect();
         let review_photos = self.deps.review_photos.for_reviews(&review_ids).await?;
         let signals = self
@@ -1070,7 +1147,7 @@ impl ContributionService {
 
         // Recommendation explanation from a summary with no origin (distance
         // factor omitted). Page with origin rendering is favorites/search territory.
-        let summary = summary_of(&location, &reviews);
+        let summary = summary_of(&location);
         let reasons = recommendation_reasons(
             &summary,
             crate::ports::DEFAULT_RADIUS_M,
@@ -1082,6 +1159,7 @@ impl ContributionService {
         Ok(CommunityParkingDetails {
             location,
             reviews,
+            reviews_has_more,
             review_photos,
             confidence,
             disputed,
@@ -1139,22 +1217,7 @@ fn signal_kind_code(signal: &NewVerification) -> &'static str {
     }
 }
 
-fn summary_of(location: &ParkingLocation, reviews: &[Review]) -> crate::ports::ParkingSummary {
-    let rating = bikesnest_domain::Rating::new(
-        if reviews.is_empty() {
-            None
-        } else {
-            Some(
-                reviews
-                    .iter()
-                    .map(|r| f64::from(r.rating.value()))
-                    .sum::<f64>()
-                    / reviews.len() as f64,
-            )
-        },
-        reviews.len() as i64,
-    )
-    .unwrap_or_else(|_| bikesnest_domain::Rating::new(None, 0).unwrap());
+fn summary_of(location: &ParkingLocation) -> crate::ports::ParkingSummary {
     crate::ports::ParkingSummary {
         id: location.id(),
         name: location.name().to_string(),
@@ -1169,7 +1232,7 @@ fn summary_of(location: &ParkingLocation, reviews: &[Review]) -> crate::ports::P
             .filter(|f| f.state() == bikesnest_domain::SecurityState::Yes)
             .map(|f| f.code().to_string())
             .collect(),
-        rating,
+        rating: *location.rating(),
         last_verified_at: location.last_verified_at(),
         timezone: location.timezone(),
         is_open_now: false,

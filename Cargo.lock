@@ -859,6 +859,7 @@ name = "bikesnest-web"
 version = "0.1.0"
 dependencies = [
  "askama",
+ "async-trait",
  "axum",
  "bikesnest-application",
  "bikesnest-domain",

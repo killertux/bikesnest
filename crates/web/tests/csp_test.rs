@@ -40,6 +40,7 @@ async fn csp_app() -> (axum::Router, FakeEmailProvider) {
         hasher: TestPasswordHasher,
         rate_limiter: Box::new(bikesnest_infrastructure::InMemoryRateLimiter::new()),
         storage: std::sync::Arc::new(bikesnest_test_support::TestObjectStorage::new()),
+        detail_reads: None,
     };
     let app = app_router_with(std::sync::Arc::new(config), db, deps);
     (app, email)
