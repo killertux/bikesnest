@@ -1,8 +1,8 @@
-Esta Política de Cookies descreve os cookies que o BikesNest grava no seu navegador. Ela complementa a [Política de Privacidade](/privacy).
+Esta Política de Cookies descreve cookies, preferências locais e telemetria de provedores usados com o BikesNest. Ela complementa a [Política de Privacidade](/privacy).
 
 ## O que usamos
 
-Usamos **apenas cookies próprios e estritamente necessários ou funcionais**. Nenhum deles é usado para publicidade, análise de audiência ou rastreamento entre sites, e por isso **não exigem consentimento** e não exibimos banner de cookies.
+O aplicativo usa cookies próprios para autenticação, proteção de formulários e preferência de idioma. As preferências locais e o tratamento por provedores externos são descritos separadamente abaixo.
 
 | Cookie | Finalidade | Duração | Tipo | Atributos |
 |---|---|---|---|---|
@@ -10,7 +10,9 @@ Usamos **apenas cookies próprios e estritamente necessários ou funcionais**. N
 | `csrf` | Protege formulários contra falsificação de requisição entre sites (CSRF) enquanto você não está autenticado | 1 hora | Necessário — segurança | HttpOnly, SameSite=Lax |
 | `lang` | Guarda o idioma que você escolheu (português ou inglês); só é gravado quando você troca o idioma | 1 ano | Funcional | SameSite=Lax |
 
-Não usamos armazenamento local (*localStorage*) nem outras tecnologias de rastreamento.
+A preferência de mapa aberto fica no *localStorage* sob `bn.search.mapOpen`. Ela lembra se você abriu ou fechou o mapa da busca, não tem expiração definida pelo aplicativo e muda quando você alterna essa preferência. Você pode removê-la limpando o armazenamento deste site no navegador; o próprio navegador também pode removê-la. O aplicativo não envia essa preferência como cookie. Bloquear o armazenamento local não impede o botão do mapa de funcionar, mas a preferência pode não ser lembrada.
+
+O Cloudflare Web Analytics é usado para medir visualizações de páginas e desempenho por meio de um beacon no navegador. Essas medições são separadas da preferência local do mapa e dos nossos cookies de autenticação. A Cloudflare descreve esse serviço como focado em privacidade; consulte [Cloudflare Web Analytics](https://developers.cloudflare.com/web-analytics/about/). A presença de análise de uso, por si só, não comprova o armazenamento de um cookie de análise.
 
 ## Cookies de terceiros
 
@@ -22,6 +24,6 @@ Você pode apagar ou bloquear cookies nas configurações do seu navegador. Sem 
 
 ## Alterações
 
-Se passarmos a usar cookies opcionais (por exemplo, de análise), atualizaremos esta Política e pediremos seu consentimento antes de gravá-los. As versões anteriores ficam em [/cookies/versions](/cookies/versions).
+Atualizaremos esta Política quando nossas práticas de armazenamento no navegador ou telemetria mudarem. Quando a lei aplicável exigir consentimento para tecnologias opcionais, nós o solicitaremos antes de ativá-las. As versões anteriores ficam em [/cookies/versions](/cookies/versions).
 
 Contato: **{{CONTACT_EMAIL}}**.

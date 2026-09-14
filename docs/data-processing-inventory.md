@@ -1,49 +1,47 @@
 # Data-processing inventory + legal basis
 
-> **Living document.** Legal bases below were **decided by product on 2026-09-03**
-> (see `docs/legal-review.md` for the decision record and what still needs
-> outside counsel). Engineering did not invent them: each is the standard basis
-> for that purpose under LGPD art. 7 / GDPR art. 6, and the privacy policy
-> (`policies/privacy.*.md`, purposes table) states exactly the same table. **Keep the two in
-> sync** — a change here is a policy change (bump `POLICY_VERSION`).
+> **Living document.** The legal bases below are product/engineering proposals,
+> not legal conclusions. Counsel must confirm that each basis and each law is
+> applicable. Keep this inventory and `policies/privacy.*.md` in sync before
+> publishing a new policy version.
 >
-> Controller: the Brazilian company named by `POLICY_OPERATOR_*`. Hosting and
-> all processors are outside Brazil (EU/US) — see
-> `docs/provider-transfer-inventory.md`.
+> Controller: the Brazilian company named by `POLICY_OPERATOR_*`. Deployed
+> providers, regions, roles and transfer mechanisms still require owner
+> evidence; see `docs/provider-transfer-inventory.md`.
 
 | Data element | Purpose | LGPD art. 7 | GDPR art. 6 | Req/Opt | Stored | Access | Retention | Recipients / transfer |
 |---|---|---|---|---|---|---|---|---|
-| email | account identity, verification, reset, contact | V contract | (1)(b) contract | required | `users.email`, `authentication_identities.provider_subject` | self; admin (investigation) | until anonymization | email provider (delivery only) |
-| password hash | password auth | V contract | (1)(b) contract | required | `authentication_identities.credential_hash` | never readable | deleted on anonymization | — (never transferred) |
-| OAuth provider id (`google.sub`) | OAuth auth — **not offered in production (Google OAuth deferred)** | V contract | (1)(b) contract | optional | `authentication_identities.provider_subject` | self | deleted on anonymization | Google (their own records) — add to the policy when shipped |
-| display_name | optional profile field the user fills in | V contract | (1)(b) contract | optional | `users.display_name` | self; publicly attributed only with the separate optional preference below | nulled on anonymization | — |
-| public-name preference | optional public attribution on new reviews/proposals; disabled by default | proposed I consent, pending legal review | proposed (1)(a) consent, pending legal review | optional; not needed to use the service | `users.public_contribution_name`, latest-change timestamp, per-contribution `public_author` flags | self; public name only while both current preference and original contribution flag allow it | disabling permanently clears old flags; account deletion clears preference and attribution | public audience when opted in |
+| email | account identity, verification, reset, contact | V contract | (1)(b) contract | required | `users.email`, `authentication_identities.provider_subject` | self; admin (investigation) | until account de-identification | email provider (transactional delivery) |
+| password hash | password auth | V contract | (1)(b) contract | required | `authentication_identities.credential_hash` | never readable | deleted on account de-identification | — (never transferred) |
+| OAuth provider id (`google.sub`) | OAuth auth — code/config disabled by default; deployed state unverified | V contract (proposed) | (1)(b) contract (proposed) | optional | `authentication_identities.provider_subject` | self | deleted on account de-identification | Google records if enabled; complete inventory before enabling |
+| display_name | optional profile field the user fills in | V contract | (1)(b) contract | optional | `users.display_name` | self; publicly attributed only under the separate setting below | nulled on account de-identification | — |
+| public-name setting | optional public attribution on new reviews/proposals; enabled by default for new accounts and changeable by the user | legal basis pending counsel review; do not assume consent | legal basis pending applicability/counsel review | optional; not needed to use the service | `users.public_contribution_name`, latest-change timestamp, per-contribution `public_author` flags | self; public name only while both current setting and original contribution flag allow it | disabling permanently clears old flags; account deletion clears setting and attribution | public audience according to the user's setting |
 | session info (hash, timestamps) | session/CSRF | IX legitimate interest (security) | (1)(f) | required | `sessions` | never readable | 30d idle / 90d cap; purged | — |
-| IP address / user-agent (in-request) | rate-limit keys, abuse prevention | IX legitimate interest (security) | (1)(f) | transient | limiter keys (ValKey, TTL-bound); not persisted by the app | internal | request/window scoped | — |
-| **access logs (date/time + IP)** | statutory *registros de acesso* | **II legal obligation — Marco Civil art. 15** | (1)(f) | automatic | reverse-proxy / LB access log (not the app DB) | ops only, confidential | **6 months**, then deleted | hosting provider |
-| reviews | community content | V contract (publishing is the service) | (1)(b) | optional | `review`/`review_revision` | public (anonymous unless separately opted in at creation) | retained, anonymized on deletion | — |
-| contributions (locations, proposals, revisions) | dataset | V contract | (1)(b) | optional | `parking_location`/`parking_proposal`/`parking_revision` | public (proposal authors anonymous unless separately opted in at creation) | retained, anonymized | — |
-| verification activity | confidence signals | V contract | (1)(b) | optional | `verification` | aggregated | retained anonymized | — |
+| IP address / user-agent (in-request) | rate-limit keys, abuse prevention | IX legitimate interest (security) | (1)(f) | transient | limiter keys (ValKey, TTL-bound); not persisted in the application DB; proxy/provider logs are separate | internal; infrastructure providers | request/window scoped in limiter; external log retention separately configured | hosting/edge provider |
+| **access logs (date/time + IP)** | proposed statutory *registros de acesso* purpose | II legal obligation proposed — Marco Civil art. 15 applicability pending counsel | (1)(f) proposed if GDPR applies | automatic if configured | reverse-proxy / LB access log (not the app DB) | ops/provider as configured | proposed 6 months; actual enforcement unverified | hosting/edge provider |
+| reviews | community content; may publish immediately | V contract (publishing is the service) | (1)(b) | optional | `review`/`review_revision` | public (name shown only under the attribution rules) | retained; account link/attribution removed on deletion, body unchanged | — |
+| contributions (locations, proposals, revisions) | dataset; new listings may publish immediately, existing-fact proposals need six eligible approvals or moderator action | V contract | (1)(b) | optional | `parking_location`/`parking_proposal`/`parking_revision` | public after the applicable workflow (name shown only under attribution rules) | retained; account link/attribution removed | — |
+| verification activity | confidence signals | V contract | (1)(b) | optional | `verification` | aggregated | retained with account link removed | — |
 | parked-here events | personal "I was here" | V contract | (1)(b) | optional | `verification(kind=parked_here)` | never public | 90 days; deleted on account deletion | — |
 | favorites | private bookmarks | V contract | (1)(b) | optional | `favorite` | self only | deleted on account deletion | — |
-| reports | moderation input (reporter + reported content) | IX legitimate interest (safety of the service) | (1)(f) | optional | `report` | moderators only | retained; reporter anonymized | — |
-| photos + metadata | community content; EXIF stripped, original never published | V contract | (1)(b) | optional | `parking_photo`/`review_photo` + object storage | public once approved (uploader never shown) | retained, uploader anonymized; rejected/orphans purged in 24h | object-storage provider (opaque keys) |
-| **automated content screening** (planned: LLM/classifier over photos + texts) | detect ToS-violating content before human review | IX legitimate interest | (1)(f) | automatic | flags on the moderation queue; **no personal data sent besides the content itself** — send no account identity to the model provider | moderators | with the moderation record | model provider (processor) — add to `provider-transfer-inventory.md` when wired; disclosed in the policy moderation section |
-| browser geolocation | search origin | V contract (running the search) | (1)(b) | optional; browser permission prompt | never persisted | client only | not retained | geocoder/map (coordinates only) |
-| audit events | security, accountability, moderation traceability | IX legitimate interest; II where a legal duty applies | (1)(f) | required | `audit_events` | admin only | **5 years** | — |
-| privacy requests | rights workflow record | II legal obligation (LGPD art. 18/19; GDPR art. 12) | (1)(c) | optional | `privacy_request` | admin only | **5 years**, `user_id` nulled on deletion | — |
-| consent preference evidence | current public-name choice and its latest change | basis and notice review required before release | basis and notice review required before release | optional | account preference/timestamp and per-contribution attribution flags (not a separate consent ledger) | self/admin | account lifetime; cleared on anonymization | — |
+| reports | moderation input (reporter + reported content) | IX legitimate interest (safety of the service) | (1)(f) | optional | `report` | moderators only | retained; reporter account link removed, content unchanged | — |
+| photos + metadata | community content; EXIF stripped, original never published | V contract | (1)(b) | optional | `parking_photo`/`review_photo` + object storage | public only after moderator approval; uploader name is not displayed, though image content can identify someone | retained with account attribution removed; rejected/orphans targeted for purge in 24h | object-storage provider (opaque keys) |
+| browser geolocation / map pin | search origin | V contract (running the search) | (1)(b) | optional; browser permission prompt or user selection | not intentionally persisted as an account record; coordinates can be in search URL/history and request/access/provider logs | browser, app request path and infrastructure providers | browser/log/provider retention applies | hosting/edge logs; selected geocoder/map provider |
+| search UI preference | remember whether the results map is open | V contract (proposed) | (1)(b) (proposed) | optional | browser `localStorage` key `bn.search.mapOpen` | that browser profile | no app-set expiry; user/browser clearing or eviction | — |
+| edge/browser telemetry | page-view/performance telemetry observed from the configured edge on 2026-09-08 | basis pending deployed-payload review | basis/applicability pending review | automatic if enabled at edge | provider-controlled; exact fields, cookies and retention unverified | operator/provider as configured | unverified | Cloudflare/selected edge provider; legal role unverified |
+| audit events | security, accountability, moderation traceability | IX legitimate interest proposed; II only where counsel confirms a duty | (1)(f) proposed if GDPR applies | required | `audit_events` | admin only | proposed 5 years; purge not automated | — |
+| privacy requests | rights workflow record | II legal obligation proposed (LGPD arts. 18/19) | (1)(c) proposed only if GDPR applies and the obligation qualifies | optional | `privacy_request` | admin only | proposed 5 years; `user_id` nulled on deletion; purge not automated | — |
+| public-attribution setting evidence | current setting and its latest change | basis and notice review required before release | basis and applicability review required before release | optional | account setting/timestamp and per-contribution attribution flags | self/admin | account lifetime; cleared on de-identification | — |
 
 ### Why these bases
 
 - **Contract (V / 6(1)(b))** for everything the user asks the service to do:
   holding an account, publishing their contributions, keeping their favorites.
-  Consent was deliberately *not* used here — it would be a catch-all and
-  its withdrawal would break the service.
+  Consent is not proposed as a catch-all because withdrawal would conflict with
+  the requested core service; counsel must confirm necessity and scope.
 - **Legitimate interest (IX / 6(1)(f))** for security, rate limiting,
-  moderation and audit: necessary to keep a UGC service safe; low privacy
-  impact; users can object (policy rights section). Recorded balancing note in
-  `docs/legal-review.md`.
+  moderation and audit. The preliminary balance and its caveats are recorded in
+  `docs/legal-review.md`; counsel must confirm it.
 - **Legal obligation (II / 6(1)(c))** only where a statute actually requires the
   record: Marco Civil access logs, the rights-request log, consent evidence.
   Note that for GDPR a *Brazilian* statute is not a 6(1)(c) basis, so the access
@@ -51,14 +49,18 @@
 
 ### Notes
 
-- **No entry sends data to a third party beyond the recipients listed.** No
-  marketing, no advertising, no cross-site tracking → no consent banner.
-- **Data minimization** is asserted by tests; provider boundaries are in
+- No marketing or advertising integration is implemented. That fact does not,
+  by itself, decide whether an edge telemetry feature needs consent or another
+  notice; inspect the deployed payload/cookies/configuration first.
+- Provider-boundary tests cover specific application payloads; they do not
+  establish external provider configuration. See
   `docs/provider-transfer-inventory.md`.
-- **Minimum age 18** (decision): no child/adolescent processing (LGPD art. 14,
-  GDPR art. 8) — stated in the policy age section and on the sign-up form.
+- **Minimum account age 18** is a product rule, not evidence that no minor can
+  access the public service. Counsel must assess Law 15.211/2025 probable-access
+  duties, Decree 12.880/2026 and current ANPD guidance; there is no default
+  identity-document collection.
 
-- Public attribution is a new, separately optional purpose, not covered by the
-  earlier product decision. The proposed consent basis and source-policy changes
-  need legal/product review and a new published policy version before release.
+- Public attribution is a separately optional purpose but is enabled by default
+  for new accounts, so this inventory does not characterize it as affirmative
+  consent. Its basis/default/notice need legal and product review before release.
   Editing these source files does not update already-seeded policy versions.

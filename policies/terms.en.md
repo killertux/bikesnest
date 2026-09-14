@@ -29,7 +29,7 @@ By submitting Content you represent and warrant that:
 
 ### 3.3 Licence you grant us
 
-You keep ownership of your Content. So that the service can operate, you grant us a **worldwide, non-exclusive, royalty-free, irrevocable licence of indefinite duration** to host, store, reproduce, adapt (resize, crop, generate thumbnails and strip metadata), publish, display and distribute the Content as part of BikesNest and its community dataset, including after your account is deleted. Your display name appears on new reviews and change proposals according to your account visibility setting, which is on by default for new accounts and can be turned off at any time. Earlier anonymous contributions stay anonymous. Contributions remain in the dataset, anonymised, after your account is deleted. See the [Privacy Policy](/privacy) for how name visibility works.
+You keep ownership of your Content. So that the service can operate, you grant us a **worldwide, non-exclusive, royalty-free, irrevocable licence of indefinite duration** to host, store, reproduce, adapt (resize, crop, generate thumbnails and strip metadata), publish, display and distribute the Content as part of BikesNest and its community dataset, including after your account is deleted. Your display name appears on new reviews and change proposals according to your account visibility setting, which is on by default for new accounts and can be turned off at any time. Earlier anonymous contributions stay anonymous. After account deletion, retained contributions are no longer linked to the account or display-name attribution; their free text or images are not thereby guaranteed to be anonymous. See the [Privacy Policy](/privacy) for name visibility and requests concerning the retained content itself.
 
 ### 3.4 Indemnity
 
@@ -37,8 +37,8 @@ To the extent permitted by law, you will indemnify us for losses, damages, costs
 
 ## 4. Moderation, reports and removal
 
-- **Photos are held until approved.** No photo is published before it passes moderation. Other types of Content may be published immediately and reviewed afterwards.
-- Moderation is carried out by **human moderators** and may be supported by **automated tools**, including artificial-intelligence models that classify images and text to detect breaches of these Terms. Content flagged automatically is passed to a moderator.
+- **Photos are held until approved by a moderator.** New parking listings and reviews may be published immediately. A proposed change to an existing published parking fact is published only after six eligible community approvals or a moderator decision.
+- Moderation is carried out by **human moderators**.
 - We may, at our discretion and without prior notice, **refuse, hide, remove or mark as invalid** any Content, and **suspend or terminate** accounts that breach these Terms or the law. We have no obligation to monitor all Content, but we may do so.
 - **Reports.** Anyone can report a location, photo or review with the *Report* button on the relevant page or by e-mail to **{{CONTACT_EMAIL}}**. For notices about unlawful content or content that infringes third-party rights, include the address (URL) of the Content, a description of the infringement and your contact details; we will assess it and take appropriate action, including removal.
 - **Review.** If you disagree with a moderation decision, write to {{CONTACT_EMAIL}}; a person will review the case.
@@ -67,7 +67,7 @@ To the fullest extent permitted by applicable law, including the Brazilian Consu
 
 ## 9. Termination
 
-You can delete your account at any time under *Account → Privacy & data*. Your identity data is removed and your contributions remain in the dataset, anonymised (section 3.3). We may suspend or terminate your account for breach of these Terms or the law, or if the service is discontinued. Sections 3.3, 3.4, 7, 8 and 12 survive termination.
+You can delete your account at any time under *Account → Privacy & data*. Your account identity and display-name attribution are removed from retained contributions as described in section 3.3; this does not rewrite their text or images. We may suspend or terminate your account for breach of these Terms or the law, or if the service is discontinued. Sections 3.3, 3.4, 7, 8 and 12 survive termination.
 
 ## 10. Privacy
 
