@@ -76,6 +76,7 @@ impl RetentionRepository for SqlxRetentionRepository {
                 last_error=CASE WHEN state IN ('pending','running','failed') THEN 'mail credential expired' ELSE NULL END,
                 finished_at=CASE WHEN state IN ('pending','running') THEN COALESCE(finished_at,$1) ELSE finished_at END,
                 claimed_by=NULL, lease_expires_at=NULL, heartbeat_at=NULL,
+                mail_recipient_hash=NULL, mail_transition_audit_id=NULL,
                 payload_redacted_at=COALESCE(payload_redacted_at,$1), updated_at=now()
               WHERE kind='email.send' AND mail_purpose='reset' AND mail_token_expires_at < $1
             ), deleted AS (DELETE FROM password_reset_tokens WHERE expires_at < $1 RETURNING 1)
@@ -103,6 +104,7 @@ impl RetentionRepository for SqlxRetentionRepository {
                 last_error=CASE WHEN state IN ('pending','running','failed') THEN 'mail credential expired' ELSE NULL END,
                 finished_at=CASE WHEN state IN ('pending','running') THEN COALESCE(finished_at,$1) ELSE finished_at END,
                 claimed_by=NULL, lease_expires_at=NULL, heartbeat_at=NULL,
+                mail_recipient_hash=NULL, mail_transition_audit_id=NULL,
                 payload_redacted_at=COALESCE(payload_redacted_at,$1), updated_at=now()
               WHERE kind='email.send' AND mail_purpose IN ('verify','change') AND mail_token_expires_at < $1
             ), deleted AS (DELETE FROM email_verification_tokens WHERE expires_at < $1 RETURNING 1)

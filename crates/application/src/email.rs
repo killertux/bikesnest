@@ -1,21 +1,23 @@
 //! Transactional email ports.
 //!
-//! The application layer describes *what* to send — recipient, locale, kind and
-//! the single-use link — and never *how it reads*: subject and body come from
+//! The application layer describes *what* to send — recipient, locale, kind,
+//! and either a credential link or credential-free notice identity — and never
+//! *how it reads*: subject and body come from
 //! the message catalog at render time, in the recipient's own language. That is
 //! the i18n rule (no user-facing strings outside the catalog) applied to mail.
 //!
 //! Two ports, deliberately separate:
 //!
-//! - [`EmailQueue`] is what use cases call. The durable implementation writes
-//!   an `email.send` row and returns before provider delivery; that enqueue is
-//!   currently separate from the preceding auth transaction. The inline
-//!   implementation keeps provider delivery on the request path.
+//! - [`EmailQueue`] supports generic callers. Authentication uses `AuthOutbox`
+//!   so its transition, audit, and durable `email.send` admission commit in one
+//!   transaction. Inline dispatch may attempt the exact admitted job after
+//!   commit, but never makes provider I/O part of that transaction.
 //! - [`EmailProvider`] is what actually talks to a relay/ESP. Only the job
 //!   handler (and the inline queue used when the worker is disabled) calls it.
 
 use async_trait::async_trait;
 use bikesnest_domain::{LocaleCode, UserId};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
@@ -29,16 +31,39 @@ pub enum EmailError {
 }
 
 /// Which transactional message this is. The variant chooses the catalog keys;
-/// its payload carries the one thing that varies, the single-use link.
+/// its payload carries either a single-use credential link or an immutable,
+/// credential-free security-notice identity.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EmailKind {
     /// Registration (and re-send): confirm the address on a pending account.
-    VerifyEmail { link: String },
+    VerifyEmail {
+        link: String,
+        #[serde(default)]
+        expires_at: Option<DateTime<Utc>>,
+    },
     /// Password reset: choose a new password.
-    ResetPassword { link: String },
+    ResetPassword {
+        link: String,
+        #[serde(default)]
+        expires_at: Option<DateTime<Utc>>,
+    },
     /// Email change: confirm the *new* address before it becomes canonical.
-    ConfirmEmailChange { link: String },
+    ConfirmEmailChange {
+        link: String,
+        #[serde(default)]
+        expires_at: Option<DateTime<Utc>>,
+    },
+    /// A password was successfully replaced. Carries no credential.
+    PasswordChanged {
+        account_link: String,
+        notification_id: String,
+    },
+    /// The canonical email was successfully changed; sent to the old address.
+    EmailAddressChanged {
+        account_link: String,
+        notification_id: String,
+    },
 }
 
 impl std::fmt::Debug for EmailKind {
@@ -58,15 +83,53 @@ impl EmailKind {
             EmailKind::VerifyEmail { .. } => "verify",
             EmailKind::ResetPassword { .. } => "reset",
             EmailKind::ConfirmEmailChange { .. } => "change",
+            EmailKind::PasswordChanged { .. } => "password_changed",
+            EmailKind::EmailAddressChanged { .. } => "email_changed",
         }
     }
 
-    /// The single-use link this message exists to deliver.
-    pub fn link(&self) -> &str {
+    /// The CTA/fallback URL. Security-notice URLs carry no credential.
+    pub fn action_link(&self) -> &str {
         match self {
-            EmailKind::VerifyEmail { link }
-            | EmailKind::ResetPassword { link }
-            | EmailKind::ConfirmEmailChange { link } => link,
+            EmailKind::VerifyEmail { link, .. }
+            | EmailKind::ResetPassword { link, .. }
+            | EmailKind::ConfirmEmailChange { link, .. } => link,
+            EmailKind::PasswordChanged { account_link, .. }
+            | EmailKind::EmailAddressChanged { account_link, .. } => account_link,
+        }
+    }
+    /// Return a single-use credential only for action mails. Security notices
+    /// deliberately have no credential-bearing destination.
+    pub fn credential_link(&self) -> Option<&str> {
+        match self {
+            EmailKind::VerifyEmail { link, .. }
+            | EmailKind::ResetPassword { link, .. }
+            | EmailKind::ConfirmEmailChange { link, .. } => Some(link),
+            EmailKind::PasswordChanged { .. } | EmailKind::EmailAddressChanged { .. } => None,
+        }
+    }
+
+    pub fn expires_at(&self) -> Option<DateTime<Utc>> {
+        match self {
+            EmailKind::VerifyEmail { expires_at, .. }
+            | EmailKind::ResetPassword { expires_at, .. }
+            | EmailKind::ConfirmEmailChange { expires_at, .. } => *expires_at,
+            EmailKind::PasswordChanged { .. } | EmailKind::EmailAddressChanged { .. } => None,
+        }
+    }
+
+    /// Stable material for queue/provider replay; never rendered or logged.
+    pub fn idempotency_material(&self) -> &str {
+        match self {
+            EmailKind::VerifyEmail { link, .. }
+            | EmailKind::ResetPassword { link, .. }
+            | EmailKind::ConfirmEmailChange { link, .. } => link,
+            EmailKind::PasswordChanged {
+                notification_id, ..
+            }
+            | EmailKind::EmailAddressChanged {
+                notification_id, ..
+            } => notification_id,
         }
     }
 }
@@ -173,6 +236,7 @@ mod tests {
             LocaleCode::PtBr,
             EmailKind::VerifyEmail {
                 link: "http://localhost:8080/verify-email?token=abc".into(),
+                expires_at: None,
             },
         );
         let json = serde_json::to_value(&msg).unwrap();
@@ -188,7 +252,10 @@ mod tests {
             UserId(7),
             "ada@example.com",
             LocaleCode::En,
-            EmailKind::ResetPassword { link: "x".into() },
+            EmailKind::ResetPassword {
+                link: "x".into(),
+                expires_at: None,
+            },
         );
         assert_eq!(msg.kind.code(), "reset");
     }
@@ -216,6 +283,7 @@ mod tests {
             LocaleCode::En,
             EmailKind::ResetPassword {
                 link: format!("https://x/?token={marker}"),
+                expires_at: None,
             },
         );
         let debug = format!("{msg:?}");

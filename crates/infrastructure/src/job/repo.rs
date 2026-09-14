@@ -57,10 +57,15 @@ pub struct ClaimedJob {
     pub owner: String,
 }
 
+pub enum MailCredential<'a> {
+    Token { hash: &'a str },
+    SecurityNotice { audit_id: i64 },
+}
+
 pub struct MailEnqueue<'a> {
     pub payload: &'a JobPayload,
     pub account_id: i64,
-    pub token_hash: &'a str,
+    pub credential: MailCredential<'a>,
     pub purpose: &'a str,
     pub recipient: &'a str,
     pub run_at: DateTime<Utc>,
@@ -72,28 +77,67 @@ pub(crate) async fn enqueue_mail_on(
     conn: &mut sqlx::PgConnection,
     mail: MailEnqueue<'_>,
 ) -> Result<Option<i64>, JobRepoError> {
-    let state: Option<String> =
-        sqlx::query_scalar("SELECT account_state FROM users WHERE id=$1 FOR UPDATE")
+    let state: Option<(String, String)> =
+        sqlx::query_as("SELECT account_state::text,email FROM users WHERE id=$1 FOR UPDATE")
             .bind(mail.account_id)
             .fetch_optional(&mut *conn)
             .await?;
-    let expires_at: Option<DateTime<Utc>> = match (mail.purpose, state.as_deref()) {
-        ("verify", Some("PENDING_EMAIL_VERIFICATION" | "ACTIVE"))
-        | ("change", Some("ACTIVE")) => sqlx::query_scalar("SELECT expires_at FROM email_verification_tokens WHERE token_hash=$1 AND user_id=$2 AND email=$3 AND used_at IS NULL AND expires_at>clock_timestamp()")
-            .bind(mail.token_hash).bind(mail.account_id).bind(mail.recipient).fetch_optional(&mut *conn).await?,
-        ("reset", Some("PENDING_EMAIL_VERIFICATION" | "ACTIVE")) => sqlx::query_scalar("SELECT t.expires_at FROM password_reset_tokens t JOIN users u ON u.id=t.user_id WHERE t.token_hash=$1 AND t.user_id=$2 AND u.email=$3 AND t.used_at IS NULL AND t.expires_at>clock_timestamp()")
-            .bind(mail.token_hash).bind(mail.account_id).bind(mail.recipient).fetch_optional(&mut *conn).await?,
-        _ => None,
+    let (valid, token_hash, expires_at, transition_audit_id) = match (
+        &mail.credential,
+        state.as_ref(),
+    ) {
+        (MailCredential::Token { hash }, Some((state, _))) => {
+            let expires_at: Option<DateTime<Utc>> = match (mail.purpose, state.as_str()) {
+                ("verify", "PENDING_EMAIL_VERIFICATION" | "ACTIVE")
+                | ("change", "ACTIVE") => sqlx::query_scalar("SELECT expires_at FROM email_verification_tokens WHERE token_hash=$1 AND user_id=$2 AND email=$3 AND used_at IS NULL AND expires_at>clock_timestamp()")
+                    .bind(hash).bind(mail.account_id).bind(mail.recipient).fetch_optional(&mut *conn).await?,
+                ("reset", "PENDING_EMAIL_VERIFICATION" | "ACTIVE") => sqlx::query_scalar("SELECT t.expires_at FROM password_reset_tokens t JOIN users u ON u.id=t.user_id WHERE t.token_hash=$1 AND t.user_id=$2 AND u.email=$3 AND t.used_at IS NULL AND t.expires_at>clock_timestamp()")
+                    .bind(hash).bind(mail.account_id).bind(mail.recipient).fetch_optional(&mut *conn).await?,
+                _ => None,
+            };
+            (expires_at.is_some(), Some(*hash), expires_at, None)
+        }
+        (MailCredential::SecurityNotice { audit_id }, Some((state, current_email))) => {
+            let state_ok = match mail.purpose {
+                "password_changed" => {
+                    matches!(state.as_str(), "ACTIVE" | "PENDING_EMAIL_VERIFICATION")
+                        && current_email.eq_ignore_ascii_case(mail.recipient)
+                }
+                "email_changed" => {
+                    state == "ACTIVE" && !current_email.eq_ignore_ascii_case(mail.recipient)
+                }
+                _ => false,
+            };
+            let action = match mail.purpose {
+                "password_changed" => "auth.password_changed",
+                "email_changed" => "auth.email_changed",
+                _ => "",
+            };
+            let audit_ok = state_ok && sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM audit_events WHERE id=$1 AND actor_user_id=$2 AND action=$3 AND target_type='user' AND target_id=$4 AND result='success')",
+            )
+            .bind(audit_id)
+            .bind(mail.account_id)
+            .bind(action)
+            .bind(mail.account_id.to_string())
+            .fetch_one(&mut *conn)
+            .await?;
+            (audit_ok, None, None, audit_ok.then_some(*audit_id))
+        }
+        _ => (false, None, None, None),
     };
-    let Some(expires_at) = expires_at else {
+    if !valid {
         return Err(JobRepoError::InvalidMailCredential);
-    };
+    }
+    let recipient_hash =
+        crate::auth::hash::sha256_hex(mail.recipient.to_ascii_lowercase().as_bytes());
     Ok(sqlx::query_scalar(r#"INSERT INTO background_job
-        (kind,payload,run_at,max_attempts,idempotency_key,mail_account_id,mail_token_hash,mail_purpose,mail_token_expires_at)
-        VALUES('email.send',$1,$2,$3,$4,$5,$6,$7,$8)
+        (kind,payload,run_at,max_attempts,idempotency_key,mail_account_id,mail_token_hash,mail_purpose,mail_token_expires_at,mail_recipient_hash,mail_transition_audit_id)
+        VALUES('email.send',$1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
         ON CONFLICT(idempotency_key) DO NOTHING RETURNING id"#)
         .bind(mail.payload).bind(mail.run_at).bind(mail.max_attempts).bind(mail.idempotency_key)
-        .bind(mail.account_id).bind(mail.token_hash).bind(mail.purpose).bind(expires_at)
+        .bind(mail.account_id).bind(token_hash).bind(mail.purpose).bind(expires_at)
+        .bind(recipient_hash).bind(transition_audit_id)
         .fetch_optional(conn).await?)
 }
 
@@ -467,6 +511,8 @@ impl SqlxJobRepository {
                 SET state = 'succeeded', finished_at = $2,
                     payload = CASE WHEN kind = 'email.send' THEN '{}'::jsonb ELSE payload END,
                     payload_redacted_at = CASE WHEN kind = 'email.send' THEN COALESCE(payload_redacted_at,now()) ELSE payload_redacted_at END,
+                    mail_recipient_hash = CASE WHEN kind = 'email.send' THEN NULL ELSE mail_recipient_hash END,
+                    mail_transition_audit_id = CASE WHEN kind = 'email.send' THEN NULL ELSE mail_transition_audit_id END,
                     claimed_by = NULL, lease_expires_at = NULL, heartbeat_at = NULL,
                     started_at = NULL, updated_at = now()
                 WHERE id = $1 AND state='running' AND claimed_by = $3
@@ -531,6 +577,8 @@ impl SqlxJobRepository {
             SET state = 'failed', finished_at = now(), last_error = $2,
                 payload = CASE WHEN kind = 'email.send' THEN '{}'::jsonb ELSE payload END,
                 payload_redacted_at = CASE WHEN kind = 'email.send' THEN COALESCE(payload_redacted_at,now()) ELSE payload_redacted_at END,
+                mail_recipient_hash = CASE WHEN kind = 'email.send' THEN NULL ELSE mail_recipient_hash END,
+                mail_transition_audit_id = CASE WHEN kind = 'email.send' THEN NULL ELSE mail_transition_audit_id END,
                 claimed_by = NULL, lease_expires_at = NULL, heartbeat_at = NULL, updated_at = now()
             WHERE id = $1 AND state='running' AND claimed_by = $3
               AND lease_expires_at > clock_timestamp()

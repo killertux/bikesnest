@@ -2033,24 +2033,53 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
 
         // --- transactional email ------------------------------------------
         // Rendered by the `email.send` job handler in the recipient's stored
-        // locale. `{app}` is the product name; `{link}` the single-use URL.
+        // locale. `{app}` is the product name; links and expiry are structured
+        // renderer fields, so legacy messages never imply a duration.
         "email.verify.subject" => ("Confirm your {app} email", "Confirme seu e-mail no {app}"),
         "email.verify.body" => (
-            "Welcome to {app}. Confirm your email address to activate your account:\n\n{link}\n\nIf you did not create an account, you can ignore this email.",
-            "Bem-vindo ao {app}. Confirme seu endereço de e-mail para ativar sua conta:\n\n{link}\n\nSe você não criou uma conta, pode ignorar este e-mail.",
+            "Welcome to {app}. Confirm your email address to activate your account. If you did not create an account, you can ignore this email.",
+            "Bem-vindo ao {app}. Confirme seu endereço de e-mail para ativar sua conta. Se você não criou uma conta, pode ignorar este e-mail.",
         ),
         "email.reset.subject" => ("Reset your {app} password", "Redefina sua senha do {app}"),
         "email.reset.body" => (
-            "We received a request to reset your {app} password. Choose a new one here:\n\n{link}\n\nIf you did not ask for this, you can safely ignore this email.",
-            "Recebemos um pedido para redefinir sua senha do {app}. Escolha uma nova senha aqui:\n\n{link}\n\nSe não foi você que pediu, pode ignorar este e-mail com segurança.",
+            "We received a request to reset your {app} password. If you did not ask for this, you can safely ignore this email.",
+            "Recebemos um pedido para redefinir sua senha do {app}. Se não foi você que pediu, pode ignorar este e-mail com segurança.",
         ),
         "email.change.subject" => (
             "Confirm your new {app} email",
             "Confirme seu novo e-mail no {app}",
         ),
         "email.change.body" => (
-            "Confirm this address to finish changing the email on your {app} account:\n\n{link}\n\nIf you did not ask for this change, ignore this email — your current address stays as it is.",
-            "Confirme este endereço para concluir a troca de e-mail da sua conta no {app}:\n\n{link}\n\nSe você não pediu essa troca, ignore este e-mail — seu endereço atual continua o mesmo.",
+            "Confirm this address to finish changing the email on your {app} account. If you did not ask for this change, ignore this email — your current address stays as it is.",
+            "Confirme este endereço para concluir a troca de e-mail da sua conta no {app}. Se você não pediu essa troca, ignore este e-mail — seu endereço atual continua o mesmo.",
+        ),
+        "email.password_changed.subject" => (
+            "Your {app} password was changed",
+            "Sua senha do {app} foi alterada",
+        ),
+        "email.password_changed.body" => (
+            "Your {app} password was changed. If this was not you, secure your account now.",
+            "Sua senha do {app} foi alterada. Se não foi você, proteja sua conta agora.",
+        ),
+        "email.email_changed.subject" => (
+            "Your {app} email address was changed",
+            "Seu endereço de e-mail no {app} foi alterado",
+        ),
+        "email.email_changed.body" => (
+            "Your {app} email address was changed. If this was not you, secure your account now.",
+            "Seu endereço de e-mail no {app} foi alterado. Se não foi você, proteja sua conta agora.",
+        ),
+        "email.cta.verify" => ("Confirm email", "Confirmar e-mail"),
+        "email.cta.reset" => ("Reset password", "Redefinir senha"),
+        "email.cta.change" => ("Confirm email change", "Confirmar troca de e-mail"),
+        "email.cta.account" => ("Review your account", "Revisar sua conta"),
+        "email.fallback" => (
+            "If the button does not work, copy and paste this link into your browser:",
+            "Se o botão não funcionar, copie e cole este link no navegador:",
+        ),
+        "email.expires" => (
+            "This link expires at {expires} UTC.",
+            "Este link expira em {expires} UTC.",
         ),
         // Unknown key: a visible marker (all real keys are defined above, so
         // this only appears when a template references a typo'd key).
@@ -2065,13 +2094,23 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
 /// tests below (and `bikesnest_infrastructure::email::templates`) fail loudly
 /// when one is renamed away.
 #[cfg(test)]
-const EMAIL_KEYS: [&str; 6] = [
+const EMAIL_KEYS: [&str; 16] = [
     "email.verify.subject",
     "email.verify.body",
     "email.reset.subject",
     "email.reset.body",
     "email.change.subject",
     "email.change.body",
+    "email.password_changed.subject",
+    "email.password_changed.body",
+    "email.email_changed.subject",
+    "email.email_changed.body",
+    "email.cta.verify",
+    "email.cta.reset",
+    "email.cta.change",
+    "email.cta.account",
+    "email.fallback",
+    "email.expires",
 ];
 
 #[cfg(test)]

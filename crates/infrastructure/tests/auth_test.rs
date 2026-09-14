@@ -13,10 +13,12 @@ use bikesnest_domain::{
     UserId, VerificationToken,
 };
 use bikesnest_infrastructure::{
-    Db, SqlxAccountRepository, SqlxAuditLog, SqlxAuthOutbox, SqlxSessionStore, SqlxTokenStore,
+    Db, FakeEmailProvider, SendEmailHandler, SqlxAccountRepository, SqlxAuditLog, SqlxAuthOutbox,
+    SqlxSessionStore, SqlxTokenStore,
 };
 use bikesnest_test_support::{db_test, pool, run_isolated_database_test};
 use chrono::{DateTime, Duration, Utc};
+use sha2::Digest as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -35,8 +37,356 @@ fn verification_message(
                 "https://bikesnest.test/verify-email?token={}",
                 token.to_base64url()
             ),
+            expires_at: None,
         },
     )
+}
+
+async fn confirm_email(
+    db: &Db,
+    token: &VerificationToken,
+    at: DateTime<Utc>,
+) -> Result<Option<bikesnest_application::EmailConfirmationOutcome>, bikesnest_application::AuthError>
+{
+    let tokens = SqlxTokenStore::new(db.clone());
+    let Some(user_id) = tokens.find_verification(token, at).await? else {
+        return Ok(None);
+    };
+    let Some(user) = SqlxAccountRepository::new(db.clone())
+        .find_by_id(user_id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let notice = EmailMessage::linked(
+        user_id,
+        user.email.as_str(),
+        user.locale,
+        EmailKind::EmailAddressChanged {
+            account_link: "https://bikesnest.test/login".into(),
+            notification_id: format!("test-confirm-{}", token.to_hex()),
+        },
+    );
+    SqlxAuthOutbox::new(db.clone(), 3)
+        .confirm_email(token, at, notice)
+        .await
+}
+
+async fn complete_reset(
+    db: &Db,
+    token: &VerificationToken,
+    hash: &str,
+    at: DateTime<Utc>,
+) -> Result<Option<UserId>, bikesnest_application::AuthError> {
+    let tokens = SqlxTokenStore::new(db.clone());
+    let Some(user_id) = tokens.find_reset(token, at).await? else {
+        return Ok(None);
+    };
+    let Some(user) = SqlxAccountRepository::new(db.clone())
+        .find_by_id(user_id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let notice = EmailMessage::linked(
+        user_id,
+        user.email.as_str(),
+        user.locale,
+        EmailKind::PasswordChanged {
+            account_link: "https://bikesnest.test/login".into(),
+            notification_id: format!("test-reset-{}", token.to_hex()),
+        },
+    );
+    SqlxAuthOutbox::new(db.clone(), 3)
+        .complete_password_reset(token, hash, at, notice)
+        .await
+        .map(|mail| mail.map(|_| user_id))
+}
+
+#[db_test]
+async fn authenticated_password_change_requires_owned_live_session_and_commits_notice_atomically(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let accounts = SqlxAccountRepository::new(db.clone());
+    let sessions = SqlxSessionStore::new(db.clone());
+    let tokens = SqlxTokenStore::new(db.clone());
+    let email = UserEmail::parse("notice-password@bikesnest.test").unwrap();
+    let user_id = accounts
+        .create(NewAccount {
+            email: &email,
+            display_name: None,
+            password_hash: "old-hash",
+            state: AccountState::Active,
+            locale: LocaleCode::En,
+        })
+        .await
+        .unwrap();
+    let at = Utc::now();
+    let current = SessionId::new([0xe1; 32]);
+    let other = SessionId::new([0xe2; 32]);
+    sessions
+        .create(user_id, &current, &CsrfToken::new([0xe3; 32]), at)
+        .await
+        .unwrap();
+    sessions
+        .create(user_id, &other, &CsrfToken::new([0xe4; 32]), at)
+        .await
+        .unwrap();
+    let reset = VerificationToken::new([0xe5; 32]);
+    assert!(tokens.issue_reset(user_id, &reset, at).await.unwrap());
+    let notice = || {
+        EmailMessage::linked(
+            user_id,
+            email.as_str(),
+            LocaleCode::En,
+            EmailKind::PasswordChanged {
+                account_link: "https://bikesnest.test/login".into(),
+                notification_id: "password-notice-stable".into(),
+            },
+        )
+    };
+    let outbox = SqlxAuthOutbox::new(db.clone(), 3);
+
+    assert!(
+        outbox
+            .change_password(
+                user_id,
+                "old-hash",
+                "must-not-stick",
+                &SessionId::new([0xff; 32]),
+                at,
+                notice(),
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let before: (Option<String>, i64, i64) = sqlx::query_as(
+        "SELECT i.credential_hash,
+          (SELECT count(*) FROM audit_events WHERE action='auth.password_changed' AND target_id=$1),
+          (SELECT count(*) FROM background_job WHERE mail_purpose='password_changed' AND mail_account_id=$2)
+         FROM authentication_identities i WHERE i.user_id=$2 AND i.provider='password'",
+    )
+    .bind(user_id.0.to_string())
+    .bind(user_id.0)
+    .fetch_one(&mut *db.acquire().await.unwrap())
+    .await
+    .unwrap();
+    assert_eq!(before, (Some("old-hash".into()), 0, 0));
+
+    let other_email = UserEmail::parse("notice-password-other@bikesnest.test").unwrap();
+    let other_user = accounts
+        .create(NewAccount {
+            email: &other_email,
+            display_name: None,
+            password_hash: "other-hash",
+            state: AccountState::Active,
+            locale: LocaleCode::En,
+        })
+        .await
+        .unwrap();
+    let cross_account = SessionId::new([0xf1; 32]);
+    sessions
+        .create(other_user, &cross_account, &CsrfToken::new([0xf2; 32]), at)
+        .await
+        .unwrap();
+    let revoked = SessionId::new([0xf3; 32]);
+    sessions
+        .create(user_id, &revoked, &CsrfToken::new([0xf4; 32]), at)
+        .await
+        .unwrap();
+    sessions.revoke(&revoked).await.unwrap();
+    let expired = SessionId::new([0xf5; 32]);
+    sessions
+        .create(
+            user_id,
+            &expired,
+            &CsrfToken::new([0xf6; 32]),
+            at - Duration::days(31),
+        )
+        .await
+        .unwrap();
+    let expired_hash: String = sha2::Sha256::digest(expired.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    sqlx::query("UPDATE sessions SET expires_at=$2 WHERE token_hash=$1")
+        .bind(expired_hash)
+        .bind(at - Duration::seconds(1))
+        .execute(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    for invalid in [&cross_account, &revoked, &expired] {
+        assert!(
+            outbox
+                .change_password(user_id, "old-hash", "must-not-stick", invalid, at, notice())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    let still_unchanged: (Option<String>, i64) = sqlx::query_as(
+        "SELECT credential_hash,
+          (SELECT count(*) FROM background_job WHERE mail_purpose='password_changed' AND mail_account_id=$1)
+         FROM authentication_identities WHERE user_id=$1 AND provider='password'",
+    )
+    .bind(user_id.0)
+    .fetch_one(&mut *db.acquire().await.unwrap())
+    .await
+    .unwrap();
+    assert_eq!(still_unchanged, (Some("old-hash".into()), 0));
+
+    let admitted = outbox
+        .change_password(user_id, "old-hash", "new-hash", &current, at, notice())
+        .await
+        .unwrap()
+        .expect("live owned session admits the atomic transition");
+    assert_eq!(admitted.message.kind.code(), "password_changed");
+    assert!(sessions.resolve(&current, at).await.unwrap().is_some());
+    assert!(sessions.resolve(&other, at).await.unwrap().is_none());
+    assert!(tokens.find_reset(&reset, at).await.unwrap().is_none());
+    let committed: (Option<String>, String, bool, bool, i64) = sqlx::query_as(
+        "SELECT i.credential_hash,j.mail_purpose,
+                j.mail_recipient_hash IS NOT NULL,j.mail_transition_audit_id IS NOT NULL,
+                (SELECT count(*) FROM audit_events WHERE action='auth.password_changed' AND target_id=$1)
+         FROM authentication_identities i JOIN background_job j ON j.id=$2
+         WHERE i.user_id=$3 AND i.provider='password'",
+    )
+    .bind(user_id.0.to_string())
+    .bind(admitted.job_id)
+    .bind(user_id.0)
+    .fetch_one(&mut *db.acquire().await.unwrap())
+    .await
+    .unwrap();
+    assert_eq!(
+        committed,
+        (
+            Some("new-hash".into()),
+            "password_changed".into(),
+            true,
+            true,
+            1
+        )
+    );
+}
+
+#[test]
+fn password_change_rechecks_session_expiry_after_waiting_for_its_row_lock() {
+    run_isolated_database_test(|pool: sqlx::PgPool| async move {
+        let db = Db::from_pool(pool.clone());
+        let accounts = SqlxAccountRepository::new(db.clone());
+        let sessions = SqlxSessionStore::new(db.clone());
+        let email = UserEmail::parse("session-expiry-wait@bikesnest.test").unwrap();
+        let user_id = accounts
+            .create(NewAccount {
+                email: &email,
+                display_name: None,
+                password_hash: "old-hash",
+                state: AccountState::Active,
+                locale: LocaleCode::En,
+            })
+            .await
+            .unwrap();
+        let supplied_at = Utc::now();
+        let session = SessionId::new([0xf7; 32]);
+        sessions
+            .create(user_id, &session, &CsrfToken::new([0xf8; 32]), supplied_at)
+            .await
+            .unwrap();
+        let session_hash: String = sha2::Sha256::digest(session.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let expires_at: DateTime<Utc> = sqlx::query_scalar(
+            "UPDATE sessions SET expires_at=clock_timestamp()+interval '300 milliseconds'
+             WHERE token_hash=$1 RETURNING expires_at",
+        )
+        .bind(&session_hash)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("SELECT token_hash FROM sessions WHERE token_hash=$1 FOR UPDATE")
+            .bind(&session_hash)
+            .fetch_one(&mut *blocker)
+            .await
+            .unwrap();
+        let notice = EmailMessage::linked(
+            user_id,
+            email.as_str(),
+            LocaleCode::En,
+            EmailKind::PasswordChanged {
+                account_link: "https://bikesnest.test/login".into(),
+                notification_id: "session-expiry-wait".into(),
+            },
+        );
+        let wait_db = db.clone();
+        let wait_session = session.clone();
+        let transition = tokio::spawn(async move {
+            SqlxAuthOutbox::new(wait_db, 3)
+                .change_password(
+                    user_id,
+                    "old-hash",
+                    "new-hash",
+                    &wait_session,
+                    supplied_at,
+                    notice,
+                )
+                .await
+        });
+        let mut observed_wait = false;
+        for _ in 0..50 {
+            observed_wait = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity
+                 WHERE datname=current_database() AND wait_event_type='Lock')",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if observed_wait {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        if !observed_wait {
+            blocker.rollback().await.unwrap();
+            transition.abort();
+            let _ = transition.await;
+            panic!("password transition must be waiting on the session row");
+        }
+        let clock_passed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                if now > expires_at {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if clock_passed.is_err() {
+            blocker.rollback().await.unwrap();
+            transition.abort();
+            let _ = transition.await;
+            panic!("database clock must pass the committed session expiry");
+        }
+        blocker.commit().await.unwrap();
+        assert!(transition.await.unwrap().unwrap().is_none());
+        let persisted: (Option<String>, i64) = sqlx::query_as(
+            "SELECT credential_hash,
+             (SELECT count(*) FROM background_job WHERE mail_account_id=$1 AND mail_purpose='password_changed')
+             FROM authentication_identities WHERE user_id=$1 AND provider='password'",
+        )
+        .bind(user_id.0)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(persisted, (Some("old-hash".into()), 0));
+    });
 }
 
 #[db_test]
@@ -426,6 +776,7 @@ async fn auth_mail_admission_failure_rolls_back_each_token_transition(
                 "https://bikesnest.test/password-reset/new?token={}",
                 reset.to_base64url()
             ),
+            expires_at: None,
         },
     );
     assert!(
@@ -445,6 +796,7 @@ async fn auth_mail_admission_failure_rolls_back_each_token_transition(
                 "https://bikesnest.test/verify-email?token={}",
                 change.to_base64url()
             ),
+            expires_at: None,
         },
     );
     assert!(
@@ -882,7 +1234,7 @@ async fn pending_account_confirmation_activates_without_changing_identity(
 ) {
     let db = tx.db().await;
     let accounts = SqlxAccountRepository::new(db.clone());
-    let tokens = SqlxTokenStore::new(db);
+    let tokens = SqlxTokenStore::new(db.clone());
     let email = UserEmail::parse(&unique_email("pending-confirm")).unwrap();
     let user_id = accounts
         .create(bikesnest_application::NewAccount {
@@ -909,8 +1261,7 @@ async fn pending_account_confirmation_activates_without_changing_identity(
             .unwrap()
     );
 
-    let outcome = accounts
-        .confirm_email_verification(&token, now)
+    let outcome = confirm_email(&db, &token, now)
         .await
         .unwrap()
         .expect("pending account is eligible for initial confirmation");
@@ -927,11 +1278,7 @@ async fn pending_account_confirmation_activates_without_changing_identity(
         .unwrap();
     assert_eq!(identity.user_id, user_id);
     assert!(
-        accounts
-            .confirm_email_verification(&token, now)
-            .await
-            .unwrap()
-            .is_none(),
+        confirm_email(&db, &token, now).await.unwrap().is_none(),
         "confirmation remains single-use"
     );
 }
@@ -942,7 +1289,7 @@ async fn confirmation_rejects_unused_tokens_for_suspended_and_deleted_accounts(
 ) {
     let db = tx.db().await;
     let accounts = SqlxAccountRepository::new(db.clone());
-    let tokens = SqlxTokenStore::new(db);
+    let tokens = SqlxTokenStore::new(db.clone());
     for (index, blocked_state) in [AccountState::Suspended, AccountState::Deleted]
         .into_iter()
         .enumerate()
@@ -975,13 +1322,7 @@ async fn confirmation_rejects_unused_tokens_for_suspended_and_deleted_accounts(
         );
         accounts.set_state(user_id, blocked_state).await.unwrap();
 
-        assert!(
-            accounts
-                .confirm_email_verification(&token, now)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(confirm_email(&db, &token, now).await.unwrap().is_none());
         let user = accounts.find_by_id(user_id).await.unwrap().unwrap();
         assert_eq!(user.account_state, blocked_state);
         assert!(user.email_verified_at.is_none());
@@ -1088,7 +1429,7 @@ async fn suspension_revokes_security_tokens_and_sessions_across_restore(
     let db = tx.db().await;
     let accounts = SqlxAccountRepository::new(db.clone());
     let tokens = SqlxTokenStore::new(db.clone());
-    let sessions = SqlxSessionStore::new(db);
+    let sessions = SqlxSessionStore::new(db.clone());
     let email = UserEmail::parse(&unique_email("suspension-atomic")).unwrap();
     let user_id = accounts
         .create(bikesnest_application::NewAccount {
@@ -1126,8 +1467,7 @@ async fn suspension_revokes_security_tokens_and_sessions_across_restore(
     accounts.restore_by_admin(user_id, user_id).await.unwrap();
 
     assert!(
-        accounts
-            .confirm_email_verification(&verification, now)
+        confirm_email(&db, &verification, now)
             .await
             .unwrap()
             .is_none(),
@@ -1443,7 +1783,7 @@ async fn failed_email_confirmation_rolls_back_token_consumption(
 ) {
     let db = tx.db().await;
     let accounts = SqlxAccountRepository::new(db.clone());
-    let tokens = SqlxTokenStore::new(db);
+    let tokens = SqlxTokenStore::new(db.clone());
     let old_email = UserEmail::parse(&unique_email("rollback-old")).unwrap();
     let occupied_email = UserEmail::parse(&unique_email("rollback-occupied")).unwrap();
     let freed_email = UserEmail::parse(&unique_email("rollback-freed")).unwrap();
@@ -1483,7 +1823,7 @@ async fn failed_email_confirmation_rolls_back_token_consumption(
     );
 
     assert_eq!(
-        accounts.confirm_email_verification(&token, now).await,
+        confirm_email(&db, &token, now).await,
         Err(bikesnest_application::AuthError::Conflict)
     );
     assert_eq!(
@@ -1495,13 +1835,37 @@ async fn failed_email_confirmation_rolls_back_token_consumption(
         .update_canonical_email(occupied, &freed_email)
         .await
         .unwrap();
-    let outcome = accounts
-        .confirm_email_verification(&token, now)
+    let outcome = confirm_email(&db, &token, now)
         .await
         .unwrap()
         .expect("the failed transaction must leave the token usable");
     assert_eq!(outcome.user_id, source);
     assert!(outcome.email_changed);
+    let notice = outcome
+        .mail
+        .expect("old address warning is admitted atomically");
+    assert_eq!(notice.message.to, old_email.as_str());
+    assert_eq!(notice.message.kind.code(), "email_changed");
+    let notice_metadata: (bool, bool) = sqlx::query_as(
+        "SELECT mail_recipient_hash IS NOT NULL,mail_transition_audit_id IS NOT NULL
+         FROM background_job WHERE id=$1",
+    )
+    .bind(notice.job_id)
+    .fetch_one(&mut *db.acquire().await.unwrap())
+    .await
+    .unwrap();
+    assert_eq!(notice_metadata, (true, true));
+    let provider = std::sync::Arc::new(FakeEmailProvider::with_root(None));
+    bikesnest_application::JobHandler::run(
+        &SendEmailHandler::new(db.clone(), provider.clone()),
+        &serde_json::to_value(&notice.message).unwrap(),
+    )
+    .await
+    .unwrap();
+    let sent = provider.emails();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].to, old_email.as_str());
+    assert_eq!(sent[0].kind, "email_changed");
     assert_eq!(
         accounts.find_by_id(source).await.unwrap().unwrap().email,
         occupied_email
@@ -1540,10 +1904,7 @@ async fn password_reset_atomically_updates_credential_revokes_sessions_and_compe
             .unwrap();
 
         assert_eq!(
-            accounts
-                .complete_password_reset(&first, "new-hash", now)
-                .await
-                .unwrap(),
+            complete_reset(&db, &first, "new-hash", now).await.unwrap(),
             Some(user_id)
         );
         assert_eq!(
@@ -1575,8 +1936,7 @@ async fn password_reset_atomically_updates_credential_revokes_sessions_and_compe
         );
         assert_exact_password_reset_audit(&db, user_id, 1).await;
         assert!(
-            accounts
-                .complete_password_reset(&first, "later-hash", now)
+            complete_reset(&db, &first, "later-hash", now)
                 .await
                 .unwrap()
                 .is_none()
@@ -1621,8 +1981,7 @@ async fn password_reset_rejects_expired_and_blocked_accounts_without_state_chang
         accounts.set_state(user_id, state).await.unwrap();
 
         assert!(
-            accounts
-                .complete_password_reset(&token, "new-hash", now)
+            complete_reset(&db, &token, "new-hash", now)
                 .await
                 .unwrap()
                 .is_none()
@@ -1694,8 +2053,7 @@ async fn password_reset_rejects_expired_and_blocked_accounts_without_state_chang
         .await
         .unwrap();
     assert!(
-        accounts
-            .complete_password_reset(&expired, "new-hash", now + Duration::hours(2))
+        complete_reset(&db, &expired, "new-hash", now + Duration::hours(2))
             .await
             .unwrap()
             .is_none()
@@ -1760,9 +2118,7 @@ async fn password_reset_rejects_expired_and_blocked_accounts_without_state_chang
         .await
         .unwrap();
     assert_eq!(
-        accounts
-            .complete_password_reset(&no_identity, "new-hash", now)
-            .await,
+        complete_reset(&db, &no_identity, "new-hash", now).await,
         Err(bikesnest_application::AuthError::Internal)
     );
     assert_unused_reset_count(&db, oauth_user, 2).await;
@@ -1837,9 +2193,7 @@ async fn final_audit_failure_rolls_back_the_entire_password_reset(
     }
 
     assert_eq!(
-        accounts
-            .complete_password_reset(&token, "new-hash", now)
-            .await,
+        complete_reset(&db, &token, "new-hash", now).await,
         Err(bikesnest_application::AuthError::Internal)
     );
     assert_eq!(
@@ -1874,10 +2228,7 @@ async fn final_audit_failure_rolls_back_the_entire_password_reset(
     }
     assert_exact_password_reset_audit(&db, user_id, 0).await;
     assert_eq!(
-        accounts
-            .complete_password_reset(&token, "new-hash", now)
-            .await
-            .unwrap(),
+        complete_reset(&db, &token, "new-hash", now).await.unwrap(),
         Some(user_id)
     );
     assert!(sessions.resolve(&session, now).await.unwrap().is_none());
@@ -1949,11 +2300,9 @@ fn reset_expiring_during_account_lock_wait_is_rejected() {
         .await
         .unwrap();
 
-        let reset_accounts = SqlxAccountRepository::new(db.clone());
+        let reset_db = db.clone();
         let reset_task = tokio::spawn(async move {
-            reset_accounts
-                .complete_password_reset(&token, "new-hash", supplied_at)
-                .await
+            complete_reset(&reset_db, &token, "new-hash", supplied_at).await
         });
         let mut observed_wait = false;
         for _ in 0..50 {

@@ -221,6 +221,30 @@ impl TokenStore for SqlxTokenStore {
         .map_err(|e| db_err("token.consume_reset", e))?;
         Ok(row.map(|r| UserId(r.user_id)))
     }
+
+    async fn find_reset(
+        &self,
+        raw: &VerificationToken,
+        now: DateTime<Utc>,
+    ) -> Result<Option<UserId>, AuthError> {
+        let token_hash = sha256_hex(raw.as_bytes());
+        sqlx::query_scalar(
+            "SELECT user_id FROM password_reset_tokens
+             WHERE token_hash=$1 AND used_at IS NULL AND expires_at>$2",
+        )
+        .bind(token_hash)
+        .bind(now)
+        .fetch_optional(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("token.find_reset", e))?,
+        )
+        .await
+        .map(|id| id.map(UserId))
+        .map_err(|e| db_err("token.find_reset", e))
+    }
 }
 
 /// Classify + log the sqlx error (SQLSTATE, constraint), then map it onto

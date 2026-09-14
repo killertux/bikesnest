@@ -25,9 +25,9 @@ pub use audit::{
 };
 pub use auth::{
     AccountRepository, AdmittedAuthMail, AuthError, AuthMailDispatcher, AuthOutbox, AuthService,
-    AuthenticatedUser, Clock, EmailVerificationOutcome, IdentityRecord, LoginOutcome, NewAccount,
-    OAuthProvider, PasswordHasher, ResolvedSession, Session, SessionStore, TokenGenerator,
-    TokenStore, UserActivity, UserSearch,
+    AuthenticatedUser, Clock, EmailConfirmationOutcome, EmailVerificationOutcome, IdentityRecord,
+    LoginOutcome, NewAccount, OAuthProvider, PasswordHasher, ResolvedSession, Session,
+    SessionStore, TokenGenerator, TokenStore, UserActivity, UserSearch,
 };
 pub use community::{
     AddParkingLocationOutcome, AttributeSummary, CommunityParkingDetails, ContributionDeps,

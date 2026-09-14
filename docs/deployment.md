@@ -391,8 +391,16 @@ latency off the request path.
   at registration from the page's language and updated by the header language
   toggle for signed-in users). Subject and body are rendered from the message
   catalog *at send time* — pt-BR and en, never a hard-coded English string.
+- **Alternatives and security notices.** SMTP sends `multipart/alternative`;
+  Resend receives explicit `text` and `html` bodies. Newly admitted credential
+  messages carry their exact stored expiry; legacy payloads without it make no
+  invented duration claim. Successful password replacement durably admits a
+  credential-free warning to the current canonical address, while confirmed
+  address change warns the old address. Their transition audit reference and
+  recipient digest are send-boundary evidence, not durable history.
 - **Admission deduplication, at-least-once delivery.** Each job is enqueued under
-  `email:{kind}:{sha256(link)}`, so repeated admission for the same token
+  `email:{kind}:{sha256(identity)}`, where identity is the credential link or
+  immutable security-notice id, so repeated admission for the same transition
   collapses onto the existing row. A genuine re-send issues a new token and a
   new job. This does not guarantee one provider delivery: lease expiry or an
   ambiguous provider response can result in a duplicate send.
@@ -408,9 +416,10 @@ latency off the request path.
   idempotency key and remains explicitly at-least-once.
 - **Dead letters.** An exhausted job logs only the allowlisted message kind and
   stores a bounded error classification. Its recipient/link payload is cleared
-  immediately; lifecycle metadata remains until `jobs.gc` removes the row.
-  Alert on that log line: it means someone is stuck without a verification or
-  reset link and needs a re-send.
+  immediately; recipient digests and audit references are cleared with it.
+  Non-personal lifecycle metadata remains until `jobs.gc` removes the row.
+  Alert on that log line: delivery exhausted its retry budget. A provider may
+  already have accepted an attempt whose outcome was ambiguous.
 - **Deletion boundary.** Delivery and anonymization serialize on the account
   row. Deletion-first cancels even preclaimed mail; provider-acceptance-first is
   already outside the application's recall boundary. Provider timeout or a
@@ -426,6 +435,11 @@ latency off the request path.
   shares the queue. Startup validation needs no new rule
   here: inline delivery uses the same account/token validation, lease ownership
   and lock-through-provider boundary as the worker.
+  A credential-free security transition is already complete once its notice
+  row commits: a failed post-commit inline attempt leaves its durable queue
+  outcome (retryable or terminal) recorded and does not falsely report the
+  password/address mutation as failed or invite a replay with the spent token
+  or old credential.
 
 Migration 0026 adds nullable mail lifecycle columns. During upgrade it redacts
 all legacy `email.send` payloads because those rows cannot be safely linked to
@@ -441,6 +455,16 @@ database row is scrubbed. On failure, pause mail and forward-fix. Restoring a
 backup can resurrect erased data and lose intervening writes; it is only a
 separately approved disaster-recovery action and requires erasure
 reconciliation. Backup expiry, not this migration, removes historical copies.
+
+Migration 0027 extends that lifecycle with security-notice purposes, a
+recipient digest, and a nullable audit-event foreign key (`ON DELETE SET
+NULL`). Existing token jobs remain unchanged and readable; deleting retained
+audit history does not block retention, but makes an unsent notice fail closed.
+Stop and drain old workers before enabling writers that emit the new payload
+variants: an old worker cannot decode them and may dead-letter them. Apply 0027,
+upgrade every worker, then enable the new writers. Terminal outcomes and account
+deletion clear both new metadata fields. Rollback to an old worker while new
+notice rows exist is unsupported; pause mail and forward-fix instead.
 
 ## 6. Rolling deploy + rollback
 

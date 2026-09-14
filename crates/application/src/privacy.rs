@@ -1197,29 +1197,11 @@ mod tests {
         ) -> Result<(), AuthError> {
             Ok(())
         }
-        async fn confirm_email_verification(
-            &self,
-            _token: &bikesnest_domain::VerificationToken,
-            _a: DateTime<Utc>,
-        ) -> Result<Option<crate::auth::EmailVerificationOutcome>, AuthError> {
-            Ok(None)
-        }
         async fn suspend_by_admin(&self, _i: UserId, _a: UserId) -> Result<bool, AuthError> {
             Ok(false)
         }
         async fn restore_by_admin(&self, _i: UserId, _a: UserId) -> Result<bool, AuthError> {
             Ok(false)
-        }
-        async fn complete_password_reset(
-            &self,
-            _token: &bikesnest_domain::VerificationToken,
-            _password_hash: &str,
-            _at: DateTime<Utc>,
-        ) -> Result<Option<UserId>, AuthError> {
-            Ok(None)
-        }
-        async fn set_password(&self, _i: UserId, _h: &str) -> Result<(), AuthError> {
-            Ok(())
         }
         async fn set_locale(
             &self,

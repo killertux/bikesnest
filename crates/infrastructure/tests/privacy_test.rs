@@ -122,6 +122,83 @@ fn mail_lifecycle_upgrade_redacts_legacy_rows_without_rewriting_terminal_history
 }
 
 #[test]
+fn security_notice_upgrade_preserves_legacy_jobs_and_sets_nullable_audit_authority() {
+    run_isolated_database_test(|pool: sqlx::PgPool| async move {
+        sqlx::raw_sql(
+            "DROP INDEX background_job_mail_transition_audit_idx;
+             ALTER TABLE background_job
+               DROP COLUMN mail_transition_audit_id,
+               DROP COLUMN mail_recipient_hash,
+               DROP CONSTRAINT background_job_mail_purpose_check,
+               ADD CONSTRAINT background_job_mail_purpose_check
+                 CHECK (mail_purpose IN ('verify','reset','change'));",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let legacy_id: i64 = sqlx::query_scalar(
+            "INSERT INTO background_job(kind,payload,mail_purpose)
+             VALUES('email.send','{\"legacy\":true}','verify') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/0027_security_notice_mail.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let preserved: (serde_json::Value, Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT payload,mail_recipient_hash,mail_transition_audit_id
+             FROM background_job WHERE id=$1",
+        )
+        .bind(legacy_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(preserved, (serde_json::json!({"legacy": true}), None, None));
+
+        let user_id: i64 = sqlx::query_scalar(
+            "INSERT INTO users(email,account_state) VALUES('upgrade-notice@bikesnest.test','ACTIVE') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let audit_id: i64 = sqlx::query_scalar(
+            "INSERT INTO audit_events(actor_user_id,action,target_type,target_id,result,metadata)
+             VALUES($1,'auth.password_changed','user',$2,'success','{}') RETURNING id",
+        )
+        .bind(user_id)
+        .bind(user_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let notice_id: i64 = sqlx::query_scalar(
+            "INSERT INTO background_job(kind,payload,mail_purpose,mail_recipient_hash,mail_transition_audit_id)
+             VALUES('email.send','{}','password_changed','digest',$1) RETURNING id",
+        )
+        .bind(audit_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let removed: i64 =
+            sqlx::query_scalar("SELECT purge_audit_events_before(now()+interval '1 second')")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(removed >= 1);
+        let cleared: Option<i64> =
+            sqlx::query_scalar("SELECT mail_transition_audit_id FROM background_job WHERE id=$1")
+                .bind(notice_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(cleared, None);
+    });
+}
+
+#[test]
 fn provider_acceptance_and_deletion_serialize_on_the_account() {
     use bikesnest_application::{EmailKind, EmailMessage, EmailQueue, JobHandler};
     use bikesnest_domain::{LocaleCode, VerificationToken};
@@ -151,8 +228,13 @@ fn provider_acceptance_and_deletion_serialize_on_the_account() {
                     "https://bikesnest.test/verify-email?token={}",
                     token.to_base64url()
                 ),
+                expires_at: None,
             },
         );
+        JobEmailQueue::new(SqlxJobRepository::new(Db::from_pool(pool.clone())), 3)
+            .enqueue(msg.clone())
+            .await
+            .unwrap();
         let payload = serde_json::to_value(msg).unwrap();
         let stale_snapshot = payload.clone();
         let entered = Arc::new(tokio::sync::Notify::new());
@@ -233,6 +315,7 @@ fn provider_acceptance_and_deletion_serialize_on_the_account() {
                     "https://bikesnest.test/verify-email?token={}",
                     enqueue_token.to_base64url()
                 ),
+                expires_at: None,
             },
         );
         let mut deleting = pool.acquire().await.unwrap();
@@ -292,14 +375,19 @@ async fn anonymization_redacts_every_mail_state_without_touching_other_jobs(
         .create(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
-    let ids: Vec<i64> = sqlx::query_scalar(r#"INSERT INTO background_job
-      (kind,payload,state,mail_account_id,mail_token_hash,mail_purpose,mail_token_expires_at,finished_at,claimed_by,lease_expires_at)
-      SELECT 'email.send','{"secret":"TOKEN"}',state,$1,'hash','verify',now()+interval '1 hour',
+    let mut ids: Vec<i64> = sqlx::query_scalar(r#"INSERT INTO background_job
+      (kind,payload,state,mail_account_id,mail_token_hash,mail_purpose,mail_token_expires_at,mail_recipient_hash,finished_at,claimed_by,lease_expires_at)
+      SELECT 'email.send','{"secret":"TOKEN"}',state,$1,'hash','verify',now()+interval '1 hour','recipient-digest',
        CASE WHEN state IN ('succeeded','failed') THEN now() END,
        CASE WHEN state='running' THEN 'worker' END,
        CASE WHEN state='running' THEN now()+interval '1 minute' END
       FROM unnest(ARRAY['pending','running','succeeded','failed']) state RETURNING id"#)
         .bind(user.id.0).fetch_all(&mut *db.acquire().await.unwrap()).await.unwrap();
+    let audit_id: i64 = sqlx::query_scalar("INSERT INTO audit_events(actor_user_id,action,target_type,target_id,result,metadata) VALUES($1,'auth.password_changed','user',$2,'success','{}') RETURNING id")
+        .bind(user.id.0).bind(user.id.0.to_string()).fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
+    let notice_id: i64 = sqlx::query_scalar("INSERT INTO background_job(kind,payload,state,mail_account_id,mail_purpose,mail_recipient_hash,mail_transition_audit_id) VALUES('email.send','{\"notice\":\"PRIVATE\"}','pending',$1,'password_changed','notice-digest',$2) RETURNING id")
+        .bind(user.id.0).bind(audit_id).fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
+    ids.push(notice_id);
     let other: i64 = sqlx::query_scalar("INSERT INTO background_job(kind,payload) VALUES('test.scoped.other','{\"keep\":true}') RETURNING id")
         .fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
     SqlxAnonymizationRepository::new(db.clone())
@@ -312,18 +400,21 @@ async fn anonymization_redacts_every_mail_state_without_touching_other_jobs(
         serde_json::Value,
         Option<String>,
         Option<DateTime<Utc>>,
+        Option<String>,
+        Option<i64>,
     );
     let rows: Vec<MailStateRow> = sqlx::query_as(
-        "SELECT state,payload,claimed_by,payload_redacted_at FROM background_job WHERE id=ANY($1) ORDER BY id")
+        "SELECT state,payload,claimed_by,payload_redacted_at,mail_recipient_hash,mail_transition_audit_id FROM background_job WHERE id=ANY($1) ORDER BY id")
         .bind(&ids).fetch_all(&mut *conn).await.unwrap();
     assert_eq!(
         rows.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
-        vec!["failed", "failed", "succeeded", "failed"]
+        vec!["failed", "failed", "succeeded", "failed", "failed"]
     );
-    assert!(
-        rows.iter()
-            .all(|r| r.1 == serde_json::json!({}) && r.2.is_none() && r.3.is_some())
-    );
+    assert!(rows.iter().all(|r| r.1 == serde_json::json!({})
+        && r.2.is_none()
+        && r.3.is_some()
+        && r.4.is_none()
+        && r.5.is_none()));
     let kept: serde_json::Value =
         sqlx::query_scalar("SELECT payload FROM background_job WHERE id=$1")
             .bind(other)

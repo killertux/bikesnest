@@ -66,7 +66,7 @@ pub async fn seed_admin(
             .await?
             .is_some();
         if identity_present {
-            repo.set_password(id, &hash).await?;
+            repo.set_seed_password(id, &hash).await?;
         } else {
             repo.link_identity(
                 id,

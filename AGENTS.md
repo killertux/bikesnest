@@ -108,7 +108,8 @@ npm run build:css                        # Tailwind → web/static/css/app.css
   a kind unique to that test, not the unscoped `claim` — see "Job-queue test
   isolation" in `TESTING.md`.
 - **Auth mail is one outbox transaction:** registration, verification resend,
-  reset request and email-change request use `AuthOutbox`; do not split their
+  reset request, email-change request, and committed password/email-change
+  security notices use `AuthOutbox`; do not split their
   account/token/audit/job writes or call a provider inside that transaction.
   Worker-disabled compatibility exact-claims only the admitted job afterward.
 - **New fragment endpoints** need the `is_fragment_request` tests (a request

@@ -1206,6 +1206,7 @@ async fn verify_message(tag: &str, db: &Db) -> EmailMessage {
                 "http://localhost:8080/verify-email?token={}",
                 token.to_base64url()
             ),
+            expires_at: None,
         },
     )
 }
@@ -1350,9 +1351,18 @@ async fn lifecycle_message(db: &Db, purpose: MailPurpose, case: &str) -> (EmailM
         token.to_base64url()
     );
     let kind = match purpose {
-        MailPurpose::Verify => EmailKind::VerifyEmail { link },
-        MailPurpose::Reset => EmailKind::ResetPassword { link },
-        MailPurpose::Change => EmailKind::ConfirmEmailChange { link },
+        MailPurpose::Verify => EmailKind::VerifyEmail {
+            link,
+            expires_at: None,
+        },
+        MailPurpose::Reset => EmailKind::ResetPassword {
+            link,
+            expires_at: None,
+        },
+        MailPurpose::Change => EmailKind::ConfirmEmailChange {
+            link,
+            expires_at: None,
+        },
     };
     (
         EmailMessage::linked(UserId(user_id), email, LocaleCode::En, kind),
@@ -1388,9 +1398,18 @@ async fn invalidate_credential(
                 token.to_base64url()
             );
             msg.kind = match purpose {
-                MailPurpose::Verify => EmailKind::VerifyEmail { link },
-                MailPurpose::Reset => EmailKind::ResetPassword { link },
-                MailPurpose::Change => EmailKind::ConfirmEmailChange { link },
+                MailPurpose::Verify => EmailKind::VerifyEmail {
+                    link,
+                    expires_at: None,
+                },
+                MailPurpose::Reset => EmailKind::ResetPassword {
+                    link,
+                    expires_at: None,
+                },
+                MailPurpose::Change => EmailKind::ConfirmEmailChange {
+                    link,
+                    expires_at: None,
+                },
             };
         }
         InvalidCredential::Recipient => msg.to = format!("wrong-{}@example.com", msg.account_id),
@@ -1442,6 +1461,10 @@ async fn mail_handler_and_inline_queue_enforce_exact_token_lifecycle(
                     .await
                     .unwrap();
             } else {
+                bikesnest_infrastructure::JobEmailQueue::new(SqlxJobRepository::new(db.clone()), 3)
+                    .enqueue(msg.clone())
+                    .await
+                    .unwrap();
                 SendEmailHandler::new(db.clone(), Arc::new(provider.clone()))
                     .run(&serde_json::to_value(msg).unwrap())
                     .await
@@ -1508,6 +1531,7 @@ async fn queue_admission_database_error_tracing_excludes_hostile_recipient_data(
                 "https://x/password-reset/new?token={}",
                 token.to_base64url()
             ),
+            expires_at: None,
         },
     );
     let pool = sqlx::postgres::PgPoolOptions::new()
@@ -1787,4 +1811,170 @@ async fn inline_dispatch_does_not_duplicate_an_active_lease(
         .await
         .unwrap();
     assert_eq!(owner, "already-sending");
+}
+
+#[db_test]
+async fn security_notice_send_boundary_requires_audit_hash_and_canonical_password_recipient(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    use sha2::{Digest, Sha256};
+    let db = tx.db().await;
+    let email = "notice-boundary@bikesnest.test";
+    let user_id: i64 = sqlx::query_scalar(
+        "INSERT INTO users(email,account_state,email_verified_at,locale)
+         VALUES($1,'ACTIVE',now(),'en') RETURNING id",
+    )
+    .bind(email)
+    .fetch_one(&mut *db.acquire().await.unwrap())
+    .await
+    .unwrap();
+    let audit_id: i64 = sqlx::query_scalar(
+        "INSERT INTO audit_events(actor_user_id,action,target_type,target_id,result,metadata)
+         VALUES($1,'auth.password_changed','user',$2,'success','{}') RETURNING id",
+    )
+    .bind(user_id)
+    .bind(user_id.to_string())
+    .fetch_one(&mut *db.acquire().await.unwrap())
+    .await
+    .unwrap();
+    let msg = EmailMessage::linked(
+        UserId(user_id),
+        email,
+        LocaleCode::En,
+        EmailKind::PasswordChanged {
+            account_link: "https://bikesnest.test/login".into(),
+            notification_id: unique_token("notice-boundary"),
+        },
+    );
+    let payload = serde_json::to_value(&msg).unwrap();
+    let recipient_hash: String = Sha256::digest(email.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    sqlx::query(
+        "INSERT INTO background_job
+         (kind,payload,run_at,max_attempts,idempotency_key,mail_account_id,mail_purpose,
+          mail_recipient_hash,mail_transition_audit_id)
+         VALUES('email.send',$1,now(),3,$2,$3,'password_changed',$4,$5)",
+    )
+    .bind(&payload)
+    .bind(idempotency_key(&msg))
+    .bind(user_id)
+    .bind(recipient_hash)
+    .bind(audit_id)
+    .execute(&mut *db.acquire().await.unwrap())
+    .await
+    .unwrap();
+    let provider = FakeEmailProvider::with_root(None);
+    SendEmailHandler::new(db.clone(), Arc::new(provider.clone()))
+        .run(&payload)
+        .await
+        .unwrap();
+    let sent = provider.emails();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].to, email);
+    assert_eq!(sent[0].kind, "password_changed");
+
+    sqlx::query("UPDATE background_job SET mail_recipient_hash='wrong' WHERE idempotency_key=$1")
+        .bind(idempotency_key(&msg))
+        .execute(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    assert!(matches!(
+        SendEmailHandler::new(db.clone(), Arc::new(provider.clone()))
+            .run(&payload)
+            .await,
+        Err(JobError::Permanent(_))
+    ));
+    sqlx::query("UPDATE background_job SET mail_recipient_hash=NULL WHERE idempotency_key=$1")
+        .bind(idempotency_key(&msg))
+        .execute(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    assert!(matches!(
+        SendEmailHandler::new(db.clone(), Arc::new(provider.clone()))
+            .run(&payload)
+            .await,
+        Err(JobError::Permanent(_))
+    ));
+    sqlx::query(
+        "UPDATE background_job SET mail_recipient_hash=$1,mail_transition_audit_id=NULL
+         WHERE idempotency_key=$2",
+    )
+    .bind(
+        Sha256::digest(email.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+    )
+    .bind(idempotency_key(&msg))
+    .execute(&mut *db.acquire().await.unwrap())
+    .await
+    .unwrap();
+    assert!(matches!(
+        SendEmailHandler::new(db.clone(), Arc::new(provider.clone()))
+            .run(&payload)
+            .await,
+        Err(JobError::Permanent(_))
+    ));
+    sqlx::query("UPDATE background_job SET mail_transition_audit_id=$1 WHERE idempotency_key=$2")
+        .bind(audit_id)
+        .bind(idempotency_key(&msg))
+        .execute(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET account_state='SUSPENDED' WHERE id=$1")
+        .bind(user_id)
+        .execute(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    assert!(matches!(
+        SendEmailHandler::new(db.clone(), Arc::new(provider.clone()))
+            .run(&payload)
+            .await,
+        Err(JobError::Permanent(_))
+    ));
+    sqlx::query("UPDATE users SET account_state='PENDING_EMAIL_VERIFICATION' WHERE id=$1")
+        .bind(user_id)
+        .execute(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    SendEmailHandler::new(db.clone(), Arc::new(provider.clone()))
+        .run(&payload)
+        .await
+        .unwrap();
+    assert_eq!(provider.emails().len(), 2);
+
+    sqlx::query(
+        "UPDATE users SET email='later-address@bikesnest.test',account_state='ACTIVE' WHERE id=$1",
+    )
+    .bind(user_id)
+    .execute(&mut *db.acquire().await.unwrap())
+    .await
+    .unwrap();
+    let rejected = SendEmailHandler::new(db.clone(), Arc::new(provider.clone()))
+        .run(&payload)
+        .await;
+    assert!(matches!(rejected, Err(JobError::Permanent(_))));
+    assert_eq!(provider.emails().len(), 2);
+
+    let job_id: i64 = sqlx::query_scalar("SELECT id FROM background_job WHERE idempotency_key=$1")
+        .bind(idempotency_key(&msg))
+        .fetch_one(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    simulate_claim(job_id, "notice-terminal", 1, &db).await;
+    SqlxJobRepository::new(db.clone())
+        .fail(job_id, "notice-terminal", "permanent")
+        .await
+        .unwrap();
+    let scrubbed: (serde_json::Value, Option<String>, Option<i64>) = sqlx::query_as(
+        "SELECT payload,mail_recipient_hash,mail_transition_audit_id
+         FROM background_job WHERE id=$1",
+    )
+    .bind(job_id)
+    .fetch_one(&mut *db.acquire().await.unwrap())
+    .await
+    .unwrap();
+    assert_eq!(scrubbed, (serde_json::json!({}), None, None));
 }

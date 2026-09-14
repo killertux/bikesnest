@@ -39,6 +39,7 @@ struct FakeDb {
     /// Set to make `FakeQueue::enqueue` fail, standing in for "the database
     /// that holds the job queue is unreachable".
     queue_broken: bool,
+    dispatch_broken: bool,
     hash_broken: bool,
     next_id: i64,
 }
@@ -147,55 +148,6 @@ impl AccountRepository for FakeRepo {
         }
         Ok(())
     }
-    async fn set_password(&self, id: UserId, hash: &str) -> Result<(), AuthError> {
-        let mut db = self.db.lock().unwrap();
-        for i in db.identities.iter_mut() {
-            if i.user_id == id && i.provider == AuthenticationProvider::Password {
-                i.credential_hash = Some(hash.to_string());
-            }
-        }
-        Ok(())
-    }
-    async fn confirm_email_verification(
-        &self,
-        token: &VerificationToken,
-        at: DateTime<Utc>,
-    ) -> Result<Option<EmailVerificationOutcome>, AuthError> {
-        let mut db = self.db.lock().unwrap();
-        let key = token.to_hex();
-        let Some(position) = db
-            .verification
-            .iter()
-            .position(|(k, _, _, used)| *k == key && !*used)
-        else {
-            return Ok(None);
-        };
-        let (_, id, email, _) = db.verification[position].clone();
-        let Some(user_position) = db.users.iter().position(|u| u.id == id) else {
-            return Ok(None);
-        };
-        if !matches!(
-            db.users[user_position].account_state,
-            AccountState::PendingEmailVerification | AccountState::Active
-        ) {
-            return Ok(None);
-        }
-        let parsed_email = UserEmail::parse(&email).map_err(|_| AuthError::Internal)?;
-        let changed = db.users[user_position].email != parsed_email;
-        db.verification[position].3 = true;
-        db.users[user_position].email = parsed_email;
-        db.users[user_position].email_verified_at = Some(at);
-        db.users[user_position].account_state = AccountState::Active;
-        for i in db.identities.iter_mut() {
-            if i.user_id == id && i.provider == AuthenticationProvider::Password {
-                i.provider_subject = email.clone();
-            }
-        }
-        Ok(Some(EmailVerificationOutcome {
-            user_id: id,
-            email_changed: changed,
-        }))
-    }
     async fn suspend_by_admin(&self, id: UserId, actor: UserId) -> Result<bool, AuthError> {
         let mut db = self.db.lock().unwrap();
         let Some(user) = db.users.iter_mut().find(|u| u.id == id) else {
@@ -251,55 +203,6 @@ impl AccountRepository for FakeRepo {
             id.0.to_string(),
         ));
         Ok(true)
-    }
-    async fn complete_password_reset(
-        &self,
-        token: &VerificationToken,
-        password_hash: &str,
-        at: DateTime<Utc>,
-    ) -> Result<Option<UserId>, AuthError> {
-        let mut db = self.db.lock().unwrap();
-        let key = token.to_hex();
-        let Some((_, user_id, _, _)) = db
-            .reset
-            .iter()
-            .find(|(candidate, _, expires_at, used)| {
-                *candidate == key && !*used && *expires_at > at
-            })
-            .cloned()
-        else {
-            return Ok(None);
-        };
-        if !db
-            .users
-            .iter()
-            .any(|user| user.id == user_id && user.account_state.can_log_in())
-        {
-            return Ok(None);
-        }
-        let Some(identity) = db.identities.iter_mut().find(|identity| {
-            identity.user_id == user_id && identity.provider == AuthenticationProvider::Password
-        }) else {
-            return Err(AuthError::Internal);
-        };
-        identity.credential_hash = Some(password_hash.to_string());
-        for (_, session) in &mut db.sessions {
-            if session.user_id == user_id {
-                session.revoked_at = Some(Utc::now());
-            }
-        }
-        for (_, reset_user_id, _, used) in &mut db.reset {
-            if *reset_user_id == user_id {
-                *used = true;
-            }
-        }
-        db.audits.push(AuditEvent::success(
-            Some(user_id),
-            "auth.password_changed",
-            "user",
-            user_id.0.to_string(),
-        ));
-        Ok(Some(user_id))
     }
     async fn link_identity(
         &self,
@@ -530,6 +433,21 @@ impl SessionStore for FakeRepo {
 // --- TokenStore ---
 #[async_trait]
 impl TokenStore for FakeRepo {
+    async fn find_reset(
+        &self,
+        raw: &VerificationToken,
+        now: DateTime<Utc>,
+    ) -> Result<Option<UserId>, AuthError> {
+        let db = self.db.lock().unwrap();
+        let key = raw.to_hex();
+        Ok(db
+            .reset
+            .iter()
+            .find(|(candidate, _, expires_at, used)| {
+                *candidate == key && !*used && *expires_at > now
+            })
+            .map(|(_, user_id, _, _)| *user_id))
+    }
     async fn issue_verification(
         &self,
         user_id: UserId,
@@ -685,7 +603,7 @@ struct FakeQueue {
 impl AuthMailDispatcher for FakeQueue {
     async fn dispatch(&self, mail: AdmittedAuthMail) -> Result<(), AuthError> {
         let mut db = self.db.lock().unwrap();
-        if db.queue_broken {
+        if db.dispatch_broken {
             return Err(AuthError::Unavailable);
         }
         if !db.dispatched.contains(&mail.job_id) {
@@ -822,6 +740,161 @@ impl AuthOutbox for FakeRepo {
         let mail = AdmittedAuthMail {
             job_id: db.next_id,
             message,
+        };
+        db.outbox.push(mail.clone());
+        Ok(Some(mail))
+    }
+
+    async fn confirm_email(
+        &self,
+        token: &VerificationToken,
+        at: DateTime<Utc>,
+        old_address_notice: EmailMessage,
+    ) -> Result<Option<EmailVerificationOutcome>, AuthError> {
+        let mut db = self.db.lock().unwrap();
+        let key = token.to_hex();
+        let Some(position) = db
+            .verification
+            .iter()
+            .position(|(candidate, _, _, used)| *candidate == key && !*used)
+        else {
+            return Ok(None);
+        };
+        let (_, id, email, _) = db.verification[position].clone();
+        let Some(user_position) = db.users.iter().position(|user| user.id == id) else {
+            return Ok(None);
+        };
+        if !matches!(
+            db.users[user_position].account_state,
+            AccountState::PendingEmailVerification | AccountState::Active
+        ) {
+            return Ok(None);
+        }
+        let parsed_email = UserEmail::parse(&email).map_err(|_| AuthError::Internal)?;
+        let changed = db.users[user_position].email != parsed_email;
+        db.verification[position].3 = true;
+        db.users[user_position].email = parsed_email;
+        db.users[user_position].email_verified_at = Some(at);
+        db.users[user_position].account_state = AccountState::Active;
+        for identity in &mut db.identities {
+            if identity.user_id == id && identity.provider == AuthenticationProvider::Password {
+                identity.provider_subject = email.clone();
+            }
+        }
+        if changed {
+            for (_, session) in &mut db.sessions {
+                if session.user_id == id {
+                    session.revoked_at = Some(at);
+                }
+            }
+            db.audits.push(AuditEvent::success(
+                Some(id),
+                "auth.email_changed",
+                "user",
+                id.0.to_string(),
+            ));
+        }
+        let mail = if changed {
+            db.next_id += 1;
+            let admitted = AdmittedAuthMail {
+                job_id: db.next_id,
+                message: old_address_notice,
+            };
+            db.outbox.push(admitted.clone());
+            Some(admitted)
+        } else {
+            None
+        };
+        Ok(Some(EmailVerificationOutcome {
+            user_id: id,
+            email_changed: changed,
+            mail,
+        }))
+    }
+
+    async fn complete_password_reset(
+        &self,
+        token: &VerificationToken,
+        password_hash: &str,
+        at: DateTime<Utc>,
+        notice: EmailMessage,
+    ) -> Result<Option<AdmittedAuthMail>, AuthError> {
+        let mut db = self.db.lock().unwrap();
+        let key = token.to_hex();
+        let Some((_, user_id, _, _)) = db
+            .reset
+            .iter()
+            .find(|(candidate, _, expires_at, used)| {
+                *candidate == key && !*used && *expires_at > at
+            })
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let Some(identity) = db.identities.iter_mut().find(|identity| {
+            identity.user_id == user_id && identity.provider == AuthenticationProvider::Password
+        }) else {
+            return Err(AuthError::Internal);
+        };
+        identity.credential_hash = Some(password_hash.to_string());
+        for (_, session) in &mut db.sessions {
+            if session.user_id == user_id {
+                session.revoked_at = Some(at);
+            }
+        }
+        for (_, reset_user_id, _, used) in &mut db.reset {
+            if *reset_user_id == user_id {
+                *used = true;
+            }
+        }
+        db.audits.push(AuditEvent::success(
+            Some(user_id),
+            "auth.password_changed",
+            "user",
+            user_id.0.to_string(),
+        ));
+        db.next_id += 1;
+        let mail = AdmittedAuthMail {
+            job_id: db.next_id,
+            message: notice,
+        };
+        db.outbox.push(mail.clone());
+        Ok(Some(mail))
+    }
+
+    async fn change_password(
+        &self,
+        user_id: UserId,
+        expected_hash: &str,
+        password_hash: &str,
+        current_session: &SessionId,
+        at: DateTime<Utc>,
+        notice: EmailMessage,
+    ) -> Result<Option<AdmittedAuthMail>, AuthError> {
+        let mut db = self.db.lock().unwrap();
+        let Some(identity) = db.identities.iter_mut().find(|identity| {
+            identity.user_id == user_id
+                && identity.provider == AuthenticationProvider::Password
+                && identity.credential_hash.as_deref() == Some(expected_hash)
+        }) else {
+            return Ok(None);
+        };
+        identity.credential_hash = Some(password_hash.to_string());
+        for (raw, session) in &mut db.sessions {
+            if session.user_id == user_id && raw != &current_session.to_hex() {
+                session.revoked_at = Some(at);
+            }
+        }
+        db.audits.push(AuditEvent::success(
+            Some(user_id),
+            "auth.password_changed",
+            "user",
+            user_id.0.to_string(),
+        ));
+        db.next_id += 1;
+        let mail = AdmittedAuthMail {
+            job_id: db.next_id,
+            message: notice,
         };
         db.outbox.push(mail.clone());
         Ok(Some(mail))
@@ -1040,7 +1113,12 @@ async fn register_queues_one_message_carrying_the_signup_locale() {
             "{:?}",
             queued[0].kind
         );
-        assert!(queued[0].kind.link().contains("/verify-email?token="));
+        assert!(
+            queued[0]
+                .kind
+                .action_link()
+                .contains("/verify-email?token=")
+        );
 
         // The locale is also on the account, so the *next* message — a resend
         // or a password reset, both sent with no request in scope — finds it.
@@ -1377,6 +1455,47 @@ async fn reset_password_revokes_all_sessions() {
     assert!(
         auth.resolve_session(&session).await.unwrap().is_none(),
         "old session revoked after reset"
+    );
+}
+
+#[tokio::test]
+async fn committed_security_transition_succeeds_when_inline_notice_dispatch_fails() {
+    let db = Arc::new(Mutex::new(FakeDb::default()));
+    seed_active_user(&db, "notice-failure@example.com", "correct");
+    let auth = make_service(db.clone());
+    let email = UserEmail::parse("notice-failure@example.com").unwrap();
+    auth.request_password_reset("1.1.1.1", &email)
+        .await
+        .unwrap();
+    let token = find_token(&db, "/password-reset/new");
+    db.lock().unwrap().dispatch_broken = true;
+
+    auth.reset_password(&token, "replacement-password")
+        .await
+        .expect("durably committed password change is not reported as failed");
+    assert_eq!(
+        auth.reset_password(&token, "another-password").await,
+        Err(AuthError::TokenInvalid),
+        "the spent transition is not replayed when only notice dispatch failed"
+    );
+    let db = db.lock().unwrap();
+    assert_eq!(
+        db.identities[0].credential_hash.as_deref(),
+        Some("h:replacement-password")
+    );
+    assert_eq!(
+        db.audits
+            .iter()
+            .filter(|event| event.action == "auth.password_changed")
+            .count(),
+        1
+    );
+    assert_eq!(
+        db.outbox
+            .iter()
+            .filter(|mail| mail.message.kind.code() == "password_changed")
+            .count(),
+        1
     );
 }
 
@@ -1747,8 +1866,8 @@ fn find_token(db: &Arc<Mutex<FakeDb>>, path: &str) -> String {
         .unwrap()
         .emails
         .iter()
-        .find(|e| e.kind.link().contains(path))
-        .map(|e| token_from(e.kind.link()))
+        .find(|e| e.kind.action_link().contains(path))
+        .map(|e| token_from(e.kind.action_link()))
         .unwrap_or_default()
 }
 
@@ -1833,6 +1952,7 @@ async fn change_password_requires_current_and_verifies_new() {
         AuthError::InvalidCurrentPassword
     );
     // Correct current password succeeds.
+    db.lock().unwrap().dispatch_broken = true;
     auth.change_password(UserId(1), "correct-horse", "new-password", &session)
         .await
         .unwrap();
@@ -1874,6 +1994,7 @@ async fn change_email_switches_address_and_revokes_sessions() {
         !token.is_empty(),
         "verification token sent to the new email"
     );
+    db.lock().unwrap().dispatch_broken = true;
     auth.verify_email(&token).await.unwrap();
 
     assert_eq!(

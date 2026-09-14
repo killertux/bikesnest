@@ -188,6 +188,7 @@ impl AnonymizationRepository for SqlxAnonymizationRepository {
                    last_error=CASE WHEN state IN ('pending','running','failed') THEN 'account deleted; mail cancelled' ELSE NULL END,
                    finished_at=CASE WHEN state IN ('pending','running') THEN COALESCE(finished_at,$2) ELSE finished_at END,
                    claimed_by=NULL, lease_expires_at=NULL, heartbeat_at=NULL,
+                   mail_recipient_hash=NULL, mail_transition_audit_id=NULL,
                    payload_redacted_at=COALESCE(payload_redacted_at,$2), updated_at=now()
                WHERE kind='email.send' AND mail_account_id=$1"#,
         ).bind(user_id.0).bind(now).execute(&mut *tx).await

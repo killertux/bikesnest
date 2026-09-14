@@ -94,6 +94,7 @@ impl ResendEmailProvider {
             "to": [msg.to],
             "subject": rendered.subject,
             "text": rendered.text,
+            "html": rendered.html,
         })
     }
 
@@ -150,6 +151,7 @@ mod tests {
             LocaleCode::En,
             EmailKind::VerifyEmail {
                 link: "https://bikesnest.test/verify-email?token=t".into(),
+                expires_at: None,
             },
         );
         let p = provider().payload(&msg);
@@ -157,8 +159,7 @@ mod tests {
         assert_eq!(p["to"][0], "a@example.com");
         assert_eq!(p["subject"], "Confirm your BikesNest email");
         assert!(p["text"].as_str().unwrap().contains("verify-email?token=t"));
-        // Plain text only: there is no HTML template for any kind.
-        assert!(p.get("html").is_none());
+        assert!(p["html"].as_str().unwrap().contains("verify-email?token=t"));
     }
 
     #[test]
@@ -168,6 +169,7 @@ mod tests {
             LocaleCode::PtBr,
             EmailKind::VerifyEmail {
                 link: "https://bikesnest.test/verify-email?token=t".into(),
+                expires_at: None,
             },
         );
         let p = provider().payload(&msg);
@@ -262,6 +264,7 @@ mod tests {
             LocaleCode::En,
             EmailKind::VerifyEmail {
                 link: "https://bikesnest.test/verify-email?token=stable".into(),
+                expires_at: None,
             },
         );
         let key = crate::email::idempotency_key(&msg);
@@ -277,6 +280,7 @@ mod tests {
             LocaleCode::En,
             EmailKind::VerifyEmail {
                 link: "https://bikesnest.test/verify-email?token=other".into(),
+                expires_at: None,
             },
         );
         assert_ne!(key, crate::email::idempotency_key(&other));

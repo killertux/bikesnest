@@ -1,11 +1,9 @@
 //! SQL-backed account + role repository (runtime-checked SQL).
 
 use crate::Db;
-use crate::auth::hash::sha256_hex;
 use async_trait::async_trait;
 use bikesnest_application::{
-    AccountRepository, AuthError, EmailVerificationOutcome, IdentityRecord, NewAccount,
-    UserActivity, UserSearch,
+    AccountRepository, AuthError, IdentityRecord, NewAccount, UserActivity, UserSearch,
 };
 use bikesnest_domain::{
     AccountState, AuthenticationProvider, LocaleCode, Role, User, UserEmail, UserId,
@@ -20,6 +18,27 @@ pub struct SqlxAccountRepository {
 impl SqlxAccountRepository {
     pub fn new(db: Db) -> Self {
         Self { db }
+    }
+
+    /// Administrative bootstrap-only credential replacement. Interactive
+    /// password transitions use the transactional auth outbox instead.
+    pub(crate) async fn set_seed_password(&self, id: UserId, hash: &str) -> Result<(), AuthError> {
+        sqlx::query(
+            "UPDATE authentication_identities SET credential_hash = $2
+             WHERE user_id = $1 AND provider = 'password'",
+        )
+        .bind(id.0)
+        .bind(hash)
+        .execute(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("account.acquire", e))?,
+        )
+        .await
+        .map_err(|e| db_err("account.set_seed_password", e))?;
+        Ok(())
     }
 
     async fn load_user(&self, row: UserRow) -> Result<User, AuthError> {
@@ -292,103 +311,6 @@ impl AccountRepository for SqlxAccountRepository {
         Ok(())
     }
 
-    async fn confirm_email_verification(
-        &self,
-        token: &bikesnest_domain::VerificationToken,
-        at: DateTime<Utc>,
-    ) -> Result<Option<EmailVerificationOutcome>, AuthError> {
-        #[derive(sqlx::FromRow)]
-        struct TokenRow {
-            user_id: i64,
-            email: String,
-        }
-        #[derive(sqlx::FromRow)]
-        struct UserStateRow {
-            email: String,
-            account_state: String,
-        }
-        let token_hash = sha256_hex(token.as_bytes());
-        let mut conn = self
-            .db
-            .acquire()
-            .await
-            .map_err(|e| db_err("account.confirm_email_verification", e))?;
-        let mut tx = conn
-            .begin()
-            .await
-            .map_err(|e| db_err("account.confirm_email_verification", e))?;
-        let Some(token_row) = sqlx::query_as::<_, TokenRow>(
-            "SELECT user_id, email FROM email_verification_tokens
-             WHERE token_hash = $1 AND used_at IS NULL AND expires_at > $2",
-        )
-        .bind(&token_hash)
-        .bind(at)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| db_err("account.confirm_email_verification", e))?
-        else {
-            return Ok(None);
-        };
-        // Account locking is the serialization point shared with suspension.
-        // Only after acquiring it may this transaction consume the token.
-        let Some(user) = sqlx::query_as::<_, UserStateRow>(
-            "SELECT email, account_state FROM users WHERE id = $1 FOR UPDATE",
-        )
-        .bind(token_row.user_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| db_err("account.confirm_email_verification", e))?
-        else {
-            return Ok(None);
-        };
-        if !matches!(
-            AccountState::from_code(&user.account_state),
-            Some(AccountState::PendingEmailVerification | AccountState::Active)
-        ) {
-            return Ok(None);
-        }
-        let consumed = sqlx::query(
-            "UPDATE email_verification_tokens SET used_at = $2
-             WHERE token_hash = $1 AND used_at IS NULL AND expires_at > $2",
-        )
-        .bind(&token_hash)
-        .bind(at)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| db_err("account.confirm_email_verification", e))?
-        .rows_affected();
-        if consumed == 0 {
-            return Ok(None);
-        }
-        let email = UserEmail::parse(&token_row.email).map_err(|_| AuthError::Internal)?;
-        sqlx::query(
-            "UPDATE users SET email = $2, email_verified_at = $3, account_state = 'ACTIVE',
-             updated_at = now() WHERE id = $1",
-        )
-        .bind(token_row.user_id)
-        .bind(email.as_str())
-        .bind(at)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| db_err("account.confirm_email_verification", e))?;
-        sqlx::query(
-            "UPDATE authentication_identities SET provider_subject = $2
-             WHERE user_id = $1 AND provider = 'password'",
-        )
-        .bind(token_row.user_id)
-        .bind(email.as_str())
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| db_err("account.confirm_email_verification", e))?;
-        tx.commit()
-            .await
-            .map_err(|e| db_err("account.confirm_email_verification", e))?;
-        Ok(Some(EmailVerificationOutcome {
-            user_id: UserId(token_row.user_id),
-            email_changed: user.email != token_row.email,
-        }))
-    }
-
     async fn suspend_by_admin(&self, id: UserId, actor: UserId) -> Result<bool, AuthError> {
         let mut conn = self
             .db
@@ -500,129 +422,6 @@ impl AccountRepository for SqlxAccountRepository {
             .await
             .map_err(|e| db_err("account.restore", e))?;
         Ok(true)
-    }
-
-    async fn complete_password_reset(
-        &self,
-        token: &bikesnest_domain::VerificationToken,
-        password_hash: &str,
-        at: DateTime<Utc>,
-    ) -> Result<Option<UserId>, AuthError> {
-        let token_hash = sha256_hex(token.as_bytes());
-        let mut conn = self
-            .db
-            .acquire()
-            .await
-            .map_err(|e| db_err("account.complete_password_reset", e))?;
-        let mut tx = conn
-            .begin()
-            .await
-            .map_err(|e| db_err("account.complete_password_reset", e))?;
-        let Some(user_id) = sqlx::query_scalar::<_, i64>(
-            "SELECT user_id FROM password_reset_tokens
-             WHERE token_hash = $1 AND used_at IS NULL
-               AND expires_at > GREATEST($2, clock_timestamp())",
-        )
-        .bind(&token_hash)
-        .bind(at)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| db_err("account.complete_password_reset", e))?
-        else {
-            return Ok(None);
-        };
-        let eligible = sqlx::query_scalar::<_, bool>(
-            "SELECT account_state IN ('PENDING_EMAIL_VERIFICATION', 'ACTIVE')
-             FROM users WHERE id = $1 FOR UPDATE",
-        )
-        .bind(user_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| db_err("account.complete_password_reset", e))?
-        .unwrap_or(false);
-        if !eligible {
-            return Ok(None);
-        }
-        let consumed = sqlx::query(
-            "UPDATE password_reset_tokens SET used_at = $2
-             WHERE token_hash = $1 AND user_id = $3
-               AND used_at IS NULL
-               AND expires_at > GREATEST($2, clock_timestamp())",
-        )
-        .bind(&token_hash)
-        .bind(at)
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| db_err("account.complete_password_reset", e))?
-        .rows_affected();
-        if consumed != 1 {
-            return Ok(None);
-        }
-        let updated = sqlx::query(
-            "UPDATE authentication_identities SET credential_hash = $2
-             WHERE user_id = $1 AND provider = 'password'",
-        )
-        .bind(user_id)
-        .bind(password_hash)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| db_err("account.complete_password_reset", e))?
-        .rows_affected();
-        if updated != 1 {
-            return Err(AuthError::Internal);
-        }
-        sqlx::query(
-            "UPDATE sessions SET revoked_at = $2
-             WHERE user_id = $1 AND revoked_at IS NULL",
-        )
-        .bind(user_id)
-        .bind(at)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| db_err("account.complete_password_reset", e))?;
-        sqlx::query(
-            "UPDATE password_reset_tokens SET used_at = $2
-             WHERE user_id = $1 AND used_at IS NULL",
-        )
-        .bind(user_id)
-        .bind(at)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| db_err("account.complete_password_reset", e))?;
-        sqlx::query(
-            "INSERT INTO audit_events
-                (actor_user_id, action, target_type, target_id, result, metadata)
-             VALUES ($1, 'auth.password_changed', 'user', $2, 'success', '{}'::jsonb)",
-        )
-        .bind(user_id)
-        .bind(user_id.to_string())
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| db_err("account.complete_password_reset", e))?;
-        tx.commit()
-            .await
-            .map_err(|e| db_err("account.complete_password_reset", e))?;
-        Ok(Some(UserId(user_id)))
-    }
-
-    async fn set_password(&self, id: UserId, hash: &str) -> Result<(), AuthError> {
-        sqlx::query(
-            "UPDATE authentication_identities SET credential_hash = $2
-             WHERE user_id = $1 AND provider = 'password'",
-        )
-        .bind(id.0)
-        .bind(hash)
-        .execute(
-            &mut *self
-                .db
-                .acquire()
-                .await
-                .map_err(|e| db_err("account.acquire", e))?,
-        )
-        .await
-        .map_err(|e| db_err("account.set_password", e))?;
-        Ok(())
     }
 
     async fn set_locale(&self, id: UserId, locale: LocaleCode) -> Result<(), AuthError> {

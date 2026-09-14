@@ -1,11 +1,10 @@
 //! `EmailQueue` implementations: durable (via the job queue) and inline.
 //!
 //! [`JobEmailQueue`] is the durable implementation. It validates the current
-//! account/token and inserts `background_job` in its own transaction, after the
-//! caller's auth transition has committed. Provider delivery, retries and
-//! dead-lettering then happen outside the request path. Authentication uses
-//! its narrower transactional outbox port; this generic queue remains for
-//! non-aggregate callers and direct queue tests.
+//! account/token and inserts `background_job` in its own transaction. Auth
+//! transitions instead use the narrower transactional outbox so state, audit,
+//! and mail admission commit together. Provider delivery, retries, and
+//! dead-lettering happen after that durable commit.
 //!
 //! [`InlineEmailQueue`] sends on the spot. It exists for two reasons: tests
 //! that want the message without running a worker, and deployments with
@@ -26,10 +25,10 @@ use bikesnest_application::{
 };
 use std::sync::Arc;
 
-/// Enqueue-time idempotency key for one message: `email:{kind}:{sha256(link)}`.
+/// Enqueue-time idempotency key for one message and its immutable identity.
 ///
-/// The link embeds the single-use token, so the key identifies exactly "this
-/// message about this token". A retried enqueue of the same token — a
+/// Credential messages use their single-use link; security notices use their
+/// immutable notification id. A retried enqueue of the same identity — a
 /// double-submitted form, a retried request — collapses onto the existing row.
 /// This deduplicates queue admission, not provider delivery: lease expiry or an
 /// ambiguous provider outcome can still cause an at-least-once duplicate. A
@@ -38,7 +37,7 @@ pub fn idempotency_key(msg: &EmailMessage) -> String {
     format!(
         "email:{}:{}",
         msg.kind.code(),
-        sha256_hex(msg.kind.link().as_bytes())
+        sha256_hex(msg.kind.idempotency_material().as_bytes())
     )
 }
 
@@ -159,14 +158,16 @@ impl EmailQueue for JobEmailQueue {
         let payload = serde_json::to_value(&msg)
             .map_err(|_| EmailError::Unexpected("email payload encoding failed".into()))?;
         let key = idempotency_key(&msg);
-        let token_hash = token_hash_from_link(msg.kind.link())
-            .ok_or_else(|| EmailError::Unexpected("email token reference missing".into()))?;
+        let token_hash = token_hash_from_link(msg.kind.credential_link().ok_or_else(|| {
+            EmailError::Unexpected("generic queue requires a credential message".into())
+        })?)
+        .ok_or_else(|| EmailError::Unexpected("email token reference missing".into()))?;
         let queued = self
             .jobs
             .enqueue_mail(MailEnqueue {
                 payload: &payload,
                 account_id: msg.account_id,
-                token_hash: &token_hash,
+                credential: crate::job::repo::MailCredential::Token { hash: &token_hash },
                 purpose: msg.kind.code(),
                 recipient: &msg.to,
                 run_at: chrono::Utc::now(),
@@ -250,15 +251,19 @@ mod tests {
     fn the_key_is_per_kind_and_per_token() {
         let verify = msg(EmailKind::VerifyEmail {
             link: "https://x/verify-email?token=aaa".into(),
+            expires_at: None,
         });
         let same_again = msg(EmailKind::VerifyEmail {
             link: "https://x/verify-email?token=aaa".into(),
+            expires_at: None,
         });
         let other_token = msg(EmailKind::VerifyEmail {
             link: "https://x/verify-email?token=bbb".into(),
+            expires_at: None,
         });
         let other_kind = msg(EmailKind::ResetPassword {
             link: "https://x/verify-email?token=aaa".into(),
+            expires_at: None,
         });
 
         // Same message twice → one key → the second enqueue is a no-op.

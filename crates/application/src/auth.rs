@@ -10,7 +10,7 @@ use bikesnest_domain::{
     AccountState, AuthenticationProvider, CsrfToken, LocaleCode, Password, PasswordPolicy,
     ProviderIdentity, Role, SessionId, User, UserEmail, UserId, VerificationToken,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -127,12 +127,17 @@ pub struct IdentityRecord {
     pub credential_hash: Option<String>,
 }
 
-/// Result of the repository's atomic email-verification transition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EmailVerificationOutcome {
+/// Result of an atomic email confirmation and any resulting old-address notice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmailConfirmationOutcome {
     pub user_id: UserId,
     pub email_changed: bool,
+    pub mail: Option<AdmittedAuthMail>,
 }
+
+/// Compatibility alias for adapters and tests while confirmation ownership
+/// moves into the transactional auth outbox.
+pub type EmailVerificationOutcome = EmailConfirmationOutcome;
 
 /// A new account to create (user + password identity + baseline USER role).
 #[derive(Debug)]
@@ -182,6 +187,29 @@ pub trait AuthOutbox: Send + Sync {
         at: DateTime<Utc>,
         message: EmailMessage,
     ) -> Result<Option<AdmittedAuthMail>, AuthError>;
+    async fn confirm_email(
+        &self,
+        token: &VerificationToken,
+        at: DateTime<Utc>,
+        old_address_notice: EmailMessage,
+    ) -> Result<Option<EmailConfirmationOutcome>, AuthError>;
+    async fn complete_password_reset(
+        &self,
+        token: &VerificationToken,
+        password_hash: &str,
+        at: DateTime<Utc>,
+        notice: EmailMessage,
+    ) -> Result<Option<AdmittedAuthMail>, AuthError>;
+    #[allow(clippy::too_many_arguments)]
+    async fn change_password(
+        &self,
+        user_id: UserId,
+        expected_hash: &str,
+        password_hash: &str,
+        current_session: &SessionId,
+        at: DateTime<Utc>,
+        notice: EmailMessage,
+    ) -> Result<Option<AdmittedAuthMail>, AuthError>;
 }
 
 #[async_trait]
@@ -222,15 +250,6 @@ pub trait AccountRepository: Send + Sync {
     async fn set_state(&self, id: UserId, state: AccountState) -> Result<(), AuthError>;
     async fn mark_email_verified(&self, id: UserId, at: DateTime<Utc>) -> Result<(), AuthError>;
     async fn update_canonical_email(&self, id: UserId, email: &UserEmail) -> Result<(), AuthError>;
-    /// Atomically consume a verification token and confirm its address.
-    /// Implementations must lock the account before consuming the token and
-    /// permit only pending or active accounts, so suspension cannot race a
-    /// token into reactivating an account.
-    async fn confirm_email_verification(
-        &self,
-        token: &VerificationToken,
-        at: DateTime<Utc>,
-    ) -> Result<Option<EmailVerificationOutcome>, AuthError>;
     /// Atomically suspend an eligible account, revoke its sessions plus all
     /// outstanding verification and password-reset tokens, and write the
     /// administrator audit event while holding the account row lock. Deleted
@@ -240,18 +259,6 @@ pub trait AccountRepository: Send + Sync {
     /// audit event. A verified account becomes active; an unverified account
     /// returns to pending email verification. Other states are unchanged.
     async fn restore_by_admin(&self, id: UserId, actor: UserId) -> Result<bool, AuthError>;
-    /// Atomically consume one valid reset token, replace the password, revoke
-    /// every session, invalidate competing reset tokens, and write the
-    /// password-changed audit event. Implementations
-    /// must lock the account before changing any of those rows and must reject
-    /// suspended or deleted accounts without consuming the token.
-    async fn complete_password_reset(
-        &self,
-        token: &VerificationToken,
-        password_hash: &str,
-        at: DateTime<Utc>,
-    ) -> Result<Option<UserId>, AuthError>;
-    async fn set_password(&self, id: UserId, hash: &str) -> Result<(), AuthError>;
     /// Persist the account's reading language (the header language toggle, for
     /// a signed-in user). Transactional email is rendered from this value.
     async fn set_locale(&self, id: UserId, locale: LocaleCode) -> Result<(), AuthError>;
@@ -375,6 +382,13 @@ pub trait TokenStore: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<bool, AuthError>;
     async fn consume_reset(
+        &self,
+        raw: &VerificationToken,
+        now: DateTime<Utc>,
+    ) -> Result<Option<UserId>, AuthError>;
+    /// Non-consuming lookup; the outbox repeats expiry and account guards
+    /// atomically after password hashing.
+    async fn find_reset(
         &self,
         raw: &VerificationToken,
         now: DateTime<Utc>,
@@ -518,6 +532,10 @@ impl AuthService {
         )
     }
 
+    fn account_link(&self) -> String {
+        format!("{}/login", self.base_url.trim_end_matches('/'))
+    }
+
     /// Describe the verification email for a token link. Subject and body are
     /// *not* built here: the message names its kind and locale, and the
     /// provider renders both from the catalog when it sends.
@@ -527,6 +545,7 @@ impl AuthService {
         to: &UserEmail,
         locale: LocaleCode,
         token: &VerificationToken,
+        expires_at: DateTime<Utc>,
     ) -> EmailMessage {
         EmailMessage::linked(
             account_id,
@@ -534,6 +553,7 @@ impl AuthService {
             locale,
             EmailKind::VerifyEmail {
                 link: self.verification_link(token),
+                expires_at: Some(expires_at),
             },
         )
     }
@@ -545,6 +565,7 @@ impl AuthService {
         to: &UserEmail,
         locale: LocaleCode,
         token: &VerificationToken,
+        expires_at: DateTime<Utc>,
     ) -> EmailMessage {
         EmailMessage::linked(
             account_id,
@@ -552,6 +573,7 @@ impl AuthService {
             locale,
             EmailKind::ConfirmEmailChange {
                 link: self.verification_link(token),
+                expires_at: Some(expires_at),
             },
         )
     }
@@ -563,6 +585,7 @@ impl AuthService {
         to: &UserEmail,
         locale: LocaleCode,
         token: &VerificationToken,
+        expires_at: DateTime<Utc>,
     ) -> EmailMessage {
         EmailMessage::linked(
             account_id,
@@ -570,8 +593,53 @@ impl AuthService {
             locale,
             EmailKind::ResetPassword {
                 link: self.reset_link(token),
+                expires_at: Some(expires_at),
             },
         )
+    }
+
+    fn security_notice(
+        &self,
+        account_id: UserId,
+        to: &UserEmail,
+        locale: LocaleCode,
+        email_changed: bool,
+    ) -> EmailMessage {
+        let notification_id = VerificationToken::new(self.tokens_gen.generate()).to_base64url();
+        let account_link = self.account_link();
+        let kind = if email_changed {
+            EmailKind::EmailAddressChanged {
+                account_link,
+                notification_id,
+            }
+        } else {
+            EmailKind::PasswordChanged {
+                account_link,
+                notification_id,
+            }
+        };
+        EmailMessage::linked(account_id, to.as_str(), locale, kind)
+    }
+
+    /// The security transition and durable notice already committed. An inline
+    /// delivery attempt may fail, but reporting the transition itself as failed
+    /// would invite an impossible/unsafe replay with an old credential or spent
+    /// token. The durable row retains its queue outcome, whether retryable or
+    /// terminal.
+    async fn dispatch_committed_notice(&self, mail: AdmittedAuthMail) {
+        let account_id = mail.message.account_id;
+        let kind = mail.message.kind.code();
+        if self.mail_dispatcher.dispatch(mail).await.is_err() {
+            let _ = self
+                .audit
+                .record(AuditEvent::failure(
+                    Some(UserId(account_id)),
+                    "auth.security_notice_dispatch_failed",
+                    "email_kind",
+                    kind,
+                ))
+                .await;
+        }
     }
 
     async fn allowed(
@@ -624,7 +692,8 @@ impl AuthService {
         // precheck can race into creating a dummy credential.
         let hash = self.hasher.hash(&password).await?;
         let token = VerificationToken::new(self.tokens_gen.generate());
-        let message = self.verification_email(UserId(0), &email, locale, &token);
+        let message =
+            self.verification_email(UserId(0), &email, locale, &token, now + Duration::hours(24));
         if let Some(mail) = self
             .outbox
             .register(
@@ -664,9 +733,10 @@ impl AuthService {
         ) {
             return Err(AuthError::TokenInvalid);
         }
+        let notice = self.security_notice(user.id, &user.email, user.locale, true);
         let Some(outcome) = self
-            .accounts
-            .confirm_email_verification(&token, now)
+            .outbox
+            .confirm_email(&token, now, notice)
             .await
             .map_err(|e| match e {
                 AuthError::Conflict => AuthError::EmailTaken,
@@ -675,26 +745,9 @@ impl AuthService {
         else {
             return Err(AuthError::TokenInvalid);
         };
-        if outcome.email_changed {
-            // An email change is a security event: invalidate every session so
-            // a stale credential on the old address can't keep a session alive.
-            self.sessions
-                .revoke_all_for_user_except(outcome.user_id, &SessionId::new([0u8; 32]))
-                .await?;
+        if let Some(mail) = outcome.mail {
+            self.dispatch_committed_notice(mail).await;
         }
-        let action = if outcome.email_changed {
-            "auth.email_changed"
-        } else {
-            "auth.email_verified"
-        };
-        self.audit
-            .record(AuditEvent::success(
-                Some(outcome.user_id),
-                action,
-                "user",
-                outcome.user_id.0.to_string(),
-            ))
-            .await?;
         Ok(())
     }
 
@@ -720,14 +773,21 @@ impl AuthService {
         .await?;
 
         let token = VerificationToken::new(self.tokens_gen.generate());
-        let message = self.verification_email(user.id, email, user.locale, &token);
+        let now = self.now();
+        let message = self.verification_email(
+            user.id,
+            email,
+            user.locale,
+            &token,
+            now + Duration::hours(24),
+        );
         let admitted = self
             .outbox
             .issue_verification(
                 user.id,
                 email.as_str(),
                 &token,
-                self.now(),
+                now,
                 AccountState::PendingEmailVerification,
                 message,
                 None,
@@ -899,10 +959,17 @@ impl AuthService {
             return Ok(());
         }
         let token = VerificationToken::new(self.tokens_gen.generate());
-        let message = self.reset_email(user.id, email, user.locale, &token);
+        let now = self.now();
+        let message = self.reset_email(
+            user.id,
+            email,
+            user.locale,
+            &token,
+            now + Duration::hours(1),
+        );
         if let Some(mail) = self
             .outbox
-            .issue_reset(user.id, &token, self.now(), message)
+            .issue_reset(user.id, &token, now, message)
             .await?
         {
             self.mail_dispatcher.dispatch(mail).await?;
@@ -919,17 +986,26 @@ impl AuthService {
     ) -> Result<(), AuthError> {
         let token = decode_token(raw_token).ok_or(AuthError::TokenInvalid)?;
         self.password_policy.validate(raw_password)?;
+        let lookup_now = self.now();
+        let Some(user_id) = self.tokens.find_reset(&token, lookup_now).await? else {
+            return Err(AuthError::TokenInvalid);
+        };
+        let Some(user) = self.accounts.find_by_id(user_id).await? else {
+            return Err(AuthError::TokenInvalid);
+        };
         let hash = self.hasher.hash(&Password::new(raw_password)).await?;
         // Expiry is judged after the potentially slow password hash, at the
         // instant the atomic persistence transition begins.
         let now = self.now();
-        let Some(_) = self
-            .accounts
-            .complete_password_reset(&token, &hash, now)
+        let notice = self.security_notice(user.id, &user.email, user.locale, false);
+        let Some(mail) = self
+            .outbox
+            .complete_password_reset(&token, &hash, now, notice)
             .await?
         else {
             return Err(AuthError::TokenInvalid);
         };
+        self.dispatch_committed_notice(mail).await;
         Ok(())
     }
 
@@ -962,18 +1038,22 @@ impl AuthService {
         }
         self.password_policy.validate(new)?;
         let new_hash = self.hasher.hash(&Password::new(new)).await?;
-        self.accounts.set_password(user_id, &new_hash).await?;
-        self.sessions
-            .revoke_all_for_user_except(user_id, current_session)
-            .await?;
-        self.audit
-            .record(AuditEvent::success(
-                Some(user_id),
-                "auth.password_changed",
-                "user",
-                user_id.0.to_string(),
-            ))
-            .await?;
+        let notice = self.security_notice(user.id, &user.email, user.locale, false);
+        let Some(mail) = self
+            .outbox
+            .change_password(
+                user_id,
+                hash,
+                &new_hash,
+                current_session,
+                self.now(),
+                notice,
+            )
+            .await?
+        else {
+            return Err(AuthError::InvalidCurrentPassword);
+        };
+        self.dispatch_committed_notice(mail).await;
         Ok(())
     }
 
@@ -1011,14 +1091,21 @@ impl AuthService {
             return Err(AuthError::EmailTaken);
         }
         let token = VerificationToken::new(self.tokens_gen.generate());
-        let message = self.change_email_message(user.id, new_email, user.locale, &token);
+        let now = self.now();
+        let message = self.change_email_message(
+            user.id,
+            new_email,
+            user.locale,
+            &token,
+            now + Duration::hours(24),
+        );
         let Some(mail) = self
             .outbox
             .issue_verification(
                 user_id,
                 new_email.as_str(),
                 &token,
-                self.now(),
+                now,
                 AccountState::Active,
                 message,
                 Some("auth.email_change_requested"),

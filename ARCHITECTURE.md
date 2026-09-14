@@ -157,17 +157,23 @@ memory disappear from capacity accounting.
 Providers are selected from environment variables in `config.rs` and wired into
 the router in `crates/web/src/wiring.rs` — the one module that names them.
 
-Transactional mail jobs carry canonical account, token-hash, purpose and token-
-expiry metadata. Queue admission, delayed delivery and account anonymization
-serialize on the `users` row. Delivery revalidates the exact unused,
-unexpired token and recipient while holding that lock through a bounded provider
-call; terminal outcomes, deletion and the expiry-retention sweep redact the
+Transactional mail jobs carry canonical account and purpose plus either token-
+hash/expiry evidence or a recipient digest and successful-transition audit
+reference for a credential-free security notice. Queue admission, delayed delivery and account anonymization
+serialize on the `users` row. Delivery revalidates either the exact unused,
+unexpired token and recipient or the notice's audit/digest/state authority
+while holding that lock through a bounded provider call; terminal outcomes,
+deletion and the expiry-retention sweep redact the
 recipient/link payload. Provider acceptance is the external recall boundary,
 not a distributed exactly-once guarantee. Registration, resend, reset request
 and email-change request use one `AuthOutbox` port whose SQL adapter commits the
 auth transition, applicable audit and lifecycle row together. Post-commit
 dispatch either leaves that row for the worker or exact-claims it for inline
 compatibility; provider I/O never occurs inside the auth transaction.
+Successful password replacement queues a warning to the current canonical
+address; a confirmed address change queues one to the locked old address.
+These notices follow the same at-least-once lifecycle, and terminalization or
+account deletion clears their payload, recipient digest, and audit reference.
 
 ### Web (`crates/web`)
 
