@@ -618,9 +618,11 @@ document.addEventListener('alpine:init', function () {
   Alpine.data('parkingForm', function () {
     return {
       cur: '',
+      costKind: 'unknown',
       syms: { BRL: 'R$', EUR: '€', USD: '$', GBP: '£', JPY: '¥' },
       init: function () {
         if (this.$el.dataset.currency) this.cur = this.$el.dataset.currency;
+        if (this.$el.dataset.costKind) this.costKind = this.$el.dataset.costKind;
       },
       get sym() { return this.syms[this.cur.toUpperCase()] || this.cur; },
     };

@@ -2988,7 +2988,7 @@ async fn verified_user_adds_a_location_and_sees_details(tx: &mut bikesnest_test_
         .unwrap();
     assert_eq!(version, 1);
 
-    // The P3 details page renders.
+    // The details page renders.
     let (s, body) = get_c(&app, &format!("/parking/{id}"), Some(&cookie)).await;
     assert_eq!(s, StatusCode::OK);
     assert!(body.contains("Estação Centro Added"));
@@ -4397,7 +4397,7 @@ async fn report_review_flow_claim_resolve_hides_and_audits(
     const UPLOADER: &str = "m5-up@example.com";
     const REPORTER: &str = "m5-reporter@example.com";
     const MOD: &str = "m5-mod@example.com";
-    let loc = fixture_location(tx, "m5-report-loc", "M5 Report Loc").await;
+    let loc = fixture_location(tx, "m5-report-loc", "Reported Review Location").await;
 
     // Uploader (verified) writes a multipart review.
     let uploader = verified_cookie(&app, &email, UPLOADER).await;
@@ -4489,7 +4489,7 @@ async fn report_review_flow_claim_resolve_hides_and_audits(
         .unwrap();
     assert_eq!(rstate, "HIDDEN", "resolved report hides the review");
 
-    // The hidden review disappears from public P3.
+    // The hidden review disappears from the public details page.
     let (_, pub_page) = get_c(&app, &format!("/parking/{loc}"), None).await;
     assert!(
         !pub_page.contains("Great secured rack"),
@@ -4528,7 +4528,7 @@ async fn report_review_flow_claim_resolve_hides_and_audits(
 async fn moderator_cannot_resolve_own_report(tx: &mut bikesnest_test_support::TestTx) {
     let (app, email) = auth_app().await;
     const MOD: &str = "m5-selfmod@example.com";
-    let loc = fixture_location(tx, "m5-self-loc", "M5 Self Loc").await;
+    let loc = fixture_location(tx, "m5-self-loc", "Self Report Location").await;
     let mod_cookie = moderator_cookie(&app, &email, MOD).await;
     let (_, mod_page) = get_c(&app, &format!("/parking/{loc}"), Some(&mod_cookie)).await;
     let csrf = extract_csrf(&mod_page);
@@ -4596,7 +4596,7 @@ async fn invalidate_parking_public_404_moderator_banner_and_restore(
 ) {
     let (app, email) = auth_app().await;
     const MOD: &str = "m5-inv-mod@example.com";
-    let loc = fixture_location(tx, "m5-inv-loc", "M5 Invalidate Loc").await;
+    let loc = fixture_location(tx, "m5-inv-loc", "Invalidated Location").await;
 
     // Public sees the active listing.
     let (s, _) = get_c(&app, &format!("/parking/{loc}"), None).await;
@@ -4614,7 +4614,7 @@ async fn invalidate_parking_public_404_moderator_banner_and_restore(
     .await;
     assert_eq!(s, StatusCode::OK, "invalidate: {s}");
 
-    // Public P3 now 404s; the moderator still sees it with a banner.
+    // Public details now 404; the moderator still sees them with a banner.
     let (s, _) = get_c(&app, &format!("/parking/{loc}"), None).await;
     assert_eq!(
         s,
@@ -4630,7 +4630,7 @@ async fn invalidate_parking_public_404_moderator_banner_and_restore(
 
     // Also absent from search (search filters ACTIVE).
     let (_, search) = get_c(&app, "/search?lat=-25.4284&lon=-49.2733&radius=2000", None).await;
-    assert!(!search.contains("M5 Invalidate Loc"));
+    assert!(!search.contains("Invalidated Location"));
 
     // Restore brings it back (grab a fresh CSRF from the dashboard).
     let (_, mod_page2) = get_c(&app, "/moderation", Some(&mod_cookie)).await;
@@ -4791,10 +4791,10 @@ async fn moderation_and_audit_routes_are_gated(tx: &mut bikesnest_test_support::
 }
 
 #[db_test]
-async fn d3_review_photos_held_pending_until_approved(tx: &mut bikesnest_test_support::TestTx) {
+async fn review_photos_are_held_pending_until_approved(tx: &mut bikesnest_test_support::TestTx) {
     let (app, email) = auth_app().await;
     const AUTHOR: &str = "m5-review-photo@example.com";
-    let loc = fixture_location(tx, "m5-rp-loc", "M5 Review Photo Loc").await;
+    let loc = fixture_location(tx, "m5-rp-loc", "Pending Review Photo Location").await;
     let cookie = verified_cookie(&app, &email, AUTHOR).await;
     let (_, form) = get_c(&app, &format!("/parking/{loc}/review"), Some(&cookie)).await;
     let csrf = extract_csrf(&form);
@@ -4850,11 +4850,11 @@ async fn d3_review_photos_held_pending_until_approved(tx: &mut bikesnest_test_su
 }
 
 #[db_test]
-async fn approved_review_photo_renders_on_p3(tx: &mut bikesnest_test_support::TestTx) {
+async fn approved_review_photo_renders_on_details(tx: &mut bikesnest_test_support::TestTx) {
     let (app, email) = auth_app().await;
     const AUTHOR: &str = "m5-rp-render@example.com";
     const MOD: &str = "m5-rp-mod@example.com";
-    let loc = fixture_location(tx, "m5-rp-render-loc", "M5 Review Render Loc").await;
+    let loc = fixture_location(tx, "m5-rp-render-loc", "Approved Review Photo Location").await;
     let cookie = verified_cookie(&app, &email, AUTHOR).await;
     let (_, form) = get_c(&app, &format!("/parking/{loc}/review"), Some(&cookie)).await;
     let csrf = extract_csrf(&form);
@@ -4891,7 +4891,7 @@ async fn approved_review_photo_renders_on_p3(tx: &mut bikesnest_test_support::Te
         .await
         .unwrap();
 
-    // Pending → not yet rendered on the public P3.
+    // Pending → not yet rendered on the public details page.
     let (_, pub_page) = get_c(&app, &format!("/parking/{loc}"), None).await;
     assert!(
         !pub_page.contains(&format!("{MEDIA_ORIGIN}/uploads/")),
@@ -4911,11 +4911,11 @@ async fn approved_review_photo_renders_on_p3(tx: &mut bikesnest_test_support::Te
     .await;
     assert_eq!(s, StatusCode::OK);
 
-    // Now the approved review photo renders on P3.
+    // Now the approved review photo renders on the details page.
     let (_, pub_page) = get_c(&app, &format!("/parking/{loc}"), None).await;
     assert!(
         pub_page.contains(&format!("{MEDIA_ORIGIN}/uploads/")),
-        "approved review photo renders on P3"
+        "approved review photo renders on details"
     );
 
     let _ = tx;
@@ -5612,10 +5612,10 @@ async fn html_pages_vary_by_locale_and_session(_tx: &mut TestTx) {
     assert!(vary.contains("cookie"), "vary: {vary}");
 }
 
-// --- P3 fragment endpoints: partial for htmx, 303 for everyone else --------
+// --- Details fragment endpoints: partial for htmx, 303 otherwise -----------
 
 #[db_test]
-async fn p3_fragment_endpoints_redirect_a_whole_document_request(
+async fn details_fragment_endpoints_redirect_a_whole_document_request(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
     let (app, email) = auth_app().await;
@@ -5722,7 +5722,7 @@ async fn p3_fragment_endpoints_redirect_a_whole_document_request(
 }
 
 #[db_test]
-async fn p3_fragment_endpoints_send_a_no_js_caller_to_the_page(
+async fn details_fragment_endpoints_send_a_no_js_caller_to_the_page(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
     let (app, email) = auth_app().await;
@@ -6859,7 +6859,7 @@ async fn user_id_for(email: &str) -> i64 {
 }
 
 #[db_test]
-async fn wp13_proposal_queue_prefills_the_move_and_links_the_location(
+async fn proposal_queue_prefills_the_move_and_links_the_location(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
     const MOD: &str = "wp13-prop-mod@example.com";
@@ -6968,7 +6968,7 @@ async fn wp13_proposal_queue_prefills_the_move_and_links_the_location(
 }
 
 #[db_test]
-async fn wp13_proposal_queue_flags_stale_and_unreadable_proposals(
+async fn proposal_queue_flags_stale_and_unreadable_proposals(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
     const MOD: &str = "wp13-stale-mod@example.com";
@@ -7065,7 +7065,7 @@ async fn wp13_proposal_queue_flags_stale_and_unreadable_proposals(
 }
 
 #[db_test]
-async fn wp13_report_queue_previews_and_links_its_targets(tx: &mut bikesnest_test_support::TestTx) {
+async fn report_queue_previews_and_links_its_targets(tx: &mut bikesnest_test_support::TestTx) {
     const MOD: &str = "wp13-rep-mod@example.com";
     const AUTHOR: &str = "wp13-rep-author@example.com";
     let (app, email) = auth_app().await;
@@ -7182,7 +7182,7 @@ async fn wp13_report_queue_previews_and_links_its_targets(tx: &mut bikesnest_tes
 }
 
 #[db_test]
-async fn wp13_photo_queue_refuses_to_approve_an_image_it_cannot_show(
+async fn photo_queue_refuses_to_approve_an_image_it_cannot_show(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
     const MOD: &str = "wp13-photo-mod@example.com";
@@ -7251,9 +7251,7 @@ async fn wp13_photo_queue_refuses_to_approve_an_image_it_cannot_show(
 }
 
 #[db_test]
-async fn wp13_audit_log_shows_exact_times_and_named_actors(
-    tx: &mut bikesnest_test_support::TestTx,
-) {
+async fn audit_log_shows_exact_times_and_named_actors(tx: &mut bikesnest_test_support::TestTx) {
     const ADMIN: &str = "wp13-audit-admin@example.com";
     let (app, email) = auth_app().await;
     let admin = admin_cookie(&app, &email, ADMIN).await;
@@ -7360,7 +7358,7 @@ fn regex_lite_date(html: &str) -> Option<&str> {
 }
 
 #[db_test]
-async fn wp13_privacy_queue_shows_the_subject_and_what_they_asked(
+async fn privacy_queue_shows_the_subject_and_what_they_asked(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
     const ADMIN: &str = "wp13-priv-admin@example.com";
@@ -7418,7 +7416,7 @@ async fn wp13_privacy_queue_shows_the_subject_and_what_they_asked(
 }
 
 #[db_test]
-async fn wp13_admin_user_list_searches_masks_and_confirms(tx: &mut bikesnest_test_support::TestTx) {
+async fn admin_user_list_searches_masks_and_confirms(tx: &mut bikesnest_test_support::TestTx) {
     const ADMIN: &str = "wp13-users-admin@example.com";
     const NEEDLE: &str = "wp13-findme@example.com";
     const OTHER: &str = "wp13-other@example.com";
@@ -8685,6 +8683,55 @@ async fn parking_new_bad_currency_code_flags_the_price_field(
         "{price_input}"
     );
     assert!(body.contains(r#"<p id="price-error""#), "{body}");
+    assert!(
+        price_input.contains("data-form-error-focus") && price_input.contains("autofocus"),
+        "the boosted full-page error path has a narrow focus target: {price_input}"
+    );
+    assert!(
+        body.contains(r#"x-show="costKind === 'paid'""#),
+        "paid fields are conditional only after Alpine initializes: {body}"
+    );
+
+    let _ = tx;
+    cleanup_user_contributions(EMAIL_ADDR).await;
+}
+
+#[db_test]
+async fn parking_new_timezone_error_opens_advanced_coordinates(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let (app, email) = auth_app().await;
+    const EMAIL_ADDR: &str = "wp21-timezone@example.com";
+    let cookie = verified_cookie(&app, &email, EMAIL_ADDR).await;
+    let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
+    let csrf = extract_csrf(&form);
+
+    let (status, body, _) = post_form(
+        &app,
+        "/parking/new",
+        &[
+            ("csrf", &csrf),
+            ("name", "Timezone Rack"),
+            ("address", "Rua X, 1"),
+            ("parking_type", "rack"),
+            ("cost_kind", "free"),
+            ("lat", "-23.4"),
+            ("lon", "-46.6"),
+            ("timezone", "not/a-timezone"),
+            ("confirm", "1"),
+        ],
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let timezone = opening_tag_with_id(&body, "timezone");
+    assert!(timezone.contains("data-form-error-focus"), "{timezone}");
+    let advanced = body
+        .find(r#"<details class="mt-6 rounded-lg border border-border bg-surface px-3 py-2" open"#);
+    assert!(
+        advanced.is_some(),
+        "the error must open its native ancestor: {body}"
+    );
 
     let _ = tx;
     cleanup_user_contributions(EMAIL_ADDR).await;
@@ -8766,6 +8813,39 @@ async fn parking_details_dialogs_and_swap_targets_are_accessible(
 
     let (s, body) = get_c(&app, &format!("/parking/{loc}"), Some(&uploader)).await;
     assert_eq!(s, StatusCode::OK);
+    assert!(body.contains(r#"<label for="photo-upload-file"#), "{body}");
+    assert!(body.contains("Image file"), "{body}");
+    assert!(body.contains(r#"<label for="photo-upload-alt"#), "{body}");
+    assert!(body.contains("Image description (optional)"), "{body}");
+    assert!(
+        body.contains("Describe what helps riders recognize"),
+        "{body}"
+    );
+
+    let pt_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/parking/{loc}"))
+                .header("accept-language", "pt-BR")
+                .header("cookie", &uploader)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pt_response.status(), StatusCode::OK);
+    let pt_body = pt_response.into_body().collect().await.unwrap().to_bytes();
+    let pt_body = String::from_utf8_lossy(&pt_body);
+    assert!(pt_body.contains("Arquivo de imagem"), "{pt_body}");
+    assert!(
+        pt_body.contains("Descrição da imagem (opcional)"),
+        "{pt_body}"
+    );
+    assert!(
+        pt_body.contains("Descreva o que ajuda ciclistas"),
+        "{pt_body}"
+    );
 
     // Report modal: role/aria-modal/aria-labelledby, and the target exists.
     let report_modal = opening_tag_with_id(&body, "report-modal");

@@ -129,6 +129,15 @@
     });
   }
 
+  function focusFormError(formError) {
+    // Unlike ordinary document navigation, a rejected form needs its actual
+    // correction visible — especially when the invalid control is inside a
+    // native disclosure below the fold on a phone. Center it before focusing
+    // so a sticky header cannot obscure the input.
+    formError.scrollIntoView({ block: "center" });
+    formError.focus({ preventScroll: true });
+  }
+
   function focusNewPage() {
     var heading = document.querySelector("main h1");
     if (!heading) return;
@@ -227,7 +236,28 @@
     var meta = event.detail.ctx && event.detail.ctx.bikesnestDocumentMeta;
     if (meta) {
       syncDocument(meta);
-      focusNewPage();
+      var formError = document.querySelector('[data-form-error-focus]');
+      if (formError && event.detail.ctx.target === document.body) {
+        // Keep the correction on this request context. htmx carries the same
+        // ctx through finally:swap, after its boosted `show:top` scroll.
+        event.detail.ctx.bikesnestFormErrorFocus = formError;
+      } else {
+        focusNewPage();
+      }
+    }
+  });
+  document.addEventListener("htmx:finally:swap", function (event) {
+    var ctx = event.detail.ctx;
+    if (!ctx) return;
+    var formError = ctx.bikesnestFormErrorFocus;
+    delete ctx.bikesnestFormErrorFocus;
+    if (
+      ctx.target === document.body &&
+      formError &&
+      formError.isConnected &&
+      document.querySelector('[data-form-error-focus]') === formError
+    ) {
+      focusFormError(formError);
     }
   });
   document.addEventListener("click", function (event) {

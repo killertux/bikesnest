@@ -12,13 +12,15 @@
       <div class="mt-4 rounded-lg border border-danger/30 bg-danger/10 px-4 py-3 text-sm text-danger" role="alert">{{ error.as_deref().unwrap_or("") }}</div>
     {% endif %}
 
-    <form action="/parking/{{ id }}/edit" method="post" class="mt-6 space-y-4">
+    <form action="/parking/{{ id }}/edit" method="post" class="mt-6 space-y-4" x-data="parkingForm"
+          data-currency="{{ price_currency }}" data-cost-kind="{{ cost_kind }}">
       <input type="hidden" name="csrf" value="{{ layout.csrf }}" />
       <input type="hidden" name="version" value="{{ version }}" />
       <div class="grid gap-4 sm:grid-cols-2">
         <div class="sm:col-span-2">
           <label for="name" class="mb-1 block text-sm font-medium">{{ tr.t("new.field.name") }}</label>
           <input id="name" name="name" value="{{ name }}" required
+                 {% if field_errors.has("name") %}data-form-error-focus autofocus{% endif %}
                  {% if let Some(msg) = field_errors.err("name") %}aria-invalid="true" aria-describedby="name-error"{% endif %}
                  class="w-full rounded-lg border border-border bg-surface px-3 py-2 text-fg outline-none focus:border-accent" />
           {% if let Some(msg) = field_errors.err("name") %}
@@ -28,6 +30,7 @@
         <div class="sm:col-span-2">
           <label for="address" class="mb-1 block text-sm font-medium">{{ tr.t("new.field.address") }}</label>
           <input id="address" name="address" value="{{ address }}" required
+                 {% if field_errors.has("address") %}data-form-error-focus autofocus{% endif %}
                  {% if let Some(msg) = field_errors.err("address") %}aria-invalid="true" aria-describedby="address-error"{% endif %}
                  class="w-full rounded-lg border border-border bg-surface px-3 py-2 text-fg outline-none focus:border-accent" />
           {% if let Some(msg) = field_errors.err("address") %}
@@ -48,13 +51,13 @@
         </div>
         <div class="sm:col-span-2">
           <label for="cost_kind" class="mb-1 block text-sm font-medium">{{ tr.t("new.field.cost") }}</label>
-          <select id="cost_kind" name="cost_kind" class="w-full rounded-lg border border-border bg-surface px-3 py-2 outline-none focus:border-accent">
+          <select id="cost_kind" name="cost_kind" x-model="costKind" class="w-full rounded-lg border border-border bg-surface px-3 py-2 outline-none focus:border-accent">
             <option value="free" {% if cost_kind == "free" %}selected{% endif %}>{{ tr.t("cost.free") }}</option>
             <option value="paid" {% if cost_kind == "paid" %}selected{% endif %}>{{ tr.t("cost.paid_unknown") }}</option>
             <option value="unknown" {% if cost_kind == "unknown" %}selected{% endif %}>{{ tr.t("cost.unknown") }}</option>
           </select>
         </div>
-        <div class="sm:col-span-2" x-data="parkingForm" data-currency="{{ price_currency }}">
+        <div class="sm:col-span-2" x-show="costKind === 'paid'">
           <div class="grid gap-4 sm:grid-cols-3 items-end">
             <div>
               <label for="price_currency" class="mb-1 block text-sm font-medium">{{ tr.t("new.field.currency") }}</label>
@@ -72,6 +75,7 @@
               <div class="flex items-center rounded-lg border border-border bg-surface focus-within:border-accent">
                 <span class="select-none pl-3 pr-1 text-muted" x-text="sym"></span>
                 <input id="price" name="price" value="{{ price }}" inputmode="decimal" placeholder="0.00"
+                       {% if field_errors.has("price") %}data-form-error-focus autofocus{% endif %}
                        {% if let Some(msg) = field_errors.err("price") %}aria-invalid="true" aria-describedby="price-error"{% endif %}
                        class="w-full rounded-lg bg-transparent py-2 pr-3 text-fg outline-none" />
               </div>

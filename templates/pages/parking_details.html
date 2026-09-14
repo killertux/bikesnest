@@ -222,8 +222,15 @@
               hx-encoding="multipart/form-data"
               hx-headers='{"X-CSRF-Token": "{{ layout.csrf }}"}'
               class="mt-4 flex flex-wrap items-center gap-3">
-          <input type="file" name="photo" accept="image/jpeg,image/png,image/webp" required class="text-sm" />
-          <input type="text" name="alt" maxlength="500" placeholder="{{ tr.t("photo.upload.title") }}" class="rounded-lg border border-border bg-bg px-3 py-2 text-sm" />
+          <div>
+            <label for="photo-upload-file" class="mb-1 block text-sm font-medium">{{ tr.t("photo.upload.file_label") }}</label>
+            <input id="photo-upload-file" type="file" name="photo" accept="image/jpeg,image/png,image/webp" required class="text-sm" />
+          </div>
+          <div>
+            <label for="photo-upload-alt" class="mb-1 block text-sm font-medium">{{ tr.t("photo.upload.alt_label") }}</label>
+            <input id="photo-upload-alt" type="text" name="alt" maxlength="500" aria-describedby="photo-upload-alt-hint" class="rounded-lg border border-border bg-bg px-3 py-2 text-sm" />
+            <p id="photo-upload-alt-hint" class="mt-1 max-w-sm text-xs text-muted">{{ tr.t("photo.upload.alt_hint") }}</p>
+          </div>
           <button type="submit" class="rounded-lg bg-accent-strong px-4 py-2 text-sm font-medium text-white hover:bg-accent-dark">{{ tr.t("photo.upload.submit") }}</button>
         </form>
         <div id="photo-upload-result" class="mt-3" aria-live="polite" tabindex="-1"></div>

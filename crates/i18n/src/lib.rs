@@ -1525,6 +1525,15 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
             "Uma foto ajuda a reconhecer a vaga. Envie apenas fotos que você tirou do próprio local e evite rostos de pessoas e placas de veículos. Você é responsável pelo que envia; as fotos passam por revisão de moderadores e ferramentas automáticas antes de aparecer.",
         ),
         "photo.upload.submit" => ("Upload photo", "Enviar foto"),
+        "photo.upload.file_label" => ("Image file", "Arquivo de imagem"),
+        "photo.upload.alt_label" => (
+            "Image description (optional)",
+            "Descrição da imagem (opcional)",
+        ),
+        "photo.upload.alt_hint" => (
+            "Describe what helps riders recognize this parking spot.",
+            "Descreva o que ajuda ciclistas a reconhecer este local.",
+        ),
         "photo.upload.pending_notice" => (
             "Photo submitted — it appears once a moderator approves it.",
             "Foto enviada — ela aparece assim que um moderador a aprovar.",

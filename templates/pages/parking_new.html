@@ -30,12 +30,14 @@
       </div>
     {% endif %}
 
-    <form action="/parking/new" method="post" class="mt-6 space-y-4">
+    <form action="/parking/new" method="post" class="mt-6 space-y-4" x-data="parkingForm"
+          data-currency="{{ price_currency }}" data-cost-kind="{{ cost_kind }}">
       <input type="hidden" name="csrf" value="{{ layout.csrf }}" />
       <div class="grid gap-4 sm:grid-cols-2">
         <div class="sm:col-span-2">
           <label for="name" class="mb-1 block text-sm font-medium">{{ tr.t("new.field.name") }}</label>
           <input id="name" name="name" value="{{ name }}" required
+                 {% if field_errors.has("name") %}data-form-error-focus autofocus{% endif %}
                  {% if let Some(msg) = field_errors.err("name") %}aria-invalid="true" aria-describedby="name-error"{% endif %}
                  class="w-full rounded-lg border border-border bg-surface px-3 py-2 text-fg outline-none focus:border-accent" />
           {% if let Some(msg) = field_errors.err("name") %}
@@ -62,6 +64,7 @@
                data-no-results="{{ tr.t("address.autocomplete.no_results") }}"
                data-failed="{{ tr.t("address.autocomplete.failed") }}">
             <input id="address" name="address" value="{{ address }}" required
+                   {% if field_errors.has("address") %}data-form-error-focus autofocus{% endif %}
                    data-address-query autocomplete="off" role="combobox"
                    aria-autocomplete="list" aria-controls="new-address-suggestions"
                    :aria-expanded="open" :aria-activedescendant="activeDescendant"
@@ -133,13 +136,13 @@
         </div>
         <div>
           <label for="cost_kind" class="mb-1 block text-sm font-medium">{{ tr.t("new.field.cost") }}</label>
-          <select id="cost_kind" name="cost_kind" class="w-full rounded-lg border border-border bg-surface px-3 py-2 outline-none focus:border-accent">
+          <select id="cost_kind" name="cost_kind" x-model="costKind" class="w-full rounded-lg border border-border bg-surface px-3 py-2 outline-none focus:border-accent">
             <option value="free" {% if cost_kind == "free" %}selected{% endif %}>{{ tr.t("cost.free") }}</option>
             <option value="paid" {% if cost_kind == "paid" %}selected{% endif %}>{{ tr.t("cost.paid_unknown") }}</option>
             <option value="unknown" {% if cost_kind == "unknown" %}selected{% endif %}>{{ tr.t("cost.unknown") }}</option>
           </select>
         </div>
-        <div class="sm:col-span-2" x-data="parkingForm" data-currency="{{ price_currency }}">
+        <div class="sm:col-span-2" x-show="costKind === 'paid'">
           <div class="grid gap-4 sm:grid-cols-3 items-end">
             <div>
               <label for="price_currency" class="mb-1 block text-sm font-medium">{{ tr.t("new.field.currency") }}</label>
@@ -157,6 +160,7 @@
               <div class="flex items-center rounded-lg border border-border bg-surface focus-within:border-accent">
                 <span class="select-none pl-3 pr-1 text-muted" x-text="sym"></span>
                 <input id="price" name="price" value="{{ price }}" inputmode="decimal" placeholder="0.00"
+                       {% if field_errors.has("price") %}data-form-error-focus autofocus{% endif %}
                        {% if let Some(msg) = field_errors.err("price") %}aria-invalid="true" aria-describedby="price-error"{% endif %}
                        class="w-full rounded-lg bg-transparent py-2 pr-3 text-fg outline-none" />
               </div>
@@ -184,13 +188,14 @@
       {# Coordinates and timezone: still real inputs, still submitted, just not
          the first thing a contributor is asked for. Left alone, the pin sets
          the position and the server derives the timezone from it. #}
-      <details class="mt-6 rounded-lg border border-border bg-surface px-3 py-2">
+      <details class="mt-6 rounded-lg border border-border bg-surface px-3 py-2" {% if advanced_open %}open{% endif %}>
         <summary class="cursor-pointer text-sm font-medium">{{ tr.t("form.advanced") }}</summary>
         <p class="mt-2 text-xs text-muted">{{ tr.t("form.advanced_hint") }}</p>
         <div class="mt-3 grid gap-3 sm:grid-cols-2">
           <div>
             <label for="lat" class="mb-1 block text-sm font-medium">{{ tr.t("new.field.lat") }}</label>
             <input id="lat" name="lat" type="number" step="any" value="{{ lat }}" placeholder="-25.4284"
+                   {% if field_errors.has("lat") %}data-form-error-focus autofocus{% endif %}
                    {% if let Some(msg) = field_errors.err("lat") %}aria-invalid="true" aria-describedby="lat-error"{% endif %}
                    class="w-full rounded-lg border border-border bg-surface px-3 py-2 outline-none focus:border-accent" />
             {% if let Some(msg) = field_errors.err("lat") %}
@@ -200,6 +205,7 @@
           <div>
             <label for="lon" class="mb-1 block text-sm font-medium">{{ tr.t("new.field.lon") }}</label>
             <input id="lon" name="lon" type="number" step="any" value="{{ lon }}" placeholder="-49.2733"
+                   {% if field_errors.has("lon") %}data-form-error-focus autofocus{% endif %}
                    {% if let Some(msg) = field_errors.err("lon") %}aria-invalid="true" aria-describedby="lon-error"{% endif %}
                    class="w-full rounded-lg border border-border bg-surface px-3 py-2 outline-none focus:border-accent" />
             {% if let Some(msg) = field_errors.err("lon") %}
@@ -208,8 +214,14 @@
           </div>
           <div class="sm:col-span-2">
             <label for="timezone" class="mb-1 block text-sm font-medium">{{ tr.t("new.field.tz") }}</label>
-            <input id="timezone" name="timezone" value="{{ timezone }}" placeholder="America/Sao_Paulo" class="w-full rounded-lg border border-border bg-surface px-3 py-2 outline-none focus:border-accent" />
+            <input id="timezone" name="timezone" value="{{ timezone }}" placeholder="America/Sao_Paulo"
+                   {% if field_errors.has("timezone") %}data-form-error-focus autofocus{% endif %}
+                   {% if let Some(msg) = field_errors.err("timezone") %}aria-invalid="true" aria-describedby="timezone-error"{% endif %}
+                   class="w-full rounded-lg border border-border bg-surface px-3 py-2 outline-none focus:border-accent" />
             <p class="mt-1 text-xs text-muted">{{ tr.t("new.field.tz_hint") }}</p>
+            {% if let Some(msg) = field_errors.err("timezone") %}
+              <p id="timezone-error" role="alert" class="mt-1 text-sm text-danger">{{ msg }}</p>
+            {% endif %}
           </div>
         </div>
       </details>

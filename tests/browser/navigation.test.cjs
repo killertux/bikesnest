@@ -57,6 +57,15 @@ async function pageHtml(kind, provider) {
     content = '<div id="gps" x-data="pinPicker" data-empty="empty" data-locate-failed="failed" data-location-loading="loading" data-location-unavailable="unavailable" data-location-timeout="timeout" data-location-denied="denied">' +
       '<input id="address"><input id="lat"><input id="lon"><div data-lat-input="lat" data-lon-input="lon"></div><button id="locate" @click="useLocation" :disabled="locating">locate</button><p x-text="message"></p></div>';
   }
+  if (kind === 'form-start') {
+    content = '<form id="rejected-form" action="/form-error/' + provider + '" method="post">' +
+      '<button type="submit">Submit invalid form</button></form>';
+  }
+  if (kind === 'form-error') {
+    content = '<div style="height:1100px"></div><details id="error-group" open>' +
+      '<summary>Price details</summary><label>Price<input id="invalid-price" data-form-error-focus aria-invalid="true"></label></details>' +
+      '<div id="unrelated-fragment"></div>';
+  }
   return '<!DOCTYPE html><html><head><title>' + kind + '</title>' +
     '<link rel="stylesheet" href="/static/css/app.css">' + scripts +
     '</head><body hx-boost:inherited="true" data-document-lang="pt-BR" data-document-title="' + kind + '" data-document-canonical="/' + kind + '" data-document-description="' + kind + ' description" data-map-provider="' + provider + '">' +
@@ -378,6 +387,32 @@ test('boosted and history page swaps synchronize document metadata and heading f
   await page.waitForFunction(() => document.querySelector('h1')?.textContent === 'empty-meta');
   assert.equal(await page.locator("link[rel='canonical']").count(), 0);
   assert.equal(await page.locator("meta[name='description']").count(), 0);
+  await page.close();
+});
+
+test('rejected full-body form focus survives boosted scroll and belongs to its request', async () => {
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+  await page.goto(origin + '/form-start/google');
+  await page.getByRole('button', { name: 'Submit invalid form' }).click();
+  await page.waitForFunction(() => document.activeElement?.id === 'invalid-price');
+  const box = await page.locator('#invalid-price').boundingBox();
+  assert.ok(box.y >= 0 && box.y + box.height <= 844, 'marked correction must remain visible after boosted show=top');
+  assert.equal(await page.locator('#error-group').getAttribute('open'), '');
+
+  await page.route('**/unrelated-focus-fragment', route => route.fulfill({
+    contentType: 'text/html', body: '<p id="fragment-result">fragment settled</p>',
+  }));
+  await page.evaluate(() => htmx.ajax('GET', '/unrelated-focus-fragment', {
+    target: '#unrelated-fragment', swap: 'innerHTML',
+  }));
+  await page.locator('#fragment-result').waitFor();
+  assert.equal(await page.evaluate(() => document.activeElement?.id), 'invalid-price',
+    'an unrelated fragment must not claim full-body error focus');
+
+  await page.locator('#go-plain').click();
+  await page.waitForFunction(() => document.querySelector('h1')?.textContent === 'plain');
+  assert.equal(await page.evaluate(() => document.activeElement?.textContent), 'plain',
+    'a later error-free navigation owns normal heading focus');
   await page.close();
 });
 

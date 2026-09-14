@@ -5,9 +5,11 @@
    unrecordable, and the details page's ✗ marker unreachable. The checkboxes
    also carried no `name`, so with scripting off every selection was dropped on
    the way to the server. Radios need neither a hidden mirror nor JavaScript. #}
-<fieldset class="mt-6">
-  <legend class="text-sm font-medium">{{ tr.t("new.field.security") }}</legend>
-  <div class="mt-3 space-y-2">
+<details class="mt-6 rounded-lg border border-border bg-surface px-3 py-2" {% if security_open %}open{% endif %}>
+  <summary class="cursor-pointer text-sm font-medium">{{ tr.t("new.field.security") }}</summary>
+  <fieldset class="mt-3">
+  <legend class="sr-only">{{ tr.t("new.field.security") }}</legend>
+  <div class="space-y-2">
     {% for s in security_states %}
       <div class="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-surface px-3 py-2">
         <span class="text-sm">{{ s.label }}</span>
@@ -22,4 +24,5 @@
       </div>
     {% endfor %}
   </div>
-</fieldset>
+  </fieldset>
+</details>

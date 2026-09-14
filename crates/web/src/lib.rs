@@ -928,6 +928,9 @@ pub struct ParkingNewPage {
     pub default_lon: f64,
     pub hours_days: Vec<ContributionHoursDayVm>,
     pub security_states: Vec<ContributionTriStateVm>,
+    pub hours_open: bool,
+    pub security_open: bool,
+    pub advanced_open: bool,
     pub type_options: Vec<view::OptionVm>,
     pub error: Option<String>,
     /// Which input(s) a rejected submission belongs to.
@@ -967,6 +970,8 @@ pub struct ParkingEditPage {
     pub price_unit: String,
     pub hours_days: Vec<ContributionHoursDayVm>,
     pub security_states: Vec<ContributionTriStateVm>,
+    pub hours_open: bool,
+    pub security_open: bool,
     pub type_options: Vec<view::OptionVm>,
     /// The spot's current position. Not editable here — moving a pin is a
     /// reviewed proposal — but it seeds the map on the "move the pin" form.

@@ -98,6 +98,12 @@ impl FieldErrors {
             .map(|(_, m)| m.as_str())
     }
 
+    /// Whether a server-rendered field should be surfaced (for example, by
+    /// opening the native disclosure that contains it after a rejected form).
+    pub fn has(&self, field: &str) -> bool {
+        self.err(field).is_some()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -221,7 +227,7 @@ pub fn open_label(t: Translator, s: OpenStatus) -> &'static str {
     }
 }
 
-/// One parking card in the results list (P2 search results).
+/// One parking card in the search results list.
 #[derive(Debug, Clone)]
 pub struct CardVm {
     pub id: i64,
@@ -848,7 +854,7 @@ pub struct ContributionVm {
     pub at_label: String,
 }
 
-/// One advisory duplicate candidate (D1/).
+/// One advisory duplicate candidate.
 #[derive(Debug, Clone)]
 pub struct DuplicateVm {
     pub id: i64,
