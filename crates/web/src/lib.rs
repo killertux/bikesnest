@@ -569,14 +569,17 @@ impl DetailsPage {
             dispute_items: Vec::new(),
             parked_here_count: 0,
             is_favorited: false,
-            can_contribute: false,
-            is_authenticated: false,
+            can_contribute: auth.user.as_ref().is_some_and(|u| u.is_verified),
+            is_authenticated: auth.authenticated(),
             has_own_review: false,
             own_rating: 0,
             reasons: Vec::new(),
             notice: None,
             moderation_state: loc.moderation_state().as_code(),
-            is_moderator: false,
+            is_moderator: auth.user.as_ref().is_some_and(|u| {
+                u.has_role(bikesnest_domain::Role::Moderator)
+                    || u.has_role(bikesnest_domain::Role::Admin)
+            }),
             reason_options: view::report_reason_options(tr),
             collaboration_proposals: Vec::new(),
             collaboration_history: Vec::new(),
@@ -672,15 +675,9 @@ impl DetailsPage {
             .collect();
         page.parked_here_count = c.parked_here_count;
         page.is_favorited = c.is_favorited;
-        page.can_contribute = auth.user.as_ref().is_some_and(|u| u.is_verified);
-        page.is_authenticated = auth.authenticated();
         page.has_own_review = c.own_review.is_some();
         page.own_rating = c.own_review.map(|r| r.rating.value()).unwrap_or(0);
         page.reasons = c.reasons.iter().map(|r| view::reason_vm(tr, r)).collect();
-        page.is_moderator = auth.user.as_ref().is_some_and(|u| {
-            u.has_role(bikesnest_domain::Role::Moderator)
-                || u.has_role(bikesnest_domain::Role::Admin)
-        });
         page
     }
 

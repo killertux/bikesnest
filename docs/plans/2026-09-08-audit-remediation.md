@@ -129,6 +129,14 @@ These remain explicit until the owner supplies evidence or approves action:
 
 ## Progress log
 
+- B11 followup gate passed: independent authenticated-route1/1, sequential HTTP179/179, browser27/27, formatting/strict web Clippy/diff all passed. Verified base auth flags, own/stale/unverified/anonymous fences and exact no-extra-reader counts. Review explicitly records missed branch and reopened PASS. Source re-accepted, not deployed; B12 may resume after checkpoint.
+
+- B11 authentication-state followup frozen for review: base page now derives the three principal/role flags independently of optional community data. Implementer reports actual authenticated route1/1 (eligible/own/stale/unverified/anonymous/moderator, History and Current outage), sequential HTTP179/179, browser27/27 and strict checks passed. See [B11 followup](../reviews/remediation/B11-followup.md). B12 remains paused pending genuine re-acceptance.
+
+- B11 gate reopened after lead found an authenticated-approvals regression in committed `ce0aa52`: base page initializes `can_contribute=false`, and the skipped Current community overlay was its only verified-auth initializer. Eligible users therefore lose approval controls. B12 paused with no source edits (Terra confirmed). Sol assigned bounded auth-derived base-state correction and authenticated-route regressions; separate reviewer independently confirming. Prior PASS did not cover this branch; acceptance withdrawn pending correction.
+
+- B11 checkpoint: `ce0aa52`. B12 assigned to Terra for compact cyclist-first profile/search presentation and precise trust/history/eligibility copy, with actual mobile/desktop/native checks. B11 read/failure boundaries and approval invariants must remain intact; escalate multilayer eligibility work if needed. No production action.
+
 - B11 gate passed after independent re-review: media matrix1/1, sequential HTTP178/178, browser27/27 and strict checks passed; original application11/infrastructure4 and real-route counting evidence remain valid. Per-review unavailability, safe diagnostics, thumbnail fallback, tab-specific reads and pagination accepted. Source only, not deployed. Known parallel fixture issue remains B16. B12 is next.
 
 - B11 corrections frozen for same Sol reviewer: per-review primary-signing failure now exposes localized unavailable state; full-image thumbnail fallbacks preserved. Implementer reports actual-router media matrix1/1, sequential HTTP178/178, browser27/27 and strict checks passed; see [B11 corrections](../reviews/remediation/B11-corrections.md). Historical parallel review-create flake recurred, then focused/sequential passed; B16 reliability remains unresolved. Acceptance pending.

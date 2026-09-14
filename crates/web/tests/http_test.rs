@@ -1141,6 +1141,98 @@ impl bikesnest_web::state::DetailReads for MediaDetailReads {
     }
 }
 
+struct EligibilityDetailReads {
+    calls: std::sync::Arc<std::sync::Mutex<[usize; 6]>>,
+    viewer: bikesnest_domain::UserId,
+}
+
+#[async_trait::async_trait]
+impl bikesnest_web::state::DetailReads for EligibilityDetailReads {
+    async fn photos_page(
+        &self,
+        _id: i64,
+        _limit: i64,
+    ) -> Result<(Vec<bikesnest_application::StoredPhoto>, i64), bikesnest_application::ReaderError>
+    {
+        self.calls.lock().unwrap()[0] += 1;
+        Ok((vec![], 0))
+    }
+    async fn pending_photos(&self, _id: i64) -> Result<i64, bikesnest_application::ReaderError> {
+        self.calls.lock().unwrap()[1] += 1;
+        Ok(1)
+    }
+    async fn community(
+        &self,
+        _location: bikesnest_domain::ParkingLocation,
+        _viewer: Option<bikesnest_domain::UserId>,
+        _after: Option<i64>,
+        _limit: i64,
+    ) -> Result<
+        bikesnest_application::CommunityParkingDetails,
+        bikesnest_application::ContributionError,
+    > {
+        self.calls.lock().unwrap()[2] += 1;
+        Err(bikesnest_application::ContributionError::Unavailable)
+    }
+    async fn summary(
+        &self,
+        _id: i64,
+    ) -> Result<
+        bikesnest_application::PendingProposalSummary,
+        bikesnest_application::ContributionError,
+    > {
+        self.calls.lock().unwrap()[3] += 1;
+        Ok(bikesnest_application::PendingProposalSummary {
+            total: 3,
+            fields: vec![],
+        })
+    }
+    async fn proposals(
+        &self,
+        _id: i64,
+        _after: Option<i64>,
+        _limit: i64,
+    ) -> Result<
+        (Vec<bikesnest_application::ListingProposal>, i64, bool),
+        bikesnest_application::ContributionError,
+    > {
+        self.calls.lock().unwrap()[4] += 1;
+        let proposal = |id, proposer_id, base_version| bikesnest_application::ListingProposal {
+            id,
+            kind: bikesnest_domain::ProposalKind::ChangeExistence,
+            change: bikesnest_domain::ProposedChange::ChangeExistence { exists: false },
+            reason: None,
+            status: bikesnest_domain::ProposalStatus::Pending,
+            approvals: 0,
+            rejections: 0,
+            created_at: chrono::Utc::now(),
+            base_version,
+            proposer_id,
+        };
+        Ok((
+            vec![
+                proposal(81, Some(bikesnest_domain::UserId(999_999)), 1),
+                proposal(82, Some(self.viewer), 1),
+                proposal(83, Some(bikesnest_domain::UserId(999_998)), 0),
+            ],
+            3,
+            false,
+        ))
+    }
+    async fn history(
+        &self,
+        _id: i64,
+        _after: Option<i64>,
+        _limit: i64,
+    ) -> Result<
+        (Vec<bikesnest_domain::RevisionSummary>, i64, bool),
+        bikesnest_application::ContributionError,
+    > {
+        self.calls.lock().unwrap()[5] += 1;
+        Ok((vec![], 0, false))
+    }
+}
+
 struct CountingStorage {
     inner: bikesnest_test_support::TestObjectStorage,
     signs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -1235,6 +1327,145 @@ fn detail_tabs_count_actual_reader_calls_through_the_router() {
                 expected_signs
             );
         }
+    });
+}
+
+#[test]
+fn approvals_derive_eligibility_from_auth_without_loading_current_tab_data() {
+    run_isolated_database_test(|pool| async move {
+        use bikesnest_application::SessionStore;
+        use bikesnest_domain::{CsrfToken, SessionId};
+
+        let db = Db::from_pool(pool);
+        let mut conn = db.acquire().await.unwrap();
+        let location = ParkingBuilder::new()
+            .with_name("B11 approvals eligibility")
+            .create(&mut conn)
+            .await
+            .unwrap();
+        let verified = bikesnest_test_support::UserBuilder::new()
+            .with_email("b11-eligible@example.com")
+            .create(&mut *conn)
+            .await
+            .unwrap();
+        let unverified = bikesnest_test_support::UserBuilder::new()
+            .with_email("b11-unverified@example.com")
+            .create(&mut *conn)
+            .await
+            .unwrap();
+        let moderator = bikesnest_test_support::UserBuilder::new()
+            .with_email("b11-moderator@example.com")
+            .create(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE users SET account_state='ACTIVE',email_verified_at=now() WHERE id IN ($1,$2)",
+        )
+        .bind(verified.id.0)
+        .bind(moderator.id.0)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO user_roles (user_id,role) VALUES ($1,'MODERATOR')")
+            .bind(moderator.id.0)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        let sessions = bikesnest_infrastructure::SqlxSessionStore::new(db.clone());
+        let verified_token = SessionId::new([81; 32]);
+        let unverified_token = SessionId::new([82; 32]);
+        let moderator_token = SessionId::new([83; 32]);
+        for (user, token) in [
+            (verified.id, &verified_token),
+            (unverified.id, &unverified_token),
+            (moderator.id, &moderator_token),
+        ] {
+            sessions
+                .create(user, token, &CsrfToken::new([84; 32]), chrono::Utc::now())
+                .await
+                .unwrap();
+        }
+
+        let calls = std::sync::Arc::new(std::sync::Mutex::new([0; 6]));
+        let deps = RouterDeps {
+            email: std::sync::Arc::new(FakeEmailProvider::with_root(None)),
+            oauth: None,
+            hasher: TestPasswordHasher,
+            rate_limiter: Box::new(bikesnest_infrastructure::InMemoryRateLimiter::new()),
+            storage: std::sync::Arc::new(bikesnest_test_support::TestObjectStorage::new()),
+            detail_reads: Some(std::sync::Arc::new(EligibilityDetailReads {
+                calls: calls.clone(),
+                viewer: verified.id,
+            })),
+        };
+        let app = app_router_with(std::sync::Arc::new(test_config()), db, deps);
+        let fetch = |path: String, cookie: Option<String>| {
+            let app = app.clone();
+            async move {
+                let mut request = Request::builder().uri(path);
+                if let Some(cookie) = cookie {
+                    request = request.header("Cookie", cookie);
+                }
+                let response = app
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+                    .to_string()
+            }
+        };
+        let path = format!("/parking/{}?tab=approvals", location.id());
+
+        *calls.lock().unwrap() = [0; 6];
+        let eligible = fetch(
+            path.clone(),
+            Some(format!("session_id={}", verified_token.to_hex())),
+        )
+        .await;
+        assert_eq!(
+            eligible.matches("name=\"vote\"").count(),
+            2,
+            "only the other, current proposal is votable"
+        );
+        assert!(eligible.contains(&format!("/parking/{}/edit", location.id())));
+        assert!(eligible.contains("report('parking'"));
+        assert_eq!(*calls.lock().unwrap(), [0, 1, 0, 1, 1, 0]);
+
+        let unverified_body = fetch(
+            path.clone(),
+            Some(format!("session_id={}", unverified_token.to_hex())),
+        )
+        .await;
+        assert!(!unverified_body.contains("name=\"vote\""));
+        assert!(!unverified_body.contains(&format!("/parking/{}/edit", location.id())));
+        let anonymous = fetch(path.clone(), None).await;
+        assert!(!anonymous.contains("name=\"vote\""));
+        let moderator_body = fetch(
+            path,
+            Some(format!("session_id={}", moderator_token.to_hex())),
+        )
+        .await;
+        assert!(moderator_body.contains("/moderation/photos"));
+
+        *calls.lock().unwrap() = [0; 6];
+        let history = fetch(
+            format!("/parking/{}?tab=history", location.id()),
+            Some(format!("session_id={}", verified_token.to_hex())),
+        )
+        .await;
+        assert!(history.contains(&format!("/parking/{}/edit", location.id())));
+        assert!(history.contains("report('parking'"));
+        assert_eq!(*calls.lock().unwrap(), [0, 1, 0, 1, 0, 1]);
+
+        *calls.lock().unwrap() = [0; 6];
+        let current_outage = fetch(
+            format!("/parking/{}", location.id()),
+            Some(format!("session_id={}", verified_token.to_hex())),
+        )
+        .await;
+        assert!(current_outage.contains(&format!("/parking/{}/edit", location.id())));
+        assert_eq!(*calls.lock().unwrap(), [1, 1, 1, 1, 0, 0]);
     });
 }
 

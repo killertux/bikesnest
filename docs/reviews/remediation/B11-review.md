@@ -7,6 +7,31 @@ Decision: **PASS**
 
 I read the B11 handoff, plan/HX-06 criteria and current architecture/testing guidance, inspected the complete frozen diff except lead ledger edits, and independently executed the required gates. I changed no source, plan, provider, generated asset, release, deployment or production state.
 
+## Reopened authentication-state gate
+
+The earlier PASS was reopened after checkpoint `ce0aa52` because Approvals and
+History no longer load the Current-tab community model, while the base page
+builder defaulted `can_contribute`, `is_authenticated`, and `is_moderator` to
+false. That made eligible proposal votes and shared Suggest, Report/modal, and
+moderator controls disappear on those tabs. The follow-up correction is
+independently **PASS**.
+
+`DetailsPage::build` now derives only those three request-authoritative values
+from `Auth`, before any optional community read and before proposal view models
+compute `can_vote`. The community overlay still owns favorite state, own-review
+state/rating, confidence/dispute data, parked-here count, recommendation reasons,
+and reviews. `viewer_id` remains base-derived, so an eligible viewer can vote on
+another user's current proposal but not their own; stale/unknown proposals and
+unverified or anonymous viewers remain blocked.
+
+The actual production-router regression also confirms that verified Approvals
+and History render Suggest and Report/modal controls, the moderator sees the
+pending-photo moderation link, and a Current community-reader outage retains
+verified auth controls. Its exact facade counts prove the correction adds no
+reader calls: Approvals `[0,1,0,1,1,0]`, History `[0,1,0,1,0,1]`, and Current
+outage `[1,1,1,1,0,0]` for gallery, pending photos, community, summary,
+proposals, and history respectively.
+
 ## Correction disposition
 
 No material findings remain. Primary review-photo signing failure now marks only that review's `media_available` false, preserves the review text and published parking facts, and renders localized English/Portuguese unavailable copy. Its diagnostic contains only the allowlisted category, location id and review id—no provider error or object key. Gallery primary failure remains unavailable; gallery and review thumbnail failures consistently fall back to the successfully signed full image. The actual-router matrix populates all media and independently exercises all four branches plus Portuguese copy.
@@ -55,6 +80,34 @@ npm run test:browser
 ```
 
 Result before correction: HTTP **177 passed** and browser **27 passed**. After correction, the exact `detail_media_signing_failures_are_honest_and_thumbnail_fallbacks_remain_usable` matrix passed **1/1**, the full sequential HTTP suite passed **178/178**, and browser passed **27/27**.
+
+Authentication-state follow-up validation against `ce0aa52`:
+
+```text
+env -u DATABASE_URL \
+  TEST_DATABASE_URL=postgres://bikesnest_test:bikesnest_test@127.0.0.1:55439/bikesnest_test_audit \
+  CARGO_TARGET_DIR=/home/bruno/Projects/bikenest/target \
+  cargo test -p bikesnest-web --test http_test \
+  approvals_derive_eligibility_from_auth_without_loading_current_tab_data \
+  --locked -- --exact --test-threads=1
+```
+
+Result: **1 passed, 0 failed** (178 filtered out).
+
+```text
+env -u DATABASE_URL \
+  TEST_DATABASE_URL=postgres://bikesnest_test:bikesnest_test@127.0.0.1:55439/bikesnest_test_audit \
+  CARGO_TARGET_DIR=/home/bruno/Projects/bikenest/target \
+  cargo test -p bikesnest-web --test http_test --locked -- --test-threads=1
+npm run test:browser
+cargo fmt --all -- --check
+env -u DATABASE_URL CARGO_TARGET_DIR=/home/bruno/Projects/bikenest/target \
+  cargo clippy -p bikesnest-web --all-targets --locked -- -D warnings
+git diff --check ce0aa52
+```
+
+Result: sequential HTTP **179 passed, 0 failed**; browser **27 passed, 0
+failed**; formatting, strict web Clippy, and follow-up diff validation passed.
 
 ```text
 cargo fmt --all -- --check
