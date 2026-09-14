@@ -88,6 +88,7 @@ pub(crate) async fn register_page(
     render_anon(
         RegisterPage {
             layout: PageLayout::new(&state.map, tr.t("auth.register_title").to_string(), "auth")
+                .csp_nonce(auth.csp_nonce.clone())
                 .csrf(token.clone()),
             tr,
             email: String::new(),
@@ -142,6 +143,7 @@ pub(crate) async fn register_post(
                         tr.t("auth.register_title").to_string(),
                         "auth",
                     )
+                    .csp_nonce(auth.csp_nonce.clone())
                     .csrf(token.clone()),
                     tr,
                     email: form.email,
@@ -223,6 +225,7 @@ pub(crate) async fn login_page(
     render_anon(
         LoginPage {
             layout: PageLayout::new(&state.map, tr.t("auth.login_title").to_string(), "auth")
+                .csp_nonce(auth.csp_nonce.clone())
                 .csrf(token.clone()),
             tr,
             email: String::new(),
@@ -282,6 +285,7 @@ pub(crate) async fn login_post(
                         tr.t("auth.login_title").to_string(),
                         "auth",
                     )
+                    .csp_nonce(auth.csp_nonce.clone())
                     .csrf(token.clone()),
                     tr,
                     email: String::new(),
@@ -326,6 +330,7 @@ pub(crate) async fn verify_email(
         return render_anon(
             VerifyEmailPage {
                 layout: PageLayout::new(&state.map, tr.t("auth.verify_title").to_string(), "auth")
+                    .csp_nonce(auth.csp_nonce.clone())
                     .csrf(t.clone()),
                 tr,
                 success: false,
@@ -345,6 +350,7 @@ pub(crate) async fn verify_email(
                         tr.t("auth.verify_title").to_string(),
                         "auth",
                     )
+                    .csp_nonce(auth.csp_nonce.clone())
                     .csrf(t.clone()),
                     tr,
                     success: false,
@@ -384,6 +390,7 @@ pub(crate) async fn verify_resend(
                         tr.t("auth.login_title").to_string(),
                         "auth",
                     )
+                    .csp_nonce(auth.csp_nonce.clone())
                     .csrf(t.clone()),
                     tr,
                     email: String::new(),
@@ -427,6 +434,7 @@ pub(crate) async fn password_reset_page(
     render_anon(
         PasswordResetPage {
             layout: PageLayout::new(&state.map, tr.t("auth.reset_title").to_string(), "auth")
+                .csp_nonce(auth.csp_nonce.clone())
                 .csrf(token.clone()),
             tr,
             email: String::new(),
@@ -459,6 +467,7 @@ pub(crate) async fn password_reset_post(
                         tr.t("auth.reset_title").to_string(),
                         "auth",
                     )
+                    .csp_nonce(auth.csp_nonce.clone())
                     .csrf(t.clone()),
                     tr,
                     email: form.email,
@@ -483,6 +492,7 @@ pub(crate) async fn password_reset_new(
     render_anon(
         PasswordResetNewPage {
             layout: PageLayout::new(&state.map, tr.t("auth.reset_new_title").to_string(), "auth")
+                .csp_nonce(auth.csp_nonce.clone())
                 .csrf(t.clone()),
             tr,
             token,
@@ -518,6 +528,7 @@ pub(crate) async fn password_reset_new_post(
                         tr.t("auth.reset_new_title").to_string(),
                         "auth",
                     )
+                    .csp_nonce(auth.csp_nonce.clone())
                     .csrf(t.clone()),
                     tr,
                     token: form.token,

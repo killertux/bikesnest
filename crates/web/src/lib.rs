@@ -31,6 +31,7 @@ use routes::contribution_form::{
 /// `csrf` is the request's session or stable anonymous token, rendered into
 /// forms and document metadata for native and htmx submissions.
 pub struct PageLayout {
+    pub csp_nonce: String,
     pub title: String,
     pub current: String,
     pub csrf: String,
@@ -106,6 +107,7 @@ impl PageLayout {
                 ),
             };
         Self {
+            csp_nonce: String::new(),
             title,
             current: current.to_string(),
             csrf: String::new(),
@@ -148,6 +150,7 @@ impl PageLayout {
             .is_some_and(|u| u.has_role(bikesnest_domain::Role::Admin));
         let can_contribute = auth.user.as_ref().is_some_and(|u| u.is_verified);
         Self {
+            csp_nonce: auth.csp_nonce.to_string(),
             is_authenticated: auth.authenticated(),
             is_moderator,
             is_admin,
@@ -159,6 +162,11 @@ impl PageLayout {
     /// Set (or overwrite) the canonical URL.
     pub fn canonical(mut self, url: impl Into<String>) -> Self {
         self.canonical = url.into();
+        self
+    }
+
+    pub fn csp_nonce(mut self, nonce: impl ToString) -> Self {
+        self.csp_nonce = nonce.to_string();
         self
     }
 

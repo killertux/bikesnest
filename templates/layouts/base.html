@@ -33,12 +33,12 @@
        their own head/scripts blocks, not unconditionally here. -->
   {% block head %}{% endblock %}
   <!-- Persistent scripts run once. Register components before Alpine starts. -->
-  <script defer src="{{ layout.asset("vendor/htmx.js") }}"></script>
-  <script defer src="{{ layout.asset("vendor/hx-alpine-compat.js") }}"></script>
-  <script defer src="{{ layout.asset("js/app.js") }}"></script>
-  <script defer src="{{ layout.asset("vendor/alpine.min.js") }}"></script>
-  <script defer src="{{ layout.asset("js/auth.js") }}"></script>
-  <script defer src="{{ layout.asset("js/navigation.js") }}"></script>
+  <script nonce="{{ layout.csp_nonce }}" defer src="{{ layout.asset("vendor/htmx.js") }}"></script>
+  <script nonce="{{ layout.csp_nonce }}" defer src="{{ layout.asset("vendor/hx-alpine-compat.js") }}"></script>
+  <script nonce="{{ layout.csp_nonce }}" defer src="{{ layout.asset("js/app.js") }}"></script>
+  <script nonce="{{ layout.csp_nonce }}" defer src="{{ layout.asset("vendor/alpine.min.js") }}"></script>
+  <script nonce="{{ layout.csp_nonce }}" defer src="{{ layout.asset("js/auth.js") }}"></script>
+  <script nonce="{{ layout.csp_nonce }}" defer src="{{ layout.asset("js/navigation.js") }}"></script>
 </head>
 {# htmx 4 has `config.implicitInheritance = false`, so a plain `hx-boost` on
    <body> applies to <body> alone and every link/form below it stayed unboosted.

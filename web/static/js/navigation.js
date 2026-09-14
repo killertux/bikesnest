@@ -2,13 +2,28 @@
 (function () {
   "use strict";
   if (window.BikesNestMaps) return;
+  // This is the nonce of the original trusted document. Never copy a nonce
+  // from a swapped map manifest or a request header.
+  var documentNonce = document.currentScript && document.currentScript.nonce || "";
   var assets = new Map();
   var maps = new Map();
   var observers = new Map();
   var pending;
 
+  function allowedAsset(node, rawUrl) {
+    var url;
+    try { url = new URL(rawUrl, document.baseURI); } catch (_) { return false; }
+    if (url.origin !== location.origin || url.search || url.hash) return false;
+    var path = url.pathname.replace(/^\/static\/h\/[0-9a-f]{10}\//, "/static/");
+    if (node.tagName === "SCRIPT") {
+      return /^\/static\/(vendor\/(maplibre-gl|mapbox-gl)\.js|js\/(map-provider-(maplibre|mapbox|google)|search|details-map|pin-picker)\.js)$/.test(path);
+    }
+    return /^\/static\/(vendor\/(maplibre-gl|mapbox-gl)\.css|css\/map\.css)$/.test(path);
+  }
+
   function load(node) {
     var url = node.src || node.href;
+    if (!allowedAsset(node, url)) return Promise.reject(new Error("map_asset_refused"));
     if (assets.has(url)) return assets.get(url);
     // A hard-loaded map page already has these styles in its head.
     if (node.tagName === "LINK") {
@@ -19,7 +34,11 @@
     }
     var promise = new Promise(function (resolve, reject) {
       var el = document.createElement(node.tagName.toLowerCase());
-      if (node.tagName === "SCRIPT") { el.src = url; el.async = false; }
+      if (node.tagName === "SCRIPT") {
+        el.src = url;
+        el.async = false;
+        if (documentNonce) el.nonce = documentNonce;
+      }
       else { el.rel = "stylesheet"; el.href = url; }
       el.onload = resolve;
       el.onerror = function () {
@@ -78,6 +97,10 @@
   // page. Explicit fragment swaps retain their original behavior.
   document.addEventListener("htmx:before:swap", function (event) {
     event.detail.tasks.forEach(function (task) {
+      // Responses never need executable scripts: persistent document scripts
+      // and the explicit map manifest own all application code. Keep inert JSON.
+      task.fragment.querySelectorAll('script:not([type="application/json"])')
+        .forEach(function (script) { script.remove(); });
       if (task.target === document.body && task.swapSpec.style === "outerMorph") {
         task.swapSpec.style = "outerSync";
       }

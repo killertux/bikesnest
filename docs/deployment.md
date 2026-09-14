@@ -25,6 +25,17 @@ a localStorage history snapshot cache. That is a pinned-library property guarded
 by the browser suite, not an HTML configuration attribute; rerun that suite when
 upgrading the vendored htmx asset.
 
+HTML responses enforce the existing provider-compatible CSP and simultaneously
+emit a fresh-nonce, `strict-dynamic` candidate as
+`Content-Security-Policy-Report-Only`. This is deliberately observation-only:
+promoting it to enforcement requires live restricted-key Google Maps evidence
+and a decision to nonce or disable the Cloudflare-injected analytics beacon,
+which a host fallback cannot authorize under `strict-dynamic`. Google Maps is
+the only candidate profile retaining `unsafe-eval`, per the official
+[Google Maps CSP guide](https://developers.google.com/maps/documentation/javascript/content-security-policy).
+Mapbox blob-worker and stricter worker-bundle tradeoffs are documented in its
+[security guide](https://docs.mapbox.com/mapbox-gl-js/guides/security-and-testing/).
+
 Build is reproducible because `Cargo.lock` is committed and the toolchain is
 pinned by the base image tag. No `DATABASE_URL`, no offline cache, no build-time
 DB.

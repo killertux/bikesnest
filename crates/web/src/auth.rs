@@ -10,6 +10,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use bikesnest_application::{AuthenticatedUser, TokenGenerator};
 use bikesnest_domain::{CsrfToken, SessionId};
 use bikesnest_infrastructure::MapConfig;
+use std::sync::Arc;
 
 use crate::htmx;
 use crate::i18n::{Locale, Translator};
@@ -41,6 +42,7 @@ pub const CSRF_BODY_LIMIT: usize = 64 * 1024;
 /// whether this request wants a swap-safe fragment or a whole document.
 #[derive(Debug, Clone)]
 pub struct Auth {
+    pub csp_nonce: Arc<String>,
     pub user: Option<AuthenticatedUser>,
     pub csrf: Option<CsrfToken>,
     /// A session cookie was presented but no live session resolved.
@@ -61,6 +63,7 @@ pub struct Auth {
 impl Default for Auth {
     fn default() -> Self {
         Self {
+            csp_nonce: Arc::new(String::new()),
             user: None,
             csrf: None,
             stale_session: false,
@@ -376,22 +379,32 @@ pub async fn auth_middleware(
     // Snapshot what `Auth` needs *before* the await: `&Request<Body>` is not
     // `Send` (axum's `Body` is not `Sync`), and holding one across an await
     // would make the middleware future non-`Send`.
-    let (auth, set_anon_cookie) =
-        match resolve_auth(&state, req.method(), req.uri(), req.headers().clone()).await {
-            Ok(resolved) => resolved,
-            Err(auth) => {
-                tracing::error!(
-                    auth_failure = "session_store_unavailable",
-                    "session resolution failed"
-                );
-                let mut response = auth.deny(StatusCode::SERVICE_UNAVAILABLE, "error.unavailable");
-                response.headers_mut().insert(
-                    header::CACHE_CONTROL,
-                    HeaderValue::from_static("private, no-store"),
-                );
-                return response;
-            }
-        };
+    let (auth, set_anon_cookie) = match resolve_auth(
+        &state,
+        req.method(),
+        req.uri(),
+        req.headers().clone(),
+        req.extensions()
+            .get::<crate::security::CspNonce>()
+            .map(|nonce| nonce.0.clone())
+            .unwrap_or_default(),
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(auth) => {
+            tracing::error!(
+                auth_failure = "session_store_unavailable",
+                "session resolution failed"
+            );
+            let mut response = auth.deny(StatusCode::SERVICE_UNAVAILABLE, "error.unavailable");
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("private, no-store"),
+            );
+            return response;
+        }
+    };
 
     // Safe methods never carry a token. `HEAD` and `OPTIONS` are as read-only
     // as `GET` (axum answers `HEAD` with the `GET` route), so requiring one
@@ -503,8 +516,10 @@ async fn resolve_auth(
     method: &Method,
     uri: &axum::http::Uri,
     headers: HeaderMap,
-) -> Result<(Auth, Option<CsrfToken>), Auth> {
+    csp_nonce: String,
+) -> Result<(Auth, Option<CsrfToken>), Box<Auth>> {
     let base = Auth {
+        csp_nonce: Arc::new(csp_nonce),
         next: htmx::login_next(method, uri, &headers),
         fragment: htmx::is_fragment_request(&headers),
         tr: Translator::new(Locale::from_headers(&headers)),
@@ -527,7 +542,7 @@ async fn resolve_auth(
                 ));
             }
             Ok(None) => {}
-            Err(_) => return Err(base),
+            Err(_) => return Err(Box::new(base)),
         }
     }
     let stale_session = session_id_from_headers(&headers).is_some();

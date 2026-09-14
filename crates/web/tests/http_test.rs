@@ -48,9 +48,23 @@ async fn get(uri: &str) -> (StatusCode, String) {
         )
         .await
         .unwrap();
+    let report_only = res.headers()["content-security-policy-report-only"]
+        .to_str()
+        .unwrap()
+        .to_string();
     let status = res.status();
     let body = res.into_body().collect().await.unwrap().to_bytes();
-    (status, String::from_utf8_lossy(&body).to_string())
+    let body = String::from_utf8_lossy(&body).to_string();
+    if status.is_success() && body.contains("<html") {
+        let nonce = regex::Regex::new(r#"<script nonce="([^"]+)""#)
+            .unwrap()
+            .captures(&body)
+            .and_then(|captures| captures.get(1))
+            .map(|value| value.as_str())
+            .expect("rendered HTML has trusted nonced scripts");
+        assert!(report_only.contains(&format!("'nonce-{nonce}'")));
+    }
+    (status, body)
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +102,35 @@ async fn security_headers_present_on_public_page(_tx: &mut TestTx) {
     assert_eq!(headers["x-frame-options"], "DENY");
     assert!(headers.contains_key("content-security-policy"));
     assert!(headers.contains_key("permissions-policy"));
+}
+
+#[db_test]
+async fn report_only_csp_nonce_matches_markup_and_is_fresh(_tx: &mut TestTx) {
+    let (_, first_headers, first_body) = get_raw("/", ("accept-encoding", "identity")).await;
+    let (_, second_headers, _) = get_raw("/", ("accept-encoding", "identity")).await;
+    let (_, hostile_headers, hostile_body) = get_raw("/", ("x-csp-nonce", "attacker")).await;
+    let first = first_headers["content-security-policy-report-only"]
+        .to_str()
+        .unwrap();
+    let second = second_headers["content-security-policy-report-only"]
+        .to_str()
+        .unwrap();
+    let nonce = first
+        .split("'nonce-")
+        .nth(1)
+        .and_then(|tail| tail.split('\'').next())
+        .unwrap();
+    assert_eq!(nonce.len(), 32);
+    assert!(first.contains("'strict-dynamic'"));
+    assert!(String::from_utf8_lossy(&first_body).contains(&format!("<script nonce=\"{nonce}\"")));
+    assert!(!second.contains(&format!("'nonce-{nonce}'")));
+    assert!(
+        !hostile_headers["content-security-policy-report-only"]
+            .to_str()
+            .unwrap()
+            .contains("attacker")
+    );
+    assert!(!String::from_utf8_lossy(&hostile_body).contains("nonce=\"attacker\""));
 }
 
 #[db_test]
@@ -945,6 +988,10 @@ async fn get_c(app: &axum::Router, uri: &str, cookie: Option<&str>) -> (StatusCo
         .oneshot(b.body(Body::empty()).unwrap())
         .await
         .unwrap();
+    let report_only = res.headers()["content-security-policy-report-only"]
+        .to_str()
+        .unwrap()
+        .to_string();
     assert_eq!(
         res.headers()["cache-control"],
         "private, no-store",
@@ -952,7 +999,29 @@ async fn get_c(app: &axum::Router, uri: &str, cookie: Option<&str>) -> (StatusCo
     );
     let status = res.status();
     let body = res.into_body().collect().await.unwrap().to_bytes();
-    (status, String::from_utf8_lossy(&body).to_string())
+    let body = String::from_utf8_lossy(&body).to_string();
+    if status.is_success() && body.contains("<html") {
+        let nonce = regex::Regex::new(r#"<script nonce="([^"]+)""#)
+            .unwrap()
+            .captures(&body)
+            .and_then(|captures| captures.get(1))
+            .unwrap()
+            .as_str();
+        assert!(report_only.contains(&format!("'nonce-{nonce}'")), "{uri}");
+        for script in regex::Regex::new(r"<script\b[^>]*>")
+            .unwrap()
+            .find_iter(&body)
+            .map(|found| found.as_str())
+        {
+            if !script.contains("type=\"application/json\"") {
+                assert!(
+                    script.contains(&format!("nonce=\"{nonce}\"")),
+                    "{uri}: {script}"
+                );
+            }
+        }
+    }
+    (status, body)
 }
 
 /// Which page to GET to obtain the anonymous double-submit CSRF cookie for a
@@ -4176,6 +4245,36 @@ fn base_layout_does_not_branch_on_csrf_presence() {
     assert!(
         contents.contains("layout.is_authenticated"),
         "base.html header should branch on layout.is_authenticated"
+    );
+}
+
+#[test]
+fn every_executable_template_script_uses_the_response_nonce() {
+    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates"));
+    let tag = regex::Regex::new(r"<script\b[^>]*>").unwrap();
+    let mut stack = vec![root.to_path_buf()];
+    let mut offenders = Vec::new();
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "html") {
+                let source = std::fs::read_to_string(&path).unwrap();
+                for script in tag.find_iter(&source).map(|found| found.as_str()) {
+                    if !script.contains("type=\"application/json\"")
+                        && !script.contains("nonce=\"{{ layout.csp_nonce }}\"")
+                    {
+                        offenders.push(format!("{}: {script}", path.display()));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "unnonced executable scripts:\n{}",
+        offenders.join("\n")
     );
 }
 

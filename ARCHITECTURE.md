@@ -342,7 +342,13 @@ Key modeling notes:
   shipped htmx 4.0.0 network-restores history and does not implement a
   localStorage snapshot cache; the installed-library browser regression guards
   that version-dependent property. Only successful static assets retain
-  explicit cacheable policies. See `crates/web/src/security.rs`.
+  explicit cacheable policies. The currently enforced CSP remains the known
+  provider-compatible baseline. Each HTML response also carries a fresh nonce
+  on trusted script elements and a nonce/`strict-dynamic` candidate in
+  `Content-Security-Policy-Report-Only`; Google alone retains its documented
+  `unsafe-eval` exception there. Promotion waits on live Google and edge-beacon
+  validation. Dynamic map loaders retain the original document nonce and never
+  trust swapped manifests or request headers. See `crates/web/src/security.rs`.
 - **Observability:** `APP_ENV=production` → JSON structured logs; PII-free.
 - **Rate limiting:** sliding-window via ValKey (Lua atomic, bounded provider
   deadline). General traffic may follow the configured fail-open policy;

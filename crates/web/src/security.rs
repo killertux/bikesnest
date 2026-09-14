@@ -18,6 +18,9 @@ use bikesnest_infrastructure::{MapConfig, SecurityConfig};
 
 use crate::htmx;
 
+#[derive(Clone, Debug, Default)]
+pub struct CspNonce(pub String);
+
 /// Config-driven security-header policy for the running instance.
 #[derive(Debug, Clone)]
 pub struct SecurityHeaders {
@@ -108,6 +111,55 @@ impl SecurityHeaders {
         )
     }
 
+    /// Nonce/strict-dynamic candidate emitted report-only until edge analytics
+    /// and the live Google SDK have been validated with the same policy.
+    pub fn candidate_csp(&self, nonce: &str) -> String {
+        let tile = self.join_hosts(&self.tile_hosts);
+        let geocode = self.join_hosts(&self.geocode_hosts);
+        let media = self.join_hosts(&self.media_hosts);
+        let google_eval = if self.google_maps {
+            " 'unsafe-eval'"
+        } else {
+            ""
+        };
+        let google_style = if self.google_maps {
+            " https://fonts.googleapis.com"
+        } else {
+            ""
+        };
+        let google_content = if self.google_maps {
+            " https://*.googleapis.com https://*.gstatic.com https://*.google.com https://*.ggpht.com https://*.googleusercontent.com"
+        } else {
+            ""
+        };
+        let google_font = if self.google_maps {
+            " https://fonts.gstatic.com"
+        } else {
+            ""
+        };
+        let google_connect = if self.google_maps { " data: blob:" } else { "" };
+        let frame = if self.google_maps {
+            "; frame-src https://*.google.com"
+        } else {
+            ""
+        };
+        let mapbox_content = if self.mapbox_maps {
+            " https://api.mapbox.com https://events.mapbox.com"
+        } else {
+            ""
+        };
+        format!(
+            "default-src 'self'; \
+             script-src 'nonce-{nonce}' 'strict-dynamic'{google_eval}; \
+             style-src 'self' 'unsafe-inline'{google_style}; \
+             img-src 'self' data: blob:{tile}{media}{google_content}{mapbox_content}; \
+             font-src 'self'{tile}{google_font}; \
+             connect-src 'self'{tile}{geocode}{google_content}{google_connect}{mapbox_content}; \
+             worker-src 'self' blob:; object-src 'none'; base-uri 'self'; \
+             frame-ancestors 'none'; form-action 'self'{frame}"
+        )
+    }
+
     /// Join configured origins into a directive fragment (leading space when non-empty).
     fn join_hosts(&self, hosts: &[String]) -> String {
         if hosts.is_empty() {
@@ -121,11 +173,13 @@ impl SecurityHeaders {
 /// Axum middleware: append the security-header set to every response.
 pub async fn security_headers(
     State(s): State<SecurityHeaders>,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: Next,
 ) -> Response {
     let path_is_private = is_private_path(req.uri().path());
     let path_is_static = req.uri().path().starts_with("/static/");
+    let nonce = format!("{:032x}", rand::random::<u128>());
+    req.extensions_mut().insert(CspNonce(nonce.clone()));
     let mut res = next.run(req).await;
     let response_is_success = res.status().is_success();
     let head = res.headers_mut();
@@ -151,6 +205,10 @@ pub async fn security_headers(
     head.insert(
         "Content-Security-Policy",
         HeaderValue::from_str(&s.csp()).expect("valid CSP header value"),
+    );
+    head.insert(
+        "Content-Security-Policy-Report-Only",
+        HeaderValue::from_str(&s.candidate_csp(&nonce)).expect("valid CSP header value"),
     );
     if s.tls_on {
         head.insert(
@@ -269,6 +327,31 @@ mod tests {
         let csp = headers(false, &[], &[]).csp();
         assert!(csp.contains("script-src 'self' https://static.cloudflareinsights.com"));
         assert!(csp.contains("connect-src 'self' https://cloudflareinsights.com"));
+    }
+
+    #[test]
+    fn report_only_candidate_is_nonce_strict_dynamic_and_eval_free_by_default() {
+        let csp = headers(false, &[], &[]).candidate_csp("known-nonce");
+        let script = csp
+            .split(';')
+            .find(|part| part.contains("script-src"))
+            .unwrap();
+        assert!(script.contains("script-src 'nonce-known-nonce' 'strict-dynamic'"));
+        assert!(!script.contains("unsafe-inline"));
+        assert!(!script.contains("unsafe-eval"));
+        assert!(!csp.contains("cloudflareinsights"));
+    }
+
+    #[test]
+    fn google_candidate_retains_only_its_documented_eval_exception() {
+        let map = MapConfig::Google {
+            browser_api_key: "browser-key".to_string(),
+            map_id: "map-id".to_string(),
+        };
+        let csp = SecurityHeaders::new(&SecurityConfig::default(), &map, false)
+            .candidate_csp("known-nonce");
+        assert!(csp.contains("script-src 'nonce-known-nonce' 'strict-dynamic' 'unsafe-eval'"));
+        assert!(!csp.contains("script-src 'nonce-known-nonce' 'strict-dynamic' 'unsafe-inline'"));
     }
 
     #[test]
