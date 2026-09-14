@@ -26,6 +26,7 @@ pub struct CollaborationProposalVm {
     pub changes: Vec<ProfileDiffVm>,
     pub stale: bool,
     pub manual_review: bool,
+    pub is_own: bool,
     pub can_vote: bool,
     pub created_label: String,
 }
@@ -225,6 +226,9 @@ impl DetailsPage {
                     changes,
                     stale,
                     manual_review: p.change == ProposedChange::Unknown,
+                    is_own: self
+                        .viewer_id
+                        .is_some_and(|viewer_id| p.proposer_id == Some(viewer_id)),
                     can_vote: self.can_contribute
                         && !stale
                         && p.proposer_id != self.viewer_id
@@ -242,6 +246,7 @@ impl DetailsPage {
                     label: self.tr.security(code).into(),
                     state: "unknown",
                 });
+                self.has_unknown_security = true;
             }
         }
         self

@@ -815,7 +815,7 @@ async fn parking_details_renders_full_page_and_404_for_unknown(tx: &mut TestTx) 
     assert!(body.contains("Key facts"));
     assert!(body.contains("Opening hours"));
     assert!(
-        body.contains("Open in Google Maps"),
+        body.contains("Cycling directions in Google Maps"),
         "external navigation link"
     );
     assert!(body.contains("Security attributes"));

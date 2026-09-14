@@ -428,6 +428,7 @@ pub struct DetailsPage {
     pub hours: Vec<view::HoursRowVm>,
     pub timezone_label: String,
     pub security: Vec<SecVm>,
+    pub has_unknown_security: bool,
     pub verified_label: String,
     pub osm_url: String,
     pub google_url: String,
@@ -509,6 +510,20 @@ impl DetailsPage {
             OpenStatus::Unknown => "unknown",
         };
         let open_label = view::open_label(tr, v.is_open_now);
+        let security = loc
+            .security()
+            .iter()
+            .map(|f| SecVm {
+                code: f.code().to_string(),
+                label: tr.security(f.code()).to_string(),
+                state: match f.state() {
+                    bikesnest_domain::SecurityState::Yes => "yes",
+                    bikesnest_domain::SecurityState::No => "no",
+                    bikesnest_domain::SecurityState::Unknown => "unknown",
+                },
+            })
+            .collect::<Vec<_>>();
+        let has_unknown_security = security.iter().any(|f| f.state == "unknown");
         Self {
             layout: PageLayout::for_request(format!("{} — BikesNest", loc.name()), "", auth, map),
             tr,
@@ -526,19 +541,8 @@ impl DetailsPage {
             open_code,
             hours: view::hours_rows(tr, loc.hours(), loc.timezone(), now),
             timezone_label: loc.timezone().name().to_string(),
-            security: loc
-                .security()
-                .iter()
-                .map(|f| SecVm {
-                    code: f.code().to_string(),
-                    label: tr.security(f.code()).to_string(),
-                    state: match f.state() {
-                        bikesnest_domain::SecurityState::Yes => "yes",
-                        bikesnest_domain::SecurityState::No => "no",
-                        bikesnest_domain::SecurityState::Unknown => "unknown",
-                    },
-                })
-                .collect(),
+            security,
+            has_unknown_security,
             verified_label: match loc.last_verified_at() {
                 Some(t) => {
                     let days = (now - t).num_days();
@@ -557,7 +561,12 @@ impl DetailsPage {
             osm_url: format!(
                 "https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=18/{lat}/{lon}"
             ),
-            google_url: format!("https://www.google.com/maps/dir/?api=1&destination={lat},{lon}"),
+            // Google Maps URLs documents `travelmode=bicycling` for the
+            // directions action. Coordinates are the only value we send when
+            // the rider explicitly follows this external link.
+            google_url: format!(
+                "https://www.google.com/maps/dir/?api=1&destination={lat},{lon}&travelmode=bicycling"
+            ),
             lat,
             lon,
             gallery,

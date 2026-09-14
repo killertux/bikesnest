@@ -48,7 +48,7 @@ Statuses: `queued`, `implementing`, `reviewing`, `changes-requested`, `accepted`
 | B09b | Sol | Provider CSP hardening (`SEC-04`) | Strict nonce-based strategy verified against installed htmx and all map providers; dynamic loader propagates nonce safely; legitimate SDKs work; required eval exceptions documented; report-only rollout path | accepted |
 | B10 | Terra → Sol | Map/GPS recovery, document metadata and navigation accessibility (`UX-01/02/11`, `HX-07`) | Localized loading/failure/retry, finite GPS timeout and manual destination fallback; blocked SDK/style/tiles handled; lang/title/focus/history sync; no reintroduced menu/map bugs | accepted |
 | B11 | Sol | Tab-specific detail reads and honest degraded states (`HX-06`) | Count/reader tests prove unused history/gallery not fetched; cheap pending-field metadata retained; bounded pagination/totals; failed collaboration read shown unavailable, never zero; compare query/response work before/after | accepted |
-| B12 | Terra | Compact cyclist-first profile/search presentation (`UX-03/04/05/06/07/08`) | 390px + desktop task checks; security/access/cost/map before reviews; short current/history/pending links; eligibility next steps; precise trust/history copy; cycling directions with fallback; compact results retain map/list mapping | queued |
+| B12 | Terra | Compact cyclist-first profile/search presentation (`UX-03/04/05/06/07/08`) | 390px + desktop task checks; security/access/cost/map before reviews; short current/history/pending links; eligibility next steps; precise trust/history copy; cycling directions with fallback; compact results retain map/list mapping | accepted |
 | B13 | Terra | Contribution forms and accessibility (`UX-09`, acceptance journeys) | Paid fields conditionally disclosed; optional groups readable; file/description labels; pin/address validation; errors retain values and focus; keyboard/native fallback; no weakening approval | queued |
 | B14 | Terra (Sol for security-notification logic) | Branded transactional HTML + plaintext and security notifications | Shared escaped bilingual template, actual expiry, accessible CTA/fallback URL; SMTP multipart + Resend text/html; both locales/kinds; blocked images/narrow/dark checks; password/old-address warnings queued without credentials | queued |
 | B15a | Terra | Factual policy/runbook corrections (`LEG-01/03/05`, `UX-12`) | Browser storage/analytics and moderation accurately described in both languages; attribution vs anonymization precise; minors exemption claim removed; incident deadlines sourced; drafts not seeded/published automatically | queued |
@@ -128,6 +128,12 @@ These remain explicit until the owner supplies evidence or approves action:
 5. Release window, migration/backfill review, exact production recurring-job reconciliation and separately approved deployment.
 
 ## Progress log
+
+- B12 gate passed: separate Sol independently passed real profile1/search1, profile integration1, sequential HTTP179, navigation-browser27, library69 and strict checks; inspected both screenshots and preserved unknown/negative/pending security, truthful gallery totals, native behavior, auth fences and B11 read/outage contracts. See [B12 review](../reviews/remediation/B12-review.md). Source accepted, not deployed; provider gates remain B19. B13 is next.
+
+- B12 frozen for independent Sol review: Terra reports library69/profile1/HTTP179/navigation-browser27 and real owned-DB profile1/search1, formatting/strict checks passed. Lead inspected populated desktop/390px captures; gallery labels retain bounded loaded/total truthfulness. Search browser fixture moved to owned DB after unchanged fake-geocoder flow hit foreign Curitiba fixtures. See [B12 handoff](../reviews/remediation/B12-handoff.md). Acceptance pending; B13 queued.
+
+- B11 followup checkpoint: `378b448`. B12 resumed with Terra after independent re-acceptance; prior pause had no B12 source edits. Same bounded presentation scope and separate Sol review retained.
 
 - B11 followup gate passed: independent authenticated-route1/1, sequential HTTP179/179, browser27/27, formatting/strict web Clippy/diff all passed. Verified base auth flags, own/stale/unverified/anonymous fences and exact no-extra-reader counts. Review explicitly records missed branch and reopened PASS. Source re-accepted, not deployed; B12 may resume after checkpoint.
 

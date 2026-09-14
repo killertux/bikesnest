@@ -69,9 +69,9 @@
   </header>
 
   <nav class="my-6 flex flex-wrap items-center gap-x-6 gap-y-1 border-b border-border text-sm" aria-label="{{ tr.t("collab.tabs") }}" data-od-id="parking-navigation">
-    <a href="/parking/{{ id }}" {% if tab == "current" %}aria-current="page"{% endif %} class="inline-flex min-h-11 items-center border-b-2 py-3 {% if tab == "current" %}border-accent-strong font-semibold text-fg{% else %}border-transparent text-muted{% endif %}">{{ tr.t("profile.current") }}</a>
-    <a href="/parking/{{ id }}?tab=history" {% if tab == "history" %}aria-current="page"{% endif %} class="inline-flex min-h-11 items-center border-b-2 py-3 {% if tab == "history" %}border-accent-strong font-semibold text-fg{% else %}border-transparent text-muted{% endif %}">{{ tr.t("profile.history") }}</a>
-    <a href="/parking/{{ id }}?tab=approvals" {% if tab == "approvals" %}aria-current="page"{% endif %} class="inline-flex min-h-11 items-center gap-2 border-b-2 py-3 {% if tab == "approvals" %}border-accent-strong font-semibold text-fg{% else %}border-transparent text-muted{% endif %}">{{ tr.t("profile.approvals") }} {% if collaboration_summary_available %}<span class="rounded-full bg-accent-soft px-2 font-mono text-xs text-accent-strong">{{ self.pending_count() }}</span>{% endif %}</a>
+    <a href="/parking/{{ id }}" {% if tab == "current" %}aria-current="page"{% endif %} class="inline-flex min-h-11 items-center border-b-2 py-3 {% if tab == "current" %}border-accent-strong font-semibold text-fg{% else %}border-transparent text-muted{% endif %}">{{ tr.t("profile.tab.current") }}</a>
+    <a href="/parking/{{ id }}?tab=history" {% if tab == "history" %}aria-current="page"{% endif %} class="inline-flex min-h-11 items-center border-b-2 py-3 {% if tab == "history" %}border-accent-strong font-semibold text-fg{% else %}border-transparent text-muted{% endif %}">{{ tr.t("profile.tab.history") }}</a>
+    <a href="/parking/{{ id }}?tab=approvals" {% if tab == "approvals" %}aria-current="page"{% endif %} class="inline-flex min-h-11 items-center gap-2 border-b-2 py-3 {% if tab == "approvals" %}border-accent-strong font-semibold text-fg{% else %}border-transparent text-muted{% endif %}">{{ tr.t("profile.tab.approvals") }} {% if collaboration_summary_available %}<span class="rounded-full bg-accent-soft px-2 font-mono text-xs text-accent-strong">{{ self.pending_count() }}</span>{% endif %}</a>
     {% if can_contribute %}<a href="/parking/{{ id }}/edit" class="ml-auto inline-flex min-h-11 items-center font-medium text-accent-strong">{{ tr.t("collab.suggest") }}</a>{% endif %}
   </nav>
   {% if !collaboration_summary_available %}<p role="status" class="mb-4 rounded-xl border border-border bg-surface p-4 text-sm text-muted">{{ tr.t("profile.data_unavailable") }}</p>{% endif %}
@@ -90,8 +90,67 @@
   <div id="listing-overview" class="parking-overview grid gap-8 lg:grid-cols-[1fr_320px]" data-listing-pane="overview">
     <div>
 
+      <!-- The decisions a rider needs first. These are published facts; the
+           separate confidence panel below describes community signals. -->
+      <section class="border-b border-border pb-4" data-od-id="parking-key-facts">
+        <h2 class="font-display text-lg font-semibold">{{ tr.t("details.facts.title") }}</h2>
+        <div class="mt-3 grid grid-cols-2 gap-x-5 gap-y-4 sm:grid-cols-3">
+          <div><p class="text-xs text-muted">{{ tr.t("details.facts.cost") }}</p><p class="mt-1 font-medium">{{ cost_label }}</p>{% let pending_field = "cost" %}{% include "partials/pending_change.html" %}</div>
+          <div><p class="text-xs text-muted">{{ tr.t("details.facts.open_now") }}</p><p class="mt-1 font-medium">{{ open_label }}</p></div>
+          <div><p class="text-xs text-muted">{{ tr.t("details.facts.last_verified") }}</p><p class="mt-1 font-medium">{{ verified_label }}</p></div>
+          <div><p class="text-xs text-muted">{{ tr.t("details.facts.type") }}</p><p class="mt-1 font-medium">{{ type_label }}</p></div>
+          <div><p class="text-xs text-muted">{{ tr.t("details.facts.rating") }}</p><p class="mt-1 font-medium">{{ rating_label }}</p></div>
+        </div>
+      </section>
+
+      <!-- Security is a fact supplied for this listing, not an aggregate
+           confidence claim, so it stays with the route decision information. -->
+      <section class="mt-6 border-b border-border pb-4" data-od-id="security-features">
+        <h2 class="py-2 font-medium">{{ tr.t("details.security.title") }}</h2>
+        <ul class="mt-3 grid gap-2 sm:grid-cols-2 text-sm">
+          {% for f in security %}
+            {% if f.state != "unknown" %}
+            <li class="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-surface px-3 py-2">
+              {% if f.state == "yes" %}
+                <span class="grid h-5 w-5 place-items-center rounded-full bg-fresh/10 text-fresh" aria-label="{{ tr.t("details.security.yes") }}">✓</span><span>{{ f.label }}</span>
+              {% else if f.state == "no" %}
+                <span class="grid h-5 w-5 place-items-center rounded-full bg-stale/10 text-stale" aria-label="{{ tr.t("details.security.no") }}">✗</span><span class="text-muted">{{ f.label }}</span>
+              {% else %}
+                <span class="grid h-5 w-5 place-items-center rounded-full bg-bg text-muted" aria-label="{{ tr.t("details.security.unknown") }}">?</span><span class="text-muted">{{ f.label }}</span>
+              {% endif %}
+              {% let pending_field = f.code.as_str() %}{% include "partials/pending_change.html" %}
+            </li>
+            {% endif %}
+          {% endfor %}
+        </ul>
+        {% if has_unknown_security %}
+        <details class="mt-2">
+          <summary class="inline-flex min-h-11 cursor-pointer items-center text-sm font-medium text-muted">{{ tr.t("details.security.other") }}</summary>
+          <ul class="mt-1 grid gap-2 sm:grid-cols-2 text-sm">
+          {% for f in security %}{% if f.state == "unknown" %}
+            <li class="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-surface px-3 py-2"><span class="grid h-5 w-5 place-items-center rounded-full bg-bg text-muted" aria-label="{{ tr.t("details.security.unknown") }}">?</span><span class="text-muted">{{ f.label }}</span>{% let pending_field = f.code.as_str() %}{% include "partials/pending_change.html" %}</li>
+          {% endif %}{% endfor %}
+          </ul>
+        </details>
+        {% endif %}
+      </section>
+
+      <section id="parking-map" class="mt-6 border-b border-border pb-6" data-od-id="parking-map">
+        <div class="flex flex-wrap items-baseline justify-between gap-2">
+          <h2 class="font-display text-lg font-semibold">{{ tr.t("details.map.title") }}</h2>
+          <a href="{{ osm_url }}" target="_blank" rel="noopener" class="text-sm font-medium text-accent-strong hover:underline">{{ tr.t("details.navigate.osm") }}</a>
+        </div>
+        <p class="mt-1 text-sm text-muted">{{ tr.t("details.map.fallback") }}</p>
+        {% let pending_field = "point" %}{% include "partials/pending_change.html" %}
+        <div class="relative mt-3">
+          <div id="map-single" data-lat="{{ lat }}" data-lon="{{ lon }}" data-name="{{ name }}" class="h-64 rounded-2xl border border-border"></div>
+          <div data-map-status class="absolute inset-0 flex items-center justify-center rounded-2xl bg-surface/90 p-4 text-center text-sm text-muted" role="status"
+               data-loading="{{ tr.t("map.loading") }}" data-failed="{{ tr.t("map.failed") }}" data-retry="{{ tr.t("map.retry") }}">{{ tr.t("map.loading") }}</div>
+        </div>
+      </section>
+
       <!-- Photo gallery -->
-      <section class="parking-gallery">
+      <section class="parking-gallery mt-6">
         {% if pending_photos > 0 %}<a href="/parking/{{ id }}?tab=approvals#pending-photos" class="mb-2 inline-flex min-h-11 items-center text-sm font-medium text-accent-strong" data-pending-field="photos">{{ tr.t("profile.photos_pending") }} · {{ pending_photos }}</a>{% endif %}
         {% if !gallery_available %}
         {% else if gallery.is_empty() %}
@@ -104,20 +163,34 @@
             {% endif %}
           </div>
         {% else %}
-          <div class="parking-gallery-grid grid gap-3 sm:grid-cols-4">
+          <div class="parking-gallery-grid grid grid-cols-2 gap-3">
             {% for photo in gallery %}
+              {% if loop.first %}
               <button
                 type="button"
                 @click="openLightbox"
                 data-src="{{ photo.url }}"
                 data-alt="{{ photo.alt }}"
                 aria-label="{{ tr.t("gallery.view_photo") }}"
-                class="{% if loop.first %}sm:col-span-4 aspect-[2/1]{% else %}aspect-square{% endif %} overflow-hidden rounded-2xl border border-border"
+                class="{% if loop.first %}col-span-2 aspect-[16/9]{% else %}aspect-square{% endif %} overflow-hidden rounded-2xl border border-border"
               >
-                <img src="{% if loop.first %}{{ photo.url }}{% else %}{{ photo.thumb_url }}{% endif %}" alt="{{ photo.alt }}" loading="lazy" class="h-full w-full object-cover" />
+                <img src="{{ photo.url }}" alt="{{ photo.alt }}" loading="lazy" class="h-full w-full object-cover" />
               </button>
+              {% endif %}
             {% endfor %}
           </div>
+          {% if gallery.len() > 1 %}
+          <details class="mt-3">
+            <summary class="inline-flex min-h-11 cursor-pointer items-center text-sm font-medium text-accent-strong">{{ tr.t("gallery.view_loaded").replace("{n}", gallery.len().to_string().as_str()) }}</summary>
+            <div class="mt-2 grid grid-cols-2 gap-3 sm:grid-cols-4">
+              {% for photo in gallery %}{% if !loop.first %}
+              <button type="button" @click="openLightbox" data-src="{{ photo.url }}" data-alt="{{ photo.alt }}" aria-label="{{ tr.t("gallery.view_photo") }}" class="aspect-square overflow-hidden rounded-2xl border border-border">
+                <img src="{{ photo.thumb_url }}" alt="{{ photo.alt }}" loading="lazy" class="h-full w-full object-cover" />
+              </button>
+              {% endif %}{% endfor %}
+            </div>
+          </details>
+          {% endif %}
           <!-- Lightbox -->
           <div
             id="photo-lightbox" x-show="galleryOpen" x-cloak
@@ -156,28 +229,6 @@
         <div id="photo-upload-result" class="mt-3" aria-live="polite" tabindex="-1"></div>
       </details>
       {% endif %}
-
-      <!-- At-a-glance facts -->
-      <section class="mt-8">
-        <h2 class="font-display text-lg font-semibold">{{ tr.t("details.facts.title") }}</h2>
-        <div class="mt-4 grid grid-cols-2 gap-x-6 gap-y-4 border-y border-border py-4 sm:grid-cols-3">
-          <div>
-            <p class="text-xs text-muted">{{ tr.t("details.facts.cost") }}</p>
-            <p class="mt-1 font-medium">{{ cost_label }}</p>
-            {% let pending_field = "cost" %}{% include "partials/pending_change.html" %}
-          </div>
-          <div>
-            <p class="text-xs text-muted">{{ tr.t("details.facts.freshness") }}</p>
-            <p class="mt-1 font-medium">{% if freshness_code == "never" %}{{ freshness_label }}{% else %}{{ freshness_label }} · {{ verified_label }}{% endif %}</p>
-          </div>
-          <div>
-            <p class="text-xs text-muted">{{ tr.t("details.facts.rating") }}</p>
-            <p class="mt-1 font-medium">{{ rating_label }}</p>
-          </div>
-        </div>
-      </section>
-
-
       {% let pending_field = "hours" %}{% include "partials/pending_change.html" %}
       {% let pending_field = "timezone" %}{% include "partials/pending_change.html" %}
       <!-- Opening hours -->
@@ -196,29 +247,11 @@
         </table>
       </details>
 
-      <!-- Security attributes (yes / no / unknown) -->
-      <section class="mt-6 border-b border-border pb-4" data-od-id="security-features">
-        <h2 class="py-2 font-medium">{{ tr.t("details.security.title") }}</h2>
-        <ul class="mt-3 grid gap-2 sm:grid-cols-2 text-sm">
-          {% for f in security %}
-            <li class="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-surface px-3 py-2">
-              {% if f.state == "yes" %}
-                <span class="grid h-5 w-5 place-items-center rounded-full bg-fresh/10 text-fresh" aria-label="{{ tr.t("details.security.yes") }}">✓</span><span>{{ f.label }}</span>
-              {% else if f.state == "no" %}
-                <span class="grid h-5 w-5 place-items-center rounded-full bg-stale/10 text-stale" aria-label="{{ tr.t("details.security.no") }}">✗</span><span class="text-muted">{{ f.label }}</span>
-              {% else %}
-                <span class="grid h-5 w-5 place-items-center rounded-full bg-bg text-muted" aria-label="{{ tr.t("details.security.unknown") }}">?</span><span class="text-muted">{{ f.label }}</span>
-              {% endif %}
-              {% let pending_field = f.code.as_str() %}{% include "partials/pending_change.html" %}
-            </li>
-          {% endfor %}
-        </ul>
-      </section>
-
       <!-- Community signals: recommended because -->
       {% if !reasons.is_empty() %}
-        <section class="mt-8">
-          <h2 class="font-display text-lg font-semibold">{{ tr.t("details.recommend.title") }}</h2>
+        <details class="mt-8 border-b border-border pb-4">
+          <summary class="min-h-11 cursor-pointer py-2 font-display text-lg font-semibold">{{ tr.t("details.recommend.title") }}</summary>
+          <p class="mt-1 text-sm text-muted">{{ tr.t("details.recommend.hint") }}</p>
           <ul class="mt-3 grid gap-2 sm:grid-cols-2 text-sm">
             {% for r in reasons %}
               <li class="flex items-center gap-2 rounded-lg border border-border bg-surface px-3 py-2">
@@ -230,7 +263,7 @@
               </li>
             {% endfor %}
           </ul>
-        </section>
+        </details>
       {% endif %}
 
       <!-- Reviews -->
@@ -279,24 +312,6 @@
     </div>
 
     <aside class="parking-sidebar space-y-4">
-      {% let pending_field = "point" %}{% include "partials/pending_change.html" %}
-      <div class="relative">
-      <div id="map-single"
-        data-lat="{{ lat }}"
-        data-lon="{{ lon }}"
-        data-name="{{ name }}"
-        class="h-72 rounded-2xl border border-border"
-      ></div>
-      <div data-map-status class="absolute inset-0 flex items-center justify-center rounded-2xl bg-surface/90 p-4 text-center text-sm text-muted" role="status"
-           data-loading="{{ tr.t("map.loading") }}" data-failed="{{ tr.t("map.failed") }}" data-retry="{{ tr.t("map.retry") }}">{{ tr.t("map.loading") }}</div>
-      </div>
-
-      <div class="rounded-2xl border border-border bg-surface p-4">
-        <div class="flex flex-col gap-2 text-sm">
-          <a href="{{ osm_url }}" target="_blank" rel="noopener" class="rounded-lg border border-border px-4 py-2 text-center hover:border-accent">{{ tr.t("details.navigate.osm") }}</a>
-        </div>
-      </div>
-
       <!-- Add a nearby spot: the map above only ever shows this one
            listing, so this is the entry point to add whatever it doesn't cover. -->
       <details class="rounded-xl border border-border bg-surface p-4 text-sm" data-od-id="add-nearby">

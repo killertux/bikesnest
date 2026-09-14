@@ -4,7 +4,7 @@ use bikesnest_domain::{FreshnessCategory, OpenStatus};
 use bikesnest_infrastructure::SqlxParkingContributionRepository;
 use bikesnest_test_support::{ParkingBuilder, UserBuilder, db_test, test_config};
 use bikesnest_web::{
-    DetailsPage,
+    DetailsPage, PhotoVm,
     auth::Auth,
     i18n::{Locale, Translator},
 };
@@ -49,8 +49,13 @@ async fn parking_profile_shows_real_pending_diffs_in_both_languages(tx: &mut Tes
             .execute(&mut *conn).await.unwrap();
     }
     drop(conn);
-    let proposals = SqlxParkingContributionRepository::new(db.clone())
+    let contributions = SqlxParkingContributionRepository::new(db.clone());
+    let proposals = contributions
         .listing_proposals(location.id(), 50)
+        .await
+        .unwrap();
+    let summary = contributions
+        .pending_proposal_summary(location.id())
         .await
         .unwrap();
     assert_eq!(proposals.len(), 5);
@@ -63,14 +68,48 @@ async fn parking_profile_shows_real_pending_diffs_in_both_languages(tx: &mut Tes
                 freshness: FreshnessCategory::Never,
                 is_open_now: OpenStatus::Unknown,
             },
-            Vec::new(),
+            vec![
+                PhotoVm {
+                    url: "https://media.example.test/photo.jpg".into(),
+                    thumb_url: "https://media.example.test/photo-thumb.jpg".into(),
+                    alt: "Fixture bike parking".into(),
+                },
+                PhotoVm {
+                    url: "https://media.example.test/photo-2.jpg".into(),
+                    thumb_url: "https://media.example.test/photo-2-thumb.jpg".into(),
+                    alt: "Second fixture bike parking".into(),
+                },
+            ],
             &Auth::default(),
         )
+        .pending_summary(summary.clone())
         .collaboration_proposals(proposals.clone());
         page.pending_photos = 2;
+        page.gallery_total = 3;
         assert_eq!(page.pending_count(), 6);
         let current = page.render().unwrap();
         assert!(!current.contains("data-od-id=\"proposal-card\""));
+        assert!(current.contains("travelmode=bicycling"));
+        assert_eq!(current.matches("id=\"map-single\"").count(), 1);
+        assert!(current.contains("grid grid-cols-2 gap-3"));
+        assert!(
+            current.contains("View loaded photos (2)")
+                || current.contains("Ver fotos carregadas (2)")
+        );
+        assert!(
+            current.contains("Showing 2 of 3") || current.contains("Exibindo 2 de 3"),
+            "the disclosure must not claim to expose unloaded gallery pages"
+        );
+        assert!(current.contains("href=\"/parking/"));
+        assert!(current.contains("?tab=history\""));
+        let facts = current.find("data-od-id=\"parking-key-facts\"").unwrap();
+        let security = current.find("data-od-id=\"security-features\"").unwrap();
+        let map = current.find("data-od-id=\"parking-map\"").unwrap();
+        let reviews = current.find("data-od-id=\"parking-reviews\"").unwrap();
+        assert!(
+            facts < security && security < map && map < reviews,
+            "rider facts, security and map lead reviews"
+        );
         assert!(current.contains("data-pending-field=\"point\""));
         assert!(current.contains("data-pending-field=\"photos\""));
         assert!(current.contains("data-pending-field=\"cctv\""));
@@ -97,6 +136,10 @@ async fn parking_profile_shows_real_pending_diffs_in_both_languages(tx: &mut Tes
             !body.contains("name=\"vote\""),
             "anonymous viewers cannot vote"
         );
+        assert!(
+            body.contains("Sign in to vote") || body.contains("Entre para votar"),
+            "anonymous viewers get the available sign-in next step"
+        );
         if index == 0 {
             assert!(body.contains("Published now"));
             assert!(body.contains("Needs manual review"));
@@ -118,6 +161,10 @@ async fn parking_profile_shows_real_pending_diffs_in_both_languages(tx: &mut Tes
         }]);
         page.tab = "history".into();
         let history = page.render().unwrap();
+        assert!(
+            history.contains("Only published versions saved by BikesNest")
+                || history.contains("Apenas versões publicadas salvas pelo BikesNest")
+        );
         assert!(history.contains("Saved historic name"));
         assert!(!history.contains("Proposed replacement name"));
         assert!(!history.contains("must-not-be-rendered"));
