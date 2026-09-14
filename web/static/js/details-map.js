@@ -36,14 +36,23 @@
     var fromLon = num(el.dataset.currentLon);
     var hasFrom = fromLat !== null && fromLon !== null;
 
-    var map = provider.createMap(el, {
-      center: { lon: lon, lat: lat },
-      zoom: 17,
-      navigation: true,
-    });
+    var map;
+    var attempt = (el._bnAttempt || 0) + 1;
+    el._bnAttempt = attempt;
+    try {
+      map = provider.createMap(el, { center: { lon: lon, lat: lat }, zoom: 17, navigation: true });
+    } catch (_) {
+      window.BikesNestMaps.report("failed", el);
+      return;
+    }
     window.BikesNestMaps.track(el, map);
+    if (typeof map.onError === "function") map.onError(function () {
+      if (el.isConnected && el._bnAttempt === attempt) window.BikesNestMaps.report("failed", el);
+    });
     map.onLoad(function () {
       if (!el.isConnected) return;
+      if (el._bnAttempt !== attempt) return;
+      window.BikesNestMaps.report("ready", el);
       if (hasFrom) {
         addMarker(map, fromLon, fromLat, "marker marker-before", el.dataset.currentLabel);
       }
@@ -69,10 +78,11 @@
       initOne(document.getElementById("map-single"));
       var pairs = document.querySelectorAll(".proposal-map");
       for (var i = 0; i < pairs.length; i++) initOne(pairs[i]);
-    }).catch(function () { /* The rest of the page remains usable. */ });
+    }).catch(function () { window.BikesNestMaps.report("failed"); });
   }
 
   document.addEventListener("bikesnest:maps-ready", init);
+  document.addEventListener("bikesnest:map-retry", init);
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", init);
   } else {

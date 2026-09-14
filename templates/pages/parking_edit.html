@@ -107,6 +107,10 @@
               x-data="pinPicker"
               data-empty="{{ tr.t("form.picked_none") }}"
               data-locate-failed="{{ tr.t("form.locate_failed") }}"
+              data-location-loading="{{ tr.t("search.location.loading") }}"
+              data-location-unavailable="{{ tr.t("search.location.unavailable") }}"
+              data-location-timeout="{{ tr.t("search.location.timeout") }}"
+              data-location-denied="{{ tr.t("search.location.denied") }}"
               data-geocode-failed="{{ tr.t("form.geocode_failed") }}">
           <input type="hidden" name="csrf" value="{{ layout.csrf }}" />
           <input type="hidden" name="kind" value="move_location" />
@@ -116,14 +120,17 @@
           {# The same picker as the add form: a rider proposing a correction
              should not have to read a decimal latitude off a map app either.
              The number inputs stay, in "Advanced", so this posts without JS. #}
-          <div id="pin-map" class="mt-2"
+          <div class="relative mt-2"><div id="pin-map"
                data-lat="{{ lat }}" data-lon="{{ lon }}"
                data-default-lat="{{ lat }}" data-default-lon="{{ lon }}"
                data-lat-input="move_lat" data-lon-input="move_lon"
                @bikesnest:pin="onPin"></div>
+          <div data-map-status class="absolute inset-0 flex items-center justify-center rounded-lg bg-surface/90 p-3 text-center text-xs text-muted" role="status"
+               data-loading="{{ tr.t("map.loading") }}" data-failed="{{ tr.t("map.failed") }}" data-retry="{{ tr.t("map.retry") }}">{{ tr.t("map.loading") }}</div></div>
           <p class="mt-2 text-xs text-muted">{{ tr.t("form.picked") }}: <span x-text="coords">{{ lat }}, {{ lon }}</span></p>
           <p x-show="message" class="mt-1 text-xs font-medium text-danger" x-text="message"></p>
           <button type="button" @click="useLocation"
+                  :disabled="locating"
                   class="mt-2 rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-muted hover:border-accent hover:text-fg">
             {{ tr.t("form.use_location") }}
             <span x-show="locating" class="text-muted">…</span>

@@ -47,9 +47,12 @@ RUST_LOG=info cargo test -- --nocapture
 Chromium against a local fixture server using the real layout asset declarations,
 map-page manifests, htmx, Alpine and consumer scripts. External map services are
 stubbed with delayed responses; no database, account or API key is needed.
-The suite covers mobile menus, history navigation, every map consumer and
-provider configuration, and retry after an asset failure. CI installs Chromium
-with its system dependencies and runs these tests in the Frontend assets job.
+The suite covers mobile menus, metadata/focus across boost and history,
+geolocation outcomes and detached callbacks, every map consumer and provider
+configuration, same-page map recovery/state preservation, and retry after an
+asset or renderer failure. It also constructs the vendored MapLibre and Mapbox
+SDKs with local empty styles. CI installs Chromium with its system dependencies
+and runs these tests in the Frontend assets job.
 
 The CSRF lifecycle also has a rendered-router browser regression. It requires
 the disposable PostgreSQL target and Chromium, starts the real Axum router on a

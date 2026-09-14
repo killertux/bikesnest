@@ -46,7 +46,7 @@ Statuses: `queued`, `implementing`, `reviewing`, `changes-requested`, `accepted`
 | B08 | Sol | CPU admission control and cancellation (`SEC-05`, `ENG-07`) | Owned image permit lives inside blocking closure; bounded hash work/admission; cancellation/burst tests assert actual running maximum; no durable login work | accepted |
 | B09a | Sol | Sensitive-response cache and abuse-limit hardening (security additional checks) | Auth/private/token HTML no-store, fragment/full consistency, public cache policy explicit; credential-sensitive limiter failure has bounded safe behavior and monitoring; test trusted-proxy assumptions without changing edge | accepted |
 | B09b | Sol | Provider CSP hardening (`SEC-04`) | Strict nonce-based strategy verified against installed htmx and all map providers; dynamic loader propagates nonce safely; legitimate SDKs work; required eval exceptions documented; report-only rollout path | accepted |
-| B10 | Terra | Map/GPS recovery, document metadata and navigation accessibility (`UX-01/02/11`, `HX-07`) | Localized loading/failure/retry, finite GPS timeout and manual destination fallback; blocked SDK/style/tiles handled; lang/title/focus/history sync; no reintroduced menu/map bugs | queued |
+| B10 | Terra → Sol | Map/GPS recovery, document metadata and navigation accessibility (`UX-01/02/11`, `HX-07`) | Localized loading/failure/retry, finite GPS timeout and manual destination fallback; blocked SDK/style/tiles handled; lang/title/focus/history sync; no reintroduced menu/map bugs | accepted |
 | B11 | Sol | Tab-specific detail reads and honest degraded states (`HX-06`) | Count/reader tests prove unused history/gallery not fetched; cheap pending-field metadata retained; bounded pagination/totals; failed collaboration read shown unavailable, never zero; compare query/response work before/after | queued |
 | B12 | Terra | Compact cyclist-first profile/search presentation (`UX-03/04/05/06/07/08`) | 390px + desktop task checks; security/access/cost/map before reviews; short current/history/pending links; eligibility next steps; precise trust/history copy; cycling directions with fallback; compact results retain map/list mapping | queued |
 | B13 | Terra | Contribution forms and accessibility (`UX-09`, acceptance journeys) | Paid fields conditionally disclosed; optional groups readable; file/description labels; pin/address validation; errors retain values and focus; keyboard/native fallback; no weakening approval | queued |
@@ -128,6 +128,14 @@ These remain explicit until the owner supplies evidence or approves action:
 5. Release window, migration/backfill review, exact production recurring-job reconciliation and separately approved deployment.
 
 ## Progress log
+
+- B10 gate passed: independent Sol reports no material findings, browser27/27, HTTP175/175, formatting/workspace all-target check/strict web+i18n Clippy/diff passed. See [B10 review](../reviews/remediation/B10-review.md). Source accepted, not deployed; live Google restricted-key/outage checks remain external. B11 is next.
+
+- B10 frozen handoff sent to the separate Sol reviewer: implementer reports browser27/27, HTTP175/175, repeated retry3/3, formatting/strict web+i18n Clippy/diff checks passed. Scoped retry lifecycle, bounded asset loading, GPS outcomes and request-local document metadata implemented; see [B10 handoff](../reviews/remediation/B10-handoff.md). Live Google outage evidence remains external. Independent validation pending; no next-batch or production work.
+
+- B10 escalated from Terra to Sol implementation after repeated unresolved real-htmx metadata regression. Existing browser17/17 and new SDK/runtime retry checks passed earlier, but boosted locale metadata test remains red; GPS normalization and broader recovery evidence remain incomplete. Terra source frozen and handed over; independent reviewer unchanged. No acceptance or next-batch work.
+
+- B09b checkpoint: `9887acb` (local staging approval timed out once, safe retry succeeded). B10 assigned to a Terra implementation thread for map/GPS failure recovery and document/navigation accessibility, with existing separate Sol reviewer retained. No production action; next batches remain queued.
 
 - B09b gate passed after independent runtime continuation: browser17/17, full HTTP175/175, CSP11/11, formatting/strict web Clippy/diff all passed. Explicit trusted-template nonce inventory, create/edit coverage and loader/swap boundaries accepted. The stricter candidate remains report-only by default; live restricted-key Google validation and Cloudflare edge decision remain B19 enforcement gates, not completed compatibility claims. No deployment. B10 is next.
 

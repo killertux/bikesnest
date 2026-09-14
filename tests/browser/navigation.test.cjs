@@ -9,10 +9,10 @@ const root = resolve(__dirname, '../..');
 const source = (path) => readFile(resolve(root, path), 'utf8');
 let browser, server, origin;
 const consumers = {
-  search: ['search', '<div id="map" style="height:300px"></div><script id="search-data" type="application/json">{"items":[],"total":0}</script>'],
-  details: ['parking_details', '<div id="map-single" data-lat="-25" data-lon="-49"></div>'],
-  new: ['parking_new', '<input id="lat"><input id="lon"><div id="pin-map" data-default-lat="-25" data-default-lon="-49"></div>'],
-  edit: ['parking_edit', '<input id="lat" value="-25"><input id="lon" value="-49"><div id="pin-map"></div>'],
+  search: ['search', '<div id="map" style="height:300px"></div><div data-map-status data-loading="Loading map" data-failed="Map failed" data-retry="Retry map">Loading map</div><script id="search-data" type="application/json">{"items":[],"total":0}</script>'],
+  details: ['parking_details', '<div id="map-single" data-lat="-25" data-lon="-49"></div><div data-map-status data-loading="Loading map" data-failed="Map failed" data-retry="Retry map">Loading map</div>'],
+  new: ['parking_new', '<input id="lat"><input id="lon"><div id="pin-map" data-default-lat="-25" data-default-lon="-49"></div><div data-map-status data-loading="Loading map" data-failed="Map failed" data-retry="Retry map">Loading map</div>'],
+  edit: ['parking_edit', '<input id="lat" value="-25"><input id="lon" value="-49"><div id="pin-map"></div><div data-map-status data-loading="Loading map" data-failed="Map failed" data-retry="Retry map">Loading map</div>'],
   proposals: ['moderation_proposals', '<div class="proposal-map" data-lat="-25" data-lon="-49" data-current-lat="-26" data-current-lon="-50"></div><div class="proposal-map" data-lat="-27" data-lon="-48"></div>'],
 };
 
@@ -45,11 +45,23 @@ async function pageHtml(kind, provider) {
       '<img src=x onerror="window.injectedHandlerRan=true">' +
       '<template data-map-assets><script src="https://evil.invalid/payload.js"></script></template>';
   }
+  if (kind === 'gps-home') {
+    content = '<div id="gps" x-data="homeHero" data-location-loading="loading" data-location-unavailable="unavailable" data-location-timeout="timeout" data-location-denied="denied">' +
+      '<input id="q"><button id="locate" @click="locate" :disabled="locating">locate</button><p x-text="locationMessage"></p></div>';
+  }
+  if (kind === 'gps-search') {
+    content = '<div id="gps" x-data="searchFilters" data-location-loading="loading" data-location-unavailable="unavailable" data-location-timeout="timeout" data-location-denied="denied">' +
+      '<input id="q"><button id="locate" @click="locate" :disabled="locating">locate</button><button id="fallback" @click="focusDestination">fallback</button><p x-text="locationMessage"></p></div>';
+  }
+  if (kind === 'gps-pin') {
+    content = '<div id="gps" x-data="pinPicker" data-empty="empty" data-locate-failed="failed" data-location-loading="loading" data-location-unavailable="unavailable" data-location-timeout="timeout" data-location-denied="denied">' +
+      '<input id="address"><input id="lat"><input id="lon"><div data-lat-input="lat" data-lon-input="lon"></div><button id="locate" @click="useLocation" :disabled="locating">locate</button><p x-text="message"></p></div>';
+  }
   return '<!DOCTYPE html><html><head><title>' + kind + '</title>' +
     '<link rel="stylesheet" href="/static/css/app.css">' + scripts +
-    '</head><body hx-boost:inherited="true" data-map-provider="' + provider + '">' +
+    '</head><body hx-boost:inherited="true" data-document-lang="pt-BR" data-document-title="' + kind + '" data-document-canonical="/' + kind + '" data-document-description="' + kind + ' description" data-map-provider="' + provider + '">' +
     header + button + menu + '<a id="menu-link" href="/details/' + provider + '">details</a></div></header>' +
-    '<div x-data="accountMenu"><button id="account-toggle" @click="toggle">account</button><div id="account-menu" x-show="open" x-cloak>account items</div></div>' +
+    '<div x-data="accountMenu"><button id="account-toggle" @click="toggle">account</button><div id="account-menu" x-show="open" x-cloak>account items</div></div><p id="page-change-announcement" aria-live="polite" data-page-changed="Page changed"></p><div hidden data-document-meta data-lang="pt-BR" data-title="' + kind + '" data-canonical="/' + kind + '" data-description="' + kind + ' description"></div>' +
     '<main id="content"><h1>' + kind + '</h1>' + content + '</main>' +
     Object.keys({ plain: 1, ...consumers }).map(k => '<a id="go-' + k + '" href="/' + k + '/' + provider + '">' + k + '</a>').join(' ') +
     assets + '</body></html>';
@@ -60,17 +72,21 @@ if (document.body.dataset.mapProvider !== 'google' && !window.testSdk) throw Err
 window.providerLoads = (window.providerLoads || 0) + 1;
 window.created = window.created || 0;
 window.destroyed = window.destroyed || 0;
+window.resizeCalls = window.resizeCalls || [];
+window.flyCalls = window.flyCalls || 0;
+window.jumpCalls = window.jumpCalls || [];
 window.BikesNestMapProvider = {
  ready: function () { return Promise.resolve(); },
  createMap: function(el) {
   window.created++;
+  var mapId = window.created;
   el.appendChild(document.createElement('canvas'));
   var map = {
    onLoad: function(fn) { setTimeout(function() { if(el.isConnected) fn(); }, 0); },
-   onClick: function(fn) { map.click = fn; }, onMoveEnd: function() {},
+   onClick: function(fn) { map.click = fn; }, onMoveEnd: function() {}, onError: function(fn) { map.error = fn; },
    addMarker: function(opts) { return { remove: function(){}, setPosition: function(){}, getElement: function(){ return opts.element; } }; },
-   resize: function(){}, fitBounds: function(){}, jumpTo: function(){},
-   flyTo: function(){}, easeTo: function(){}, getBounds: function(){ return null; }, getZoom: function(){return 14;},
+   resize: function(){ window.resizeCalls.push(mapId); }, fitBounds: function(){}, jumpTo: function(){ window.jumpCalls.push(mapId); },
+   flyTo: function(){ window.flyCalls++; }, easeTo: function(){}, getBounds: function(){ return null; }, getZoom: function(){return 14;},
    destroy: function(){ window.destroyed++; }
   };
   return map;
@@ -103,17 +119,38 @@ before(async () => {
       const [, kind = 'plain', provider = 'google'] = url.pathname.split('/');
       res.setHeader('Content-Type', 'text/html');
       res.setHeader('Content-Security-Policy', "script-src 'nonce-test-nonce' 'strict-dynamic'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; worker-src 'self' blob:; object-src 'none'");
-      if (kind === 'sdk') {
+      if (kind === 'sdk' || kind === 'sdk-fail') {
         const global = provider === 'mapbox' ? 'mapboxgl' : 'maplibregl';
+        const style = kind === 'sdk-fail'
+          ? '{version:8,sources:{broken:{type:"vector",tiles:["/missing/{z}/{x}/{y}.pbf"]}},layers:[{id:"broken",type:"circle",source:"broken","source-layer":"missing"}]}'
+          : '{version:8,sources:{},layers:[]}';
         return res.end('<!doctype html><div id="map" style="width:200px;height:200px"></div>' +
           '<script nonce="test-nonce" src="/static/vendor/' + provider + '-gl.js?actual=1"></script>' +
           '<script nonce="test-nonce">var sdk=' + global + ';' +
           (provider === 'mapbox' ? 'sdk.accessToken="";' : '') +
-          'window.actualMap=new sdk.Map({container:"map",style:{version:8,sources:{},layers:[]},center:[0,0],zoom:1,attributionControl:false});' +
-          'window.actualMap.on("load",function(){window.sdkReady=true})</script>');
+          'window.actualMap=new sdk.Map({container:"map",style:' + style + ',center:[0,0],zoom:1,attributionControl:false});' +
+          'window.actualMap.on("load",function(){window.sdkReady=true});window.actualMap.on("error",function(){window.sdkFailed=true})</script>');
       }
-      const html = (await pageHtml(kind, provider))
+      let html = (await pageHtml(kind === 'english' ? 'plain' : kind, provider))
         .replace(/<script(?=\s+defer)/g, '<script nonce="test-nonce"');
+      if (kind === 'english') {
+        html = html.replace('<html>', '<html lang="en">').replace('<title>plain</title>', '<title>English page</title>')
+          .replaceAll('data-document-lang="pt-BR"', 'data-document-lang="en"')
+          .replaceAll('data-lang="pt-BR"', 'data-lang="en"')
+          .replaceAll('data-document-title="plain"', 'data-document-title="English page"')
+          .replaceAll('data-title="plain"', 'data-title="English page"')
+          .replaceAll('data-document-canonical="/plain"', 'data-document-canonical="/english"')
+          .replaceAll('data-canonical="/plain"', 'data-canonical="/english"')
+          .replaceAll('data-document-description="plain description"', 'data-document-description="English description"')
+          .replaceAll('data-description="plain description"', 'data-description="English description"')
+          .replace('<h1>plain</h1>', '<h1>English page</h1>');
+      }
+      if (kind === 'empty-meta') {
+        html = html.replaceAll('data-document-canonical="/empty-meta"', 'data-document-canonical=""')
+          .replaceAll('data-canonical="/empty-meta"', 'data-canonical=""')
+          .replaceAll('data-document-description="empty-meta description"', 'data-document-description=""')
+          .replaceAll('data-description="empty-meta description"', 'data-description=""');
+      }
       res.end(html);
     } catch (error) {
       res.statusCode = 500;
@@ -212,6 +249,170 @@ test('failed provider download can retry on a later navigation', async () => {
   await page.close();
 });
 
+test('stalled map asset reaches finite failure and retries on the same page', async () => {
+  const page = await browser.newPage();
+  let release;
+  const stall = route => new Promise(resolve => {
+    release = async () => { try { await route.continue(); } catch (_) { /* timed-out script removal aborted it */ } resolve(); };
+  });
+  await page.route('**/map-provider-google.js', stall);
+  await page.goto(origin + '/details/google', { waitUntil: 'domcontentloaded' });
+  await page.getByRole('button', { name: 'Retry map' }).waitFor({ timeout: 12000 });
+  await page.unroute('**/map-provider-google.js', stall);
+  await release();
+  await page.getByRole('button', { name: 'Retry map' }).evaluate(button => button.click());
+  await assertMaps(page, 'details');
+  await page.close();
+});
+
+test('failed SDK and renderer errors retry in place without duplicate maps', async () => {
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+  let fail = true;
+  await page.route('**/map-provider-google.js', route => fail ? route.abort() : route.continue());
+  await page.goto(origin + '/details/google');
+  await page.getByRole('button', { name: 'Retry map' }).waitFor();
+  fail = false;
+  await page.getByRole('button', { name: 'Retry map' }).evaluate(button => button.click());
+  await assertMaps(page, 'details');
+  assert.equal(await page.locator('canvas').count(), 1);
+  await page.evaluate(() => document.querySelector('#map-single')._bnMap.error());
+  await page.getByRole('button', { name: 'Retry map' }).waitFor();
+  await page.getByRole('button', { name: 'Retry map' }).evaluate(button => button.click());
+  await page.waitForFunction(() => window.created === 2 && window.destroyed === 1);
+  await page.locator('[data-map-status]').waitFor({ state: 'hidden' });
+  assert.equal(await page.locator('canvas').count(), 1);
+  await page.close();
+});
+
+test('map retry preserves same-page form state and pin coordinates', async () => {
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+  await page.goto(origin + '/new/google');
+  await assertMaps(page, 'new');
+  await page.locator('#lat').fill('12.345678');
+  await page.locator('#lon').fill('23.456789');
+  await page.evaluate(() => {
+    window.oldPinMap = document.querySelector('#pin-map')._bnMap;
+    window.oldPinMap.error();
+  });
+  await page.getByRole('button', { name: 'Retry map' }).evaluate(button => button.click());
+  await page.waitForFunction(() => window.created === 2 && window.destroyed === 1);
+  await page.locator('[data-map-status]').waitFor({ state: 'hidden' });
+  assert.equal(await page.locator('#lat').inputValue(), '12.345678');
+  assert.equal(await page.locator('#lon').inputValue(), '23.456789');
+  assert.equal(await page.locator('canvas').count(), 1);
+  await page.evaluate(() => window.oldPinMap.error());
+  assert.equal(await page.getByRole('button', { name: 'Retry map' }).count(), 0);
+  await page.evaluate(() => document.querySelector('#pin-map')._bnMap.error());
+  await page.getByRole('button', { name: 'Retry map' }).evaluate(button => button.click());
+  await page.waitForFunction(() => window.created === 3 && window.destroyed === 2);
+  assert.equal(await page.locator('canvas').count(), 1);
+  await page.evaluate(() => {
+    window.oldPinMap.click({ lat: 99, lon: 88 });
+    document.querySelector('#pin-map').dispatchEvent(new CustomEvent('bikesnest:pin-set', { detail: { lat: 33, lon: 44 } }));
+  });
+  assert.equal(await page.locator('#lat').inputValue(), '12.345678');
+  assert.deepEqual(await page.evaluate(() => window.jumpCalls), [3]);
+  await page.evaluate(() => { document.querySelector('#pin-map').style.width = '321px'; });
+  await page.waitForFunction(() => window.resizeCalls.includes(3));
+  assert.equal(await page.evaluate(() => window.resizeCalls.at(-1)), 3);
+  await page.close();
+});
+
+test('search map retries preserve filters without stacking recenter listeners', async () => {
+  const page = await browser.newPage();
+  await page.goto(origin + '/search/google');
+  await assertMaps(page, 'search');
+  await page.evaluate(() => {
+    const filter = document.createElement('input'); filter.id = 'kept-filter'; filter.value = 'covered';
+    document.querySelector('main').appendChild(filter);
+    const recenter = document.createElement('button'); recenter.id = 'recenter'; recenter.textContent = 'recenter';
+    document.querySelector('#map').before(recenter);
+    // Re-run readiness once so the persistent button gets its single listener.
+    document.dispatchEvent(new CustomEvent('bikesnest:maps-ready'));
+  });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await page.evaluate(() => document.querySelector('#map')._bnMap.error());
+    await page.getByRole('button', { name: 'Retry map' }).evaluate(button => button.click());
+    await page.waitForFunction(expected => window.created === expected, attempt + 2);
+    await page.locator('[data-map-status]').waitFor({ state: 'hidden' });
+  }
+  await page.locator('#recenter').click();
+  assert.equal(await page.evaluate(() => window.flyCalls), 1);
+  assert.equal(await page.locator('#kept-filter').inputValue(), 'covered');
+  assert.equal(await page.locator('canvas').count(), 1);
+  await page.close();
+});
+
+test('boosted and history page swaps synchronize document metadata and heading focus', async () => {
+  const page = await browser.newPage({ viewport: { width: 1440, height: 844 } });
+  const errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.goto(origin + '/plain/google');
+  await page.evaluate(() => {
+    const link = document.createElement('a');
+    link.href = '/english/google'; link.id = 'english-link'; link.textContent = 'English';
+    document.body.appendChild(link);
+    htmx.process(link);
+  });
+  await page.locator('#english-link').click();
+  await page.waitForFunction(() => document.title === 'English page', null, { timeout: 2000 });
+  await page.waitForTimeout(100);
+  assert.deepEqual(errors, []);
+  assert.equal(await page.evaluate(() => document.documentElement.lang), 'en');
+  assert.equal(await page.evaluate(() => document.body.dataset.documentCanonical), '/english');
+  assert.equal(await page.evaluate(() => document.querySelector("link[rel='canonical']")?.getAttribute('href')), '/english');
+  assert.equal(await page.evaluate(() => document.activeElement.textContent), 'English page');
+  assert.match(await page.locator('#page-change-announcement').textContent(), /English page/);
+  await page.goBack();
+  await page.waitForFunction(() => document.querySelector('h1')?.textContent === 'plain', null, { timeout: 2000 });
+  await page.waitForFunction(() => document.title === 'plain' && document.documentElement.lang === 'pt-BR');
+  assert.equal(await page.evaluate(() => document.body.dataset.documentCanonical), '/plain');
+  assert.equal(await page.evaluate(() => document.querySelector("link[rel='canonical']")?.getAttribute('href')), '/plain');
+  assert.equal(await page.evaluate(() => document.activeElement.textContent), 'plain');
+  await page.evaluate(() => {
+    const link = document.createElement('a');
+    link.href = '/empty-meta/google'; link.id = 'empty-meta-link'; link.textContent = 'Empty metadata';
+    document.body.appendChild(link); htmx.process(link);
+  });
+  await page.locator('#empty-meta-link').click();
+  await page.waitForFunction(() => document.querySelector('h1')?.textContent === 'empty-meta');
+  assert.equal(await page.locator("link[rel='canonical']").count(), 0);
+  assert.equal(await page.locator("meta[name='description']").count(), 0);
+  await page.close();
+});
+
+for (const kind of ['gps-home', 'gps-search', 'gps-pin']) {
+  test(kind + ': location outcomes are announced and detached callbacks are ignored', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+    await page.addInitScript(() => {
+      window.locationCallbacks = [];
+      Object.defineProperty(navigator, 'geolocation', { configurable: true, value: {
+        getCurrentPosition: (success, failure, options) => window.locationCallbacks.push({ success, failure, options }),
+      }});
+    });
+    await page.goto(origin + '/' + kind + '/google');
+    for (const outcome of [{ code: 1, text: 'denied' }, { code: 2, text: 'unavailable' }, { code: 3, text: 'timeout' }]) {
+      await page.locator('#locate').click();
+      assert.equal(await page.locator('#gps p').textContent(), 'loading');
+      assert.equal(await page.evaluate(() => window.locationCallbacks.at(-1).options.timeout), 10000);
+      await page.evaluate(code => window.locationCallbacks.at(-1).failure({ code }), outcome.code);
+      await page.waitForFunction(text => document.querySelector('#gps p').textContent === text, outcome.text);
+    }
+    if (kind === 'gps-search') {
+      await page.locator('#fallback').click();
+      assert.equal(await page.evaluate(() => document.activeElement.id), 'q');
+    } else {
+      assert.equal(await page.locator(kind === 'gps-pin' ? '#address' : '#q').count(), 1);
+    }
+    await page.locator('#locate').click();
+    await navigate(page, 'plain');
+    await page.evaluate(() => window.locationCallbacks.at(-1).success({ coords: { latitude: 1, longitude: 2 } }));
+    await page.waitForFunction(() => document.querySelector('h1').textContent === 'plain');
+    assert.match(page.url(), /\/plain\/google$/);
+    await page.close();
+  });
+}
+
 test('pinned htmx network-restores without a localStorage history snapshot', async () => {
   const page = await browser.newPage();
   await page.goto(origin + '/plain/google');
@@ -256,6 +457,13 @@ for (const provider of ['maplibre', 'mapbox']) {
     await page.waitForFunction(() => window.sdkReady === true);
     assert.equal(await page.evaluate(() => !!window.actualMap.getCanvas()), true);
     assert.deepEqual(violations, []);
+    await page.close();
+  });
+  test(provider + ': actual vendored SDK surfaces a failed local tile request', async () => {
+    const page = await browser.newPage();
+    await page.goto(origin + '/sdk-fail/' + provider);
+    await page.waitForFunction(() => window.sdkFailed === true);
+    assert.equal(await page.evaluate(() => !!window.actualMap.getCanvas()), true);
     await page.close();
   });
 }

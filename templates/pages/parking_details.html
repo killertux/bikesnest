@@ -266,12 +266,16 @@
 
     <aside class="parking-sidebar space-y-4">
       {% let pending_field = "point" %}{% include "partials/pending_change.html" %}
+      <div class="relative">
       <div id="map-single"
         data-lat="{{ lat }}"
         data-lon="{{ lon }}"
         data-name="{{ name }}"
         class="h-72 rounded-2xl border border-border"
       ></div>
+      <div data-map-status class="absolute inset-0 flex items-center justify-center rounded-2xl bg-surface/90 p-4 text-center text-sm text-muted" role="status"
+           data-loading="{{ tr.t("map.loading") }}" data-failed="{{ tr.t("map.failed") }}" data-retry="{{ tr.t("map.retry") }}">{{ tr.t("map.loading") }}</div>
+      </div>
 
       <div class="rounded-2xl border border-border bg-surface p-4">
         <div class="flex flex-col gap-2 text-sm">

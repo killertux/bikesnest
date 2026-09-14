@@ -26,6 +26,7 @@
   MapLibreAdapter.prototype.onLoad = function (handler) {
     this.raw.on("load", handler);
   };
+  MapLibreAdapter.prototype.onError = function (handler) { this.raw.on("error", handler); };
   MapLibreAdapter.prototype.onMoveEnd = function (handler) {
     this.raw.on("moveend", handler);
   };

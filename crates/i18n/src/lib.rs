@@ -193,6 +193,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "a11y.report_filter" => ("Report state filter", "Filtro de estado do relato"),
         "a11y.results_pages" => ("Results pages", "Páginas de resultados"),
         "a11y.dialog_photo_title" => ("Photo", "Foto"),
+        "a11y.page_changed" => ("Page changed", "Página alterada"),
         "nav.how" => ("How it works", "Como funciona"),
         "nav.spots" => ("Parking spots", "Vagas de bike"),
         "nav.community" => ("Community", "Comunidade"),
@@ -663,6 +664,26 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "search.map.hide" => ("Show list", "Mostrar lista"),
         "search.map.recenter" => ("Recenter", "Recentralizar"),
         "search.map.title" => ("Map", "Mapa"),
+        "map.loading" => ("Loading map…", "Carregando mapa…"),
+        "map.failed" => (
+            "The map could not load. You can still use the address and links on this page.",
+            "Não foi possível carregar o mapa. Você ainda pode usar o endereço e os links desta página.",
+        ),
+        "map.retry" => ("Retry map", "Tentar mapa novamente"),
+        "search.location.loading" => ("Getting your location…", "Obtendo sua localização…"),
+        "search.location.unavailable" => (
+            "Your location is unavailable. Enter a destination instead.",
+            "Sua localização não está disponível. Informe um destino.",
+        ),
+        "search.location.timeout" => (
+            "Location request timed out. Enter a destination instead.",
+            "A solicitação de localização expirou. Informe um destino.",
+        ),
+        "search.location.denied" => (
+            "Location permission was not granted. Enter a destination instead.",
+            "A permissão de localização não foi concedida. Informe um destino.",
+        ),
+        "search.location.destination" => ("Enter a destination", "Informar destino"),
         "search.map.pins" => (
             "Numbered pins match the list",
             "Os pinos numerados batem com a lista",

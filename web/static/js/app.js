@@ -157,18 +157,37 @@ document.addEventListener('alpine:init', function () {
   Alpine.data('homeHero', function () {
     return {
       locating: false,
-      denied: false,
+      locationRequest: 0,
+      locationMessage: '',
+      init: function () {
+        var ds = this.$el.dataset;
+        this.locationLoading = ds.locationLoading || '';
+        this.locationUnavailable = ds.locationUnavailable || '';
+        this.locationTimeout = ds.locationTimeout || '';
+        this.locationDenied = ds.locationDenied || '';
+      },
       locate: function () {
         var self = this;
-        if (!navigator.geolocation) { self.denied = true; return; }
+        var request = ++this.locationRequest;
+        var root = this.$root;
+        function current() { return root && root.isConnected && request === self.locationRequest; }
+        if (!navigator.geolocation) { self.locationMessage = self.locationUnavailable; return; }
         self.locating = true;
+        self.locationMessage = self.locationLoading;
         navigator.geolocation.getCurrentPosition(
           function (pos) {
+            if (!current()) return;
             window.location =
               '/search?lat=' + pos.coords.latitude.toFixed(6) +
               '&lon=' + pos.coords.longitude.toFixed(6);
           },
-          function () { self.locating = false; self.denied = true; }
+          function (error) {
+            if (!current()) return;
+            self.locating = false;
+            self.locationMessage = error && error.code === 1 ? self.locationDenied :
+              error && error.code === 3 ? self.locationTimeout : self.locationUnavailable;
+          },
+          { enableHighAccuracy: false, timeout: 10000, maximumAge: 300000 }
         );
       },
     };
@@ -410,11 +429,18 @@ document.addEventListener('alpine:init', function () {
       filtersOpen: true,
       mapOpen: false,
       locating: false,
+      locationMessage: '',
+      locationRequest: 0,
       /* True once the viewer has panned or zoomed: only then is there an area
        * worth offering to search. */
       moved: false,
       init: function () {
         var self = this;
+        var locationDs = this.$el.dataset;
+        this.locationLoading = locationDs.locationLoading || '';
+        this.locationUnavailable = locationDs.locationUnavailable || '';
+        this.locationTimeout = locationDs.locationTimeout || '';
+        this.locationDenied = locationDs.locationDenied || '';
         /* htmx registers delegated bubbling listeners before Alpine starts.
          * Capture makes these mirrors current before htmx serializes a changed
          * filter form, and before a native form begins its submission. */
@@ -559,16 +585,31 @@ document.addEventListener('alpine:init', function () {
       },
       locate: function () {
         var self = this;
-        if (!navigator.geolocation) { return; }
+        var request = ++this.locationRequest;
+        var root = this.$root;
+        function current() { return root && root.isConnected && request === self.locationRequest; }
+        if (!navigator.geolocation) { self.locationMessage = self.locationUnavailable; return; }
         self.locating = true;
+        self.locationMessage = self.locationLoading;
         navigator.geolocation.getCurrentPosition(
           function (pos) {
+            if (!current()) return;
             window.location =
               '/search?lat=' + pos.coords.latitude.toFixed(6) +
               '&lon=' + pos.coords.longitude.toFixed(6);
           },
-          function () { self.locating = false; }
+          function (error) {
+            if (!current()) return;
+            self.locating = false;
+            self.locationMessage = error && error.code === 1 ? self.locationDenied :
+              error && error.code === 3 ? self.locationTimeout : self.locationUnavailable;
+          },
+          { enableHighAccuracy: false, timeout: 10000, maximumAge: 300000 }
         );
+      },
+      focusDestination: function () {
+        var input = this.$root.querySelector('#q');
+        if (input) input.focus();
       },
     };
   });
@@ -641,6 +682,7 @@ document.addEventListener('alpine:init', function () {
       lat: null,
       lon: null,
       locating: false,
+      locationRequest: 0,
       message: '',
       emptyLabel: '',
       locateFailed: '',
@@ -650,6 +692,10 @@ document.addEventListener('alpine:init', function () {
         var ds = this.$el.dataset;
         this.emptyLabel = ds.empty || '';
         this.locateFailed = ds.locateFailed || '';
+        this.locationLoading = ds.locationLoading || '';
+        this.locationUnavailable = ds.locationUnavailable || this.locateFailed;
+        this.locationTimeout = ds.locationTimeout || this.locateFailed;
+        this.locationDenied = ds.locationDenied || this.locateFailed;
         this.geocodeFailed = ds.geocodeFailed || '';
         var current = this.inputs();
         var lat = parseFloat(current.lat && current.lat.value);
@@ -707,14 +753,25 @@ document.addEventListener('alpine:init', function () {
       },
       useLocation: function () {
         var self = this;
-        if (!navigator.geolocation) { self.message = self.locateFailed; return; }
+        var request = ++this.locationRequest;
+        var root = this.$root;
+        function current() { return root && root.isConnected && request === self.locationRequest; }
+        if (!navigator.geolocation) { self.message = self.locationUnavailable; return; }
         self.locating = true;
+        self.message = self.locationLoading;
         navigator.geolocation.getCurrentPosition(
           function (pos) {
+            if (!current()) return;
             self.locating = false;
             self.setPosition(pos.coords.latitude, pos.coords.longitude);
           },
-          function () { self.locating = false; self.message = self.locateFailed; }
+          function (error) {
+            if (!current()) return;
+            self.locating = false;
+            self.message = error && error.code === 1 ? self.locationDenied :
+              error && error.code === 3 ? self.locationTimeout : self.locationUnavailable;
+          },
+          { enableHighAccuracy: false, timeout: 10000, maximumAge: 300000 }
         );
       },
       /* Address → position. Never on a keystroke: this reaches a billable

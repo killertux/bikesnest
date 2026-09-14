@@ -46,12 +46,17 @@
    (`closest('[hx-boost\:inherited]')`), so this is the attribute that actually
    boosts the document's links and forms. #}
 <body class="bg-bg font-body text-fg" data-csrf="{{ layout.csrf }}" data-csrf-error="{{ tr.t("error.csrf") }}" data-csrf-reload="{{ tr.t("error.reload") }}" data-csrf-login="{{ tr.t("auth.login") }}" hx-boost:inherited="true"
+      data-document-lang="{{ tr.lang() }}" data-document-title="{{ layout.title }}"
+      data-document-canonical="{{ layout.canonical }}" data-document-description="{{ layout.description }}"
       data-map-provider="{{ layout.map_provider }}"
       data-map-style-url="{{ layout.map_style_url }}"
       data-map-access-token="{{ layout.map_access_token }}"
       data-google-maps-api-key="{{ layout.google_maps_api_key }}"
       data-google-map-id="{{ layout.google_map_id }}">
   <a href="#content" class="sr-only focus:not-sr-only focus:absolute focus:left-4 focus:top-4 focus:z-50 focus:rounded-lg focus:bg-surface focus:px-4 focus:py-2 focus:text-fg">{{ tr.t("a11y.skip") }}</a>
+  <div hidden data-document-meta data-lang="{{ tr.lang() }}" data-title="{{ layout.title }}"
+       data-canonical="{{ layout.canonical }}" data-description="{{ layout.description }}"></div>
+  <p id="page-change-announcement" class="sr-only" aria-live="polite" aria-atomic="true" data-page-changed="{{ tr.t("a11y.page_changed") }}"></p>
   <header id="top" class="sticky top-0 z-40 border-b border-border bg-[oklch(98%_0.004_240_/_0.9)] backdrop-blur" x-data="mobileMenu"
           @htmx:before:request.window="close" @pageshow.window="close" @keydown.escape.window="close">
     <div class="mx-auto flex h-16 max-w-shell items-center justify-between gap-6 px-4 lg:px-8">

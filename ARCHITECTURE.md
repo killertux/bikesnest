@@ -247,14 +247,22 @@ Persistent htmx, Alpine and app scripts load once from the layout head. Whole-pa
 boosted navigation uses a body sync swap to reset page-local state; targeted
 fragment swaps retain their declared behavior. The visibility extension in
 `web/static/js/navigation.js` preserves Alpine-owned `x-show` display during
-fragment morphs.
+fragment morphs. Full-document responses carry an inert metadata record through
+htmx's request-local swap context; after the body swap it synchronizes language,
+title, canonical and social metadata, announces the new heading, and moves focus
+there. Fragment swaps do not run that document/focus transition.
 
 Map pages declare an inert `template[data-map-assets]` containing their hashed
 stylesheet, SDK, adapter and consumer URLs. The navigation lifecycle loads these
 in order, caches successful loads, and signals consumers after swaps (including
-history restoration). Failed downloads can retry on subsequent navigation or
-reconnection. Map adapters expose `destroy`; detached maps and resize observers
-are disposed, while search-result fragment updates retain the live map.
+history restoration). Loading and render failures have localized page-level
+status and same-page retry; attempt fencing prevents detached or superseded maps
+from changing the current page's status. Map adapters expose `destroy`; detached
+maps and resize observers are disposed, while search-result fragment updates
+retain the live map and contribution retries retain the form's coordinates.
+Home, search and pin-picker geolocation requests have a finite timeout, distinct
+denied/timeout/unavailable messages, and ignore callbacks after their page is
+detached; typed address and coordinate controls remain the fallback.
 
 ## Data model
 
