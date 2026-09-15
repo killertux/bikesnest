@@ -331,7 +331,6 @@ mod test_database_target_tests {
 /// so tests are isolated without cleanup logic.
 pub struct TestTx {
     tx: Option<Transaction<'static, Postgres>>,
-    pool: PgPool,
     scoped: Option<bikesnest_infrastructure::Db>,
 }
 
@@ -389,29 +388,6 @@ impl TestTx {
     pub fn executor(&mut self) -> &mut sqlx::PgConnection {
         self.tx.as_mut().expect("transaction still open")
     }
-
-    /// Commits the current transaction and opens a fresh one.
-    ///
-    /// Use case: read-model tests whose queries run on *other* pool
-    /// connections (they cannot see uncommitted rows of this transaction).
-    /// The test commits a tagged fixture, asserts against the readers, then
-    /// deletes the fixture rows (by tag) via the pool. The fresh transaction
-    /// the harness opened is simply rolled back at test end.
-    pub async fn commit_fixture(&mut self) {
-        assert!(
-            self.scoped.is_none(),
-            "scoped repository tests must never commit fixtures"
-        );
-        if let Some(tx) = self.tx.take() {
-            tx.commit().await.expect("commit test fixture");
-        }
-        self.tx = Some(
-            self.pool
-                .begin()
-                .await
-                .expect("begin tx after fixture commit"),
-        );
-    }
 }
 
 /// A named SAVEPOINT opened inside a [`TestTx`].
@@ -448,77 +424,11 @@ impl Savepoint<'_> {
 // Runner used by #[db_test]
 // ---------------------------------------------------------------------------
 
-/// Clone of the shared, migrated pool (for wiring routers in HTTP tests).
-/// Await this inside a `#[db_test]` body — never `block_on` there.
+/// Clone of the shared, migrated pool for explicit external, query-only
+/// observers and the harness itself. Ordinary fixtures and routers use the
+/// transaction-scoped [`TestTx::db`] seam.
 pub async fn pool() -> PgPool {
     shared_pool().get_or_init(connect_and_migrate).await.clone()
-}
-
-/// Lock id for the system-wide ADMIN set. Arbitrary but fixed; it only has to
-/// be unique among this suite's advisory locks.
-const ADMIN_SET_LOCK: i64 = 0x62_69_6b_65_00_01;
-
-/// A transaction holding the shared lock on the system's ADMIN set.
-///
-/// "Never zero administrators" is a property of the whole `user_roles` table,
-/// so a test that needs to be the *only* admin has to exclude every other
-/// writer — including the other test binaries running against the same
-/// database. `pg_advisory_xact_lock` reaches across processes and is released
-/// when the returned transaction is dropped, so a panicking test cannot wedge
-/// the suite. Hold it for as long as the exclusive state must last.
-///
-/// Every test that creates or removes an ADMIN row must take this lock, or the
-/// exclusion is one-sided: see [`hold_admin_set_lock_for_process`] for the
-/// fixture-helper side.
-pub async fn admin_set_lock(pool: &PgPool) -> Transaction<'static, Postgres> {
-    let mut tx = pool.begin().await.expect("begin admin-set lock");
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(ADMIN_SET_LOCK)
-        .execute(&mut *tx)
-        .await
-        .expect("take admin-set lock");
-    tx
-}
-
-/// Claims the ADMIN-set lock for the rest of this test process.
-///
-/// The counterpart to [`admin_set_lock`], for fixture helpers that grant ADMIN
-/// and then need the row to stay put for the remainder of their test. A
-/// transaction-scoped lock cannot express that (the helper returns long before
-/// its caller is done), so this takes a *session*-scoped lock on a dedicated
-/// connection and keeps it for the process. Idempotent: the first caller takes
-/// it, every later one returns immediately.
-pub async fn hold_admin_set_lock_for_process(pool: &PgPool) {
-    static HELD: OnceCell<()> = OnceCell::const_new();
-    HELD.get_or_init(|| async {
-        let mut conn = pool.acquire().await.expect("acquire admin-set lock conn");
-        sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(ADMIN_SET_LOCK)
-            .execute(&mut *conn)
-            .await
-            .expect("take process admin-set lock");
-        // Leak the connection so the session — and with it the lock — outlives
-        // this call. It is one connection out of the pool for the process.
-        std::mem::forget(conn);
-    })
-    .await;
-}
-
-/// A transaction allowed to mutate `audit_events`.
-///
-/// The table is append-only (migration 0019): the trigger refuses every UPDATE
-/// and DELETE unless the transaction sets `app.audit_purge`, which the
-/// production erasure and retention-purge paths do. A test cleaning up the
-/// audit rows its own fixture wrote is the same kind of sanctioned mutation, so
-/// it says so the same way. Run the DELETE on the returned transaction and
-/// commit it.
-pub async fn audit_mutation_tx(pool: &PgPool) -> Transaction<'static, Postgres> {
-    let mut tx = pool.begin().await.expect("begin audit mutation");
-    sqlx::query("SET LOCAL app.audit_purge = 'on'")
-        .execute(&mut *tx)
-        .await
-        .expect("announce audit mutation");
-    tx
 }
 
 /// Entry point behind `#[db_test]`: runs `f` on the shared runtime with a
@@ -529,7 +439,6 @@ pub fn run_db_test(f: impl AsyncFnOnce(&mut TestTx)) {
         let pool = shared_pool().get_or_init(connect_and_migrate).await;
         TestTx {
             tx: Some(pool.begin().await.expect("begin test transaction")),
-            pool: pool.clone(),
             scoped: None,
         }
     });
@@ -630,8 +539,7 @@ pub struct ParkingBuilder {
     rating_count: i64,
     verified_days_ago: Option<i64>,
     moderation_state: &'static str,
-    /// Tag stored in `seed_key` so committed fixture rows can be cleaned up
-    /// by tag (`seed_key` column).
+    /// Optional `seed_key` used when a test needs to distinguish fixture rows.
     fixture_tag: Option<String>,
     /// Optimistic-concurrency version. Defaults to 1 for fresh inserts.
     version: i64,
@@ -667,8 +575,7 @@ impl ParkingBuilder {
         Self::default()
     }
 
-    /// Tags the row with `seed_key = marker` for committed-fixture cleanup
-    /// (read-model tests that query through pool connections).
+    /// Tags the row with `seed_key = marker` for fixture selection assertions.
     pub fn with_fixture_tag(mut self, marker: impl Into<String>) -> Self {
         self.fixture_tag = Some(marker.into());
         self

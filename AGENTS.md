@@ -86,10 +86,9 @@ npm run build:css                        # Tailwind → web/static/css/app.css
 - **Repository tests:** prefer `let db = tx.db().await` before fixture queries.
   Seed through `db.acquire()`, release the lease, and inject `db.clone()` into
   repositories. Repository transactions use savepoints; the harness awaits
-  outer rollback even after a panic. Adapters must use `Db::acquire()`, not
-  `Db::pool()`. Account/review/export adapters are migrated; others still need
-  migration. True multi-connection race tests need separate database isolation,
-  not this single-connection scope. See `TESTING.md` for legacy pooled tests.
+  outer rollback even after a panic. Every ordinary adapter uses
+  `Db::acquire()`, not `Db::pool()`. True multi-connection race tests need a
+  separate disposable database, not this single-connection scope.
 - **Subcommands** dispatch in `crates/web/src/main.rs`; default is `serve`.
   Add a new `Some("…")` arm there for a new CLI command.
 - **Providers are wired in one place:** `crates/web/src/wiring.rs`

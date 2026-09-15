@@ -149,7 +149,7 @@ impl Db {
         result
     }
 
-    pub fn pool(&self) -> &PgPool {
+    fn pool(&self) -> &PgPool {
         match &self.source {
             Source::Pool(pool) => pool,
             Source::Transaction(_) => {

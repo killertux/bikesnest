@@ -1,8 +1,7 @@
 //! Database-backed auth integration tests against real PostgreSQL.
 //!
-//! Older tests below use committed, uniquely marked pool fixtures and clean
-//! them up explicitly. New sequential repository regressions inject `tx.db()`
-//! and rely on the harness's automatic outer rollback.
+//! Sequential repositories share rollback-scoped fixtures. True multi-connection
+//! races use owned disposable databases.
 
 use bikesnest_application::{
     AccountRepository, AuditEvent, AuditLog, AuthOutbox, EmailKind, EmailMessage, NewAccount,
@@ -16,7 +15,7 @@ use bikesnest_infrastructure::{
     Db, FakeEmailProvider, SendEmailHandler, SqlxAccountRepository, SqlxAuditLog, SqlxAuthOutbox,
     SqlxSessionStore, SqlxTokenStore,
 };
-use bikesnest_test_support::{db_test, pool, run_isolated_database_test};
+use bikesnest_test_support::{db_test, run_isolated_database_test};
 use chrono::{DateTime, Duration, Utc};
 use sha2::Digest as _;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -994,20 +993,12 @@ async fn assert_unused_reset_count(db: &Db, user_id: bikesnest_domain::UserId, e
     assert_eq!(count, expected);
 }
 
-async fn cleanup_user(email: &str) {
-    sqlx::query("DELETE FROM users WHERE email = $1")
-        .bind(email)
-        .execute(&pool().await)
-        .await
-        .unwrap();
-}
-
 #[db_test]
-async fn account_repo_round_trip(_tx: &mut bikesnest_test_support::TestTx) {
-    let db = Db::from_pool(pool().await);
-    let repo = SqlxAccountRepository::new(db);
+async fn account_repo_round_trip(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
+    let repo = SqlxAccountRepository::new(db.clone());
     let email = marker_email("repo");
-    cleanup_user(&email).await;
+
     let eu = UserEmail::parse(&email).unwrap();
 
     let id = repo
@@ -1047,16 +1038,14 @@ async fn account_repo_round_trip(_tx: &mut bikesnest_test_support::TestTx) {
     assert!(found2.is_verified());
     let all = repo.list_users().await.unwrap();
     assert!(all.iter().any(|u| u.id == id));
-
-    cleanup_user(&email).await;
 }
 
 #[db_test]
-async fn update_canonical_email_keeps_identity_in_sync(_tx: &mut bikesnest_test_support::TestTx) {
-    let db = Db::from_pool(pool().await);
-    let repo = SqlxAccountRepository::new(db);
+async fn update_canonical_email_keeps_identity_in_sync(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
+    let repo = SqlxAccountRepository::new(db.clone());
     let email = marker_email("sync");
-    cleanup_user(&email).await;
+
     let eu = UserEmail::parse(&email).unwrap();
 
     let id = repo
@@ -1086,20 +1075,17 @@ async fn update_canonical_email_keeps_identity_in_sync(_tx: &mut bikesnest_test_
         .unwrap()
         .unwrap();
     assert_eq!(idrec.user_id, id);
-
-    cleanup_user(&email).await;
-    cleanup_user("renamed@bikesnest.test").await;
 }
 
 #[db_test]
-async fn session_store_create_resolve_expire_revoke(_tx: &mut bikesnest_test_support::TestTx) {
-    let db = Db::from_pool(pool().await);
-    let store = SqlxSessionStore::new(db);
+async fn session_store_create_resolve_expire_revoke(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
+    let store = SqlxSessionStore::new(db.clone());
     let email = marker_email("session");
-    cleanup_user(&email).await;
+
     let (user_id,) = sqlx::query_as("INSERT INTO users (email) VALUES ($1) RETURNING id")
         .bind(&email)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     let user_id = bikesnest_domain::UserId(user_id);
@@ -1134,70 +1120,97 @@ async fn session_store_create_resolve_expire_revoke(_tx: &mut bikesnest_test_sup
     // Revoke.
     store.revoke(&raw).await.unwrap();
     assert!(store.resolve(&raw, now).await.unwrap().is_none());
-
-    cleanup_user(&email).await;
 }
 
-#[db_test]
-async fn token_store_single_use_is_atomic(_tx: &mut bikesnest_test_support::TestTx) {
-    let db = Db::from_pool(pool().await);
-    let store = SqlxTokenStore::new(db);
-    let email = marker_email("token");
-    cleanup_user(&email).await;
-    let (user_id,) = sqlx::query_as("INSERT INTO users (email) VALUES ($1) RETURNING id")
-        .bind(&email)
-        .fetch_one(&pool().await)
-        .await
-        .unwrap();
-    let user_id = bikesnest_domain::UserId(user_id);
-    let now = Utc::now();
+#[test]
+fn token_store_single_use_is_atomic() {
+    run_isolated_database_test(|pool: sqlx::PgPool| async move {
+        let db = Db::from_pool(pool.clone());
+        let store = SqlxTokenStore::new(db);
+        let email = marker_email("token");
 
-    let raw = VerificationToken::new([42u8; 32]);
-    store
-        .issue_verification(
-            user_id,
-            &email,
-            &raw,
-            now,
-            AccountState::PendingEmailVerification,
-        )
-        .await
-        .unwrap();
-
-    // Two concurrent consumes: exactly one wins (atomic used_at guard).
-    let (a, b) = tokio::join!(
-        store.consume_verification(&raw, now),
-        store.consume_verification(&raw, now),
-    );
-    let hits = [a, b].iter().filter(|r| matches!(r, Ok(Some(_)))).count();
-    assert_eq!(hits, 1, "single-use guard must allow exactly one consume");
-
-    // The consumed token is no longer usable.
-    assert!(
-        store
-            .consume_verification(&raw, now)
+        let (user_id,) = sqlx::query_as("INSERT INTO users (email) VALUES ($1) RETURNING id")
+            .bind(&email)
+            .fetch_one(&pool)
             .await
-            .unwrap()
-            .is_none()
-    );
+            .unwrap();
+        let user_id = bikesnest_domain::UserId(user_id);
+        let now = Utc::now();
 
-    // Reset token similarly single-use and short-lived.
-    store.issue_reset(user_id, &raw, now).await.unwrap();
-    assert!(store.consume_reset(&raw, now).await.unwrap().is_some());
-    assert!(store.consume_reset(&raw, now).await.unwrap().is_none());
+        let raw = VerificationToken::new([42u8; 32]);
+        store
+            .issue_verification(
+                user_id,
+                &email,
+                &raw,
+                now,
+                AccountState::PendingEmailVerification,
+            )
+            .await
+            .unwrap();
 
-    cleanup_user(&email).await;
+        // Hold the exact token while both real consumers reach their row locks.
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("SELECT token_hash FROM email_verification_tokens WHERE user_id=$1 FOR UPDATE")
+            .bind(user_id.0)
+            .fetch_one(&mut *blocker)
+            .await
+            .unwrap();
+        let mut consumes = Box::pin(async {
+            tokio::join!(
+                store.consume_verification(&raw, now),
+                store.consume_verification(&raw, now),
+            )
+        });
+        let observed = tokio::select! {
+            result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let count: i64 = sqlx::query_scalar(
+                        "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock'",
+                    ).fetch_one(&pool).await.unwrap();
+                    if count >= 2 { break; }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }) => result.is_ok(),
+            _ = &mut consumes => false,
+        };
+        blocker.rollback().await.unwrap();
+        assert!(observed, "both consumers must overlap at the token lock");
+        let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(10), consumes)
+            .await
+            .expect("both consumers finish after lock release");
+        assert!(
+            a.is_ok() && b.is_ok(),
+            "neither consumer may fail: {a:?}, {b:?}"
+        );
+        let hits = [a, b].iter().filter(|r| matches!(r, Ok(Some(_)))).count();
+        assert_eq!(hits, 1, "single-use guard must allow exactly one consume");
+
+        // The consumed token is no longer usable.
+        assert!(
+            store
+                .consume_verification(&raw, now)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Reset token similarly single-use and short-lived.
+        store.issue_reset(user_id, &raw, now).await.unwrap();
+        assert!(store.consume_reset(&raw, now).await.unwrap().is_some());
+        assert!(store.consume_reset(&raw, now).await.unwrap().is_none());
+    });
 }
 
 #[db_test]
-async fn token_expiry_blocks_consumption_after_ttl(_tx: &mut bikesnest_test_support::TestTx) {
-    let db = Db::from_pool(pool().await);
-    let store = SqlxTokenStore::new(db);
+async fn token_expiry_blocks_consumption_after_ttl(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
+    let store = SqlxTokenStore::new(db.clone());
     let email = marker_email("expiry");
-    cleanup_user(&email).await;
+
     let (user_id,) = sqlx::query_as("INSERT INTO users (email) VALUES ($1) RETURNING id")
         .bind(&email)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     let user_id = bikesnest_domain::UserId(user_id);
@@ -1232,8 +1245,6 @@ async fn token_expiry_blocks_consumption_after_ttl(_tx: &mut bikesnest_test_supp
             .unwrap()
             .is_none()
     );
-
-    cleanup_user(&email).await;
 }
 
 #[db_test]
@@ -2546,14 +2557,14 @@ fn isolated_database_helper_cleans_up_after_panic() {
 }
 
 #[db_test]
-async fn audit_insert_round_trip(_tx: &mut bikesnest_test_support::TestTx) {
-    let db = Db::from_pool(pool().await);
-    let audit = SqlxAuditLog::new(db);
+async fn audit_insert_round_trip(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
+    let audit = SqlxAuditLog::new(db.clone());
     let email = marker_email("audit");
-    cleanup_user(&email).await;
+
     let (user_id,) = sqlx::query_as("INSERT INTO users (email) VALUES ($1) RETURNING id")
         .bind(&email)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
 
@@ -2571,12 +2582,10 @@ async fn audit_insert_round_trip(_tx: &mut bikesnest_test_support::TestTx) {
         "SELECT count(*) FROM audit_events WHERE actor_user_id = $1 AND action = 'auth.login'",
     )
     .bind(user_id)
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     assert_eq!(count, 1);
-
-    cleanup_user(&email).await;
 }
 
 /// `resolve` runs on every authenticated request, so its `last_seen_at` write
@@ -2584,14 +2593,14 @@ async fn audit_insert_round_trip(_tx: &mut bikesnest_test_support::TestTx) {
 /// is unaffected: the column may lag by five minutes, which is immaterial
 /// against 30 days.
 #[db_test]
-async fn resolve_throttles_the_last_seen_write(_tx: &mut bikesnest_test_support::TestTx) {
-    let db = Db::from_pool(pool().await);
-    let store = SqlxSessionStore::new(db);
+async fn resolve_throttles_the_last_seen_write(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
+    let store = SqlxSessionStore::new(db.clone());
     let email = marker_email("session-throttle");
-    cleanup_user(&email).await;
+
     let (uid,): (i64,) = sqlx::query_as("INSERT INTO users (email) VALUES ($1) RETURNING id")
         .bind(&email)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     let user_id = bikesnest_domain::UserId(uid);
@@ -2601,17 +2610,17 @@ async fn resolve_throttles_the_last_seen_write(_tx: &mut bikesnest_test_support:
     let now = Utc::now();
     store.create(user_id, &raw, &csrf, now).await.unwrap();
 
-    async fn last_seen(uid: i64) -> chrono::DateTime<Utc> {
+    async fn last_seen(db: &Db, uid: i64) -> chrono::DateTime<Utc> {
         sqlx::query_scalar("SELECT last_seen_at FROM sessions WHERE user_id = $1")
             .bind(uid)
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap()
     }
 
     // Two resolves a minute apart: inside the throttle window, so the column is
     // left exactly as `create` wrote it.
-    let before = last_seen(uid).await;
+    let before = last_seen(&db, uid).await;
     assert!(store.resolve(&raw, now).await.unwrap().is_some());
     assert!(
         store
@@ -2621,7 +2630,7 @@ async fn resolve_throttles_the_last_seen_write(_tx: &mut bikesnest_test_support:
             .is_some()
     );
     assert_eq!(
-        last_seen(uid).await,
+        last_seen(&db, uid).await,
         before,
         "last_seen_at must not be rewritten inside the throttle window"
     );
@@ -2630,23 +2639,21 @@ async fn resolve_throttles_the_last_seen_write(_tx: &mut bikesnest_test_support:
     sqlx::query("UPDATE sessions SET last_seen_at = $2 WHERE user_id = $1")
         .bind(uid)
         .bind(now - Duration::minutes(10))
-        .execute(&pool().await)
+        .execute(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
-    let stale = last_seen(uid).await;
+    let stale = last_seen(&db, uid).await;
     let at = now + Duration::seconds(1);
     let session = store.resolve(&raw, at).await.unwrap().expect("still valid");
     // The row is returned as *read* — the update lands in the same statement,
     // under the same snapshot.
     assert_eq!(session.last_seen_at, stale);
-    let refreshed = last_seen(uid).await;
+    let refreshed = last_seen(&db, uid).await;
     assert!(
         refreshed > stale,
         "a stale last_seen_at must be refreshed: {refreshed} vs {stale}"
     );
     assert_eq!(refreshed.timestamp(), at.timestamp());
-
-    cleanup_user(&email).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -2656,15 +2663,15 @@ async fn resolve_throttles_the_last_seen_write(_tx: &mut bikesnest_test_support:
 
 #[db_test]
 async fn search_users_matches_email_or_name_and_pages_by_keyset(
-    _tx: &mut bikesnest_test_support::TestTx,
+    tx: &mut bikesnest_test_support::TestTx,
 ) {
-    let repo = SqlxAccountRepository::new(Db::from_pool(pool().await));
+    let db = tx.db().await;
+    let repo = SqlxAccountRepository::new(db.clone());
     let needle = format!("adminneedle{}", std::process::id());
     let mut ids = Vec::new();
-    let mut emails = Vec::new();
     for n in 0..3 {
         let email = format!("{needle}-{n}@bikesnest.test");
-        cleanup_user(&email).await;
+
         let eu = UserEmail::parse(&email).unwrap();
         let id = repo
             .create(bikesnest_application::NewAccount {
@@ -2677,7 +2684,6 @@ async fn search_users_matches_email_or_name_and_pages_by_keyset(
             .await
             .unwrap();
         ids.push(id.0);
-        emails.push(email);
     }
     ids.sort_unstable();
 
@@ -2753,7 +2759,7 @@ async fn search_users_matches_email_or_name_and_pages_by_keyset(
     // …and a literal underscore in the term matches a literal underscore
     // (the escape character must be the one the query declares).
     let under_email = format!("{needle}-under@bikesnest.test");
-    cleanup_user(&under_email).await;
+
     let under = UserEmail::parse(&under_email).unwrap();
     repo.create(bikesnest_application::NewAccount {
         email: &under,
@@ -2764,7 +2770,7 @@ async fn search_users_matches_email_or_name_and_pages_by_keyset(
     })
     .await
     .unwrap();
-    emails.push(under_email);
+
     let literal = search(Some("Under_sc"), None, 50).await.unwrap();
     assert_eq!(literal.len(), 1, "a literal `_` in the term matches itself");
 
@@ -2780,7 +2786,7 @@ async fn search_users_matches_email_or_name_and_pages_by_keyset(
     // With no display name, the label falls back to the email.
     sqlx::query("UPDATE users SET display_name = NULL WHERE id = $1")
         .bind(ids[0])
-        .execute(&pool().await)
+        .execute(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     let labels = repo.labels_for(&[ids[0]]).await.unwrap();
@@ -2792,7 +2798,7 @@ async fn search_users_matches_email_or_name_and_pages_by_keyset(
     // A blank display name is not a label either.
     sqlx::query("UPDATE users SET display_name = '   ' WHERE id = $1")
         .bind(ids[1])
-        .execute(&pool().await)
+        .execute(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     let labels = repo.labels_for(&[ids[1]]).await.unwrap();
@@ -2803,19 +2809,16 @@ async fn search_users_matches_email_or_name_and_pages_by_keyset(
     );
 
     assert!(repo.labels_for(&[]).await.unwrap().is_empty());
-
-    for email in &emails {
-        cleanup_user(email).await;
-    }
 }
 
 #[db_test]
 async fn activity_for_reports_last_seen_and_a_contribution_total(
-    _tx: &mut bikesnest_test_support::TestTx,
+    tx: &mut bikesnest_test_support::TestTx,
 ) {
-    let repo = SqlxAccountRepository::new(Db::from_pool(pool().await));
+    let db = tx.db().await;
+    let repo = SqlxAccountRepository::new(db.clone());
     let email = marker_email("admin-activity");
-    cleanup_user(&email).await;
+
     let eu = UserEmail::parse(&email).unwrap();
     let id = repo
         .create(bikesnest_application::NewAccount {
@@ -2846,7 +2849,7 @@ async fn activity_for_reports_last_seen_and_a_contribution_total(
     .bind(id)
     .bind(seen)
     .bind(Utc::now() + Duration::days(1))
-    .execute(&pool().await)
+    .execute(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     let (loc,): (i64,) = sqlx::query_as(
@@ -2858,7 +2861,7 @@ async fn activity_for_reports_last_seen_and_a_contribution_total(
     )
     .bind(id)
     .bind(format!("admin-activity-{id}"))
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     sqlx::query(
@@ -2867,7 +2870,7 @@ async fn activity_for_reports_last_seen_and_a_contribution_total(
     )
     .bind(loc)
     .bind(id)
-    .execute(&pool().await)
+    .execute(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
 
@@ -2890,26 +2893,19 @@ async fn activity_for_reports_last_seen_and_a_contribution_total(
     assert_eq!(batch[&-1].contributions, 0);
 
     assert!(repo.activity_for(&[]).await.unwrap().is_empty());
-
-    sqlx::query("DELETE FROM parking_location WHERE id = $1")
-        .bind(loc)
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    cleanup_user(&email).await;
 }
 
 /// `users.locale` round-trips: the registration locale is persisted, every read
 /// model carries it, and the language toggle updates it. This column is the
 /// only thing a background job can read to know which language to write in.
 #[db_test]
-async fn account_locale_is_persisted_and_updatable(_tx: &mut bikesnest_test_support::TestTx) {
+async fn account_locale_is_persisted_and_updatable(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
     use bikesnest_domain::LocaleCode;
 
-    let db = Db::from_pool(pool().await);
-    let repo = SqlxAccountRepository::new(db);
+    let repo = SqlxAccountRepository::new(db.clone());
     let email = marker_email("locale");
-    cleanup_user(&email).await;
+
     let eu = UserEmail::parse(&email).unwrap();
 
     let id = repo
@@ -2941,10 +2937,8 @@ async fn account_locale_is_persisted_and_updatable(_tx: &mut bikesnest_test_supp
     // Stored in the canonical spelling the CHECK constraint allows.
     let stored: String = sqlx::query_scalar("SELECT locale FROM users WHERE id = $1")
         .bind(id.0)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     assert_eq!(stored, "pt-BR");
-
-    cleanup_user(&email).await;
 }

@@ -117,28 +117,43 @@ impl RetentionRepository for SqlxRetentionRepository {
     }
 
     async fn purge_expired_sessions(&self, now: DateTime<Utc>) -> Result<u64, PrivacyError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("retention.purge_expired_sessions", e))?;
         let idle_cutoff = now - self.policy.session_idle;
         let res = sqlx::query("DELETE FROM sessions WHERE expires_at < $1 OR last_seen_at < $2")
             .bind(now)
             .bind(idle_cutoff)
-            .execute(self.db.pool())
+            .execute(&mut *conn)
             .await
             .map_err(|e| db_err("retention.purge_expired_sessions", e))?;
         Ok(res.rows_affected())
     }
 
     async fn purge_expired_parked_here(&self, now: DateTime<Utc>) -> Result<u64, PrivacyError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("retention.purge_expired_parked_here", e))?;
         let res = sqlx::query("DELETE FROM verification WHERE kind = 'parked_here' AND expires_at IS NOT NULL AND expires_at < $1").bind(now)
-        .execute(self.db.pool())
+        .execute(&mut *conn)
         .await
         .map_err(|e| db_err("retention.purge_expired_parked_here", e))?;
         Ok(res.rows_affected())
     }
 
     async fn purge_expired_exports(&self, now: DateTime<Utc>) -> Result<u64, PrivacyError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("retention.purge_expired_exports", e))?;
         let res = sqlx::query("DELETE FROM personal_data_export WHERE expires_at < $1")
             .bind(now)
-            .execute(self.db.pool())
+            .execute(&mut *conn)
             .await
             .map_err(|e| db_err("retention.purge_expired_exports", e))?;
         Ok(res.rows_affected())
@@ -199,14 +214,21 @@ impl RetentionRepository for SqlxRetentionRepository {
             ),
             ("review_photo", "retention.reconcile_pending_photos.review"),
         ] {
-            let rows: Vec<(i64, String)> = sqlx::query_as(&format!(
-                "SELECT id, storage_key FROM {table} \
-                 WHERE moderation_state = 'PENDING_REVIEW' AND created_at < $1"
-            ))
-            .bind(cutoff)
-            .fetch_all(self.db.pool())
-            .await
-            .map_err(|e| db_err("retention.reconcile_pending_photos", e))?;
+            let rows: Vec<(i64, String)> = {
+                let mut conn = self
+                    .db
+                    .acquire()
+                    .await
+                    .map_err(|e| db_err("retention.reconcile_pending_photos", e))?;
+                sqlx::query_as(&format!(
+                    "SELECT id, storage_key FROM {table} \
+                     WHERE moderation_state = 'PENDING_REVIEW' AND created_at < $1"
+                ))
+                .bind(cutoff)
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(|e| db_err("retention.reconcile_pending_photos", e))?
+            };
 
             for (id, key) in rows {
                 if self
@@ -217,9 +239,14 @@ impl RetentionRepository for SqlxRetentionRepository {
                 {
                     continue;
                 }
+                let mut conn = self
+                    .db
+                    .acquire()
+                    .await
+                    .map_err(|e| db_err("retention.reconcile_pending_photos", e))?;
                 let res = sqlx::query(&format!("DELETE FROM {table} WHERE id = $1"))
                     .bind(id)
-                    .execute(self.db.pool())
+                    .execute(&mut *conn)
                     .await
                     .map_err(|e| db_err("retention.reconcile_pending_photos", e))?;
                 deleted += res.rows_affected();
@@ -236,6 +263,11 @@ impl RetentionRepository for SqlxRetentionRepository {
         struct IdRow {
             id: i64,
         }
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("retention.anonymize_inactive_accounts", e))?;
         let candidates: Vec<i64> = sqlx::query_as::<_, IdRow>(r#"
             SELECT u.id FROM users u
             WHERE u.account_state <> 'DELETED'
@@ -245,12 +277,13 @@ impl RetentionRepository for SqlxRetentionRepository {
                     u.created_at
                   ) < $1
             "#).bind(cutoff)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *conn)
         .await
         .map_err(|e| db_err("retention.anonymize_inactive_accounts", e))?
         .into_iter()
         .map(|r| r.id)
         .collect();
+        drop(conn);
 
         let anonymizer = SqlxAnonymizationRepository::new(self.db.clone());
         let mut count = 0u64;
@@ -262,10 +295,15 @@ impl RetentionRepository for SqlxRetentionRepository {
     }
 
     async fn purge_deleted_accounts(&self, cutoff: DateTime<Utc>) -> Result<u64, PrivacyError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("retention.purge_deleted_accounts", e))?;
         let res =
             sqlx::query("DELETE FROM users WHERE account_state = 'DELETED' AND deleted_at < $1")
                 .bind(cutoff)
-                .execute(self.db.pool())
+                .execute(&mut *conn)
                 .await
                 .map_err(|e| db_err("retention.purge_deleted_accounts", e))?;
         Ok(res.rows_affected())
@@ -281,6 +319,11 @@ impl SqlxRetentionRepository {
         if candidate_keys.is_empty() {
             return Ok(HashSet::new());
         }
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("retention.referenced", e))?;
         let rows = sqlx::query_scalar::<_, String>(
             r#"
             SELECT storage_key FROM parking_photo WHERE storage_key = ANY($1)
@@ -293,7 +336,7 @@ impl SqlxRetentionRepository {
             "#,
         )
         .bind(candidate_keys)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *conn)
         .await
         .map_err(|e| db_err("retention.referenced", e))?;
         Ok(rows.into_iter().collect())

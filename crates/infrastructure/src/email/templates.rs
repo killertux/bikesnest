@@ -160,8 +160,18 @@ mod tests {
                     false,
                 ),
             ] {
+                let action_link = kind.action_link().to_owned();
+                let escaped_action_link = escape_html(&action_link);
                 let out = render(&message(locale, kind));
                 assert!(!out.subject.is_empty() && !out.text.is_empty() && !out.html.is_empty());
+                assert_eq!(out.text.matches(&action_link).count(), 2);
+                assert_eq!(
+                    out.html
+                        .matches(&format!("href=\"{escaped_action_link}\""))
+                        .count(),
+                    2
+                );
+                assert!(!out.text.contains("{link}") && !out.html.contains("{link}"));
                 if hostile_link {
                     assert!(!out.html.contains("<x>") && out.html.contains("&lt;x&gt;"));
                     assert!(out.html.contains("&amp;") && out.html.contains("&quot;"));

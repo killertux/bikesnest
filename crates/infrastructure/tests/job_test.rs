@@ -1,15 +1,10 @@
-//! Integration tests for the PostgreSQL background job repository
 //! PostgreSQL-backed background-job integration tests.
 //!
-//! The repo operates on the shared pool, so each test seeds rows with a unique
-//! `kind` prefix and cleans them up at the end (rows are not rolled back — they
-//! are on the pool, not the test transaction). Where a test needs a "claimed"
-//! row it simulates it with a direct `UPDATE` so it does not race other tests'
-//! `claim` calls; the one real `claim` test asserts only the `SKIP LOCKED`
-//! disjointness property, which holds regardless of concurrent claims.
+//! Sequential repository fixtures roll back with their scoped Db. Workers and
+//! multi-connection claims own disposable child databases and scoped job kinds.
 
 use bikesnest_infrastructure::{Db, JobConfig, JobRegistry, SqlxJobRepository, Worker};
-use bikesnest_test_support::{db_test, pool, run_isolated_database_test};
+use bikesnest_test_support::{db_test, run_isolated_database_test};
 use chrono::{Duration, Utc};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -154,27 +149,10 @@ impl<S: tracing::Subscriber> Layer<S> for CaptureLayer {
     }
 }
 
-async fn db() -> Db {
-    Db::from_pool(pool().await)
-}
-
-async fn repo() -> SqlxJobRepository {
-    SqlxJobRepository::new(db().await)
-}
-
-/// Delete every background_job row whose kind starts with `jobtest.` (cleanup for
-/// whatever this test created; other tests use their own distinct kinds).
-async fn clear_kind(kind_prefix: &str) {
-    sqlx::query("DELETE FROM background_job WHERE kind LIKE $1")
-        .bind(format!("{kind_prefix}%"))
-        .execute(&pool().await)
-        .await
-        .unwrap();
-}
-
 #[db_test]
-async fn enqueue_is_idempotent_on_key(_tx: &mut bikesnest_test_support::TestTx) {
-    let r = repo().await;
+async fn enqueue_is_idempotent_on_key(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
+    let r = SqlxJobRepository::new(db.clone());
     let now = Utc::now();
     // First insert with a stable key → Ok(Some(id)).
     let first = r
@@ -202,16 +180,16 @@ async fn enqueue_is_idempotent_on_key(_tx: &mut bikesnest_test_support::TestTx) 
     assert!(second.is_none(), "idempotency_key must dedup enqueue");
     let n: i64 =
         sqlx::query_scalar("SELECT count(*) FROM background_job WHERE kind = 'jobtest.idem'")
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
     assert_eq!(n, 1);
-    clear_kind("jobtest.idem").await;
 }
 
 #[db_test]
-async fn finish_success_completes_oneshot(_tx: &mut bikesnest_test_support::TestTx) {
-    let r = repo().await;
+async fn finish_success_completes_oneshot(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
+    let r = SqlxJobRepository::new(db.clone());
     let now = Utc::now();
     let id = r
         .enqueue("jobtest.oneshot", &json!({}), now, Some(5), None)
@@ -223,7 +201,7 @@ async fn finish_success_completes_oneshot(_tx: &mut bikesnest_test_support::Test
         "UPDATE background_job SET state='running', claimed_by='w', lease_expires_at=now()+interval '60 seconds', attempts=1 WHERE id=$1",
     )
     .bind(id)
-    .execute(&pool().await)
+    .execute(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     assert_eq!(claimed.rows_affected(), 1);
@@ -233,17 +211,17 @@ async fn finish_success_completes_oneshot(_tx: &mut bikesnest_test_support::Test
     let (state, finished): (String, Option<chrono::DateTime<Utc>>) =
         sqlx::query_as("SELECT state, finished_at FROM background_job WHERE id=$1")
             .bind(id)
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
     assert_eq!(state, "succeeded");
     assert!(finished.is_some());
-    clear_kind("jobtest.oneshot").await;
 }
 
 #[db_test]
-async fn finish_success_reschedules_recurring(_tx: &mut bikesnest_test_support::TestTx) {
-    let r = repo().await;
+async fn finish_success_reschedules_recurring(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
+    let r = SqlxJobRepository::new(db.clone());
     let now = Utc::now();
     let id = r
         .enqueue("jobtest.recurr", &json!({}), now, Some(5), None)
@@ -255,7 +233,7 @@ async fn finish_success_reschedules_recurring(_tx: &mut bikesnest_test_support::
         "UPDATE background_job SET state='running', claimed_by='w', lease_expires_at=clock_timestamp()+interval '60 seconds', schedule='{\"every_seconds\": 60}'::jsonb, attempts=1 WHERE id=$1",
     )
     .bind(id)
-    .execute(&pool().await)
+    .execute(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
 
@@ -265,18 +243,18 @@ async fn finish_success_reschedules_recurring(_tx: &mut bikesnest_test_support::
     let (state, attempts, run_at): (String, i32, chrono::DateTime<Utc>) =
         sqlx::query_as("SELECT state, attempts, run_at FROM background_job WHERE id=$1")
             .bind(id)
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
     assert_eq!(state, "pending");
     assert_eq!(attempts, 0, "recurring success resets the attempt budget");
     assert!(run_at > now, "next run is in the future");
-    clear_kind("jobtest.recurr").await;
 }
 
 #[db_test]
-async fn retry_then_dead_letter(_tx: &mut bikesnest_test_support::TestTx) {
-    let r = repo().await;
+async fn retry_then_dead_letter(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
+    let r = SqlxJobRepository::new(db.clone());
     let now = Utc::now();
     let id = r
         .enqueue("jobtest.retry", &json!({}), now, Some(2), None)
@@ -287,7 +265,7 @@ async fn retry_then_dead_letter(_tx: &mut bikesnest_test_support::TestTx) {
         "UPDATE background_job SET state='running', claimed_by='w', lease_expires_at=clock_timestamp()+interval '60 seconds', attempts=1 WHERE id=$1",
     )
     .bind(id)
-    .execute(&pool().await)
+    .execute(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
 
@@ -297,7 +275,7 @@ async fn retry_then_dead_letter(_tx: &mut bikesnest_test_support::TestTx) {
     let (state, last_error): (String, Option<String>) =
         sqlx::query_as("SELECT state, last_error FROM background_job WHERE id=$1")
             .bind(id)
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
     assert_eq!(state, "pending");
@@ -308,24 +286,24 @@ async fn retry_then_dead_letter(_tx: &mut bikesnest_test_support::TestTx) {
         "UPDATE background_job SET state='running', claimed_by='w', lease_expires_at=clock_timestamp()+interval '60 seconds', attempts=2 WHERE id=$1",
     )
     .bind(id)
-    .execute(&pool().await)
+    .execute(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     r.fail(id, "w", "boom-again").await.unwrap();
     let (state, finished): (String, Option<chrono::DateTime<Utc>>) =
         sqlx::query_as("SELECT state, finished_at FROM background_job WHERE id=$1")
             .bind(id)
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
     assert_eq!(state, "failed");
     assert!(finished.is_some());
-    clear_kind("jobtest.retry").await;
 }
 
 #[db_test]
-async fn gc_deletes_only_old_terminal_rows(_tx: &mut bikesnest_test_support::TestTx) {
-    let r = repo().await;
+async fn gc_deletes_only_old_terminal_rows(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
+    let r = SqlxJobRepository::new(db.clone());
     let now = Utc::now();
     let cut_off = now - Duration::days(7);
     let id_old = r
@@ -342,14 +320,14 @@ async fn gc_deletes_only_old_terminal_rows(_tx: &mut bikesnest_test_support::Tes
     sqlx::query("UPDATE background_job SET state='succeeded', finished_at=$2 WHERE id=$1")
         .bind(id_old)
         .bind(now - Duration::days(10))
-        .execute(&pool().await)
+        .execute(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     sqlx::query(
         "UPDATE background_job SET state='failed', finished_at=now(), last_error='x' WHERE id=$1",
     )
     .bind(id_fresh)
-    .execute(&pool().await)
+    .execute(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     let id_pending = r
@@ -363,123 +341,126 @@ async fn gc_deletes_only_old_terminal_rows(_tx: &mut bikesnest_test_support::Tes
 
     let gone: i64 = sqlx::query_scalar("SELECT count(*) FROM background_job WHERE id=$1")
         .bind(id_old)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     assert_eq!(gone, 0, "old terminal row is deleted");
     let fresh: i64 = sqlx::query_scalar("SELECT count(*) FROM background_job WHERE id=$1")
         .bind(id_fresh)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     assert_eq!(fresh, 1, "fresh terminal row is kept");
     let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM background_job WHERE id=$1")
         .bind(id_pending)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     assert_eq!(pending, 1, "pending row is never deleted");
-    clear_kind("jobtest.gc").await;
 }
 
-#[db_test]
-async fn concurrent_claims_are_disjoint(_tx: &mut bikesnest_test_support::TestTx) {
-    let r = repo().await;
-    let now = Utc::now();
-    // A kind unique to this test run: `claim_kinds` scopes both workers to it,
-    // so no concurrently-running test (in this binary or another) can crowd
-    // our rows out, or be crowded out by our large batch. That is what lets
-    // the assertions below be exact instead of "claimed by *someone*".
-    let kind = format!(
-        "test.{}.concurrent_claims_are_disjoint.{}",
-        module_path!(),
-        std::process::id()
-    );
-    // Seed a handful of due, unique-kind rows.
-    let mut ids = Vec::new();
-    for i in 0..6 {
-        let id = r
-            .enqueue(&kind, &json!({"i": i}), now, Some(5), None)
-            .await
-            .unwrap()
-            .unwrap();
-        ids.push(id);
-    }
-
-    // Two workers claim concurrently, each with a large batch so the whole due
-    // set is covered — safe now that `claim_kinds` confines both to our kind.
-    let repo_a = r.clone();
-    let repo_b = r.clone();
-    let (kind_a, kind_b) = (kind.clone(), kind.clone());
-    let a = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
-    let b = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
-    let (a2, b2) = (a.clone(), b.clone());
-    let h1 = tokio::spawn(async move {
-        let got = repo_a
-            .claim_kinds(
-                1000,
-                "worker-a",
-                std::time::Duration::from_secs(60),
-                &[&kind_a],
-            )
-            .await
-            .unwrap();
-        *a2.lock().await = got;
-    });
-    let h2 = tokio::spawn(async move {
-        let got = repo_b
-            .claim_kinds(
-                1000,
-                "worker-b",
-                std::time::Duration::from_secs(60),
-                &[&kind_b],
-            )
-            .await
-            .unwrap();
-        *b2.lock().await = got;
-    });
-    let _ = (h1.await.unwrap(), h2.await.unwrap());
-    let claim_a = std::mem::take(&mut *a.lock().await);
-    let claim_b = std::mem::take(&mut *b.lock().await);
-
-    // SKIP LOCKED → the two claims never share an id.
-    let ids_a: std::collections::HashSet<i64> = claim_a.iter().map(|j| j.id).collect();
-    let ids_b: std::collections::HashSet<i64> = claim_b.iter().map(|j| j.id).collect();
-    assert!(
-        ids_a.is_disjoint(&ids_b),
-        "two workers must never claim the same job ({ids_a:?} vs {ids_b:?})"
-    );
-
-    // Kind-scoped claims mean nothing else could have touched these rows:
-    // every one of them must be claimed by exactly worker-a or worker-b, no
-    // more, no less.
-    let all_ids: std::collections::HashSet<i64> = ids.iter().copied().collect();
-    let claimed: std::collections::HashSet<i64> = ids_a.union(&ids_b).copied().collect();
-    assert_eq!(
-        claimed, all_ids,
-        "every seeded row must be claimed by exactly worker-a or worker-b"
-    );
-
-    for id in &ids {
-        let (state, attempts, claimed_by): (String, i32, Option<String>) =
-            sqlx::query_as("SELECT state, attempts, claimed_by FROM background_job WHERE id=$1")
-                .bind(id)
-                .fetch_one(&pool().await)
-                .await
-                .unwrap();
-        assert_eq!(state, "running");
-        assert_eq!(attempts, 1);
-        assert!(
-            matches!(claimed_by.as_deref(), Some("worker-a") | Some("worker-b")),
-            "claimed row must be held by one of this test's own workers, got {claimed_by:?}"
+#[test]
+fn concurrent_claims_are_disjoint() {
+    run_isolated_database_test(|pool: sqlx::PgPool| async move {
+        let r = SqlxJobRepository::new(Db::from_pool(pool.clone()));
+        let now = Utc::now();
+        // A kind unique to this test run: `claim_kinds` scopes both workers to it,
+        // so no concurrently-running test (in this binary or another) can crowd
+        // our rows out, or be crowded out by our large batch. That is what lets
+        // the assertions below be exact instead of "claimed by *someone*".
+        let kind = format!(
+            "test.{}.concurrent_claims_are_disjoint.{}",
+            module_path!(),
+            std::process::id()
         );
-    }
-    clear_kind(&kind).await;
+        // Seed a handful of due, unique-kind rows.
+        let mut ids = Vec::new();
+        for i in 0..6 {
+            let id = r
+                .enqueue(&kind, &json!({"i": i}), now, Some(5), None)
+                .await
+                .unwrap()
+                .unwrap();
+            ids.push(id);
+        }
+
+        // Two workers claim concurrently, each with a large batch so the whole due
+        // set is covered — safe now that `claim_kinds` confines both to our kind.
+        let kinds = [&*kind];
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE background_job IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let mut claims = Box::pin(async {
+            tokio::join!(
+                r.claim_kinds(1000, "worker-a", std::time::Duration::from_secs(60), &kinds),
+                r.claim_kinds(1000, "worker-b", std::time::Duration::from_secs(60), &kinds),
+            )
+        });
+        let overlapped = tokio::select! {
+            result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let count: i64 = sqlx::query_scalar(
+                        "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock'",
+                    ).fetch_one(&pool).await.unwrap();
+                    if count >= 2 { break; }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }) => result.is_ok(),
+            _ = &mut claims => false,
+        };
+        blocker.rollback().await.unwrap();
+        assert!(
+            overlapped,
+            "both real claims must overlap behind the table lock"
+        );
+        let (claim_a, claim_b) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), &mut claims)
+                .await
+                .expect("both claims must finish");
+        let (claim_a, claim_b) = (claim_a.unwrap(), claim_b.unwrap());
+
+        // SKIP LOCKED → the two claims never share an id.
+        let ids_a: std::collections::HashSet<i64> = claim_a.iter().map(|j| j.id).collect();
+        let ids_b: std::collections::HashSet<i64> = claim_b.iter().map(|j| j.id).collect();
+        assert!(
+            ids_a.is_disjoint(&ids_b),
+            "two workers must never claim the same job ({ids_a:?} vs {ids_b:?})"
+        );
+
+        // Kind-scoped claims mean nothing else could have touched these rows:
+        // every one of them must be claimed by exactly worker-a or worker-b, no
+        // more, no less.
+        let all_ids: std::collections::HashSet<i64> = ids.iter().copied().collect();
+        let claimed: std::collections::HashSet<i64> = ids_a.union(&ids_b).copied().collect();
+        assert_eq!(
+            claimed, all_ids,
+            "every seeded row must be claimed by exactly worker-a or worker-b"
+        );
+
+        for id in &ids {
+            let (state, attempts, claimed_by): (String, i32, Option<String>) = sqlx::query_as(
+                "SELECT state, attempts, claimed_by FROM background_job WHERE id=$1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(state, "running");
+            assert_eq!(attempts, 1);
+            assert!(
+                matches!(claimed_by.as_deref(), Some("worker-a") | Some("worker-b")),
+                "claimed row must be held by one of this test's own workers, got {claimed_by:?}"
+            );
+        }
+    });
 }
 
 #[db_test]
-async fn claim_reclaims_a_crashed_workers_running_job(_tx: &mut bikesnest_test_support::TestTx) {
-    let r = repo().await;
+async fn claim_reclaims_a_crashed_workers_running_job(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
+    let r = SqlxJobRepository::new(db.clone());
     let now = Utc::now();
     let kind = format!(
         "test.{}.claim_reclaims_a_crashed_workers_running_job.{}",
@@ -498,7 +479,7 @@ async fn claim_reclaims_a_crashed_workers_running_job(_tx: &mut bikesnest_test_s
             lease_expires_at=now() - interval '1 second', attempts=1 WHERE id=$1",
     )
     .bind(id)
-    .execute(&pool().await)
+    .execute(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
 
@@ -519,7 +500,7 @@ async fn claim_reclaims_a_crashed_workers_running_job(_tx: &mut bikesnest_test_s
         "SELECT state, claimed_by, attempts, lease_expires_at FROM background_job WHERE id=$1",
     )
     .bind(id)
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     assert_eq!(state, "running");
@@ -552,15 +533,14 @@ async fn claim_reclaims_a_crashed_workers_running_job(_tx: &mut bikesnest_test_s
         !claimed_again.iter().any(|j| j.id == id),
         "a freshly (re)claimed job must not be claimed again"
     );
-
-    clear_kind(&kind).await;
 }
 
 #[db_test]
 async fn finish_success_reports_lost_ownership_for_the_wrong_claimant(
-    _tx: &mut bikesnest_test_support::TestTx,
+    tx: &mut bikesnest_test_support::TestTx,
 ) {
-    let r = repo().await;
+    let db = tx.db().await;
+    let r = SqlxJobRepository::new(db.clone());
     let now = Utc::now();
     let id = r
         .enqueue("jobtest.zombie", &json!({}), now, Some(5), None)
@@ -574,7 +554,7 @@ async fn finish_success_reports_lost_ownership_for_the_wrong_claimant(
             lease_expires_at=now()+interval '60 seconds', attempts=2 WHERE id=$1",
     )
     .bind(id)
-    .execute(&pool().await)
+    .execute(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
 
@@ -587,63 +567,63 @@ async fn finish_success_reports_lost_ownership_for_the_wrong_claimant(
     let (state, claimed_by): (String, Option<String>) =
         sqlx::query_as("SELECT state, claimed_by FROM background_job WHERE id=$1")
             .bind(id)
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
     assert_eq!(state, "running", "wrong claimant's write must not apply");
     assert_eq!(claimed_by.as_deref(), Some("worker-b"));
-
-    clear_kind("jobtest.zombie").await;
 }
 
-/// Graceful shutdown (WP7): cancelling the token while the worker sits in its
+/// Graceful shutdown: cancelling the token while the worker sits in its
 /// idle poll must return from `run` well inside one poll interval — not after
 /// it — and must leave nothing claimed.
 ///
 /// `batch_size` 0 makes `claim` a `LIMIT 0` query, so the worker only ever
 /// idle-polls and cannot disturb rows other tests own.
-#[db_test]
-async fn cancelling_the_token_stops_an_idle_worker(_tx: &mut bikesnest_test_support::TestTx) {
-    let config = JobConfig {
-        enabled: true,
-        // Far longer than the test may take: if cancellation did not interrupt
-        // the sleep, the timeout below would fire instead.
-        poll_interval: std::time::Duration::from_secs(60),
-        batch_size: 0,
-        ..JobConfig::default()
-    };
-    let worker = Worker::new(
-        repo().await,
-        std::sync::Arc::new(JobRegistry::new(Vec::new(), Vec::new())),
-        config,
-    );
-    let worker_id = worker.id().to_string();
+#[test]
+fn cancelling_the_token_stops_an_idle_worker() {
+    run_isolated_database_test(|pool: sqlx::PgPool| async move {
+        let config = JobConfig {
+            enabled: true,
+            // Far longer than the test may take: if cancellation did not interrupt
+            // the sleep, the timeout below would fire instead.
+            poll_interval: std::time::Duration::from_secs(60),
+            batch_size: 0,
+            ..JobConfig::default()
+        };
+        let worker = Worker::new(
+            SqlxJobRepository::new(Db::from_pool(pool.clone())),
+            std::sync::Arc::new(JobRegistry::new(Vec::new(), Vec::new())),
+            config,
+        );
+        let worker_id = worker.id().to_string();
 
-    let token = CancellationToken::new();
-    let handle = tokio::spawn(worker.run(token.clone()));
-    // Let the loop reach its idle sleep before signalling.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(worker.run(token.clone()));
+        // Let the loop reach its idle sleep before signalling.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    let started = std::time::Instant::now();
-    token.cancel();
-    tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+        let started = std::time::Instant::now();
+        token.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("run must return promptly after cancellation, not after the poll interval")
+            .expect("worker task must not panic");
+        assert!(
+            started.elapsed() < config.poll_interval,
+            "returned only after the full poll interval: {:?}",
+            started.elapsed()
+        );
+
+        let running: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM background_job WHERE state = 'running' AND claimed_by = $1",
+        )
+        .bind(&worker_id)
+        .fetch_one(&pool)
         .await
-        .expect("run must return promptly after cancellation, not after the poll interval")
-        .expect("worker task must not panic");
-    assert!(
-        started.elapsed() < config.poll_interval,
-        "returned only after the full poll interval: {:?}",
-        started.elapsed()
-    );
-
-    let running: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM background_job WHERE state = 'running' AND claimed_by = $1",
-    )
-    .bind(&worker_id)
-    .fetch_one(&pool().await)
-    .await
-    .unwrap();
-    assert_eq!(running, 0, "a stopped worker must leave no job running");
+        .unwrap();
+        assert_eq!(running, 0, "a stopped worker must leave no job running");
+    });
 }
 
 async fn wait_for_count(counter: &std::sync::atomic::AtomicUsize, expected: usize) {

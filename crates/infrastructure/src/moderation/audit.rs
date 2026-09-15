@@ -22,6 +22,11 @@ impl SqlxAuditLogReader {
 #[async_trait]
 impl AuditLogReader for SqlxAuditLogReader {
     async fn list(&self, filter: AuditFilter) -> Result<AuditPage, AuditError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("audit.list", e))?;
         let limit = filter.limit.clamp(1, 100);
         let mut sql = String::from(
             "SELECT id, actor_user_id, action, target_type, target_id, result, metadata, created_at \
@@ -72,7 +77,7 @@ impl AuditLogReader for SqlxAuditLogReader {
         }
 
         let rows = query
-            .fetch_all(self.db.pool())
+            .fetch_all(&mut *conn)
             .await
             .map_err(|e| db_err("audit.list", e))?;
         use sqlx::Row;

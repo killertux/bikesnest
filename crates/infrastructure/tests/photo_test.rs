@@ -9,12 +9,8 @@ use bikesnest_domain::{PhotoDimensions, PhotoLimits, UserId};
 use bikesnest_infrastructure::{
     Db, LocalImageProcessor, SqlxParkingPhotoReader, SqlxPhotoRepository,
 };
-use bikesnest_test_support::{ParkingBuilder, UserBuilder, db_test, pool};
+use bikesnest_test_support::{ParkingBuilder, UserBuilder, db_test};
 use sqlx::Row;
-
-async fn db() -> Db {
-    Db::from_pool(pool().await)
-}
 
 // ---------------------------------------------------------------------------
 // Processor (no DB)
@@ -194,7 +190,7 @@ fn decode_jpeg_dims(bytes: &[u8]) -> (u32, u32) {
 }
 
 // ---------------------------------------------------------------------------
-// Repository (real Postgres, committed-fixture + cleanup)
+// Repository (real Postgres, shared rollback scope for fixtures and adapters)
 // ---------------------------------------------------------------------------
 
 struct Fixture {
@@ -203,68 +199,31 @@ struct Fixture {
     /// requires a real user row).
     moderator_id: UserId,
     location_id: i64,
-    email: String,
-    tag: String,
 }
 
-/// Create a committed user + moderator + location and return ids for cleanup.
-async fn fresh_fixture(tx: &mut bikesnest_test_support::TestTx, email: &str) -> Fixture {
-    let pool = pool().await;
-    let tag = format!("photo-fixture-{email}");
+/// Create users and location inside the same scope the repositories receive.
+async fn fresh_fixture(db: &Db, email: &str) -> Fixture {
+    let mut conn = db.acquire().await.unwrap();
     let moderator_email = format!("mod-{email}");
-    // Clean leftovers from a prior identical run.
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(&tag)
-        .execute(&pool)
-        .await
-        .unwrap();
-    for e in [email, moderator_email.as_str()] {
-        sqlx::query("DELETE FROM users WHERE email = $1")
-            .bind(e)
-            .execute(&pool)
-            .await
-            .unwrap();
-    }
-
     let user = UserBuilder::new()
         .with_email(email)
-        .create(tx.executor())
+        .create(&mut *conn)
         .await
         .unwrap();
     let moderator = UserBuilder::new()
         .with_email(&moderator_email)
-        .create(tx.executor())
+        .create(&mut *conn)
         .await
         .unwrap();
     let location = ParkingBuilder::new()
-        .with_fixture_tag(tag.clone())
         .with_name(format!("Photo Test Location {email}"))
-        .create(tx.executor())
+        .create(&mut conn)
         .await
         .unwrap();
-    tx.commit_fixture().await;
     Fixture {
         user_id: user.id,
         moderator_id: moderator.id,
         location_id: location.id(),
-        email: email.to_string(),
-        tag,
-    }
-}
-
-async fn cleanup(fx: &Fixture) {
-    let pool = pool().await;
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(&fx.tag)
-        .execute(&pool)
-        .await
-        .unwrap();
-    for e in [&fx.email, &format!("mod-{}", fx.email)] {
-        sqlx::query("DELETE FROM users WHERE email = $1")
-            .bind(e)
-            .execute(&pool)
-            .await
-            .unwrap();
     }
 }
 
@@ -289,8 +248,9 @@ fn new_pending(fx: &Fixture, slug: &str) -> NewPendingPhoto {
 
 #[db_test]
 async fn repo_insert_pending_creates_pending_row(tx: &mut bikesnest_test_support::TestTx) {
-    let fx = fresh_fixture(tx, "photo-insert@example.com").await;
-    let repo = SqlxPhotoRepository::new(db().await);
+    let db = tx.db().await;
+    let fx = fresh_fixture(&db, "photo-insert@example.com").await;
+    let repo = SqlxPhotoRepository::new(db.clone());
     let id = repo
         .insert_pending(&new_pending(&fx, "insert"))
         .await
@@ -304,7 +264,7 @@ async fn repo_insert_pending_creates_pending_row(tx: &mut bikesnest_test_support
          uploader_id FROM parking_photo WHERE id = $1",
     )
     .bind(id)
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     assert_eq!(row.get::<String, _>("moderation_state"), "PENDING_REVIEW");
@@ -323,17 +283,31 @@ async fn repo_insert_pending_creates_pending_row(tx: &mut bikesnest_test_support
             .is_some()
     );
     assert_eq!(row.get::<Option<i64>, _>("uploader_id"), Some(fx.user_id.0));
-
-    cleanup(&fx).await;
 }
 
 #[db_test]
 async fn parking_photo_rejects_an_empty_storage_key(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
     // The CHECK from migration 0019: a row that names no object is not
     // representable, so the crash window the old two-step insert had cannot
     // reopen without this test failing.
-    let fx = fresh_fixture(tx, "photo-emptykey@example.com").await;
-    for table in ["parking_photo", "review_photo"] {
+    let fx = fresh_fixture(&db, "photo-emptykey@example.com").await;
+    let mut conn = db.acquire().await.unwrap();
+    let review_id: i64 = sqlx::query_scalar(
+        "INSERT INTO review(location_id,author_id,rating,body) VALUES($1,$2,4,'Photo fixture') RETURNING id",
+    )
+    .bind(fx.location_id)
+    .bind(fx.user_id.0)
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    for (table, parent_id) in [
+        ("parking_photo", fx.location_id),
+        ("review_photo", review_id),
+    ] {
+        // Each expected CHECK error aborts only its own savepoint. Real parent
+        // rows ensure a foreign-key failure cannot masquerade as this CHECK.
+        let mut savepoint = conn.begin().await.unwrap();
         let sql = if table == "parking_photo" {
             "INSERT INTO parking_photo (location_id, storage_key, content_type, position, \
              moderation_state) VALUES ($1, '', 'image/jpeg', 0, 'PENDING_REVIEW')"
@@ -342,24 +316,25 @@ async fn parking_photo_rejects_an_empty_storage_key(tx: &mut bikesnest_test_supp
              VALUES ($1, '', 0, 'PENDING_REVIEW')"
         };
         let err = sqlx::query(sql)
-            .bind(fx.location_id)
-            .execute(&pool().await)
+            .bind(parent_id)
+            .execute(&mut *savepoint)
             .await
             .expect_err("an empty storage_key must be rejected");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("storage_key_nonempty") || msg.contains("violates"),
-            "{table}: expected the CHECK to fire, got: {msg}"
+        let error = err.as_database_error().expect("database constraint error");
+        assert_eq!(error.code().as_deref(), Some("23514"));
+        assert_eq!(
+            error.constraint(),
+            Some(format!("{table}_storage_key_nonempty").as_str())
         );
+        savepoint.rollback().await.unwrap();
     }
-
-    cleanup(&fx).await;
 }
 
 #[db_test]
 async fn repo_approve_sets_position_and_reviewer(tx: &mut bikesnest_test_support::TestTx) {
-    let fx = fresh_fixture(tx, "photo-approve@example.com").await;
-    let repo = SqlxPhotoRepository::new(db().await);
+    let db = tx.db().await;
+    let fx = fresh_fixture(&db, "photo-approve@example.com").await;
+    let repo = SqlxPhotoRepository::new(db.clone());
     let id = repo
         .insert_pending(&new_pending(&fx, "approve"))
         .await
@@ -374,7 +349,7 @@ async fn repo_approve_sets_position_and_reviewer(tx: &mut bikesnest_test_support
         "SELECT moderation_state, position, reviewed_by FROM parking_photo WHERE id = $1",
     )
     .bind(id)
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     assert_eq!(row.get::<String, _>("moderation_state"), "APPROVED");
@@ -386,14 +361,13 @@ async fn repo_approve_sets_position_and_reviewer(tx: &mut bikesnest_test_support
         repo.approve(PhotoKind::Parking, id, moderator, 6).await,
         Err(PhotoError::NotPending)
     ));
-
-    cleanup(&fx).await;
 }
 
 #[db_test]
 async fn repo_reject_records_reason_and_returns_keys(tx: &mut bikesnest_test_support::TestTx) {
-    let fx = fresh_fixture(tx, "photo-reject@example.com").await;
-    let repo = SqlxPhotoRepository::new(db().await);
+    let db = tx.db().await;
+    let fx = fresh_fixture(&db, "photo-reject@example.com").await;
+    let repo = SqlxPhotoRepository::new(db.clone());
     let id = repo
         .insert_pending(&new_pending(&fx, "reject"))
         .await
@@ -414,7 +388,7 @@ async fn repo_reject_records_reason_and_returns_keys(tx: &mut bikesnest_test_sup
         "SELECT moderation_state, rejection_reason, reviewed_by FROM parking_photo WHERE id = $1",
     )
     .bind(id)
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     assert_eq!(row.get::<String, _>("moderation_state"), "REJECTED");
@@ -423,14 +397,13 @@ async fn repo_reject_records_reason_and_returns_keys(tx: &mut bikesnest_test_sup
         Some("unclear image"),
     );
     assert_eq!(row.get::<Option<i64>, _>("reviewed_by"), Some(moderator.0));
-
-    cleanup(&fx).await;
 }
 
 #[db_test]
 async fn repo_max_position_and_queue_ordering(tx: &mut bikesnest_test_support::TestTx) {
-    let fx = fresh_fixture(tx, "photo-order@example.com").await;
-    let repo = SqlxPhotoRepository::new(db().await);
+    let db = tx.db().await;
+    let fx = fresh_fixture(&db, "photo-order@example.com").await;
+    let repo = SqlxPhotoRepository::new(db.clone());
 
     assert_eq!(
         repo.max_position(PhotoTarget::Parking(fx.location_id))
@@ -454,22 +427,22 @@ async fn repo_max_position_and_queue_ordering(tx: &mut bikesnest_test_support::T
         0
     );
 
-    // Both fixture photos must appear in the queue (it may also hold other
-    // tests' pending rows — DB is shared), oldest first relative to each other.
+    // Both scoped fixture photos appear oldest first relative to each other.
+    // Unrelated committed baseline rows may exist; concurrent scoped fixtures
+    // are invisible to this transaction.
     let list = repo.list_pending(None, 200).await.unwrap();
     let ids: Vec<i64> = list.iter().map(|p| p.id).collect();
     assert!(ids.contains(&first) && ids.contains(&second));
     let i_first = ids.iter().position(|&i| i == first).unwrap();
     let i_second = ids.iter().position(|&i| i == second).unwrap();
     assert!(i_first < i_second, "first upload must come before second");
-
-    cleanup(&fx).await;
 }
 
 #[db_test]
 async fn reader_returns_thumbnail_key_for_processed_photo(tx: &mut bikesnest_test_support::TestTx) {
-    let fx = fresh_fixture(tx, "photo-thumb@example.com").await;
-    let repo = SqlxPhotoRepository::new(db().await);
+    let db = tx.db().await;
+    let fx = fresh_fixture(&db, "photo-thumb@example.com").await;
+    let repo = SqlxPhotoRepository::new(db.clone());
     let id = repo
         .insert_pending(&new_pending(&fx, "thumb"))
         .await
@@ -479,7 +452,7 @@ async fn reader_returns_thumbnail_key_for_processed_photo(tx: &mut bikesnest_tes
         .await
         .unwrap();
 
-    let reader = SqlxParkingPhotoReader::new(db().await);
+    let reader = SqlxParkingPhotoReader::new(db.clone());
     let photos = reader.photos(fx.location_id).await.unwrap();
     let p = photos
         .iter()
@@ -487,6 +460,4 @@ async fn reader_returns_thumbnail_key_for_processed_photo(tx: &mut bikesnest_tes
         .expect("photo");
     assert_eq!(p.key, "uploads/thumb/full.jpg");
     assert_eq!(p.thumbnail_key.as_deref(), Some("uploads/thumb/thumb.jpg"));
-
-    cleanup(&fx).await;
 }

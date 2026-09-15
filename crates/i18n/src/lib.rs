@@ -2171,15 +2171,19 @@ mod tests {
         }
     }
 
-    /// Every body must keep the `{link}` placeholder the renderer substitutes;
-    /// losing it would send a verification mail with no way to verify.
+    /// Credential copy remains separate from the action URL. The renderer owns
+    /// adding the exact queued link to both the plain-text and HTML alternatives,
+    /// so catalog text must not carry a stale placeholder or hard-coded URL.
     #[test]
-    fn email_bodies_keep_the_link_placeholder() {
+    fn email_credential_bodies_do_not_embed_action_links() {
         for key in ["email.verify.body", "email.reset.body", "email.change.body"] {
             for locale in [Locale::En, Locale::PtBr] {
+                let body = msg(locale, key);
                 assert!(
-                    msg(locale, key).contains("{link}"),
-                    "{key} lost its {{link}} placeholder for {}",
+                    !body.contains("{link}")
+                        && !body.contains("http://")
+                        && !body.contains("https://"),
+                    "{key} embeds an action link for {}",
                     locale.code()
                 );
             }

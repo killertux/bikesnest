@@ -357,7 +357,10 @@ Key modeling notes:
 
 - **Repository test isolation:** `Db` can explicitly wrap a test-owned SQLx
   transaction. `Db::acquire()` leases that connection, and nested SQLx
-  transactions become savepoints. Production still uses the ordinary pool.
+  transactions become savepoints. All ordinary repositories and real test
+  routers use this same acquisition seam; production-backed `Db` values still
+  acquire from their ordinary pool. The migration runner alone detaches a
+  connection so its timeout settings cannot return to request handling.
   Test-support awaits outer rollback (including after panic) and invalidates
   surviving handles. This is not a substitute for multi-connection race tests;
   those use a separately created disposable database through the bounded

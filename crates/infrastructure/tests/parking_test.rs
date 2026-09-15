@@ -1,25 +1,20 @@
-//! Real-PostgreSQL integration tests for the parking readers (–).
-//!
-//! The readers run on pool connections, which cannot see rows inside this
-//! test's transaction — so these tests use the **committed-fixture pattern**:
-//! rows are created via `ParkingBuilder` with a unique `seed_key` fixture tag,
-//! `tx.commit_fixture()` commits them, assertions run against the real
-//! readers, and the tag is deleted (at start and end) via the shared pool.
-//! Everything else in the suite still uses transaction-per-test rollback.
+//! Real-PostgreSQL parking-reader tests with rollback-scoped fixtures.
+//! Builders, direct SQL and readers share one injected Db; repository
+//! savepoint commits never publish fixture data to another test.
 
 use bikesnest_application::{
     BoundsPage, BoundsQuery, CostFilter, Cursor, Filters, ParkingDetailsReader, ParkingSummary,
     ReaderError, SearchInput, SearchPage, SearchParking, SearchRequest, SitemapReader, Sort,
 };
 use bikesnest_domain::{Cost, CurrencyCode, Money, ParkingType, PricingUnit};
-use bikesnest_test_support::{ParkingBuilder, db_test, pool};
+use bikesnest_infrastructure::Db;
+use bikesnest_test_support::{ParkingBuilder, db_test};
 
 /// Base origin: far from any seed data (Serra da Cantareira area).
 const ORIGIN: (f64, f64) = (-23.400_000, -46.600_000);
 
-/// Each test gets its own geographic patch (~5.5 km apart) so leftover
-/// fixture rows from a crashed run of another test never interfere:
-/// the largest test radius (1 km) cannot reach a neighboring patch.
+/// Geographically separated scenarios also avoid matching unrelated baseline
+/// rows; transaction rollback provides fixture isolation and cleanup.
 fn test_origin(k: f64) -> bikesnest_domain::GeoPoint {
     bikesnest_domain::GeoPoint::new(ORIGIN.0 + k * 0.05, ORIGIN.1).unwrap()
 }
@@ -40,15 +35,6 @@ fn request_at(k: f64, sort: Sort) -> SearchRequest {
         20,
         None,
     )
-}
-
-/// Deletes committed fixture rows for a test tag (via the shared pool).
-async fn cleanup_fixture(marker: &str) {
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(marker)
-        .execute(&pool().await)
-        .await
-        .expect("cleanup fixture");
 }
 
 /// A fixed instant (noon in São Paulo — clear of every fixture's hour
@@ -72,12 +58,12 @@ fn reader(db: bikesnest_infrastructure::Db) -> bikesnest_infrastructure::SqlxPar
 }
 
 async fn real_search(
+    db: &Db,
     request: &SearchRequest,
     limit: usize,
     apply_cursor: bool,
 ) -> Result<SearchPage, ReaderError> {
-    let db = bikesnest_infrastructure::Db::from_pool(pool().await);
-    reader(db)
+    reader(db.clone())
         .search_at(request, limit, apply_cursor, fixed_now())
         .await
 }
@@ -101,93 +87,76 @@ fn bounds_at(k: f64, half: f64, limit: usize) -> BoundsQuery {
     .expect("a valid test box")
 }
 
-async fn real_bounds(query: &BoundsQuery) -> Result<BoundsPage, ReaderError> {
-    let db = bikesnest_infrastructure::Db::from_pool(pool().await);
-    reader(db).in_bounds_at(query, fixed_now()).await
+async fn real_bounds(db: &Db, query: &BoundsQuery) -> Result<BoundsPage, ReaderError> {
+    reader(db.clone()).in_bounds_at(query, fixed_now()).await
 }
 
-async fn real_details(id: i64) -> Result<Option<bikesnest_domain::ParkingLocation>, ReaderError> {
-    let db = bikesnest_infrastructure::Db::from_pool(pool().await);
-    bikesnest_infrastructure::SqlxParkingDetailsReader::new(db)
+async fn real_details(
+    db: &Db,
+    id: i64,
+) -> Result<Option<bikesnest_domain::ParkingLocation>, ReaderError> {
+    bikesnest_infrastructure::SqlxParkingDetailsReader::new(db.clone())
         .details(id)
         .await
 }
 
 #[db_test]
 async fn within_radius_ordered_by_distance_with_correct_total(tx: &mut TestTx) {
-    const MARK: &str = "fix-within-radius";
-    cleanup_fixture(MARK).await;
-    let conn = tx.executor();
+    let db = tx.db().await;
+    let mut conn = db.acquire().await.unwrap();
     at(1.0, 100.0)
-        .with_fixture_tag(MARK)
         .with_name("A 100m")
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
     at(1.0, 300.0)
-        .with_fixture_tag(MARK)
         .with_name("B 300m")
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
     at(1.0, 2000.0)
-        .with_fixture_tag(MARK)
         .with_name("C 2km")
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
-    tx.commit_fixture().await;
+    drop(conn);
 
     let mut req = request_at(1.0, Sort::Distance);
     req.radius_m = 500;
-    let page = real_search(&req, 20, false).await.unwrap();
+    let page = real_search(&db, &req, 20, false).await.unwrap();
     assert_eq!(page.items.len(), 2, "2km location is outside the radius");
     assert_eq!(page.total, 2);
     assert_eq!(page.items[0].name, "A 100m");
     assert_eq!(page.items[1].name, "B 300m");
     assert!(page.items[0].distance_m < page.items[1].distance_m);
-    cleanup_fixture(MARK).await;
 }
 
 #[db_test]
 async fn radius_filter_excludes_far_locations(tx: &mut TestTx) {
-    const MARK: &str = "fix-radius";
-    cleanup_fixture(MARK).await;
-    let conn = tx.executor();
-    at(2.0, 50.0)
-        .with_fixture_tag(MARK)
-        .create(&mut *conn)
-        .await
-        .unwrap();
-    at(2.0, 1500.0)
-        .with_fixture_tag(MARK)
-        .create(&mut *conn)
-        .await
-        .unwrap();
-    tx.commit_fixture().await;
+    let db = tx.db().await;
+    let mut conn = db.acquire().await.unwrap();
+    at(2.0, 50.0).create(&mut conn).await.unwrap();
+    at(2.0, 1500.0).create(&mut conn).await.unwrap();
+    drop(conn);
 
     let mut req = request_at(2.0, Sort::Distance);
     req.radius_m = 250;
-    let page = real_search(&req, 20, false).await.unwrap();
+    let page = real_search(&db, &req, 20, false).await.unwrap();
     assert_eq!(page.total, 1);
     assert!(page.items[0].distance_m < 60.0);
-    cleanup_fixture(MARK).await;
 }
 
 #[db_test]
 async fn cost_type_and_security_filters_apply(tx: &mut TestTx) {
-    const MARK: &str = "fix-filters";
-    cleanup_fixture(MARK).await;
-    let conn = tx.executor();
+    let db = tx.db().await;
+    let mut conn = db.acquire().await.unwrap();
     at(3.0, 30.0)
-        .with_fixture_tag(MARK)
         .with_type(ParkingType::Rack)
         .with_security("cctv", 1)
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
     at(3.0, 60.0)
-        .with_fixture_tag(MARK)
         .with_cost(Cost::Paid {
             price: Some(Money::new(
                 500,
@@ -196,65 +165,60 @@ async fn cost_type_and_security_filters_apply(tx: &mut TestTx) {
             )),
         })
         .with_type(ParkingType::Locker)
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
     at(3.0, 90.0)
-        .with_fixture_tag(MARK)
         .with_type(ParkingType::Rack)
         .with_cost(Cost::Unknown)
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
-    tx.commit_fixture().await;
+    drop(conn);
 
     let mut req = request_at(3.0, Sort::Distance);
     req.radius_m = 250;
 
     // Cost filter: free only.
     req.filters.cost = Some(CostFilter::Free);
-    let page = real_search(&req, 20, false).await.unwrap();
+    let page = real_search(&db, &req, 20, false).await.unwrap();
     assert_eq!(page.total, 1);
     assert_eq!(page.items[0].cost.kind_code(), "free");
 
     // Type filter: rack only (free + unknown-cost racks).
     req.filters.cost = None;
     req.filters.types = vec![ParkingType::Rack];
-    let page = real_search(&req, 20, false).await.unwrap();
+    let page = real_search(&db, &req, 20, false).await.unwrap();
     assert_eq!(page.total, 2);
 
     // Security all-of: cctv=yes required.
     req.filters.types.clear();
     req.filters.security_all = vec!["cctv".to_string()];
-    let page = real_search(&req, 20, false).await.unwrap();
+    let page = real_search(&db, &req, 20, false).await.unwrap();
     assert_eq!(page.total, 1);
     assert!(page.items[0].security_yes.contains(&"cctv".to_string()));
 
     // Security all-of with two required features → none match.
     req.filters.security_all = vec!["cctv".to_string(), "security_guard".to_string()];
-    let page = real_search(&req, 20, false).await.unwrap();
+    let page = real_search(&db, &req, 20, false).await.unwrap();
     assert_eq!(page.total, 0);
-    cleanup_fixture(MARK).await;
 }
 
 #[db_test]
 async fn open_now_filter_agrees_with_domain_for_all_day_hours(tx: &mut TestTx) {
-    const MARK: &str = "fix-open-now";
-    cleanup_fixture(MARK).await;
-    let conn = tx.executor();
+    let db = tx.db().await;
+    let mut conn = db.acquire().await.unwrap();
     let all_day = at(4.0, 30.0)
-        .with_fixture_tag(MARK)
         .with_all_day_hours(1..=7)
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
     let narrow = at(4.0, 60.0)
-        .with_fixture_tag(MARK)
         .with_hours(1..=7, (3, 0), (4, 0)) // open only 03:00–04:00 local
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
-    tx.commit_fixture().await;
+    drop(conn);
 
     // Pinned to noon in São Paulo (Tue 2026-03-10) — clear of the narrow
     // 03:00-04:00 window regardless of when the suite itself runs, and
@@ -271,65 +235,49 @@ async fn open_now_filter_agrees_with_domain_for_all_day_hours(tx: &mut TestTx) {
 
     let mut req = request_at(4.0, Sort::Distance);
     req.filters.open_now = true;
-    let page = search_at(&req, now).await.unwrap();
+    let page = search_at(&db, &req, now).await.unwrap();
     assert_eq!(page.total, 1);
     assert!(
         page.items[0].is_open_now,
         "all-day location must be open now"
     );
-    cleanup_fixture(MARK).await;
 }
 
 #[db_test]
 async fn non_active_locations_are_hidden_from_search(tx: &mut TestTx) {
-    const MARK: &str = "fix-moderation";
-    cleanup_fixture(MARK).await;
-    let conn = tx.executor();
+    let db = tx.db().await;
+    let mut conn = db.acquire().await.unwrap();
     at(5.0, 30.0)
-        .with_fixture_tag(MARK)
         .with_moderation_state("INVALID")
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
-    at(5.0, 60.0)
-        .with_fixture_tag(MARK)
-        .create(&mut *conn)
-        .await
-        .unwrap();
-    tx.commit_fixture().await;
+    at(5.0, 60.0).create(&mut conn).await.unwrap();
+    drop(conn);
 
-    let page = real_search(&request_at(5.0, Sort::Distance), 20, false)
+    let page = real_search(&db, &request_at(5.0, Sort::Distance), 20, false)
         .await
         .unwrap();
     assert_eq!(page.total, 1);
-    cleanup_fixture(MARK).await;
 }
 
 #[db_test]
 async fn the_sitemap_reader_lists_only_active_ids(tx: &mut TestTx) {
-    const MARK: &str = "fix-sitemap";
-    cleanup_fixture(MARK).await;
-    let conn = tx.executor();
-    let active = at(5.5, 30.0)
-        .with_fixture_tag(MARK)
-        .create(&mut *conn)
-        .await
-        .unwrap();
+    let db = tx.db().await;
+    let mut conn = db.acquire().await.unwrap();
+    let active = at(5.5, 30.0).create(&mut conn).await.unwrap();
     let invalid = at(5.5, 60.0)
-        .with_fixture_tag(MARK)
         .with_moderation_state("INVALID")
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
     let pending = at(5.5, 90.0)
-        .with_fixture_tag(MARK)
         .with_moderation_state("PENDING_REVIEW")
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
-    tx.commit_fixture().await;
+    drop(conn);
 
-    let db = bikesnest_infrastructure::Db::from_pool(pool().await);
     let ids = bikesnest_infrastructure::SqlxSitemapReader::new(db)
         .active_parking_ids()
         .await
@@ -343,27 +291,21 @@ async fn the_sitemap_reader_lists_only_active_ids(tx: &mut TestTx) {
     let mut sorted = ids.clone();
     sorted.sort_unstable();
     assert_eq!(ids, sorted, "the order is stable (by id)");
-    cleanup_fixture(MARK).await;
 }
 
 #[db_test]
 async fn keyset_pagination_is_stable_across_inserts(tx: &mut TestTx) {
-    const MARK: &str = "fix-keyset";
-    cleanup_fixture(MARK).await;
-    let conn = tx.executor();
+    let db = tx.db().await;
+    let mut conn = db.acquire().await.unwrap();
     for m in 1..=25 {
-        at(6.0, m as f64 * 10.0)
-            .with_fixture_tag(MARK)
-            .create(&mut *conn)
-            .await
-            .unwrap();
+        at(6.0, m as f64 * 10.0).create(&mut conn).await.unwrap();
     }
-    tx.commit_fixture().await;
+    drop(conn);
 
     let mut req = request_at(6.0, Sort::Distance);
     let mut seen: Vec<i64> = Vec::new();
     for _ in 0..8 {
-        let page = real_search(&req, 5, true).await.unwrap(); // page of 4 + lookahead
+        let page = real_search(&db, &req, 5, true).await.unwrap(); // page of 4 + lookahead
         for item in &page.items {
             assert!(!seen.contains(&item.id), "duplicate id across pages");
             seen.push(item.id);
@@ -386,54 +328,46 @@ async fn keyset_pagination_is_stable_across_inserts(tx: &mut TestTx) {
         });
     }
     assert_eq!(seen.len(), 25, "all 25 items paginated exactly once");
-    cleanup_fixture(MARK).await;
 }
 
 #[db_test]
 async fn rating_and_recently_verified_sorts_work(tx: &mut TestTx) {
-    const MARK: &str = "fix-sorts";
-    cleanup_fixture(MARK).await;
-    let conn = tx.executor();
+    let db = tx.db().await;
+    let mut conn = db.acquire().await.unwrap();
     at(7.0, 30.0)
-        .with_fixture_tag(MARK)
         .with_rating(3.0, 2)
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
     at(7.0, 60.0)
-        .with_fixture_tag(MARK)
         .with_rating(4.9, 10)
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
     at(7.0, 90.0)
-        .with_fixture_tag(MARK)
         .never_verified()
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
-    tx.commit_fixture().await;
+    drop(conn);
 
-    let page = real_search(&request_at(7.0, Sort::Rating), 20, false)
+    let page = real_search(&db, &request_at(7.0, Sort::Rating), 20, false)
         .await
         .unwrap();
     assert!(page.items[0].rating.avg().unwrap() > page.items[1].rating.avg().unwrap());
 
     // Recently verified: never-verified item sorts last (key 0).
-    let page = real_search(&request_at(7.0, Sort::RecentlyVerified), 20, false)
+    let page = real_search(&db, &request_at(7.0, Sort::RecentlyVerified), 20, false)
         .await
         .unwrap();
     assert!(page.items[2].last_verified_at.is_none());
-    cleanup_fixture(MARK).await;
 }
 
 #[db_test]
 async fn details_assemble_the_full_aggregate(tx: &mut TestTx) {
-    const MARK: &str = "fix-details";
-    cleanup_fixture(MARK).await;
-    let conn = tx.executor();
+    let db = tx.db().await;
+    let mut conn = db.acquire().await.unwrap();
     let created = at(8.0, 30.0)
-        .with_fixture_tag(MARK)
         .with_name("Detalhe Completo")
         .with_cost(Cost::Paid {
             price: Some(Money::new(
@@ -449,12 +383,15 @@ async fn details_assemble_the_full_aggregate(tx: &mut TestTx) {
         .with_security("staffed", 0) // explicitly unknown
         .with_rating(4.2, 5)
         .verified_days_ago(100)
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
-    tx.commit_fixture().await;
+    drop(conn);
 
-    let details = real_details(created.id()).await.unwrap().expect("found");
+    let details = real_details(&db, created.id())
+        .await
+        .unwrap()
+        .expect("found");
     assert_eq!(details.name(), "Detalhe Completo");
     assert_eq!(details.parking_type(), ParkingType::Secured);
     match details.cost() {
@@ -505,49 +442,43 @@ async fn details_assemble_the_full_aggregate(tx: &mut TestTx) {
         "every catalog feature recorded"
     );
     assert_eq!(details.security_yes_count(), 1);
-    cleanup_fixture(MARK).await;
 }
 
 #[db_test]
 async fn unknown_hours_map_to_opening_hours_unknown(tx: &mut TestTx) {
-    let conn = tx.executor();
-    const MARK: &str = "fix-unknown-hours";
-    cleanup_fixture(MARK).await;
+    let db = tx.db().await;
+    let mut conn = db.acquire().await.unwrap();
     let created = at(9.0, 30.0)
-        .with_fixture_tag(MARK)
         .with_unknown_hours()
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
-    tx.commit_fixture().await;
-    let details = real_details(created.id()).await.unwrap().unwrap();
+    drop(conn);
+    let details = real_details(&db, created.id()).await.unwrap().unwrap();
     assert!(details.hours().is_unknown());
-    cleanup_fixture(MARK).await;
 }
 
 #[db_test]
-async fn details_of_missing_id_is_none(_tx: &mut TestTx) {
-    assert!(real_details(987_654_321).await.unwrap().is_none());
+async fn details_of_missing_id_is_none(tx: &mut TestTx) {
+    let db = tx.db().await;
+    assert!(real_details(&db, 987_654_321).await.unwrap().is_none());
 }
 
 #[db_test]
 async fn invalid_type_code_is_reported_not_silently_mapped(tx: &mut TestTx) {
-    const MARK: &str = "fix-badtype";
-    cleanup_fixture(MARK).await;
-    let conn = tx.executor();
+    let db = tx.db().await;
+    let mut conn = db.acquire().await.unwrap();
     let id: (i64,) = sqlx::query_as(
-        "INSERT INTO parking_location (name, address, parking_type, cost_kind, location, timezone, seed_key) VALUES ('x','y','flying_carpet','free', ST_SetSRID(ST_MakePoint(-46.6,-23.4),4326)::geography, 'America/Sao_Paulo', $1) RETURNING id",
+        "INSERT INTO parking_location (name, address, parking_type, cost_kind, location, timezone) VALUES ('x','y','flying_carpet','free', ST_SetSRID(ST_MakePoint(-46.6,-23.4),4326)::geography, 'America/Sao_Paulo') RETURNING id",
     )
-    .bind(MARK)
     .fetch_one(&mut *conn)
     .await
     .unwrap();
-    tx.commit_fixture().await;
+    drop(conn);
     let _ = test_origin(10.0);
 
-    let err = real_details(id.0).await.unwrap_err();
+    let err = real_details(&db, id.0).await.unwrap_err();
     assert!(matches!(err, ReaderError::Unexpected(msg) if msg.contains("flying_carpet")));
-    cleanup_fixture(MARK).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -557,16 +488,16 @@ async fn invalid_type_code_is_reported_not_silently_mapped(tx: &mut TestTx) {
 /// The search evaluated at a pinned instant, so the SQL wall-clock arithmetic
 /// and `OpeningHours::status_at` can be compared on the same input.
 async fn search_at(
+    db: &Db,
     request: &SearchRequest,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<SearchPage, ReaderError> {
-    let db = bikesnest_infrastructure::Db::from_pool(pool().await);
-    reader(db).search_at(request, 20, false, now).await
+    reader(db.clone()).search_at(request, 20, false, now).await
 }
 
 /// `is_open_now` for the single fixture living in test patch `k`.
-async fn sql_open_now(k: f64, now: chrono::DateTime<chrono::Utc>) -> bool {
-    let page = search_at(&request_at(k, Sort::Distance), now)
+async fn sql_open_now(db: &Db, k: f64, now: chrono::DateTime<chrono::Utc>) -> bool {
+    let page = search_at(db, &request_at(k, Sort::Distance), now)
         .await
         .unwrap();
     assert_eq!(page.items.len(), 1, "patch {k} holds exactly one fixture");
@@ -600,22 +531,20 @@ fn utc_at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> chrono::DateTime<chrono::
 
 #[db_test]
 async fn open_now_flag_matches_the_domain_on_a_same_day_range(tx: &mut TestTx) {
-    const MARK: &str = "fix-open-same-day";
-    cleanup_fixture(MARK).await;
-    let conn = tx.executor();
+    let db = tx.db().await;
+    let mut conn = db.acquire().await.unwrap();
     let spot = at(11.0, 30.0)
-        .with_fixture_tag(MARK)
         .with_hours(1..=7, (8, 0), (18, 0))
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
-    tx.commit_fixture().await;
+    drop(conn);
 
     // Tue 2026-03-10, São Paulo (UTC-3). Both edges of the range, both sides.
     for (h, min, expected) in [(7, 59, false), (8, 0, true), (17, 59, true), (18, 0, false)] {
         let now = instant_at("America/Sao_Paulo", 2026, 3, 10, h, min);
         assert_eq!(
-            sql_open_now(11.0, now).await,
+            sql_open_now(&db, 11.0, now).await,
             expected,
             "SQL at {h:02}:{min:02} local"
         );
@@ -625,50 +554,48 @@ async fn open_now_flag_matches_the_domain_on_a_same_day_range(tx: &mut TestTx) {
             "domain at {h:02}:{min:02} local"
         );
     }
-    cleanup_fixture(MARK).await;
 }
 
 #[db_test]
 async fn open_now_flag_matches_the_domain_across_an_overnight_range(tx: &mut TestTx) {
-    const MARK: &str = "fix-open-overnight";
-    cleanup_fixture(MARK).await;
-    let conn = tx.executor();
+    let db = tx.db().await;
+    let mut conn = db.acquire().await.unwrap();
     // 22:00 → 02:00: the row belongs to one day but runs into the next.
     let spot = at(12.0, 30.0)
-        .with_fixture_tag(MARK)
         .with_hours(1..=7, (22, 0), (2, 0))
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
-    tx.commit_fixture().await;
+    drop(conn);
 
     for (h, expected) in [(21, false), (23, true), (1, true), (3, false)] {
         let now = instant_at("America/Sao_Paulo", 2026, 3, 10, h, 0);
-        assert_eq!(sql_open_now(12.0, now).await, expected, "SQL at {h:02}:00");
+        assert_eq!(
+            sql_open_now(&db, 12.0, now).await,
+            expected,
+            "SQL at {h:02}:00"
+        );
         assert_eq!(domain_open_now(&spot, now), expected, "domain at {h:02}:00");
     }
-    cleanup_fixture(MARK).await;
 }
 
 #[db_test]
 async fn open_now_flag_matches_the_domain_across_a_dst_transition(tx: &mut TestTx) {
-    const MARK: &str = "fix-open-dst";
-    cleanup_fixture(MARK).await;
-    let conn = tx.executor();
+    let db = tx.db().await;
+    let mut conn = db.acquire().await.unwrap();
     // New York springs forward 2026-03-08 at 02:00 local (07:00 UTC).
     let spot = at(13.0, 30.0)
-        .with_fixture_tag(MARK)
         .with_timezone("America/New_York")
         .with_hours(1..=7, (3, 0), (6, 0))
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
-    tx.commit_fixture().await;
+    drop(conn);
 
     // 06:30 UTC is still EST → 01:30 local, before opening.
     let before = utc_at(2026, 3, 8, 6, 30);
     assert!(
-        !sql_open_now(13.0, before).await,
+        !sql_open_now(&db, 13.0, before).await,
         "SQL before the transition"
     );
     assert!(
@@ -678,41 +605,39 @@ async fn open_now_flag_matches_the_domain_across_a_dst_transition(tx: &mut TestT
 
     // 07:30 UTC is EDT → 03:30 local, inside the range.
     let after = utc_at(2026, 3, 8, 7, 30);
-    assert!(sql_open_now(13.0, after).await, "SQL after the transition");
+    assert!(
+        sql_open_now(&db, 13.0, after).await,
+        "SQL after the transition"
+    );
     assert!(domain_open_now(&spot, after), "domain after the transition");
-    cleanup_fixture(MARK).await;
 }
 
 #[db_test]
 async fn open_now_filter_uses_the_same_rule_as_the_flag(tx: &mut TestTx) {
-    const MARK: &str = "fix-open-filter";
-    cleanup_fixture(MARK).await;
-    let conn = tx.executor();
+    let db = tx.db().await;
+    let mut conn = db.acquire().await.unwrap();
     at(14.0, 30.0)
-        .with_fixture_tag(MARK)
         .with_name("Overnight")
         .with_hours(1..=7, (22, 0), (2, 0))
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
     at(14.0, 60.0)
-        .with_fixture_tag(MARK)
         .with_name("Daytime")
         .with_hours(1..=7, (8, 0), (18, 0))
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
-    tx.commit_fixture().await;
+    drop(conn);
 
     let mut req = request_at(14.0, Sort::Distance);
     req.filters.open_now = true;
     // 23:00 in São Paulo: only the overnight location is open.
     let now = instant_at("America/Sao_Paulo", 2026, 3, 10, 23, 0);
-    let page = search_at(&req, now).await.unwrap();
+    let page = search_at(&db, &req, now).await.unwrap();
     assert_eq!(page.total, 1);
     assert_eq!(page.items[0].name, "Overnight");
     assert!(page.items[0].is_open_now);
-    cleanup_fixture(MARK).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -721,18 +646,16 @@ async fn open_now_filter_uses_the_same_rule_as_the_flag(tx: &mut TestTx) {
 
 /// The real use case over the real reader: it is the use case that turns a
 /// row's sort key into the next cursor, so the round trip is what matters.
-async fn search_use_case() -> SearchParking {
-    let db = bikesnest_infrastructure::Db::from_pool(pool().await);
+fn search_use_case(db: &Db) -> SearchParking {
     SearchParking::new(
         Box::new(bikesnest_infrastructure::FakeGeocoder),
-        Box::new(reader(db)),
+        Box::new(reader(db.clone())),
     )
 }
 
-async fn page_of(k: f64, sort: &str, cursor: Option<String>) -> SearchPage {
+async fn page_of(db: &Db, k: f64, sort: &str, cursor: Option<String>) -> SearchPage {
     let origin = test_origin(k);
-    let (page, _) = search_use_case()
-        .await
+    let (page, _) = search_use_case(db)
         .execute(SearchInput {
             lat: Some(origin.lat()),
             lon: Some(origin.lon()),
@@ -759,15 +682,15 @@ const SORTS: [&str; 5] = [
 
 /// Walks both pages of a 25-row patch and returns the rows in page order,
 /// asserting the page shapes and that the two pages are disjoint.
-async fn both_pages(k: f64, sort: &str) -> Vec<ParkingSummary> {
-    let mut first = page_of(k, sort, None).await;
+async fn both_pages(db: &Db, k: f64, sort: &str) -> Vec<ParkingSummary> {
+    let mut first = page_of(db, k, sort, None).await;
     assert_eq!(first.items.len(), 20, "{sort}: full first page");
     assert_eq!(first.total, 25, "{sort}: total counts every match");
     let cursor = first
         .next_cursor
         .unwrap_or_else(|| panic!("{sort}: a second page exists"));
 
-    let second = page_of(k, sort, Some(cursor.encode())).await;
+    let second = page_of(db, k, sort, Some(cursor.encode())).await;
     assert_eq!(
         second.items.len(),
         5,
@@ -788,20 +711,18 @@ async fn both_pages(k: f64, sort: &str) -> Vec<ParkingSummary> {
 
 #[db_test]
 async fn recently_verified_pages_advance_instead_of_repeating(tx: &mut TestTx) {
-    const MARK: &str = "fix-verified-paging";
-    cleanup_fixture(MARK).await;
-    let conn = tx.executor();
+    let db = tx.db().await;
+    let mut conn = db.acquire().await.unwrap();
     for m in 1..=25 {
         at(15.0, f64::from(m) * 10.0)
-            .with_fixture_tag(MARK)
             .verified_days_ago(i64::from(m))
-            .create(&mut *conn)
+            .create(&mut conn)
             .await
             .unwrap();
     }
-    tx.commit_fixture().await;
+    drop(conn);
 
-    let by_verification = both_pages(15.0, "recently_verified").await;
+    let by_verification = both_pages(&db, 15.0, "recently_verified").await;
     let verified: Vec<_> = by_verification.iter().map(|i| i.last_verified_at).collect();
     assert!(
         verified.windows(2).all(|w| w[0] >= w[1]),
@@ -809,14 +730,13 @@ async fn recently_verified_pages_advance_instead_of_repeating(tx: &mut TestTx) {
     );
 
     // The distance sort paginates over the same fixture.
-    let by_distance = both_pages(15.0, "distance").await;
+    let by_distance = both_pages(&db, 15.0, "distance").await;
     assert!(
         by_distance
             .windows(2)
             .all(|w| w[0].distance_m <= w[1].distance_m),
         "distances ascend across the page boundary"
     );
-    cleanup_fixture(MARK).await;
 }
 
 /// The five sorts, on one 25-row patch: two pages each, disjoint, strictly
@@ -828,12 +748,10 @@ async fn recently_verified_pages_advance_instead_of_repeating(tx: &mut TestTx) {
 /// no query had produced.
 #[db_test]
 async fn every_sort_pages_disjointly_and_deterministically(tx: &mut TestTx) {
-    const MARK: &str = "fix-all-sorts";
-    cleanup_fixture(MARK).await;
-    let conn = tx.executor();
+    let db = tx.db().await;
+    let mut conn = db.acquire().await.unwrap();
     for m in 1..=25u32 {
         let mut spot = at(16.0, f64::from(m) * 10.0)
-            .with_fixture_tag(MARK)
             .with_name(format!("Spot {m:02}"))
             .verified_days_ago(i64::from(m) * 7)
             .with_rating(f64::from(1 + m % 5), i64::from(m));
@@ -842,12 +760,12 @@ async fn every_sort_pages_disjointly_and_deterministically(tx: &mut TestTx) {
         for code in ["cctv", "well_lit", "indoor"].iter().take((m % 4) as usize) {
             spot = spot.with_security(code, 1);
         }
-        spot.create(&mut *conn).await.unwrap();
+        spot.create(&mut conn).await.unwrap();
     }
-    tx.commit_fixture().await;
+    drop(conn);
 
     for sort in SORTS {
-        let rows = both_pages(16.0, sort).await;
+        let rows = both_pages(&db, 16.0, sort).await;
         let keys: Vec<(f64, i64)> = rows
             .iter()
             .map(|r| (r.sort_key.expect("every sort carries its key"), r.id))
@@ -857,7 +775,7 @@ async fn every_sort_pages_disjointly_and_deterministically(tx: &mut TestTx) {
             "{sort}: (key, id) strictly ascends across the page boundary"
         );
 
-        let again = page_of(16.0, sort, None).await;
+        let again = page_of(&db, 16.0, sort, None).await;
         assert_eq!(
             again.items.iter().map(|i| i.id).collect::<Vec<_>>(),
             rows[..20].iter().map(|i| i.id).collect::<Vec<_>>(),
@@ -871,7 +789,7 @@ async fn every_sort_pages_disjointly_and_deterministically(tx: &mut TestTx) {
             v: f64::MAX,
             id: i64::MAX,
         };
-        let empty = page_of(16.0, sort, Some(beyond.encode())).await;
+        let empty = page_of(&db, 16.0, sort, Some(beyond.encode())).await;
         assert!(empty.items.is_empty(), "{sort}: nothing past the end");
         assert_eq!(
             empty.total, 25,
@@ -879,7 +797,6 @@ async fn every_sort_pages_disjointly_and_deterministically(tx: &mut TestTx) {
         );
         assert!(empty.next_cursor.is_none());
     }
-    cleanup_fixture(MARK).await;
 }
 
 /// A security code no catalog knows is dropped rather than matched, so the
@@ -887,21 +804,15 @@ async fn every_sort_pages_disjointly_and_deterministically(tx: &mut TestTx) {
 /// returning nothing.
 #[db_test]
 async fn an_unknown_security_filter_code_is_ignored(tx: &mut TestTx) {
-    const MARK: &str = "fix-unknown-security";
-    cleanup_fixture(MARK).await;
-    let conn = tx.executor();
+    let db = tx.db().await;
+    let mut conn = db.acquire().await.unwrap();
     at(17.0, 30.0)
-        .with_fixture_tag(MARK)
         .with_security("cctv", 1)
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
-    at(17.0, 60.0)
-        .with_fixture_tag(MARK)
-        .create(&mut *conn)
-        .await
-        .unwrap();
-    tx.commit_fixture().await;
+    at(17.0, 60.0).create(&mut conn).await.unwrap();
+    drop(conn);
 
     let request = |codes: Vec<&str>| {
         SearchRequest::new(
@@ -917,8 +828,8 @@ async fn an_unknown_security_filter_code_is_ignored(tx: &mut TestTx) {
             None,
         )
     };
-    let unfiltered = real_search(&request(vec![]), 20, false).await.unwrap();
-    let unknown_only = real_search(&request(vec!["laser_fence"]), 20, false)
+    let unfiltered = real_search(&db, &request(vec![]), 20, false).await.unwrap();
+    let unknown_only = real_search(&db, &request(vec!["laser_fence"]), 20, false)
         .await
         .unwrap();
     assert_eq!(unknown_only.total, unfiltered.total);
@@ -928,11 +839,10 @@ async fn an_unknown_security_filter_code_is_ignored(tx: &mut TestTx) {
     );
 
     // A known code alongside it still applies.
-    let mixed = real_search(&request(vec!["laser_fence", "cctv"]), 20, false)
+    let mixed = real_search(&db, &request(vec!["laser_fence", "cctv"]), 20, false)
         .await
         .unwrap();
     assert_eq!(mixed.total, 1);
-    cleanup_fixture(MARK).await;
 }
 
 /// The recommendation score, transcribed from the SQL sort key back into
@@ -985,8 +895,7 @@ fn recommendation_score(
 /// lands on the boundary rather than near it.
 #[db_test]
 async fn the_recommended_sort_key_is_the_documented_score(tx: &mut TestTx) {
-    const MARK: &str = "fix-score-agreement";
-    cleanup_fixture(MARK).await;
+    let db = tx.db().await;
     let now = instant_at("America/Sao_Paulo", 2026, 3, 10, 12, 0);
     let thresholds = bikesnest_domain::DEFAULT_THRESHOLDS;
     let ages: [Option<i64>; 10] = [
@@ -1002,12 +911,10 @@ async fn the_recommended_sort_key_is_the_documented_score(tx: &mut TestTx) {
         Some(thresholds.stale_days),
     ];
 
-    let conn = tx.executor();
+    let mut conn = db.acquire().await.unwrap();
     let mut ids = Vec::new();
     for (i, age) in ages.iter().enumerate() {
-        let mut spot = at(18.0, 30.0 + i as f64 * 40.0)
-            .with_fixture_tag(MARK)
-            .with_name(format!("Score {i}"));
+        let mut spot = at(18.0, 30.0 + i as f64 * 40.0).with_name(format!("Score {i}"));
         // Vary the other three terms too, including their neutral defaults:
         // no rating and no confirmed attributes must score 0.5, not 0.
         if i % 3 == 1 {
@@ -1020,7 +927,7 @@ async fn the_recommended_sort_key_is_the_documented_score(tx: &mut TestTx) {
             None => spot.never_verified(),
             Some(days) => spot.verified_days_ago(*days),
         };
-        let created = spot.create(&mut *conn).await.unwrap();
+        let created = spot.create(&mut conn).await.unwrap();
         ids.push(created.id());
         // The builder dates verification from wall-clock `now()`; pin it to an
         // exact offset from the instant this search is evaluated at, or the
@@ -1037,9 +944,9 @@ async fn the_recommended_sort_key_is_the_documented_score(tx: &mut TestTx) {
             .unwrap();
         }
     }
-    tx.commit_fixture().await;
+    drop(conn);
 
-    let page = search_at(&request_at(18.0, Sort::Recommended), now)
+    let page = search_at(&db, &request_at(18.0, Sort::Recommended), now)
         .await
         .unwrap();
     assert_eq!(page.items.len(), ages.len(), "every fixture is in range");
@@ -1062,7 +969,6 @@ async fn the_recommended_sort_key_is_the_documented_score(tx: &mut TestTx) {
         keys.windows(2).all(|w| w[0] <= w[1]),
         "the best score comes first: the key is the negated score"
     );
-    cleanup_fixture(MARK).await;
 }
 
 /// `bikesnest_is_open_at` (migration 0020) is the SQL half of
@@ -1071,49 +977,42 @@ async fn the_recommended_sort_key_is_the_documented_score(tx: &mut TestTx) {
 /// implementations — this is what keeps it that way.
 #[db_test]
 async fn the_open_now_function_agrees_with_the_domain(tx: &mut TestTx) {
-    const MARK: &str = "fix-open-fn";
-    cleanup_fixture(MARK).await;
-    let conn = tx.executor();
+    let db = tx.db().await;
+    let mut conn = db.acquire().await.unwrap();
 
     // (label, fixture) — each shape the rule has an arm for.
     let same_day = at(19.0, 30.0)
-        .with_fixture_tag(MARK)
         .with_hours(1..=7, (8, 0), (18, 0))
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
     let overnight = at(19.0, 60.0)
-        .with_fixture_tag(MARK)
         .with_hours(1..=7, (22, 0), (2, 0))
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
     let all_day = at(19.0, 90.0)
-        .with_fixture_tag(MARK)
         .with_all_day_hours(1..=7)
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
     let weekdays_only = at(19.0, 120.0)
-        .with_fixture_tag(MARK)
         .with_hours(1..=5, (9, 0), (17, 0))
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
     let no_hours = at(19.0, 150.0)
-        .with_fixture_tag(MARK)
         .with_unknown_hours()
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
     let dst = at(19.0, 180.0)
-        .with_fixture_tag(MARK)
         .with_timezone("America/New_York")
         .with_hours(1..=7, (3, 0), (6, 0))
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
-    tx.commit_fixture().await;
+    drop(conn);
 
     // Tuesday 2026-03-10 in São Paulo, Sunday 2026-03-08 around the US
     // spring-forward instant (02:00 EST → 03:00 EDT).
@@ -1158,7 +1057,7 @@ async fn the_open_now_function_agrees_with_the_domain(tx: &mut TestTx) {
     ];
 
     for (label, spot, at_instant, expected) in cases {
-        let sql = sql_is_open_at(spot.id(), spot.timezone().name(), at_instant).await;
+        let sql = sql_is_open_at(&db, spot.id(), spot.timezone().name(), at_instant).await;
         let domain = domain_open_now(spot, at_instant);
         assert_eq!(sql, expected, "SQL disagrees with the case: {label}");
         assert_eq!(
@@ -1167,55 +1066,55 @@ async fn the_open_now_function_agrees_with_the_domain(tx: &mut TestTx) {
         );
         assert_eq!(sql, domain, "SQL and domain disagree: {label}");
     }
-    cleanup_fixture(MARK).await;
 }
 
 /// `bikesnest_is_open_at` called directly, rather than through the search: the
 /// function is the thing under test.
-async fn sql_is_open_at(id: i64, tz: &str, at_instant: chrono::DateTime<chrono::Utc>) -> bool {
+async fn sql_is_open_at(
+    db: &Db,
+    id: i64,
+    tz: &str,
+    at_instant: chrono::DateTime<chrono::Utc>,
+) -> bool {
     let row: (bool,) = sqlx::query_as("SELECT bikesnest_is_open_at($1, $2, $3)")
         .bind(id)
         .bind(tz)
         .bind(at_instant)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .expect("open-now function");
     row.0
 }
 
 // ---------------------------------------------------------------------------
-// Browse mode (WP20): the map's viewport, and the grid it falls back to
+// Browse mode: the map's viewport, and the grid it falls back to
 // ---------------------------------------------------------------------------
 
 #[db_test]
 async fn in_bounds_returns_the_envelope_only_and_measures_from_its_centre(tx: &mut TestTx) {
-    const MARK: &str = "fix-in-bounds";
-    cleanup_fixture(MARK).await;
-    let conn = tx.executor();
+    let db = tx.db().await;
+    let mut conn = db.acquire().await.unwrap();
     // ±0.01° is ~1.1 km north–south, so 300 m north is inside the box and
     // 2 km north is not.
     at(20.0, 0.0)
-        .with_fixture_tag(MARK)
         .with_name("Inside centre")
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
     at(20.0, 300.0)
-        .with_fixture_tag(MARK)
         .with_name("Inside 300m")
         .with_cost(bikesnest_domain::Cost::Paid { price: None })
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
     at(20.0, 2000.0)
-        .with_fixture_tag(MARK)
         .with_name("Outside 2km")
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
-    tx.commit_fixture().await;
+    drop(conn);
 
-    let page = real_bounds(&bounds_at(20.0, 0.01, 200)).await.unwrap();
+    let page = real_bounds(&db, &bounds_at(20.0, 0.01, 200)).await.unwrap();
     assert_eq!(page.total, 2, "the 2 km row is outside the envelope");
     assert!(
         page.clusters.is_empty(),
@@ -1237,23 +1136,21 @@ async fn in_bounds_returns_the_envelope_only_and_measures_from_its_centre(tx: &m
     // The filters are the radius search's filters, applied to the same box.
     let mut free_only = bounds_at(20.0, 0.01, 200);
     free_only.filters.cost = Some(CostFilter::Free);
-    let page = real_bounds(&free_only).await.unwrap();
+    let page = real_bounds(&db, &free_only).await.unwrap();
     assert_eq!(page.total, 1);
     assert_eq!(page.items[0].name, "Inside centre");
 
     let mut lockers_only = bounds_at(20.0, 0.01, 200);
     lockers_only.filters.types = vec![ParkingType::Locker];
-    let page = real_bounds(&lockers_only).await.unwrap();
+    let page = real_bounds(&db, &lockers_only).await.unwrap();
     assert_eq!(page.total, 0, "every fixture here is a rack");
     assert!(page.items.is_empty());
-    cleanup_fixture(MARK).await;
 }
 
 #[db_test]
 async fn in_bounds_clusters_past_the_cap_and_the_counts_sum_to_the_total(tx: &mut TestTx) {
-    const MARK: &str = "fix-in-bounds-clusters";
-    cleanup_fixture(MARK).await;
-    let conn = tx.executor();
+    let db = tx.db().await;
+    let mut conn = db.acquire().await.unwrap();
     let o = test_origin(21.0);
     // Two groups of *identical* points, six grid cells apart (the cell is the
     // box's width over twelve, so 0.01° cannot fall in one cell with them):
@@ -1261,26 +1158,24 @@ async fn in_bounds_clusters_past_the_cap_and_the_counts_sum_to_the_total(tx: &mu
     // where the test hoped it would.
     for i in 0..3 {
         ParkingBuilder::new()
-            .with_fixture_tag(MARK)
             .with_name(format!("West {i}"))
             .at(o.lat(), o.lon() - 0.005)
-            .create(&mut *conn)
+            .create(&mut conn)
             .await
             .unwrap();
     }
     for i in 0..4 {
         ParkingBuilder::new()
-            .with_fixture_tag(MARK)
             .with_name(format!("East {i}"))
             .at(o.lat(), o.lon() + 0.005)
-            .create(&mut *conn)
+            .create(&mut conn)
             .await
             .unwrap();
     }
-    tx.commit_fixture().await;
+    drop(conn);
 
     // Cap of 3, seven rows in the box → the grid, not the rows.
-    let page = real_bounds(&bounds_at(21.0, 0.01, 3)).await.unwrap();
+    let page = real_bounds(&db, &bounds_at(21.0, 0.01, 3)).await.unwrap();
     assert_eq!(page.total, 7, "the total is the whole box, cap or no cap");
     assert!(
         page.items.is_empty(),
@@ -1301,8 +1196,7 @@ async fn in_bounds_clusters_past_the_cap_and_the_counts_sum_to_the_total(tx: &mu
 
     // Exactly at the cap the rows come back instead: the grid is for boxes
     // that hold *more* than can be drawn.
-    let page = real_bounds(&bounds_at(21.0, 0.01, 7)).await.unwrap();
+    let page = real_bounds(&db, &bounds_at(21.0, 0.01, 7)).await.unwrap();
     assert_eq!(page.items.len(), 7);
     assert!(page.clusters.is_empty());
-    cleanup_fixture(MARK).await;
 }

@@ -53,6 +53,11 @@ impl RequestRow {
 #[async_trait]
 impl PrivacyRequestRepository for SqlxPrivacyRequestRepository {
     async fn create(&self, r: &NewPrivacyRequest) -> Result<i64, PrivacyError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("privacy_request.create", e))?;
         #[derive(sqlx::FromRow)]
         struct IdRow {
             id: i64,
@@ -67,7 +72,7 @@ impl PrivacyRequestRepository for SqlxPrivacyRequestRepository {
         .bind(r.user_id.0)
         .bind(r.kind.as_code())
         .bind(&r.details)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *conn)
         .await
         .map_err(|e| db_err("privacy_request.create", e))?;
         Ok(row.id)
@@ -77,6 +82,11 @@ impl PrivacyRequestRepository for SqlxPrivacyRequestRepository {
         &self,
         state: Option<PrivacyRequestState>,
     ) -> Result<Vec<PrivacyRequest>, PrivacyError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("privacy_request.list", e))?;
         let rows: Vec<RequestRow> = match state {
             Some(s) => sqlx::query_as::<_, RequestRow>(
                 r#"
@@ -86,7 +96,7 @@ impl PrivacyRequestRepository for SqlxPrivacyRequestRepository {
                     "#,
             )
             .bind(s.as_code())
-            .fetch_all(self.db.pool())
+            .fetch_all(&mut *conn)
             .await
             .map_err(|e| db_err("privacy_request.list", e))?,
             None => sqlx::query_as::<_, RequestRow>(
@@ -96,7 +106,7 @@ impl PrivacyRequestRepository for SqlxPrivacyRequestRepository {
                     FROM privacy_request ORDER BY created_at, id
                     "#,
             )
-            .fetch_all(self.db.pool())
+            .fetch_all(&mut *conn)
             .await
             .map_err(|e| db_err("privacy_request.list", e))?,
         };
@@ -104,6 +114,11 @@ impl PrivacyRequestRepository for SqlxPrivacyRequestRepository {
     }
 
     async fn get(&self, id: i64) -> Result<Option<PrivacyRequest>, PrivacyError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("privacy_request.get", e))?;
         let row = sqlx::query_as::<_, RequestRow>(
             r#"
             SELECT id, user_id, kind, state, details, fulfilled_by, fulfilled_at,
@@ -112,7 +127,7 @@ impl PrivacyRequestRepository for SqlxPrivacyRequestRepository {
             "#,
         )
         .bind(id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *conn)
         .await
         .map_err(|e| db_err("privacy_request.get", e))?;
         match row {
@@ -122,6 +137,11 @@ impl PrivacyRequestRepository for SqlxPrivacyRequestRepository {
     }
 
     async fn fulfill(&self, id: i64, by: Option<UserId>) -> Result<(), PrivacyError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("privacy_request.fulfill", e))?;
         let by = by.map(|u| u.0);
         let res = sqlx::query(
             r#"
@@ -132,7 +152,7 @@ impl PrivacyRequestRepository for SqlxPrivacyRequestRepository {
         )
         .bind(id)
         .bind(by)
-        .execute(self.db.pool())
+        .execute(&mut *conn)
         .await
         .map_err(|e| db_err("privacy_request.fulfill", e))?;
         if res.rows_affected() != 1 {

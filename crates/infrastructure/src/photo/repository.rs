@@ -1,4 +1,4 @@
-//! SQL-backed photo repository (M4 → generalized in M5): the queue insert,
+//! SQL-backed photo repository: the queue insert,
 //! moderation flips and the pending-photo read model — now dispatching across
 //! both `parking_photo` and `review_photo` through [`bikesnest_application::PhotoKind`].
 
@@ -71,6 +71,11 @@ impl PhotoRepository for SqlxPhotoRepository {
     /// no window in which a row points at nothing — a `CHECK (storage_key <>
     /// '')` in migration 0019 now makes that unrepresentable).
     async fn insert_pending(&self, p: &NewPendingPhoto) -> Result<i64, PhotoError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("photo.insert_pending", e))?;
         let (table, parent_col) = (p.target.kind().table(), parent_col(p.target.kind()));
         let id = if table == "parking_photo" {
             let row = sqlx::query_as::<_, IdRow>(&format!(
@@ -87,7 +92,7 @@ impl PhotoRepository for SqlxPhotoRepository {
             .bind(p.dimensions.height as i32)
             .bind(p.processed_at)
             .bind(p.uploader_id.0)
-            .fetch_one(self.db.pool())
+            .fetch_one(&mut *conn)
             .await
             .map_err(|e| db_err("photo.insert_pending", e))?;
             row.id
@@ -106,7 +111,7 @@ impl PhotoRepository for SqlxPhotoRepository {
             .bind(p.dimensions.height as i32)
             .bind(p.processed_at)
             .bind(p.uploader_id.0)
-            .fetch_one(self.db.pool())
+            .fetch_one(&mut *conn)
             .await
             .map_err(|e| db_err("photo.insert_pending", e))?;
             row.id
@@ -115,21 +120,31 @@ impl PhotoRepository for SqlxPhotoRepository {
     }
 
     async fn max_position(&self, target: PhotoTarget) -> Result<i32, PhotoError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("photo.max_position", e))?;
         let (table, parent_col) = (target.kind().table(), parent_col(target.kind()));
         let row = sqlx::query_as::<_, (Option<i32>,)>(&format!(
             "SELECT COALESCE(MAX(position), 0) AS position FROM {table} WHERE {parent_col} = $1"
         ))
         .bind(target.parent_id())
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *conn)
         .await
         .map_err(|e| db_err("photo.max_position", e))?;
         Ok(row.0.unwrap_or(0))
     }
 
     async fn delete(&self, kind: PhotoKind, id: i64) -> Result<(), PhotoError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("photo.delete", e))?;
         sqlx::query(&format!("DELETE FROM {} WHERE id = $1", kind.table()))
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *conn)
             .await
             .map_err(|e| db_err("photo.delete", e))?;
         Ok(())
@@ -142,6 +157,11 @@ impl PhotoRepository for SqlxPhotoRepository {
         moderator: UserId,
         position: i32,
     ) -> Result<(), PhotoError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("photo.approve", e))?;
         let rows = sqlx::query(&format!(
             "UPDATE {} SET moderation_state = 'APPROVED', position = $3, reviewed_by = $2, reviewed_at = now() \
              WHERE id = $1 AND moderation_state = 'PENDING_REVIEW'",
@@ -150,7 +170,7 @@ impl PhotoRepository for SqlxPhotoRepository {
         .bind(id)
         .bind(moderator.0)
         .bind(position)
-        .execute(self.db.pool())
+        .execute(&mut *conn)
         .await
         .map_err(|e| db_err("photo.approve", e))?;
         if rows.rows_affected() != 1 {
@@ -166,6 +186,11 @@ impl PhotoRepository for SqlxPhotoRepository {
         moderator: UserId,
         reason: &str,
     ) -> Result<RejectedPhoto, PhotoError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("photo.reject", e))?;
         let row = sqlx::query_as::<_, RejectedRow>(&format!(
             "UPDATE {} SET moderation_state = 'REJECTED', rejection_reason = $3, reviewed_by = $2, reviewed_at = now() \
              WHERE id = $1 AND moderation_state = 'PENDING_REVIEW' RETURNING storage_key, thumbnail_key",
@@ -174,7 +199,7 @@ impl PhotoRepository for SqlxPhotoRepository {
         .bind(id)
         .bind(moderator.0)
         .bind(reason)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *conn)
         .await
         .map_err(|e| db_err("photo.reject", e))?;
         let Some(row) = row else {
@@ -196,6 +221,11 @@ impl PhotoRepository for SqlxPhotoRepository {
         after: Option<(chrono::DateTime<chrono::Utc>, i64)>,
         limit: i64,
     ) -> Result<Vec<PendingPhoto>, PhotoError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("photo.list_pending", e))?;
         let limit = limit.clamp(1, 200);
         let (after_at, after_id) = match after {
             Some((at, id)) => (Some(at), Some(id)),
@@ -225,7 +255,7 @@ impl PhotoRepository for SqlxPhotoRepository {
         .bind(after_at)
         .bind(after_id)
         .bind(limit)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *conn)
         .await
         .map_err(|e| db_err("photo.list_pending", e))?;
 
@@ -252,12 +282,17 @@ impl PhotoRepository for SqlxPhotoRepository {
         kind: PhotoKind,
         id: i64,
     ) -> Result<Option<PhotoForModeration>, PhotoError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("photo.get_for_moderation", e))?;
         let (table, parent_col) = (kind.table(), parent_col(kind));
         let row = sqlx::query_as::<_, ModRow>(&format!(
             "SELECT id, {parent_col} AS parent_id, moderation_state, storage_key, thumbnail_key FROM {table} WHERE id = $1"
         ))
         .bind(id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *conn)
         .await
         .map_err(|e| db_err("photo.get_for_moderation", e))?;
 
