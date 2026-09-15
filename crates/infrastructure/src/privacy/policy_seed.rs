@@ -1,10 +1,8 @@
 //! Policy seeding for the versioned legal pages.
 //!
-//! `seed-policies` reads `policies/{kind}.{locale}.md` and upserts one
-//! `policy_version` row per `(kind, locale)`, **keyed on `(kind, locale,
-//! version)`** — re-running with the same version string is a no-op
-//! (idempotent), and a *new* version supersedes the current one for that
-//! locale.
+//! `seed-policies` reads `policies/{kind}.{locale}.md` and installs all three
+//! kinds in both locales in one transaction. An exact six-document replay is
+//! idempotent; partial, changed, or ambiguously scheduled releases fail closed.
 //!
 //! The markdown carries `{{TOKEN}}` placeholders for the operator's identity
 //! and contact channel (see [`POLICY_PLACEHOLDERS`]) so the company details
@@ -15,6 +13,16 @@ use crate::Db;
 use bikesnest_application::PrivacyError;
 use bikesnest_domain::PolicyKind;
 use chrono::{DateTime, Utc};
+
+#[derive(Debug, Clone)]
+pub struct SeedPolicyDocument<'a> {
+    pub kind: PolicyKind,
+    pub locale: &'a str,
+    pub version: &'a str,
+    pub effective_at: DateTime<Utc>,
+    pub content: &'a str,
+    pub requires_acknowledgement: bool,
+}
 
 /// Locales a policy document is published in (`policy_version.locale`).
 /// pt-BR is the fallback the web layer uses when a locale has no document.
@@ -80,62 +88,118 @@ fn is_token(t: &str) -> bool {
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
-/// Install one `policy_version` row. Idempotent by `(kind, locale, version)`:
-/// - same `version` already present → no-op.
-/// - a *new* `version` → supersede the current row for that locale and insert.
-pub async fn seed_policy(
+/// Atomically install one coherent policy release. Production callers pass all
+/// three kinds in both locales. Replays must match every immutable byte.
+pub async fn seed_policy_release(
     db: &Db,
-    kind: PolicyKind,
-    locale: &str,
-    version: &str,
-    effective_at: DateTime<Utc>,
-    content: &str,
+    documents: &[SeedPolicyDocument<'_>],
 ) -> Result<(), PrivacyError> {
-    // Idempotency: a row with this (kind, locale, version) already exists → done.
-    let exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM policy_version WHERE kind = $1 AND locale = $2 AND version = $3)",
-    )
-    .bind(kind.as_code())
-    .bind(locale)
-    .bind(version)
-    .fetch_one(db.pool())
-    .await
-    .map_err(|e| db_err("policy_seed.seed_policy", e))?;
-    if exists {
+    if documents.len() != 6 {
+        return Err(PrivacyError::InvalidField(
+            "a policy release must contain all six kind/locale documents".into(),
+        ));
+    }
+    let version = documents[0].version;
+    let effective_at = documents[0].effective_at;
+    if documents.iter().any(|d| {
+        d.version != version
+            || d.effective_at != effective_at
+            || (d.requires_acknowledgement && d.kind != PolicyKind::Terms)
+    }) {
+        return Err(PrivacyError::InvalidField(
+            "incoherent policy release".into(),
+        ));
+    }
+    for kind in [PolicyKind::Privacy, PolicyKind::Terms, PolicyKind::Cookies] {
+        for locale in POLICY_LOCALES {
+            if documents
+                .iter()
+                .filter(|d| d.kind == kind && d.locale == *locale)
+                .count()
+                != 1
+            {
+                return Err(PrivacyError::InvalidField(
+                    "duplicate or missing policy kind/locale".into(),
+                ));
+            }
+        }
+    }
+    let material: Vec<bool> = documents
+        .iter()
+        .filter(|d| d.kind == PolicyKind::Terms)
+        .map(|d| d.requires_acknowledgement)
+        .collect();
+    if material.len() != 2 || material[0] != material[1] {
+        return Err(PrivacyError::InvalidField(
+            "terms material flag must match across locales".into(),
+        ));
+    }
+    let mut conn = db
+        .acquire()
+        .await
+        .map_err(|e| db_err("policy_seed.release", e))?;
+    let mut tx = conn
+        .begin()
+        .await
+        .map_err(|e| db_err("policy_seed.release", e))?;
+    sqlx::query("SELECT pg_advisory_xact_lock(726_159_001)")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| db_err("policy_seed.release", e))?;
+
+    let mut replayed = 0usize;
+    for doc in documents {
+        let existing: Option<(DateTime<Utc>, String, bool)> = sqlx::query_as(
+            "SELECT effective_at,content,requires_acknowledgement FROM policy_version WHERE kind=$1 AND locale=$2 AND version=$3",
+        ).bind(doc.kind.as_code()).bind(doc.locale).bind(doc.version)
+            .fetch_optional(&mut *tx).await.map_err(|e| db_err("policy_seed.release", e))?;
+        if let Some((at, content, required)) = existing {
+            if at != doc.effective_at
+                || content != doc.content
+                || required != doc.requires_acknowledgement
+            {
+                return Err(PrivacyError::Conflict);
+            }
+            replayed += 1;
+        }
+    }
+    if replayed == documents.len() {
+        tx.commit()
+            .await
+            .map_err(|e| db_err("policy_seed.release", e))?;
         return Ok(());
     }
+    if replayed != 0 {
+        return Err(PrivacyError::Conflict);
+    }
 
-    // Supersede the current row, but only when the incoming version is actually
-    // newer (no effective-date conflict — an older version must not dethrone a
-    // newer current one).
-    sqlx::query(
-        "UPDATE policy_version SET superseded_at = $3 \
-         WHERE kind = $1 AND locale = $2 AND superseded_at IS NULL AND effective_at < $3",
-    )
-    .bind(kind.as_code())
-    .bind(locale)
-    .bind(effective_at)
-    .execute(db.pool())
-    .await
-    .map_err(|e| db_err("policy_seed.seed_policy", e))?;
-
-    // Insert the new current version.
-    sqlx::query(
-        r#"
-        INSERT INTO policy_version (kind, locale, version, effective_at, content)
-        VALUES ($1, $2, $3, $4, $5)
-        "#,
-    )
-    .bind(kind.as_code())
-    .bind(locale)
-    .bind(version)
-    .bind(effective_at)
-    .bind(content)
-    .execute(db.pool())
-    .await
-    .map_err(|e| db_err("policy_seed.seed_policy", e))?;
-
-    Ok(())
+    for doc in documents {
+        let ambiguous: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM policy_version WHERE kind=$1 AND locale=$2 AND superseded_at IS NULL",
+        ).bind(doc.kind.as_code()).bind(doc.locale).fetch_one(&mut *tx).await
+            .map_err(|e| db_err("policy_seed.release", e))?;
+        let latest: Option<DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT max(effective_at) FROM policy_version WHERE kind=$1 AND locale=$2",
+        )
+        .bind(doc.kind.as_code())
+        .bind(doc.locale)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| db_err("policy_seed.release", e))?;
+        if ambiguous > 1 || latest.is_some_and(|at| at >= doc.effective_at) {
+            return Err(PrivacyError::Conflict);
+        }
+        sqlx::query("UPDATE policy_version SET superseded_at=$3 WHERE kind=$1 AND locale=$2 AND superseded_at IS NULL")
+            .bind(doc.kind.as_code()).bind(doc.locale).bind(doc.effective_at).execute(&mut *tx).await
+            .map_err(|e| db_err("policy_seed.release", e))?;
+        sqlx::query("INSERT INTO policy_version(kind,locale,version,effective_at,content,requires_acknowledgement) VALUES($1,$2,$3,$4,$5,$6)")
+            .bind(doc.kind.as_code()).bind(doc.locale).bind(doc.version).bind(doc.effective_at)
+            .bind(doc.content).bind(doc.requires_acknowledgement).execute(&mut *tx).await
+            .map_err(|e| db_err("policy_seed.release", e))?;
+    }
+    tx.commit()
+        .await
+        .map_err(|e| db_err("policy_seed.release", e))
 }
 
 /// Classify + log the sqlx error (SQLSTATE, constraint), then map it onto

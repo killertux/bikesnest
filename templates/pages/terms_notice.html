@@ -1,0 +1,18 @@
+{% extends "layouts/base.html" %}
+{% block content %}
+<section class="mx-auto max-w-3xl px-4 py-12 lg:px-8" data-effective-at="{{ effective_at }}" {% if future %}data-terms-future{% endif %}>
+  <h1 class="font-display text-3xl font-bold">{{ tr.t("terms.notice.title") }}</h1>
+  <p class="mt-2 text-sm text-muted">{{ tr.t("policy.version") }} <span class="font-mono">{{ version }}</span> · {{ tr.t("policy.effective") }} <span class="font-mono">{{ effective_label }}</span></p>
+  {% if future %}<p class="mt-4 rounded-xl border border-border bg-surface p-4">{{ tr.t("terms.notice.future_body") }}</p>{% endif %}
+  {% if error.is_some() %}<div role="alert" class="mt-4 rounded-xl border border-danger/30 bg-danger/10 p-4 text-danger">{{ error.as_deref().unwrap_or("") }}</div>{% endif %}
+  <div class="policy-content mt-6 rounded-2xl border border-border bg-surface p-6">{{ content|safe }}</div>
+  {% if !future %}
+    <form data-terms-ack action="/account/terms-notice/{{ policy_id }}/acknowledge" method="post" class="mt-6">
+      <input type="hidden" name="csrf" value="{{ layout.csrf }}" />
+      <input type="hidden" name="policy_id" value="{{ policy_id }}" />
+      <input type="hidden" name="terms_version" value="{{ version }}" />
+      <button type="submit" class="min-h-11 rounded-xl bg-accent-strong px-5 py-2.5 font-semibold text-white">{{ tr.t("terms.notice.ack") }}</button>
+    </form>
+  {% endif %}
+</section>
+{% endblock %}

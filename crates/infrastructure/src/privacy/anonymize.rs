@@ -213,6 +213,20 @@ impl AnonymizationRepository for SqlxAnonymizationRepository {
             .await
             .map_err(|e| db_err("anonymize.anonymize", e))?
             .rows_affected();
+        let terms_notice_presentations =
+            sqlx::query("DELETE FROM terms_notice_presentation WHERE user_id = $1")
+                .bind(user_id.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| db_err("anonymize.anonymize", e))?
+                .rows_affected();
+        let terms_acknowledgements =
+            sqlx::query("DELETE FROM terms_acknowledgement WHERE user_id = $1")
+                .bind(user_id.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| db_err("anonymize.anonymize", e))?
+                .rows_affected();
 
         // 2) Community content is retained but unattributed.
         let reviews_anonymized = sqlx::query(
@@ -341,6 +355,8 @@ impl AnonymizationRepository for SqlxAnonymizationRepository {
             parked_here,
             exports,
             consent_records,
+            terms_notice_presentations,
+            terms_acknowledgements,
             reviews_anonymized,
             verifications_anonymized,
             proposals_anonymized,

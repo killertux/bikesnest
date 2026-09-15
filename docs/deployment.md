@@ -477,18 +477,26 @@ notice rows exist is unsupported; pause mail and forward-fix instead.
 
 ## 6a. Legal pages (privacy / terms / cookies)
 
-The versioned legal pages are stored in `policy_version` and seeded from
+The versioned legal pages are stored in `policy_version` and seeded as one
+coherent six-document release from
 `policies/{privacy,terms,cookies}.{pt-BR,en}.md`:
+
+Every release, material or otherwise, requires the owner/counsel publication
+approval recorded by the runbook before these commands are run.
 
 1. Set `POLICY_OPERATOR_NAME`, `POLICY_OPERATOR_CNPJ`, `POLICY_OPERATOR_ADDRESS`
    and `POLICY_CONTACT_EMAIL` (the privacy inbox must be monitored — rights
    requests and takedown notices arrive there).
 2. Set `POLICY_VERSION` (e.g. `2026-09-05.1`) and `POLICY_EFFECTIVE_AT`.
-3. Run `bikesnest-web seed-policies` once per release that changes the text. It is
-   idempotent per `(kind, locale, version)`; a new version supersedes the current
-   one and the old text stays reachable at `/{privacy,terms,cookies}/versions`.
-4. Material changes must be announced to users (e-mail or in-app notice) before
-   `POLICY_EFFECTIVE_AT` — the policies promise that.
+3. Follow the preflight, fleet-coherence, activation, and rollback procedure in
+   [`policy-publication.md`](policy-publication.md). The seeder rejects partial
+   or ambiguous releases and exact replay is idempotent; published rows remain
+   immutable and reachable from version history.
+4. The acknowledgement feature is off by default. Its in-product presentation
+   evidence is not proof of delivery or reading, and it does not send the
+   advance e-mail described by the policy draft. Do not enable or publish a
+   material release until the additional activation gates in the runbook are
+   complete.
 
 Review status of the text itself: `docs/legal-review.md`.
 

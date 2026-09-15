@@ -308,6 +308,16 @@ by the dedicated `media_hosts`-list assertion at the end of the test (which
 still also fails, redundantly). Reverting `media_hosts` makes the test pass
 again with no other change.
 
+## Policy-release and terms-proof isolation
+
+`crates/infrastructure/tests/policy_terms_test.rs` uses
+`run_isolated_database_test` because release-lock, signup/publish, and
+delete/proof races require independent connections. It reconstructs the
+pre-0028 tables only inside an owned disposable child database when checking
+the forward migration. Ordinary policy reader tests use `tx.db()` and rely on
+the outer rollback; do not commit or delete immutable policy fixtures in the
+shared test database.
+
 ## Hygiene / guard tests
 
 A block of plain `#[test]`s (no database) at the bottom of `crates/web/tests/http_test.rs`

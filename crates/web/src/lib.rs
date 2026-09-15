@@ -728,6 +728,10 @@ pub struct RegisterPage {
     pub error: Option<String>,
     /// Which input(s) a rejected submission belongs to.
     pub field_errors: view::FieldErrors,
+    pub terms_required: bool,
+    pub terms_policy_id: i64,
+    pub terms_version: String,
+    pub terms_url: String,
 }
 
 /// A2 — login.
@@ -796,6 +800,30 @@ pub struct AccountPage {
     pub is_verified: bool,
     pub roles_label: String,
     pub notice: Option<String>,
+    pub terms_notices: Vec<TermsNoticeVm>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TermsNoticeVm {
+    pub url: String,
+    pub version: String,
+    pub effective_label: String,
+    pub effective_at: String,
+    pub future: bool,
+}
+
+#[derive(Template)]
+#[template(path = "pages/terms_notice.html")]
+pub struct TermsNoticePage {
+    pub layout: PageLayout,
+    pub tr: Translator,
+    pub policy_id: i64,
+    pub version: String,
+    pub effective_label: String,
+    pub effective_at: String,
+    pub content: String,
+    pub future: bool,
+    pub error: Option<String>,
 }
 
 /// C2 — change password.

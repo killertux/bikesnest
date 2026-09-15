@@ -27,7 +27,7 @@ pub use auth::{
     AccountRepository, AdmittedAuthMail, AuthError, AuthMailDispatcher, AuthOutbox, AuthService,
     AuthenticatedUser, Clock, EmailConfirmationOutcome, EmailVerificationOutcome, IdentityRecord,
     LoginOutcome, NewAccount, OAuthProvider, PasswordHasher, ResolvedSession, Session,
-    SessionStore, TokenGenerator, TokenStore, UserActivity, UserSearch,
+    SessionStore, TermsAcceptance, TokenGenerator, TokenStore, UserActivity, UserSearch,
 };
 pub use community::{
     AddParkingLocationOutcome, AttributeSummary, CommunityParkingDetails, ContributionDeps,
@@ -59,10 +59,11 @@ pub use privacy::{
     AnonymizationReport, AnonymizationRepository, Export, ExportAccount, ExportDownload,
     ExportFavorite, ExportPayload, ExportPhoto, ExportProposal, ExportProposalVote, ExportProvider,
     ExportReport, ExportRepository, ExportRequested, ExportReview, ExportReviewRevision,
-    ExportSession, ExportVerification, NewExport, NewPrivacyRequest, POLICY_FALLBACK_LOCALE,
-    PolicyDocument, PolicyReader, PrivacyDeps, PrivacyError, PrivacyRequest,
-    PrivacyRequestRepository, PrivacyService, RetentionConfig, RetentionJob, RetentionRepository,
-    RetentionStep, RetentionSummary,
+    ExportSession, ExportTermsAcknowledgement, ExportTermsPresentation, ExportVerification,
+    NewExport, NewPrivacyRequest, POLICY_FALLBACK_LOCALE, PendingTermsNotice, PolicyDocument,
+    PolicyReader, PrivacyDeps, PrivacyError, PrivacyRequest, PrivacyRequestRepository,
+    PrivacyService, RetentionConfig, RetentionJob, RetentionRepository, RetentionStep,
+    RetentionSummary, TermsAcknowledgementStore, TermsProof,
 };
 pub use rate_limit::{RateLimitError, RateLimiter};
 pub use search::{

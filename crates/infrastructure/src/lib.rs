@@ -58,9 +58,9 @@ pub use parking::{
 };
 pub use photo::{LocalImageProcessor, SqlxPhotoRepository, SqlxReviewPhotosReader};
 pub use privacy::{
-    POLICY_LOCALES, POLICY_PLACEHOLDERS, SqlxAnonymizationRepository, SqlxExportRepository,
-    SqlxPolicyReader, SqlxPrivacyRequestRepository, SqlxRetentionRepository,
-    fill_policy_placeholders, seed_policy,
+    POLICY_LOCALES, POLICY_PLACEHOLDERS, SeedPolicyDocument, SqlxAnonymizationRepository,
+    SqlxExportRepository, SqlxPolicyReader, SqlxPrivacyRequestRepository, SqlxRetentionRepository,
+    fill_policy_placeholders, seed_policy_release,
 };
 pub use storage::{S3ObjectStorage, SharedObjectStorage};
 pub use timezone::OfflineTimezoneResolver;

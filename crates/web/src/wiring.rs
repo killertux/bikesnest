@@ -181,8 +181,9 @@ pub fn app_router_with<H: PasswordHasher + Clone + 'static>(
         tokens_gen: Box::new(RealTokenGenerator),
         clock: Box::new(SystemClock),
     });
-    let policy_reader: Arc<dyn bikesnest_application::PolicyReader> =
-        Arc::new(SqlxPolicyReader::new(db.clone()));
+    let policy_adapter = Arc::new(SqlxPolicyReader::new(db.clone()));
+    let policy_reader: Arc<dyn bikesnest_application::PolicyReader> = policy_adapter.clone();
+    let terms_store: Arc<dyn bikesnest_application::TermsAcknowledgementStore> = policy_adapter;
     let photos: Arc<dyn ParkingPhotoReader> = Arc::new(SqlxParkingPhotoReader::new(db.clone()));
     let contributions = Arc::new(contribution_service);
     let detail_reads = detail_reads.unwrap_or_else(|| {
@@ -209,6 +210,7 @@ pub fn app_router_with<H: PasswordHasher + Clone + 'static>(
         moderation: Arc::new(moderation_service),
         privacy: Arc::new(privacy_service),
         policy: policy_reader,
+        terms: terms_store,
         security: SecurityHeaders::new(&config.security, &config.map, config.tls_on),
         map: config.map.clone(),
         base_url: config.base_url.clone(),

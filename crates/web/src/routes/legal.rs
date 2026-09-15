@@ -1,9 +1,9 @@
 //! The published policy documents (privacy, terms, cookies) and their
 //! version history.
 
-use axum::extract::State;
+use axum::extract::{Form, Path, State};
 use axum::http::StatusCode;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use bikesnest_application::POLICY_FALLBACK_LOCALE;
 use bikesnest_domain::PolicyKind;
 
@@ -11,7 +11,7 @@ use crate::auth::Auth;
 use crate::i18n::{Locale, Translator};
 use crate::state::AppState;
 use crate::view;
-use crate::{PageLayout, PolicyPage, PolicyVersionsPage};
+use crate::{PageLayout, PolicyPage, PolicyVersionsPage, TermsNoticePage};
 
 use super::common::render;
 
@@ -32,6 +32,184 @@ pub(crate) async fn current_policy(
             .ok()
             .flatten(),
         _ => None,
+    }
+}
+
+pub(crate) async fn pending_terms_notices(
+    state: &AppState,
+    user_id: bikesnest_domain::UserId,
+    locale: Locale,
+) -> Result<Vec<bikesnest_application::PendingTermsNotice>, bikesnest_application::PrivacyError> {
+    let code = locale.html_lang();
+    let found = state.terms.pending_notices(user_id, code).await?;
+    if !found.is_empty() || code == POLICY_FALLBACK_LOCALE {
+        return Ok(found);
+    }
+    state
+        .terms
+        .pending_notices(user_id, POLICY_FALLBACK_LOCALE)
+        .await
+}
+
+pub(crate) async fn terms_version(
+    Path(id): Path<i64>,
+    locale: Locale,
+    auth: Auth,
+    State(state): State<AppState>,
+) -> Response {
+    let doc = match state.policy.by_id(id).await {
+        Ok(Some(doc)) if doc.kind == PolicyKind::Terms => doc,
+        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let tr = Translator::new(locale);
+    render(
+        PolicyPage {
+            layout: PageLayout::for_request(
+                format!("{} — BikesNest", tr.t("nav.terms")),
+                "terms",
+                &auth,
+                &state.map,
+            ),
+            tr,
+            kind_code: "terms",
+            kind_label: tr.t("nav.terms"),
+            version: doc.version,
+            effective_label: view::iso_datetime_label(tr, doc.effective_at),
+            content: crate::markdown::render_policy_markdown(&doc.content),
+        },
+        StatusCode::OK,
+    )
+}
+
+async fn render_terms_notice(
+    state: &AppState,
+    locale: Locale,
+    auth: &Auth,
+    notice: bikesnest_application::PendingTermsNotice,
+    error: Option<String>,
+    status: StatusCode,
+) -> Response {
+    let tr = Translator::new(locale);
+    render(
+        TermsNoticePage {
+            layout: PageLayout::for_request(
+                tr.t("terms.notice.title").to_string(),
+                "account",
+                auth,
+                &state.map,
+            ),
+            tr,
+            policy_id: notice.document.id,
+            version: notice.document.version,
+            effective_label: view::iso_datetime_label(tr, notice.document.effective_at),
+            effective_at: notice.document.effective_at.to_rfc3339(),
+            content: crate::markdown::render_policy_markdown(&notice.document.content),
+            future: !notice.may_acknowledge,
+            error,
+        },
+        status,
+    )
+}
+
+pub(crate) async fn account_terms_notice(
+    Path(id): Path<i64>,
+    locale: Locale,
+    auth: Auth,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match auth.require_user() {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if !state.config.policy.acknowledgement_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let notice = match pending_terms_notices(&state, user.id, locale).await {
+        Ok(notices) if notices.iter().any(|notice| notice.document.id == id) => notices
+            .into_iter()
+            .find(|notice| notice.document.id == id)
+            .unwrap(),
+        Ok(notices) if !notices.is_empty() => return StatusCode::CONFLICT.into_response(),
+        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let proof = bikesnest_application::TermsProof {
+        policy_version_id: notice.document.id,
+        terms_version: notice.document.version.clone(),
+        shown_locale: notice.document.locale.clone(),
+    };
+    // Build the exact response before recording a presentation. The timestamp
+    // proves only that the server prepared this response for return; it does
+    // not prove browser display or human reading.
+    let response = render_terms_notice(&state, locale, &auth, notice, None, StatusCode::OK).await;
+    if state.terms.present(user.id, &proof).await.is_err() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    response
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct TermsAckForm {
+    policy_id: i64,
+    terms_version: String,
+}
+
+pub(crate) async fn account_terms_acknowledge(
+    Path(id): Path<i64>,
+    locale: Locale,
+    auth: Auth,
+    State(state): State<AppState>,
+    Form(form): Form<TermsAckForm>,
+) -> Response {
+    let user = match auth.require_user() {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if !state.config.policy.acknowledgement_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let doc = match state.policy.by_id(id).await {
+        Ok(doc) => doc,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let proof = doc.as_ref().map(|doc| bikesnest_application::TermsProof {
+        policy_version_id: form.policy_id,
+        terms_version: form.terms_version,
+        shown_locale: doc.locale.clone(),
+    });
+    let result = if id != form.policy_id {
+        Err(bikesnest_application::PrivacyError::Conflict)
+    } else if let Some(proof) = proof {
+        state.terms.acknowledge_current(user.id, &proof).await
+    } else {
+        Err(bikesnest_application::PrivacyError::Conflict)
+    };
+    match result {
+        Ok(()) => axum::response::Redirect::to("/account?terms_acknowledged=1").into_response(),
+        Err(bikesnest_application::PrivacyError::Unavailable) => {
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+        Err(_) => match pending_terms_notices(&state, user.id, locale).await {
+            Ok(notices) if !notices.is_empty() => {
+                let notice = notices
+                    .iter()
+                    .find(|notice| notice.may_acknowledge)
+                    .cloned()
+                    .unwrap_or_else(|| notices[0].clone());
+                render_terms_notice(
+                    &state,
+                    locale,
+                    &auth,
+                    notice,
+                    Some(Translator::new(locale).t("terms.notice.stale").to_string()),
+                    StatusCode::CONFLICT,
+                )
+                .await
+            }
+            Ok(_) => StatusCode::CONFLICT.into_response(),
+            Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        },
     }
 }
 
@@ -61,7 +239,7 @@ pub(crate) fn policy_kind_meta(tr: Translator, kind: PolicyKind) -> (&'static st
     }
 }
 
-/// Shared builder for a public versioned legal page (P4/P5/P6). The stored
+/// Shared builder for a public versioned legal page. The stored
 /// markdown goes through [`crate::markdown::render_policy_markdown`], which
 /// escapes raw HTML — that output is the only `|safe` value in the template.
 /// Takes `auth` so a signed-in visitor still sees their own header here (these

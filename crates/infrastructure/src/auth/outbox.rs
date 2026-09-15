@@ -7,6 +7,7 @@ use crate::job::repo::{MailCredential, MailEnqueue, enqueue_mail_on};
 use async_trait::async_trait;
 use bikesnest_application::{
     AdmittedAuthMail, AuthError, AuthOutbox, EmailConfirmationOutcome, EmailMessage, NewAccount,
+    TermsAcceptance,
 };
 use bikesnest_domain::{AccountState, LocaleCode, SessionId, UserEmail, UserId, VerificationToken};
 use chrono::{DateTime, Duration, Utc};
@@ -127,6 +128,41 @@ fn admission_err(context: &'static str, error: crate::job::JobRepoError) -> Auth
     }
 }
 
+async fn validate_registration_terms(
+    conn: &mut sqlx::PgConnection,
+    terms: Option<&TermsAcceptance>,
+) -> Result<Option<DateTime<Utc>>, AuthError> {
+    let Some(terms) = terms else {
+        return Ok(None);
+    };
+    sqlx::query("SELECT pg_advisory_xact_lock(726_159_001)")
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| db_err("auth_outbox.register", e))?;
+    let decision_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| db_err("auth_outbox.register", e))?;
+    let valid = sqlx::query_scalar::<_, bool>(
+        r#"SELECT kind='terms' AND id=$1 AND version=$2 AND locale=$3
+           AND effective_at<=$4
+           AND (superseded_at IS NULL OR superseded_at>$4)
+           FROM policy_version WHERE id=$1 FOR UPDATE"#,
+    )
+    .bind(terms.policy_version_id)
+    .bind(&terms.version)
+    .bind(&terms.shown_locale)
+    .bind(decision_at)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| db_err("auth_outbox.register", e))?
+    .unwrap_or(false);
+    if !valid {
+        return Err(AuthError::Conflict);
+    }
+    Ok(Some(decision_at))
+}
+
 #[async_trait]
 impl AuthOutbox for SqlxAuthOutbox {
     async fn register(
@@ -135,6 +171,7 @@ impl AuthOutbox for SqlxAuthOutbox {
         token: &VerificationToken,
         at: DateTime<Utc>,
         mut message: EmailMessage,
+        terms: Option<&TermsAcceptance>,
     ) -> Result<Option<AdmittedAuthMail>, AuthError> {
         let mut conn = self
             .db
@@ -160,6 +197,7 @@ impl AuthOutbox for SqlxAuthOutbox {
             let Some((user_id, state, locale)) = existing else {
                 return Err(AuthError::Conflict);
             };
+            validate_registration_terms(&mut tx, terms).await?;
             if state != "PENDING_EMAIL_VERIFICATION" {
                 tx.rollback()
                     .await
@@ -202,6 +240,7 @@ impl AuthOutbox for SqlxAuthOutbox {
                 .map_err(|e| db_err("auth_outbox.register", e))?;
             return Ok(Some(AdmittedAuthMail { job_id, message }));
         };
+        let terms_decision_at = validate_registration_terms(&mut tx, terms).await?;
         message.account_id = user_id;
         sqlx::query("INSERT INTO authentication_identities(user_id,provider,provider_subject,credential_hash) VALUES($1,'password',$2,$3)")
             .bind(user_id).bind(new.email.as_str()).bind(new.password_hash).execute(&mut *tx).await.map_err(|e| db_err("auth_outbox.register", e))?;
@@ -219,6 +258,12 @@ impl AuthOutbox for SqlxAuthOutbox {
         audit(&mut tx, user_id, "auth.register")
             .await
             .map_err(|e| db_err("auth_outbox.register", e))?;
+        if let (Some(terms), Some(decision_at)) = (terms, terms_decision_at) {
+            sqlx::query("INSERT INTO terms_acknowledgement(user_id,policy_version_id,terms_version,shown_locale,acknowledged_at,source) VALUES($1,$2,$3,$4,$5,'signup')")
+                .bind(user_id).bind(terms.policy_version_id).bind(&terms.version).bind(&terms.shown_locale)
+                .bind(decision_at)
+                .execute(&mut *tx).await.map_err(|e| db_err("auth_outbox.register", e))?;
+        }
         tx.commit()
             .await
             .map_err(|e| db_err("auth_outbox.register", e))?;

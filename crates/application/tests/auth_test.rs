@@ -622,6 +622,7 @@ impl AuthOutbox for FakeRepo {
         token: &VerificationToken,
         _at: DateTime<Utc>,
         mut message: EmailMessage,
+        _terms: Option<&bikesnest_application::TermsAcceptance>,
     ) -> Result<Option<AdmittedAuthMail>, AuthError> {
         let mut db = self.db.lock().unwrap();
         if db.queue_broken {

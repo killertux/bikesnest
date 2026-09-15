@@ -64,6 +64,8 @@ fn empty_payload(user_id: i64) -> ExportPayload {
         vec![],
         vec![],
         vec![],
+        vec![],
+        vec![],
         Utc::now(),
     )
 }
@@ -75,12 +77,6 @@ fn unique_tag(label: &str) -> String {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     format!("{label}-{}-{n}", std::process::id())
-}
-
-fn af(t: impl AsRef<str>) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(t.as_ref())
-        .unwrap()
-        .with_timezone(&Utc)
 }
 
 #[test]
@@ -487,7 +483,7 @@ async fn export_payload_excludes_credential_hash(tx: &mut bikesnest_test_support
 
     let repo = SqlxExportRepository::new(db().await);
     let payload = repo.assemble_payload(UserId(uid)).await.unwrap();
-    assert_eq!(payload.schema_version, 1);
+    assert_eq!(payload.schema_version, 2);
     assert_eq!(payload.authentication.len(), 1);
     // credential_hash is never selected into the payload.
     let json = serde_json::to_string(&payload).unwrap();
@@ -577,7 +573,7 @@ async fn export_consume_download_is_single_use_and_distinguishes_errors(
 async fn anonymize_scrubs_identity_and_nulls_attribution(tx: &mut bikesnest_test_support::TestTx) {
     // A location to hang content off of.
     let loc = ParkingBuilder::new()
-        .with_name("M6 Anon")
+        .with_name("Anonymization fixture")
         .create(tx.executor())
         .await
         .unwrap();
@@ -836,54 +832,48 @@ async fn retention_purges_only_expired(tx: &mut bikesnest_test_support::TestTx) 
 
 #[db_test]
 async fn policy_reader_current_and_history(tx: &mut bikesnest_test_support::TestTx) {
-    let reader = SqlxPolicyReader::new(db().await);
+    let scoped = tx.db().await;
+    let reader = SqlxPolicyReader::new(scoped.clone());
     let old = "m6-test-old";
     let new = "m6-test-new";
+    let locale = "pt-BR";
+    let now = Utc::now();
 
-    // Insert an old + a new privacy version with far-future effective dates so
-    // the reader's `current` (newest effective, not superseded) is deterministic
-    // regardless of any rows already in the shared dev DB.
+    // Insert an old + current version inside the scoped transaction. A future
+    // document is announced history, never the currently applicable policy.
     sqlx::query(
-        "INSERT INTO policy_version (kind, version, effective_at, content) VALUES ('privacy', $1, $2, 'old')",
+        "INSERT INTO policy_version (kind, locale, version, effective_at, content) VALUES ('privacy', $1, $2, $3, 'old')",
     )
+    .bind(locale)
     .bind(old)
-    .bind(af("2030-01-01T00:00:00Z"))
-    .execute(tx.executor())
+    .bind(now - Duration::seconds(1))
+    .execute(&mut *scoped.acquire().await.unwrap())
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO policy_version (kind, version, effective_at, content) VALUES ('privacy', $1, $2, 'new')",
+        "INSERT INTO policy_version (kind, locale, version, effective_at, content) VALUES ('privacy', $1, $2, $3, 'new')",
     )
+    .bind(locale)
     .bind(new)
-    .bind(af("2031-01-01T00:00:00Z"))
-    .execute(tx.executor())
+    .bind(now)
+    .execute(&mut *scoped.acquire().await.unwrap())
     .await
     .unwrap();
-    tx.commit_fixture().await;
 
     let current = reader
-        .current(PolicyKind::Privacy, "pt-BR")
+        .current(PolicyKind::Privacy, locale)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(current.locale, "pt-BR");
+    assert_eq!(current.locale, locale);
     assert_eq!(current.version, "m6-test-new");
     assert!(current.superseded_at.is_none());
 
-    let history = reader.history(PolicyKind::Privacy, "pt-BR").await.unwrap();
+    let history = reader.history(PolicyKind::Privacy, locale).await.unwrap();
     assert!(history.iter().any(|d| d.version == old));
     assert!(history.iter().any(|d| d.version == new));
     // Newest first.
     assert_eq!(history[0].version, "m6-test-new");
-
-    // Clean up the fixture rows (they are committed, so they persist).
-    let pool = pool().await;
-    sqlx::query("DELETE FROM policy_version WHERE version = $1 OR version = $2")
-        .bind(old)
-        .bind(new)
-        .execute(&pool)
-        .await
-        .unwrap();
 }
 
 #[db_test]

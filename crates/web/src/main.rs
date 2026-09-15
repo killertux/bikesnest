@@ -186,9 +186,9 @@ async fn main() {
 
 struct PreparedPolicy {
     kind: bikesnest_domain::PolicyKind,
-    kind_code: &'static str,
     locale: &'static str,
     content: String,
+    requires_acknowledgement: bool,
 }
 
 struct FullFreshSummary {
@@ -220,9 +220,10 @@ fn prepare_policies(config: &Config) -> Result<Vec<PreparedPolicy>, String> {
             policies.push(PreparedPolicy {
                 kind: bikesnest_domain::PolicyKind::from_code(kind_code)
                     .expect("valid policy kind"),
-                kind_code,
                 locale,
                 content,
+                requires_acknowledgement: kind_code == "terms"
+                    && config.policy.terms_material_notice,
             });
         }
     }
@@ -234,19 +235,20 @@ async fn seed_prepared_policies(
     config: &Config,
     policies: &[PreparedPolicy],
 ) -> Result<(), String> {
-    for policy in policies {
-        bikesnest_infrastructure::seed_policy(
-            db,
-            policy.kind,
-            policy.locale,
-            &config.policy.version,
-            config.policy.effective_at,
-            &policy.content,
-        )
+    let documents: Vec<_> = policies
+        .iter()
+        .map(|policy| bikesnest_infrastructure::SeedPolicyDocument {
+            kind: policy.kind,
+            locale: policy.locale,
+            version: &config.policy.version,
+            effective_at: config.policy.effective_at,
+            content: &policy.content,
+            requires_acknowledgement: policy.requires_acknowledgement,
+        })
+        .collect();
+    bikesnest_infrastructure::seed_policy_release(db, &documents)
         .await
-        .map_err(|err| format!("{} ({}): {err}", policy.kind_code, policy.locale))?;
-    }
-    Ok(())
+        .map_err(|err| format!("policy release: {err}"))
 }
 
 fn validate_admin_seed(config: &Config) -> Result<(), String> {

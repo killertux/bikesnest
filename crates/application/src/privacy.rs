@@ -7,7 +7,7 @@
 //! Design decisions are documented alongside the privacy policy:
 //! - **Deletion is anonymize-in-place** — the `users` row survives with PII
 //!   scrubbed; community content is retained *unattributed*, never hard-deleted.
-//! - **The export payload is a versioned JSON document** (`schema_version: 1`);
+//! - **The export payload is a versioned JSON document** (`schema_version: 2`);
 //!   credential/session/token hashes and audit rows are excluded by construction.
 //! - **The download link is owner-only + single-use + expiring** (two gates).
 
@@ -90,7 +90,7 @@ impl From<crate::ports::ReaderError> for PrivacyError {
 // Export payload — a versioned, machine-readable document
 // ---------------------------------------------------------------------------
 
-/// The versioned personal-data export document. `schema_version: 1`.
+/// The versioned personal-data export document. `schema_version: 2`.
 /// Excludes credential/session/token hashes, CSRF tokens and audit rows by
 /// construction — the infrastructure assemblers simply never select them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +107,10 @@ pub struct ExportPayload {
     pub proposal_votes: Vec<ExportProposalVote>,
     pub reports: Vec<ExportReport>,
     pub photos: Vec<ExportPhoto>,
+    #[serde(default)]
+    pub terms_notice_presentations: Vec<ExportTermsPresentation>,
+    #[serde(default)]
+    pub terms_acknowledgements: Vec<ExportTermsAcknowledgement>,
 }
 
 impl ExportPayload {
@@ -122,10 +126,12 @@ impl ExportPayload {
         proposal_votes: Vec<ExportProposalVote>,
         reports: Vec<ExportReport>,
         photos: Vec<ExportPhoto>,
+        terms_notice_presentations: Vec<ExportTermsPresentation>,
+        terms_acknowledgements: Vec<ExportTermsAcknowledgement>,
         exported_at: DateTime<Utc>,
     ) -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
             exported_at,
             account,
             authentication,
@@ -137,8 +143,27 @@ impl ExportPayload {
             proposal_votes,
             reports,
             photos,
+            terms_notice_presentations,
+            terms_acknowledgements,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportTermsPresentation {
+    pub policy_version_id: i64,
+    pub terms_version: String,
+    pub shown_locale: String,
+    pub presented_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportTermsAcknowledgement {
+    pub policy_version_id: i64,
+    pub terms_version: String,
+    pub shown_locale: String,
+    pub acknowledged_at: DateTime<Utc>,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -357,6 +382,8 @@ pub struct AnonymizationReport {
     pub parked_here: u64,
     pub exports: u64,
     pub consent_records: u64,
+    pub terms_notice_presentations: u64,
+    pub terms_acknowledgements: u64,
     pub reviews_anonymized: u64,
     pub verifications_anonymized: u64,
     pub proposals_anonymized: u64,
@@ -438,6 +465,9 @@ pub struct PolicyDocument {
     pub version: String,
     pub effective_at: DateTime<Utc>,
     pub superseded_at: Option<DateTime<Utc>>,
+    /// Whether this terms release participates in the explicitly enabled
+    /// material-notice/acknowledgement workflow.
+    pub requires_acknowledgement: bool,
     /// Markdown content. The web layer renders it through its own markdown
     /// renderer, which escapes any raw HTML in the source; templates
     /// never mark the stored text itself as safe.
@@ -446,9 +476,9 @@ pub struct PolicyDocument {
 
 #[async_trait]
 pub trait PolicyReader: Send + Sync {
-    /// The current version for `locale` (latest `effective_at`,
-    /// `superseded_at IS NULL`). `None` when that locale has no document —
-    /// callers fall back to [`POLICY_FALLBACK_LOCALE`].
+    /// The version applicable at the database decision time for `locale`.
+    /// Future scheduled versions are excluded. `None` when that locale has no
+    /// document — callers fall back to [`POLICY_FALLBACK_LOCALE`].
     async fn current(
         &self,
         kind: PolicyKind,
@@ -460,6 +490,47 @@ pub trait PolicyReader: Send + Sync {
         kind: PolicyKind,
         locale: &str,
     ) -> Result<Vec<PolicyDocument>, PrivacyError>;
+    /// One immutable document by id. Used by exact-version legal links.
+    async fn by_id(&self, id: i64) -> Result<Option<PolicyDocument>, PrivacyError>;
+    /// The nearest future material terms release for advance in-product notice.
+    async fn upcoming_material_terms(
+        &self,
+        locale: &str,
+    ) -> Result<Option<PolicyDocument>, PrivacyError>;
+}
+
+/// Durable evidence of what the server presented or a user acknowledged.
+/// Presentation is not proof that the person read the document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TermsProof {
+    pub policy_version_id: i64,
+    pub terms_version: String,
+    pub shown_locale: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingTermsNotice {
+    pub document: PolicyDocument,
+    pub may_acknowledge: bool,
+}
+
+#[async_trait]
+pub trait TermsAcknowledgementStore: Send + Sync {
+    /// Resolve the current unacknowledged material terms and the nearest
+    /// future material release. An acknowledgement of the same bilingual
+    /// release version satisfies either locale while retaining the exact
+    /// shown row.
+    async fn pending_notices(
+        &self,
+        user_id: UserId,
+        locale: &str,
+    ) -> Result<Vec<PendingTermsNotice>, PrivacyError>;
+    async fn present(&self, user_id: UserId, proof: &TermsProof) -> Result<(), PrivacyError>;
+    async fn acknowledge_current(
+        &self,
+        user_id: UserId,
+        proof: &TermsProof,
+    ) -> Result<(), PrivacyError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -953,6 +1024,8 @@ mod tests {
                 created_at: Utc::now(),
                 roles: vec![],
             },
+            vec![],
+            vec![],
             vec![],
             vec![],
             vec![],

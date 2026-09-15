@@ -38,7 +38,8 @@
           <p id="password-error" role="alert" class="mt-1 text-sm text-danger">{{ msg }}</p>
         {% endif %}
       </div>
-      <p class="text-xs leading-relaxed text-muted">{{ tr.t("auth.legal_prefix") }} <a href="/terms" class="font-medium text-accent-strong hover:underline">{{ tr.t("nav.terms") }}</a> {{ tr.t("auth.legal_middle") }} <a href="/privacy" class="font-medium text-accent-strong hover:underline">{{ tr.t("nav.privacy") }}</a>.</p>
+      {% if terms_required %}<input type="hidden" name="terms_policy_id" value="{{ terms_policy_id }}" /><input type="hidden" name="terms_version" value="{{ terms_version }}" />{% endif %}
+      <p class="text-xs leading-relaxed text-muted">{{ tr.t("auth.legal_prefix") }} <a href="{% if terms_required %}{{ terms_url }}{% else %}/terms{% endif %}" class="font-medium text-accent-strong hover:underline">{{ tr.t("nav.terms") }}</a> {{ tr.t("auth.legal_middle") }} <a href="/privacy" class="font-medium text-accent-strong hover:underline">{{ tr.t("nav.privacy") }}</a>.</p>
       <button type="submit" class="w-full rounded-lg bg-accent-strong px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-accent-dark">{{ tr.t("auth.signup") }}</button>
     </form>
     <p class="mt-4 text-sm text-muted">{{ tr.t("auth.have_account") }} <a href="/login" class="font-medium text-accent-strong hover:underline">{{ tr.t("auth.login") }}</a></p>

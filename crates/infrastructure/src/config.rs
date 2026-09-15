@@ -93,6 +93,17 @@ impl<'a> EnvSource<'a> {
             })
     }
 
+    fn explicit_bool_or_false(&self, key: &'static str) -> Result<bool, ConfigError> {
+        let Some(raw) = self.raw(key) else {
+            return Ok(false);
+        };
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => Err(ConfigError::invalid(key, "must be an explicit boolean")),
+        }
+    }
+
     fn require(&self, key: &'static str) -> Result<String, ConfigError> {
         self.string(key).ok_or(ConfigError::MissingEnv(key))
     }
@@ -280,6 +291,10 @@ impl Default for FakeOAuthConfig {
 pub struct PolicySeedConfig {
     pub version: String,
     pub effective_at: DateTime<Utc>,
+    /// Whole acknowledgement feature gate. Must be fleet-consistent.
+    pub acknowledgement_enabled: bool,
+    /// Marks the seeded terms release material; inert while the feature gate is off.
+    pub terms_material_notice: bool,
     /// `{{TOKEN}}` → value, for every placeholder whose variable is set.
     pub placeholders: Vec<(&'static str, String)>,
 }
@@ -544,6 +559,16 @@ impl Config {
         let env = EnvSource::new(lookup);
         let app_env = AppEnv::parse(env.string("APP_ENV").as_deref());
         let dev = !app_env.is_production();
+        let acknowledgement_enabled =
+            env.explicit_bool_or_false("POLICY_ACKNOWLEDGEMENT_ENABLED")?;
+        let terms_material_notice = env.explicit_bool_or_false("POLICY_TERMS_MATERIAL_NOTICE")?;
+        let google_oauth_enabled = env.bool("GOOGLE_OAUTH_ENABLED").unwrap_or(false);
+        if acknowledgement_enabled && google_oauth_enabled {
+            return Err(ConfigError::invalid(
+                "POLICY_ACKNOWLEDGEMENT_ENABLED",
+                "cannot be enabled with GOOGLE_OAUTH_ENABLED until OAuth captures exact shown terms",
+            ));
+        }
 
         Ok(Self {
             app_env,
@@ -589,12 +614,12 @@ impl Config {
             password_hash: password_hash_config(&env)?,
             moderation: moderation_config(&env),
             jobs: job_config(&env),
-            policy: policy_config(&env),
+            policy: policy_config(&env, acknowledgement_enabled, terms_material_notice),
             admin_seed: AdminSeedConfig {
                 email: env.string("ADMIN_EMAIL"),
                 password: env.string("ADMIN_PASSWORD"),
             },
-            google_oauth_enabled: env.bool("GOOGLE_OAUTH_ENABLED").unwrap_or(false),
+            google_oauth_enabled,
         })
     }
 
@@ -796,6 +821,8 @@ impl Config {
             policy: PolicySeedConfig {
                 version: DEFAULT_POLICY_VERSION.to_string(),
                 effective_at: Utc::now(),
+                acknowledgement_enabled: false,
+                terms_material_notice: false,
                 placeholders: Vec::new(),
             },
             admin_seed: AdminSeedConfig::default(),
@@ -1246,7 +1273,11 @@ fn retention_config(env: &EnvSource<'_>) -> RetentionPolicy {
 
 /// `seed-policies` inputs: version, effective date, and the controller identity
 /// substituted into the `{{TOKEN}}`s of `policies/*.md`.
-fn policy_config(env: &EnvSource<'_>) -> PolicySeedConfig {
+fn policy_config(
+    env: &EnvSource<'_>,
+    acknowledgement_enabled: bool,
+    terms_material_notice: bool,
+) -> PolicySeedConfig {
     PolicySeedConfig {
         version: env
             .string("POLICY_VERSION")
@@ -1259,6 +1290,8 @@ fn policy_config(env: &EnvSource<'_>) -> PolicySeedConfig {
                     .map(|d| d.with_timezone(&Utc))
             })
             .unwrap_or_else(Utc::now),
+        acknowledgement_enabled,
+        terms_material_notice,
         placeholders: crate::privacy::POLICY_PLACEHOLDERS
             .iter()
             .filter_map(|(token, var)| env.string(var).map(|value| (*token, value)))
@@ -1782,11 +1815,59 @@ mod tests {
             ("POLICY_OPERATOR_NAME", "BikesNest Ltda."),
         ]);
         assert_eq!(cfg.policy.version, "2026-10-01.1");
+        assert!(!cfg.policy.acknowledgement_enabled);
+        assert!(!cfg.policy.terms_material_notice);
         assert_eq!(
             cfg.policy.placeholder("OPERATOR_NAME").as_deref(),
             Some("BikesNest Ltda.")
         );
         assert!(cfg.policy.placeholder("CONTACT_EMAIL").is_none());
+    }
+
+    #[test]
+    fn policy_workflow_flags_are_explicit_and_fail_closed_on_invalid_values() {
+        let enabled = config(&[
+            DB,
+            ("POLICY_ACKNOWLEDGEMENT_ENABLED", "yes"),
+            ("POLICY_TERMS_MATERIAL_NOTICE", "1"),
+        ]);
+        assert!(enabled.policy.acknowledgement_enabled);
+        assert!(enabled.policy.terms_material_notice);
+        let disabled = config(&[
+            DB,
+            ("POLICY_ACKNOWLEDGEMENT_ENABLED", "off"),
+            ("POLICY_TERMS_MATERIAL_NOTICE", "false"),
+        ]);
+        assert!(!disabled.policy.acknowledgement_enabled);
+        assert!(!disabled.policy.terms_material_notice);
+        for (key, value) in [
+            ("POLICY_ACKNOWLEDGEMENT_ENABLED", ""),
+            ("POLICY_ACKNOWLEDGEMENT_ENABLED", "tru"),
+            ("POLICY_TERMS_MATERIAL_NOTICE", ""),
+            ("POLICY_TERMS_MATERIAL_NOTICE", "sometimes"),
+        ] {
+            assert!(matches!(
+                Config::from_lookup(&lookup(&[DB, (key, value)])),
+                Err(ConfigError::Invalid { key: failed, .. }) if failed == key
+            ));
+        }
+    }
+
+    #[test]
+    fn terms_acknowledgement_rejects_oauth_bypass() {
+        let err = Config::from_lookup(&lookup(&[
+            DB,
+            ("POLICY_ACKNOWLEDGEMENT_ENABLED", "true"),
+            ("GOOGLE_OAUTH_ENABLED", "true"),
+        ]))
+        .expect_err("OAuth has no exact shown-terms handoff");
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                key: "POLICY_ACKNOWLEDGEMENT_ENABLED",
+                ..
+            }
+        ));
     }
 
     // --- map style ----------------------------------------------------------

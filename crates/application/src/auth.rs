@@ -152,6 +152,14 @@ pub struct NewAccount<'a> {
     pub locale: LocaleCode,
 }
 
+/// Exact currently-effective terms displayed by the registration form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TermsAcceptance {
+    pub policy_version_id: i64,
+    pub version: String,
+    pub shown_locale: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmittedAuthMail {
     pub job_id: i64,
@@ -166,6 +174,7 @@ pub trait AuthOutbox: Send + Sync {
         token: &VerificationToken,
         at: DateTime<Utc>,
         message: EmailMessage,
+        terms: Option<&TermsAcceptance>,
     ) -> Result<Option<AdmittedAuthMail>, AuthError>;
     // The explicit transition inputs keep the atomic persistence port from
     // accepting partially populated or ambiguous verification commands.
@@ -675,6 +684,20 @@ impl AuthService {
         raw_password: &str,
         locale: LocaleCode,
     ) -> Result<(), AuthError> {
+        self.register_accepting_terms(ip, raw_email, display_name, raw_password, locale, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_accepting_terms(
+        &self,
+        ip: &str,
+        raw_email: &str,
+        display_name: Option<&str>,
+        raw_password: &str,
+        locale: LocaleCode,
+        terms: Option<TermsAcceptance>,
+    ) -> Result<(), AuthError> {
         self.allowed(
             &format!("register:ip:{ip}"),
             REGISTER_IP_LIMIT,
@@ -707,6 +730,7 @@ impl AuthService {
                 &token,
                 now,
                 message,
+                terms.as_ref(),
             )
             .await?
         {

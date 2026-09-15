@@ -413,6 +413,7 @@ async fn registration_outbox_insert_failure_rolls_back_every_row(
             &token,
             Utc::now(),
             verification_message(UserId(0), email.as_str(), &token),
+            None,
         )
         .await;
     assert!(result.is_err());
@@ -441,6 +442,7 @@ async fn registration_commits_account_token_outbox_and_audit_together(
             &token,
             Utc::now(),
             verification_message(UserId(0), email.as_str(), &token),
+            None,
         )
         .await
         .unwrap()
@@ -483,6 +485,7 @@ async fn registration_retry_recovers_or_repairs_without_overwriting_account(
             &first,
             Utc::now(),
             verification_message(UserId(0), email.as_str(), &first),
+            None,
         )
         .await
         .unwrap()
@@ -500,6 +503,7 @@ async fn registration_retry_recovers_or_repairs_without_overwriting_account(
             &retry,
             Utc::now(),
             verification_message(UserId(0), email.as_str(), &retry),
+            None,
         )
         .await
         .unwrap()
@@ -525,6 +529,7 @@ async fn registration_retry_recovers_or_repairs_without_overwriting_account(
             &retry,
             Utc::now(),
             verification_message(UserId(0), email.as_str(), &retry),
+            None,
         )
         .await
         .unwrap()
@@ -573,6 +578,7 @@ async fn registration_recovery_case(
             &first,
             Utc::now(),
             verification_message(UserId(0), email.as_str(), &first),
+            None,
         )
         .await
         .unwrap()
@@ -637,6 +643,7 @@ async fn registration_recovery_case(
             &second,
             Utc::now(),
             verification_message(UserId(0), email.as_str(), &second),
+            None,
         )
         .await
         .unwrap()
@@ -845,6 +852,7 @@ async fn registration_final_audit_failure_rolls_back_account_token_and_job(
             &token,
             Utc::now(),
             verification_message(UserId(0), email.as_str(), &token),
+            None,
         )
         .await;
     assert!(result.is_err());

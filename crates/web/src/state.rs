@@ -134,6 +134,7 @@ pub struct AppState {
     pub moderation: Arc<ModerationService>,
     pub privacy: Arc<PrivacyService>,
     pub policy: Arc<dyn bikesnest_application::PolicyReader>,
+    pub terms: Arc<dyn bikesnest_application::TermsAcknowledgementStore>,
     /// Security/CSP header policy, built once from the configured origins.
     pub security: SecurityHeaders,
     /// Client-side map style/token rendered into every page layout.

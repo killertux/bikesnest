@@ -4,7 +4,7 @@
 use axum::extract::{Form, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use bikesnest_application::AuthError;
+use bikesnest_application::{AuthError, TermsAcceptance};
 use bikesnest_domain::{Role, UserEmail};
 
 use crate::auth::{Auth, clear_session_cookie, random_state_hex, set_session_cookie};
@@ -73,6 +73,37 @@ pub(crate) struct RegisterForm {
     display_name: String,
     #[serde(default)]
     password: String,
+    #[serde(default)]
+    terms_policy_id: Option<i64>,
+    #[serde(default)]
+    terms_version: String,
+}
+
+async fn registration_terms(
+    state: &AppState,
+    locale: Locale,
+) -> Result<Option<bikesnest_application::PolicyDocument>, ()> {
+    if !state.config.policy.acknowledgement_enabled {
+        return Ok(None);
+    }
+    let requested = locale.html_lang();
+    match state
+        .policy
+        .current(bikesnest_domain::PolicyKind::Terms, requested)
+        .await
+    {
+        Ok(Some(document)) => Ok(Some(document)),
+        Ok(None) if requested != bikesnest_application::POLICY_FALLBACK_LOCALE => state
+            .policy
+            .current(
+                bikesnest_domain::PolicyKind::Terms,
+                bikesnest_application::POLICY_FALLBACK_LOCALE,
+            )
+            .await
+            .map_err(|_| ())
+            .and_then(|document| document.ok_or(()).map(Some)),
+        Ok(None) | Err(_) => Err(()),
+    }
 }
 
 pub(crate) async fn register_page(
@@ -85,6 +116,10 @@ pub(crate) async fn register_page(
     }
     let tr = Translator::new(locale);
     let token = auth.csrf_value();
+    let terms = match registration_terms(&state, locale).await {
+        Ok(terms) => terms,
+        Err(()) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     render_anon(
         RegisterPage {
             layout: PageLayout::new(&state.map, tr.t("auth.register_title").to_string(), "auth")
@@ -95,6 +130,14 @@ pub(crate) async fn register_page(
             display_name: String::new(),
             error: None,
             field_errors: view::FieldErrors::new(),
+            terms_required: terms.is_some(),
+            terms_policy_id: terms.as_ref().map_or(0, |d| d.id),
+            terms_version: terms
+                .as_ref()
+                .map_or_else(String::new, |d| d.version.clone()),
+            terms_url: terms
+                .as_ref()
+                .map_or_else(String::new, |d| format!("/terms/versions/{}", d.id)),
         },
         &token,
     )
@@ -117,14 +160,32 @@ pub(crate) async fn register_post(
     } else {
         Some(form.display_name.trim())
     };
+    let terms = if state.config.policy.acknowledgement_enabled {
+        let current = match registration_terms(&state, locale).await {
+            Ok(Some(current)) => current,
+            Ok(None) => return StatusCode::CONFLICT.into_response(),
+            Err(()) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        if form.terms_policy_id != Some(current.id) || current.version != form.terms_version {
+            return render_stale_registration(&state, locale, &auth, form, current).await;
+        }
+        Some(TermsAcceptance {
+            policy_version_id: current.id,
+            version: form.terms_version.clone(),
+            shown_locale: current.locale,
+        })
+    } else {
+        None
+    };
     match state
         .auth
-        .register(
+        .register_accepting_terms(
             &ip,
             &form.email,
             display_name,
             &form.password,
             locale_code(locale),
+            terms,
         )
         .await
     {
@@ -136,7 +197,17 @@ pub(crate) async fn register_post(
                 Some(field) => view::FieldErrors::single(field, message.clone()),
                 None => view::FieldErrors::new(),
             };
-            render_anon(
+            let terms = match registration_terms(&state, locale).await {
+                Ok(terms) => terms,
+                Err(()) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
+            let status =
+                if err == AuthError::Conflict && state.config.policy.acknowledgement_enabled {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::OK
+                };
+            let mut response = render_anon(
                 RegisterPage {
                     layout: PageLayout::new(
                         &state.map,
@@ -150,11 +221,51 @@ pub(crate) async fn register_post(
                     display_name: form.display_name,
                     error: Some(message),
                     field_errors,
+                    terms_required: terms.is_some(),
+                    terms_policy_id: terms.as_ref().map_or(0, |d| d.id),
+                    terms_version: terms
+                        .as_ref()
+                        .map_or_else(String::new, |d| d.version.clone()),
+                    terms_url: terms
+                        .as_ref()
+                        .map_or_else(String::new, |d| format!("/terms/versions/{}", d.id)),
                 },
                 &token,
-            )
+            );
+            *response.status_mut() = status;
+            response
         }
     }
+}
+
+async fn render_stale_registration(
+    state: &AppState,
+    locale: Locale,
+    auth: &Auth,
+    form: RegisterForm,
+    current: bikesnest_application::PolicyDocument,
+) -> Response {
+    let tr = Translator::new(locale);
+    let token = auth.csrf_value();
+    let mut response = render_anon(
+        RegisterPage {
+            layout: PageLayout::new(&state.map, tr.t("auth.register_title").to_string(), "auth")
+                .csp_nonce(auth.csp_nonce.clone())
+                .csrf(token.clone()),
+            tr,
+            email: form.email,
+            display_name: form.display_name,
+            error: Some(tr.t("terms.notice.stale").to_string()),
+            field_errors: view::FieldErrors::new(),
+            terms_required: true,
+            terms_policy_id: current.id,
+            terms_version: current.version,
+            terms_url: format!("/terms/versions/{}", current.id),
+        },
+        &token,
+    );
+    *response.status_mut() = StatusCode::CONFLICT;
+    response
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -591,6 +702,8 @@ pub(crate) struct AccountNotices {
     email_pending: Option<String>,
     #[serde(default)]
     attribution_saved: Option<String>,
+    #[serde(default)]
+    terms_acknowledged: Option<String>,
 }
 
 pub(crate) async fn account(
@@ -610,8 +723,27 @@ pub(crate) async fn account(
         Some(tr.t("account.email_pending").to_string())
     } else if q.attribution_saved.is_some() {
         Some(tr.t("account.attribution.saved").to_string())
+    } else if q.terms_acknowledged.is_some() {
+        Some(tr.t("terms.notice.acknowledged").to_string())
     } else {
         None
+    };
+    let terms_notices = if state.config.policy.acknowledgement_enabled {
+        match super::legal::pending_terms_notices(&state, user.id, locale).await {
+            Ok(items) => items
+                .into_iter()
+                .map(|item| crate::TermsNoticeVm {
+                    url: format!("/account/terms-notice/{}", item.document.id),
+                    version: item.document.version,
+                    effective_label: view::iso_datetime_label(tr, item.document.effective_at),
+                    effective_at: item.document.effective_at.to_rfc3339(),
+                    future: !item.may_acknowledge,
+                })
+                .collect(),
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    } else {
+        Vec::new()
     };
     render(
         AccountPage {
@@ -631,6 +763,7 @@ pub(crate) async fn account(
             is_verified: user.is_verified,
             roles_label: format_roles(tr, user.roles.clone()),
             notice,
+            terms_notices,
         },
         StatusCode::OK,
     )

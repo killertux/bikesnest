@@ -53,7 +53,8 @@ use community::{
 use details::parking_details;
 use errors::not_found;
 use legal::{
-    cookies_page, cookies_versions, privacy_page, privacy_versions, terms_page, terms_versions,
+    account_terms_acknowledge, account_terms_notice, cookies_page, cookies_versions, privacy_page,
+    privacy_versions, terms_page, terms_version, terms_versions,
 };
 use moderation::{
     moderation_dashboard, moderation_parking_invalidate, moderation_parking_restore,
@@ -137,8 +138,14 @@ pub(crate) fn routes(state: &AppState) -> Router<AppState> {
         .route("/cookies", get(cookies_page))
         .route("/privacy/versions", get(privacy_versions))
         .route("/terms/versions", get(terms_versions))
+        .route("/terms/versions/{id}", get(terms_version))
         .route("/cookies/versions", get(cookies_versions))
         .route("/account/privacy", get(account_privacy))
+        .route("/account/terms-notice/{id}", get(account_terms_notice))
+        .route(
+            "/account/terms-notice/{id}/acknowledge",
+            post(account_terms_acknowledge),
+        )
         .route("/account/privacy/export", post(account_export_post))
         .route(
             "/account/privacy/request",

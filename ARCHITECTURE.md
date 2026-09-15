@@ -131,7 +131,7 @@ directly. Examples: `SearchParking`, `ContributionService`, `AuthService`,
 | `ImageProcessor` | decode → EXIF-strip → re-encode → thumbnail |
 | `PhotoRepository` | photo lifecycle + moderation queue |
 | `ReportRepository` / `ModerationRepository` | reports + moderation actions |
-| `ExportRepository` / `PrivacyRequestRepository` / `AnonymizationRepository` / `RetentionRepository` / `PolicyReader` | privacy & retention |
+| `ExportRepository` / `PrivacyRequestRepository` / `AnonymizationRepository` / `RetentionRepository` / `PolicyReader` / `TermsAcknowledgementStore` | privacy, retention, immutable policy reads, and exact terms presentation/acknowledgement proof |
 | `TimezoneResolver` | coordinate → IANA timezone |
 | `DatabaseProbe` | readiness DB check |
 | `JobHandler` | background job execution |
@@ -302,8 +302,17 @@ Versioned, forward-only migrations in `migrations/`:
 | `0019_photo_key_and_audit_integrity.sql` | non-empty `storage_key`, append-only audit |
 | `0020_open_now_fn.sql` | `bikesnest_is_open_at()` + confirmed-attribute index |
 | `0024_approve_all_parking_edits.sql` | allow detail-edit proposals alongside moves and existence changes |
+| `0028_terms_acknowledgement.sql` | immutable policy releases plus exact terms presentation/acknowledgement evidence |
+| `0029_policy_version_id_immutable.sql` | preserve the exact published policy row id during its one allowed supersession update |
 
 Key modeling notes:
+
+- **Terms evidence is not privacy consent.** When the fleet-wide feature gate
+  is enabled, signup records the exact currently effective terms row in the
+  account/outbox transaction. Existing accounts get recoverable current and
+  nearest-future material notices without a service lockout. A presentation
+  timestamp proves only that the server prepared the response, never receipt
+  or reading. See [`docs/policy-publication.md`](docs/policy-publication.md).
 
 - **Timestamps are UTC**; opening hours are wall-clock ranges in the location's
   timezone; "open now" is computed in that timezone.

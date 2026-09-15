@@ -1712,6 +1712,199 @@ async fn auth_app_with_storage() -> (
     (app, email, storage)
 }
 
+#[test]
+fn terms_acknowledgement_gate_and_policy_read_failures_are_honest_http_states() {
+    run_isolated_database_test(|pool: sqlx::PgPool| async move {
+        let db = Db::from_pool(pool.clone());
+        let deps = || RouterDeps {
+            email: std::sync::Arc::new(FakeEmailProvider::with_root(None)),
+            oauth: None,
+            hasher: TestPasswordHasher,
+            rate_limiter: Box::new(bikesnest_infrastructure::InMemoryRateLimiter::new()),
+            storage: std::sync::Arc::new(bikesnest_test_support::TestObjectStorage::new()),
+            detail_reads: None,
+        };
+
+        let disabled = app_router_with(std::sync::Arc::new(test_config()), db.clone(), deps());
+        let response = disabled
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/register")
+                    .header("Accept-Language", "en")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body =
+            String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+                .into_owned();
+        assert!(!body.contains("name=\"terms_policy_id\""));
+        let (cookie, csrf) = scoped_login(&disabled, "terms-csrf@example.test").await;
+
+        let wrong_kind: i64 = sqlx::query_scalar(
+            "INSERT INTO policy_version(kind,locale,version,effective_at,content) \
+             VALUES('privacy','en','wrong-kind',clock_timestamp(),'privacy') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let wrong = app_router_with(std::sync::Arc::new(test_config()), db.clone(), deps())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/terms/versions/{wrong_kind}"))
+                    .header("Accept-Language", "en")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::NOT_FOUND);
+
+        let mut enabled_config = test_config();
+        enabled_config.policy.acknowledgement_enabled = true;
+        enabled_config.google_oauth_enabled = false;
+        let enabled = app_router_with(std::sync::Arc::new(enabled_config), db, deps());
+        let terms_id: i64 = sqlx::query_scalar(
+            "INSERT INTO policy_version(kind,locale,version,effective_at,content,requires_acknowledgement) \
+             VALUES('terms','en','csrf-current',clock_timestamp(),'terms',true) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // A registration form prepared before activation has no terms fields.
+        // Submitting it after fleet-wide activation must preserve only the
+        // non-secret inputs and supply the authoritative current proof for a
+        // retry; it must not create or mutate registration state.
+        let (anonymous_cookie, anonymous_csrf) = anon_csrf(&disabled, "/register")
+            .await
+            .expect("anonymous registration csrf");
+        let omitted_email = "before-activation@example.test";
+        let omitted_display_name = "Before & Activation";
+        let omitted_body = format!(
+            "email={}&display_name={}&password={}&csrf={}",
+            urlencode(omitted_email),
+            urlencode(omitted_display_name),
+            urlencode("must-not-be-rendered-123"),
+            urlencode(&anonymous_csrf),
+        );
+        let omitted = enabled
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("Accept-Language", "en")
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .header("Cookie", &anonymous_cookie)
+                    .body(Body::from(omitted_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(omitted.status(), StatusCode::CONFLICT);
+        let omitted_html =
+            String::from_utf8_lossy(&omitted.into_body().collect().await.unwrap().to_bytes())
+                .into_owned();
+        assert!(omitted_html.contains("value=\"before-activation@example.test\""));
+        let retained_name =
+            regex::Regex::new(r#"<input[^>]+name="display_name"[^>]+value="([^"]+)""#)
+                .unwrap()
+                .captures(&omitted_html)
+                .and_then(|captures| captures.get(1))
+                .expect("display name remains in the retry form")
+                .as_str();
+        assert!(retained_name.contains("Before"));
+        assert!(retained_name.contains("Activation"));
+        assert!(!omitted_html.contains("must-not-be-rendered-123"));
+        assert!(omitted_html.contains(&format!("name=\"terms_policy_id\" value=\"{terms_id}\"")));
+        assert!(omitted_html.contains("name=\"terms_version\" value=\"csrf-current\""));
+        assert!(omitted_html.contains(&format!("/terms/versions/{terms_id}")));
+        assert!(omitted_html.contains("The applicable terms changed"));
+        let omitted_artifacts: (i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+               (SELECT count(*) FROM users WHERE email=$1), \
+               (SELECT count(*) FROM terms_acknowledgement ta JOIN users u ON u.id=ta.user_id WHERE u.email=$1), \
+               (SELECT count(*) FROM background_job WHERE payload::text LIKE '%' || $1 || '%')",
+        )
+        .bind(omitted_email)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(omitted_artifacts, (0, 0, 0));
+
+        for fields in [
+            vec![
+                ("policy_id", terms_id.to_string()),
+                ("terms_version", "csrf-current".into()),
+            ],
+            vec![
+                ("policy_id", terms_id.to_string()),
+                ("terms_version", "csrf-current".into()),
+                ("csrf", "wrong-session-proof".into()),
+            ],
+        ] {
+            let borrowed = fields
+                .iter()
+                .map(|(key, value)| (*key, value.as_str()))
+                .collect::<Vec<_>>();
+            let (status, _, _) = post_form(
+                &enabled,
+                &format!("/account/terms-notice/{terms_id}/acknowledge"),
+                &borrowed,
+                Some(&cookie),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+        let acknowledgements: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM terms_acknowledgement WHERE terms_version='csrf-current'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(acknowledgements, 0);
+
+        let terms_id_field = terms_id.to_string();
+        let (status, _, _) = post_form(
+            &enabled,
+            &format!("/account/terms-notice/{terms_id}/acknowledge"),
+            &[
+                ("policy_id", &terms_id_field),
+                ("terms_version", "future-or-wrong"),
+                ("csrf", &csrf),
+            ],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        sqlx::query("ALTER TABLE policy_version RENAME TO unavailable_policy_version")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let unavailable = enabled
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/register")
+                    .header("Accept-Language", "en")
+                    .header("Accept", "text/html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body =
+            String::from_utf8_lossy(&unavailable.into_body().collect().await.unwrap().to_bytes())
+                .into_owned();
+        assert!(body.contains("temporarily unavailable"));
+    });
+}
+
 async fn get_c(app: &axum::Router, uri: &str, cookie: Option<&str>) -> (StatusCode, String) {
     let mut b = Request::builder().uri(uri).header("Accept-Language", "en");
     if let Some(c) = cookie {

@@ -1900,6 +1900,29 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "policy.back" => ("Back to policy", "Voltar à política"),
         "policy.current" => ("Current", "Atual"),
         "policy.superseded" => ("Superseded", "Substituída"),
+        "terms.notice.title" => ("Review the terms", "Revise os termos"),
+        "terms.notice.current" => (
+            "Updated terms need your acknowledgement",
+            "Termos atualizados precisam da sua confirmação",
+        ),
+        "terms.notice.future" => (
+            "A future terms update is available",
+            "Uma atualização futura dos termos está disponível",
+        ),
+        "terms.notice.review" => ("Review this version", "Revisar esta versão"),
+        "terms.notice.future_body" => (
+            "These terms are not effective yet. You can review them now; acknowledgement is available only after they take effect.",
+            "Estes termos ainda não estão em vigor. Você pode revisá-los agora; a confirmação só estará disponível depois da entrada em vigor.",
+        ),
+        "terms.notice.ack" => ("Acknowledge these terms", "Confirmar estes termos"),
+        "terms.notice.acknowledged" => (
+            "Terms acknowledgement recorded.",
+            "Confirmação dos termos registrada.",
+        ),
+        "terms.notice.stale" => (
+            "The applicable terms changed. Review the current version before continuing.",
+            "Os termos aplicáveis mudaram. Revise a versão atual antes de continuar.",
+        ),
         "privacy.kind" => ("Kind", "Tipo"),
         "privacy.state" => ("State", "Estado"),
         "privacy.hub_title" => ("Privacy & data", "Privacidade e dados"),
