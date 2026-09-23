@@ -1,16 +1,20 @@
-//! Approval transactions share the harness connection and always roll back.
+//! Sequential approval transactions share the rollback-scoped harness connection;
+//! genuine approval and eligibility races own disposable databases.
 use bikesnest_application::{
-    ContributionError, ModerationError, ModerationRepository, NewProposal,
+    AccountRepository, ContributionError, ModerationError, ModerationRepository, NewProposal,
     ParkingContributionRepository, ParkingDetailsReader, ProposalApplication, ProposalVote,
+    SessionStore, TokenStore,
 };
 use bikesnest_domain::{
-    Cost, CurrencyCode, Money, OpeningHours, ParkingEdit, PricingUnit, ProposalKind,
-    ProposalStatus, ProposedChange, SecurityFeature, SecurityState, TimeRange, UserId,
+    Cost, CsrfToken, CurrencyCode, Money, OpeningHours, ParkingEdit, PricingUnit, ProposalKind,
+    ProposalStatus, ProposedChange, SecurityFeature, SecurityState, SessionId, TimeRange, UserId,
+    VerificationToken,
 };
 use bikesnest_infrastructure::{
-    Db, SqlxModerationRepository, SqlxParkingContributionRepository, SqlxParkingDetailsReader,
+    Db, SqlxAccountRepository, SqlxModerationRepository, SqlxParkingContributionRepository,
+    SqlxParkingDetailsReader, SqlxSessionStore, SqlxTokenStore,
 };
-use bikesnest_test_support::{ParkingBuilder, UserBuilder, db_test};
+use bikesnest_test_support::{ParkingBuilder, UserBuilder, db_test, run_isolated_database_test};
 
 async fn eligible(db: &Db, suffix: &str) -> UserId {
     let mut conn = db.acquire().await.unwrap();
@@ -25,6 +29,58 @@ async fn eligible(db: &Db, suffix: &str) -> UserId {
         .await
         .unwrap();
     user.id
+}
+
+async fn wait_for_lockers(pool: &sqlx::PgPool, expected: i64) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname=current_database() AND wait_event_type='Lock'",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if waiting >= expected {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all competing operations must reach real database locks");
+}
+
+async fn proposal_with_five_votes(db: &Db, marker: &str) -> (i64, i64, UserId, ParkingEdit) {
+    let proposer = eligible(db, &format!("{marker}-author")).await;
+    let moderator = eligible(db, &format!("{marker}-moderator")).await;
+    let mut conn = db.acquire().await.unwrap();
+    let location = ParkingBuilder::new()
+        .with_name(format!("Race {marker}"))
+        .create(&mut conn)
+        .await
+        .unwrap();
+    drop(conn);
+    let mut edit = ParkingEdit::from_location(&location);
+    edit.name = format!("Published {marker}");
+    let repo = SqlxParkingContributionRepository::new(db.clone());
+    let proposal = repo
+        .create_proposal(&NewProposal {
+            location_id: location.id(),
+            proposer_id: proposer,
+            base_version: 1,
+            kind: ProposalKind::EditDetails,
+            proposed: edit.to_json(),
+        })
+        .await
+        .unwrap();
+    for index in 0..5 {
+        let voter = eligible(db, &format!("{marker}-voter-{index}")).await;
+        repo.vote_on_proposal(proposal, voter, ProposalVote::Approve)
+            .await
+            .unwrap();
+    }
+    (location.id(), proposal, moderator, edit)
 }
 
 #[db_test]
@@ -363,4 +419,304 @@ async fn moderator_can_approve_details_moves_and_removal(tx: &mut TestTx) {
         current.moderation_state(),
         bikesnest_domain::ModerationState::Removed
     );
+}
+
+#[test]
+fn sixth_vote_and_moderator_approval_publish_exactly_once() {
+    run_isolated_database_test(|pool: sqlx::PgPool| async move {
+        let db = Db::from_pool(pool.clone());
+        let (location_id, proposal_id, moderator, edit) =
+            proposal_with_five_votes(&db, "vote-moderator").await;
+        let sixth = eligible(&db, "vote-moderator-sixth").await;
+        let sibling = SqlxParkingContributionRepository::new(db.clone())
+            .create_proposal(&NewProposal {
+                location_id,
+                proposer_id: eligible(&db, "vote-moderator-sibling-author").await,
+                base_version: 1,
+                kind: ProposalKind::EditDetails,
+                proposed: edit.to_json(),
+            })
+            .await
+            .unwrap();
+
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE parking_location IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let vote_repo = SqlxParkingContributionRepository::new(db.clone());
+        let moderation_repo = SqlxModerationRepository::new(db.clone());
+        let mut decisions = Box::pin(async move {
+            tokio::join!(
+                vote_repo.vote_on_proposal(proposal_id, sixth, ProposalVote::Approve),
+                moderation_repo.approve_proposal(
+                    proposal_id,
+                    moderator,
+                    ProposalApplication::EditDetails(edit),
+                ),
+            )
+        });
+        let waited = tokio::select! {
+            _ = wait_for_lockers(&pool, 2) => true,
+            _ = &mut decisions => false,
+        };
+        blocker.rollback().await.unwrap();
+        assert!(
+            waited,
+            "both approval paths must overlap at the location lock"
+        );
+        let (vote, moderation) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), decisions)
+                .await
+                .expect("both approval paths finish after lock release");
+        assert!(
+            matches!(
+                (&vote, &moderation),
+                (Ok(_), Err(ModerationError::InvalidState))
+            ) || matches!(
+                (&vote, &moderation),
+                (Err(ContributionError::Conflict), Ok(()))
+            ),
+            "only the serialized winner may publish: vote={vote:?}, moderation={moderation:?}"
+        );
+
+        let (version, name): (i64, String) =
+            sqlx::query_as("SELECT version,name FROM parking_location WHERE id=$1")
+                .bind(location_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!((version, name.as_str()), (2, "Published vote-moderator"));
+        let (status, sibling_status, revisions): (String, String, i64) = sqlx::query_as(
+            "SELECT p.status,s.status,
+                    (SELECT count(*) FROM parking_revision WHERE location_id=$1 AND version=2)
+             FROM parking_proposal p, parking_proposal s WHERE p.id=$2 AND s.id=$3",
+        )
+        .bind(location_id)
+        .bind(proposal_id)
+        .bind(sibling)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "APPROVED");
+        assert_eq!(sibling_status, "SUPERSEDED");
+        assert_eq!(revisions, 1);
+    });
+}
+
+#[test]
+fn competing_sixth_votes_publish_only_one_proposal_for_a_location() {
+    run_isolated_database_test(|pool: sqlx::PgPool| async move {
+        let db = Db::from_pool(pool.clone());
+        let proposer = eligible(&db, "rival-author").await;
+        let mut conn = db.acquire().await.unwrap();
+        let location = ParkingBuilder::new()
+            .with_name("Rival proposal race")
+            .create(&mut conn)
+            .await
+            .unwrap();
+        drop(conn);
+        let mut edit = ParkingEdit::from_location(&location);
+        edit.name = "One published rival".into();
+        let input = NewProposal {
+            location_id: location.id(),
+            proposer_id: proposer,
+            base_version: 1,
+            kind: ProposalKind::EditDetails,
+            proposed: edit.to_json(),
+        };
+        let repo = SqlxParkingContributionRepository::new(db.clone());
+        let first = repo.create_proposal(&input).await.unwrap();
+        let second = repo.create_proposal(&input).await.unwrap();
+        for index in 0..5 {
+            let voter = eligible(&db, &format!("rival-common-{index}")).await;
+            repo.vote_on_proposal(first, voter, ProposalVote::Approve)
+                .await
+                .unwrap();
+            repo.vote_on_proposal(second, voter, ProposalVote::Approve)
+                .await
+                .unwrap();
+        }
+        let first_sixth = eligible(&db, "rival-first-sixth").await;
+        let second_sixth = eligible(&db, "rival-second-sixth").await;
+
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE parking_location IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let first_repo = SqlxParkingContributionRepository::new(db.clone());
+        let second_repo = SqlxParkingContributionRepository::new(db);
+        let mut votes = Box::pin(async move {
+            tokio::join!(
+                first_repo.vote_on_proposal(first, first_sixth, ProposalVote::Approve),
+                second_repo.vote_on_proposal(second, second_sixth, ProposalVote::Approve),
+            )
+        });
+        let waited = tokio::select! {
+            _ = wait_for_lockers(&pool, 2) => true,
+            _ = &mut votes => false,
+        };
+        blocker.rollback().await.unwrap();
+        assert!(waited, "both rival votes must wait on the location lock");
+        let (first_result, second_result) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), votes)
+                .await
+                .expect("both rival votes finish after lock release");
+        assert!(
+            matches!(
+                (&first_result, &second_result),
+                (Ok(_), Err(ContributionError::VersionConflict))
+                    | (Err(ContributionError::VersionConflict), Ok(_))
+            ),
+            "one rival must publish and the other observe the new version: {first_result:?}, {second_result:?}"
+        );
+        let (version, revisions): (i64, i64) = sqlx::query_as(
+            "SELECT version,
+                    (SELECT count(*) FROM parking_revision WHERE location_id=$1 AND version=2)
+             FROM parking_location WHERE id=$1",
+        )
+        .bind(location.id())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((version, revisions), (2, 1));
+        let states: Vec<(i64, String, i64)> = sqlx::query_as(
+            "SELECT p.id,p.status,count(v.voter_id)
+             FROM parking_proposal p LEFT JOIN parking_proposal_vote v ON v.proposal_id=p.id
+             WHERE p.id=ANY($1) GROUP BY p.id,p.status ORDER BY p.id",
+        )
+        .bind(vec![first, second])
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                states.as_slice(),
+                [(_, approved, 6), (_, superseded, 5)]
+                    if approved == "APPROVED" && superseded == "SUPERSEDED"
+            ) || matches!(
+                states.as_slice(),
+                [(_, superseded, 5), (_, approved, 6)]
+                    if approved == "APPROVED" && superseded == "SUPERSEDED"
+            )
+        );
+    });
+}
+
+#[test]
+fn sixth_vote_and_voter_suspension_have_a_consistent_eligibility_boundary() {
+    run_isolated_database_test(|pool: sqlx::PgPool| async move {
+        let db = Db::from_pool(pool.clone());
+        let (blocked_location, blocked_proposal, moderator, _edit) =
+            proposal_with_five_votes(&db, "suspend-first").await;
+        let blocked_sixth = eligible(&db, "suspend-first-sixth").await;
+        let now = chrono::Utc::now();
+        let session = SessionId::new([201; 32]);
+        SqlxSessionStore::new(db.clone())
+            .create(blocked_sixth, &session, &CsrfToken::new([202; 32]), now)
+            .await
+            .unwrap();
+        let reset = VerificationToken::new([203; 32]);
+        assert!(
+            SqlxTokenStore::new(db.clone())
+                .issue_reset(blocked_sixth, &reset, now)
+                .await
+                .unwrap()
+        );
+
+        // Force the vote to reach its first authoritative location lock, then
+        // commit suspension before allowing its eligibility read. It must not
+        // retain the earlier request's eligibility or publish a sixth vote.
+        let mut location_blocker = pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM parking_location WHERE id=$1 FOR UPDATE")
+            .bind(blocked_location)
+            .fetch_one(&mut *location_blocker)
+            .await
+            .unwrap();
+        let vote_repo = SqlxParkingContributionRepository::new(db.clone());
+        let mut blocked_vote = Box::pin(vote_repo.vote_on_proposal(
+            blocked_proposal,
+            blocked_sixth,
+            ProposalVote::Approve,
+        ));
+        let vote_waited = tokio::select! {
+            _ = wait_for_lockers(&pool, 1) => true,
+            _ = &mut blocked_vote => false,
+        };
+        if !vote_waited {
+            location_blocker.rollback().await.unwrap();
+            panic!("the vote must wait at the authoritative location lock");
+        }
+        assert!(
+            SqlxAccountRepository::new(db.clone())
+                .suspend_by_admin(blocked_sixth, moderator)
+                .await
+                .unwrap()
+        );
+        location_blocker.rollback().await.unwrap();
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), blocked_vote)
+                .await
+                .expect("blocked vote finishes after location release"),
+            Err(ContributionError::NotVerified)
+        ));
+        let blocked_state: (String, String, i64, i64, i64, bool, bool, i64) = sqlx::query_as(
+            "SELECT u.account_state,p.status,l.version,
+                    (SELECT count(*) FROM parking_revision WHERE location_id=$1 AND version=2),
+                    (SELECT count(*) FROM parking_proposal_vote WHERE proposal_id=$2),
+                    (SELECT revoked_at IS NOT NULL FROM sessions WHERE user_id=$3),
+                    (SELECT used_at IS NOT NULL FROM password_reset_tokens WHERE user_id=$3),
+                    (SELECT count(*) FROM audit_events WHERE target_id=$4
+                     AND action='user.suspended' AND result='success')
+             FROM users u,parking_proposal p,parking_location l
+             WHERE u.id=$3 AND p.id=$2 AND l.id=$1",
+        )
+        .bind(blocked_location)
+        .bind(blocked_proposal)
+        .bind(blocked_sixth.0)
+        .bind(blocked_sixth.0.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            blocked_state,
+            ("SUSPENDED".into(), "PENDING".into(), 1, 0, 5, true, true, 1)
+        );
+
+        // Complementary linearization: a vote that commits first publishes
+        // legitimately; a later suspension must not erase public history.
+        let (published_location, published_proposal, second_moderator, _edit) =
+            proposal_with_five_votes(&db, "vote-first").await;
+        let published_sixth = eligible(&db, "vote-first-sixth").await;
+        SqlxParkingContributionRepository::new(db.clone())
+            .vote_on_proposal(published_proposal, published_sixth, ProposalVote::Approve)
+            .await
+            .unwrap();
+        assert!(
+            SqlxAccountRepository::new(db.clone())
+                .suspend_by_admin(published_sixth, second_moderator)
+                .await
+                .unwrap()
+        );
+        let published_state: (String, String, i64, i64, i64) = sqlx::query_as(
+            "SELECT u.account_state,p.status,l.version,
+                    (SELECT count(*) FROM parking_revision WHERE location_id=$2 AND version=2),
+                    (SELECT count(*) FROM audit_events WHERE target_id=$4
+                     AND action='user.suspended' AND result='success')
+             FROM users u,parking_proposal p,parking_location l
+             WHERE u.id=$1 AND p.id=$3 AND l.id=$2",
+        )
+        .bind(published_sixth.0)
+        .bind(published_location)
+        .bind(published_proposal)
+        .bind(published_sixth.0.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            published_state,
+            ("SUSPENDED".into(), "APPROVED".into(), 2, 1, 1)
+        );
+    });
 }

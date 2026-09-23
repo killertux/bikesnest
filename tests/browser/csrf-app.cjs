@@ -3,6 +3,7 @@
 const assert = require('node:assert/strict');
 const { randomUUID } = require('node:crypto');
 const { chromium } = require('playwright');
+const mutation = require('./mutation.cjs').scriptMutation('csrf-stale-head');
 
 const origin = process.env.BIKESNEST_CSRF_TEST_ORIGIN;
 const target = new URL(origin);
@@ -50,9 +51,11 @@ async function submitForm(page, action, expectedStatus) {
   browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({ locale: 'en-US' });
   context.setDefaultTimeout(10_000);
-  await context.route('**/*', route => {
+  await context.route('**/*', async route => {
     const url = new URL(route.request().url());
-    return url.origin === target.origin ? route.continue() : route.abort();
+    if (url.origin !== target.origin) return route.abort();
+    if (await mutation.intercept(route)) return;
+    return route.continue();
   });
   const page = await context.newPage();
   page.on('pageerror', error => console.error('Browser script error:', error.message));
@@ -62,6 +65,7 @@ async function submitForm(page, action, expectedStatus) {
   page.on('request', request => requests.push(request));
   await page.goto(origin + '/login');
   const first = await page.locator('form[action="/login"] input[name="csrf"]').inputValue();
+  mutation.assertApplied();
   assert.ok(first);
   await page.evaluate(() => { window.csrfDocumentMarker = 'original-document'; });
   await page.locator('a[href="/password-reset"]').click();
@@ -132,30 +136,18 @@ async function submitForm(page, action, expectedStatus) {
   assert.notEqual(sessionToken, anonymousToken);
   assert.ok((await context.cookies()).some(c => c.name === 'session_id'));
 
-  // Keep the actual logout request/CSRF hook, but do not follow its landing-page
-  // redirect: the unrelated homepage search reader is not transaction-scoped
-  // yet. This also leaves a genuine old session form available for rejection.
-  await page.evaluate(() => {
-    document.addEventListener('htmx:config:request', event => {
-      if (new URL(event.detail.ctx.request.action, location.href).pathname === '/logout') {
-        event.detail.ctx.request.redirect = 'manual';
-      }
-    });
-    document.addEventListener('htmx:before:response', event => {
-      if (event.detail.ctx.response.raw.type === 'opaqueredirect') {
-        window.csrfLogoutCompleted = true;
-        event.preventDefault();
-      }
-    });
-  });
-  await page.locator('[aria-controls="account-menu"]').click();
-  await page.locator('form[action="/logout"] button[type="submit"]').first().click();
-  // Chromium exposes this manual redirect as opaque (and DevTools may report
-  // ERR_ABORTED), so observe the actual fetch response plus cookie revocation.
-  await page.waitForFunction(() => window.csrfLogoutCompleted === true);
+  // Keep a genuinely stale session form in another tab while the first tab
+  // follows the real logout redirect and renders the scoped homepage reader.
+  const staleSession = await context.newPage();
+  await staleSession.goto(origin + '/account');
+  assert.equal(await staleSession.locator('form[action="/logout"] input[name="csrf"]').first().inputValue(), sessionToken);
+  await submitForm(page, '/logout', 303);
+  await page.waitForURL(origin + '/');
+  await page.getByText('From destination to parked bike').waitFor();
   assert.ok(!(await context.cookies()).some(c => c.name === 'session_id'));
-  await submitForm(page, '/logout', 403);
-  await page.locator('#csrf-recovery').waitFor();
+  await submitForm(staleSession, '/logout', 403);
+  await staleSession.locator('#csrf-recovery').waitFor();
+  await staleSession.close();
   await page.goto(origin + '/login');
   assert.equal(await page.locator('input[name="csrf"]').inputValue(), anonymousToken);
 
@@ -205,6 +197,26 @@ async function submitForm(page, action, expectedStatus) {
   assert.equal(racePosts, 2);
   await cold.close();
 
+  // Native forms carry their own rendered token without the htmx hook.
+  const native = await browser.newContext({ javaScriptEnabled: false, locale: 'en-US' });
+  native.setDefaultTimeout(10_000);
+  await native.route('**/*', route => {
+    const url = new URL(route.request().url());
+    return url.origin === target.origin ? route.continue() : route.abort();
+  });
+  const nativePage = await native.newPage();
+  await nativePage.goto(origin + '/login');
+  const nativeToken = await nativePage.locator('input[name="csrf"]').inputValue();
+  assert.ok(nativeToken);
+  assert.equal((await native.cookies()).find(c => c.name === '__Host-csrf').value, nativeToken);
+  await nativePage.locator('input[name="email"]').fill('native-csrf-missing@example.invalid');
+  await nativePage.locator('input[name="password"]').fill('wrong-password');
+  // Invalid credentials reach the real handler at 200; CSRF rejection is 403.
+  await submitForm(nativePage, '/login', 200);
+  await nativePage.locator('#email-error[role="alert"]').waitFor();
+  assert.equal(await nativePage.locator('#email-error').innerText(), 'Email or password is incorrect.');
+  await native.close();
+
   // Fetch itself retains custom headers when following a same-origin 303.
   // Assert the hook does not add tokens to independently initiated safe reads.
   for (const request of requests.filter(r => !r.redirectedFrom() && /^(GET|HEAD|OPTIONS)$/.test(r.method()))) {
@@ -215,7 +227,7 @@ async function submitForm(page, action, expectedStatus) {
   assert.ok(cookie && cookie.httpOnly && cookie.secure);
   assert.equal(cookie.sameSite, 'Lax');
   await context.close();
-  console.log('Real Axum CSRF browser flows passed: boosted forms, explicit headers, rejection/recovery, tabs/history, login/logout and first-cookie race recovery.');
+  console.log('Real Axum CSRF browser flows passed: boosted/native forms, explicit headers, rejection/recovery, tabs/history, full login/logout navigation and first-cookie race recovery.');
 })().catch(error => {
   console.error(error);
   process.exitCode = 1;

@@ -1964,6 +1964,145 @@ async fn password_reset_atomically_updates_credential_revokes_sessions_and_compe
     }
 }
 
+#[test]
+fn two_independent_password_reset_consumers_commit_exactly_one_transition() {
+    run_isolated_database_test(|pool: sqlx::PgPool| async move {
+        let db = Db::from_pool(pool.clone());
+        let accounts = SqlxAccountRepository::new(db.clone());
+        let tokens = SqlxTokenStore::new(db.clone());
+        let sessions = SqlxSessionStore::new(db.clone());
+        let email = UserEmail::parse(&unique_email("reset-two-consumers")).unwrap();
+        let user_id = accounts
+            .create(NewAccount {
+                email: &email,
+                display_name: None,
+                password_hash: "old-hash",
+                state: AccountState::Active,
+                locale: LocaleCode::En,
+            })
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let first = VerificationToken::new([181; 32]);
+        let second = VerificationToken::new([182; 32]);
+        let first_notice_id = format!("test-reset-{}", first.to_hex());
+        let second_notice_id = format!("test-reset-{}", second.to_hex());
+        assert!(tokens.issue_reset(user_id, &first, now).await.unwrap());
+        assert!(tokens.issue_reset(user_id, &second, now).await.unwrap());
+        let session = SessionId::new([183; 32]);
+        sessions
+            .create(user_id, &session, &CsrfToken::new([184; 32]), now)
+            .await
+            .unwrap();
+
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM users WHERE id=$1 FOR UPDATE")
+            .bind(user_id.0)
+            .fetch_one(&mut *blocker)
+            .await
+            .unwrap();
+        let first_db = db.clone();
+        let second_db = db.clone();
+        let mut resets = Box::pin(async move {
+            tokio::join!(
+                complete_reset(&first_db, &first, "first-hash", now),
+                complete_reset(&second_db, &second, "second-hash", now),
+            )
+        });
+        let overlapped = tokio::select! {
+            result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let waiting: i64 = sqlx::query_scalar(
+                        "SELECT count(*) FROM pg_stat_activity
+                         WHERE datname=current_database() AND wait_event_type='Lock'",
+                    )
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                    if waiting >= 2 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }) => result.is_ok(),
+            _ = &mut resets => false,
+        };
+        blocker.rollback().await.unwrap();
+        assert!(
+            overlapped,
+            "both reset transitions must reach the account lock"
+        );
+        let (first_result, second_result) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), resets)
+                .await
+                .expect("both reset transitions finish after lock release");
+        let first_won = first_result.unwrap().is_some();
+        let second_won = second_result.unwrap().is_some();
+        assert_ne!(first_won, second_won, "exactly one reset may commit");
+
+        let stored_hash: String = sqlx::query_scalar(
+            "SELECT credential_hash FROM authentication_identities
+             WHERE user_id=$1 AND provider='password'",
+        )
+        .bind(user_id.0)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            stored_hash,
+            if first_won {
+                "first-hash"
+            } else {
+                "second-hash"
+            }
+        );
+        assert!(
+            sessions
+                .resolve(&session, Utc::now())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let unused: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM password_reset_tokens WHERE user_id=$1 AND used_at IS NULL",
+        )
+        .bind(user_id.0)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(unused, 0, "the winner invalidates every competing reset");
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_events
+             WHERE target_id=$1 AND action='auth.password_changed' AND result='success'",
+        )
+        .bind(user_id.0.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(audit_count, 1);
+        let (job_count, notification_id): (i64, Option<String>) = sqlx::query_as(
+            "SELECT count(*), max(payload->>'notification_id')
+             FROM background_job WHERE mail_account_id=$1 AND mail_purpose='password_changed'",
+        )
+        .bind(user_id.0)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(job_count, 1);
+        assert_eq!(
+            notification_id.as_deref(),
+            Some(
+                if first_won {
+                    &first_notice_id
+                } else {
+                    &second_notice_id
+                }
+                .as_str()
+            )
+        );
+    });
+}
+
 #[db_test]
 async fn password_reset_rejects_expired_and_blocked_accounts_without_state_change(
     tx: &mut bikesnest_test_support::TestTx,

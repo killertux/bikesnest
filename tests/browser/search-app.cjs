@@ -1,6 +1,7 @@
 // Invoked only by search_browser_test.rs against its real loopback Axum app.
 const assert = require('node:assert/strict');
 const { chromium } = require('playwright');
+const mutation = require('./mutation.cjs').scriptMutation('search-stale-response');
 
 const origin = process.env.BIKESNEST_SEARCH_TEST_ORIGIN;
 const target = new URL(origin);
@@ -90,6 +91,7 @@ const deadline = setTimeout(() => {
       const request = route.request();
       const url = new URL(request.url());
       if (url.origin !== target.origin) return route.abort();
+      if (await mutation.intercept(route)) return;
       if (request.method() !== 'GET' || url.pathname !== '/search' || !request.headers()['hx-request']) {
         return route.continue();
       }
@@ -114,6 +116,7 @@ const deadline = setTimeout(() => {
 
     await page.goto(origin + '/search?lat=-33.930000&lon=-70.630000&radius=1000');
     await page.locator('#search-filter-panel').waitFor();
+    mutation.assertApplied();
     const rack = page.locator('#search-filter-form input[name="type"][value="rack"]');
     if (!await rack.isVisible()) await page.getByRole('button', { name: 'Filters' }).click();
     await rack.waitFor({ state: 'visible' });

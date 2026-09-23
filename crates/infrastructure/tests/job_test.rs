@@ -20,6 +20,8 @@ const RETRY_OUTCOME_KIND: &str = "jobtest.worker-retry-outcome";
 const DEAD_OUTCOME_KIND: &str = "jobtest.worker-dead-outcome";
 const HOOK_PANIC_KIND: &str = "jobtest.worker-hook-panic";
 const HOOK_TIMEOUT_KIND: &str = "jobtest.worker-hook-timeout";
+const TWO_WORKER_KIND: &str = "jobtest.two-worker-long-first";
+const TWO_WORKER_PROBE_KIND: &str = "jobtest.two-worker-probe";
 
 struct BlockingHandler {
     kind: &'static str,
@@ -34,6 +36,57 @@ struct ActiveGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+struct LongFirstHandler {
+    blocked_started: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    blocked_started_signal: std::sync::Arc<tokio::sync::Notify>,
+    quick_runs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    quick_ran_signal: std::sync::Arc<tokio::sync::Notify>,
+    gate: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+struct ProbeHandler {
+    runs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ran_signal: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl bikesnest_application::JobHandler for ProbeHandler {
+    fn kind(&self) -> &'static str {
+        TWO_WORKER_PROBE_KIND
+    }
+
+    async fn run(&self, _: &serde_json::Value) -> Result<(), bikesnest_application::JobError> {
+        self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.ran_signal.notify_one();
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl bikesnest_application::JobHandler for LongFirstHandler {
+    fn kind(&self) -> &'static str {
+        TWO_WORKER_KIND
+    }
+
+    async fn run(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<(), bikesnest_application::JobError> {
+        if payload.get("blocked").and_then(serde_json::Value::as_bool) == Some(true) {
+            self.blocked_started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.blocked_started_signal.notify_one();
+            let permit = self.gate.acquire().await.unwrap();
+            permit.forget();
+        } else {
+            self.quick_runs
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.quick_ran_signal.notify_one();
+        }
+        Ok(())
     }
 }
 
@@ -636,6 +689,87 @@ async fn wait_for_count(counter: &std::sync::atomic::AtomicUsize, expected: usiz
     .unwrap();
 }
 
+async fn wait_for_signal(
+    counter: &std::sync::atomic::AtomicUsize,
+    signal: &tokio::sync::Notify,
+    expected: usize,
+    limit: std::time::Duration,
+) -> bool {
+    tokio::time::timeout(limit, async {
+        loop {
+            let notified = signal.notified();
+            if counter.load(std::sync::atomic::Ordering::SeqCst) >= expected {
+                break;
+            }
+            notified.await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+async fn wait_for_succeeded(
+    pool: &sqlx::PgPool,
+    id: i64,
+    limit: std::time::Duration,
+) -> Result<bool, sqlx::Error> {
+    match tokio::time::timeout(limit, async {
+        loop {
+            let state: String = sqlx::query_scalar("SELECT state FROM background_job WHERE id=$1")
+                .bind(id)
+                .fetch_one(pool)
+                .await?;
+            if state == "succeeded" {
+                return Ok::<_, sqlx::Error>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    {
+        Ok(result) => result.map(|()| true),
+        Err(_) => Ok(false),
+    }
+}
+
+async fn wait_until_heartbeat_carries_job_past(
+    pool: &sqlx::PgPool,
+    id: i64,
+    observed_lease_deadline: chrono::DateTime<Utc>,
+    limit: std::time::Duration,
+) -> Result<bool, sqlx::Error> {
+    match tokio::time::timeout(limit, async {
+        loop {
+            let (database_now, state, attempts, lease_expires_at): (
+                chrono::DateTime<Utc>,
+                String,
+                i32,
+                Option<chrono::DateTime<Utc>>,
+            ) = sqlx::query_as(
+                "SELECT clock_timestamp(),state,attempts,lease_expires_at
+                 FROM background_job WHERE id=$1",
+            )
+            .bind(id)
+            .fetch_one(pool)
+            .await?;
+            if database_now >= observed_lease_deadline
+                && state == "running"
+                && attempts == 1
+                && lease_expires_at
+                    .is_some_and(|deadline| deadline > database_now + chrono::Duration::seconds(1))
+            {
+                return Ok::<_, sqlx::Error>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    {
+        Ok(result) => result.map(|()| true),
+        Err(_) => Ok(false),
+    }
+}
+
 #[test]
 fn worker_claims_only_capacity_and_heartbeats_every_active_lease() {
     run_isolated_database_test(|pool: sqlx::PgPool| async move {
@@ -687,6 +821,205 @@ fn worker_claims_only_capacity_and_heartbeats_every_active_lease() {
         wait_for_count(&started, 3).await;
         shutdown.cancel();
         task.await.unwrap();
+    });
+}
+
+#[test]
+fn two_workers_do_not_reclaim_work_behind_a_long_first_handler() {
+    run_isolated_database_test(|pool: sqlx::PgPool| async move {
+        let observation_limit = std::time::Duration::from_secs(15);
+        let repo = SqlxJobRepository::new(Db::from_pool(pool.clone()));
+        let blocked_id = repo
+            .enqueue(
+                TWO_WORKER_KIND,
+                &json!({"blocked": true}),
+                Utc::now(),
+                Some(3),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let quick_id = repo
+            .enqueue(
+                TWO_WORKER_KIND,
+                &json!({"blocked": false}),
+                Utc::now(),
+                Some(3),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let probe_id = repo
+            .enqueue(TWO_WORKER_PROBE_KIND, &json!({}), Utc::now(), Some(3), None)
+            .await
+            .unwrap()
+            .unwrap();
+        let blocked_started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let blocked_started_signal = std::sync::Arc::new(tokio::sync::Notify::new());
+        let quick_runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let quick_ran_signal = std::sync::Arc::new(tokio::sync::Notify::new());
+        let probe_runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe_ran_signal = std::sync::Arc::new(tokio::sync::Notify::new());
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let first_registry = std::sync::Arc::new(JobRegistry::new(
+            vec![Box::new(LongFirstHandler {
+                blocked_started: blocked_started.clone(),
+                blocked_started_signal: blocked_started_signal.clone(),
+                quick_runs: quick_runs.clone(),
+                quick_ran_signal: quick_ran_signal.clone(),
+                gate: gate.clone(),
+            })],
+            vec![],
+        ));
+        let config = JobConfig {
+            batch_size: 2,
+            poll_interval: std::time::Duration::from_millis(5),
+            // Keep the lease short enough for the regression to cross its
+            // original deadline, but long enough that ordinary scheduler/DB
+            // contention cannot manufacture a false lease loss.
+            lease_ttl: std::time::Duration::from_secs(2),
+            handler_timeout: std::time::Duration::from_secs(45),
+            shutdown_grace: std::time::Duration::from_secs(2),
+            ..JobConfig::default()
+        };
+        let first_shutdown = CancellationToken::new();
+        let mut first = tokio::spawn(
+            Worker::new(repo.clone(), first_registry, config)
+                .run_kinds(first_shutdown.clone(), vec![TWO_WORKER_KIND.to_owned()]),
+        );
+        let (blocked_seen, quick_seen) = tokio::join!(
+            wait_for_signal(
+                &blocked_started,
+                &blocked_started_signal,
+                1,
+                observation_limit,
+            ),
+            wait_for_signal(&quick_runs, &quick_ran_signal, 1, observation_limit),
+        );
+        let first_ready = blocked_seen && quick_seen;
+        let initial_lease = sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+            "SELECT lease_expires_at FROM background_job
+             WHERE id=$1 AND state='running' AND attempts=1 AND lease_expires_at IS NOT NULL",
+        )
+        .bind(blocked_id)
+        .fetch_optional(&pool)
+        .await;
+        let heartbeat_carried_past_observed_lease = match initial_lease.as_ref() {
+            Ok(Some(deadline)) => wait_until_heartbeat_carries_job_past(
+                &pool,
+                blocked_id,
+                deadline.to_owned(),
+                observation_limit,
+            )
+            .await
+            .map_err(|error| error.to_string()),
+            Ok(None) => Ok(false),
+            Err(error) => Err(error.to_string()),
+        };
+        let second_registry = std::sync::Arc::new(JobRegistry::new(
+            vec![
+                Box::new(LongFirstHandler {
+                    blocked_started: blocked_started.clone(),
+                    blocked_started_signal: blocked_started_signal.clone(),
+                    quick_runs: quick_runs.clone(),
+                    quick_ran_signal: quick_ran_signal.clone(),
+                    gate: gate.clone(),
+                }),
+                Box::new(ProbeHandler {
+                    runs: probe_runs.clone(),
+                    ran_signal: probe_ran_signal.clone(),
+                }),
+            ],
+            vec![],
+        ));
+        let second_shutdown = CancellationToken::new();
+        let mut second = tokio::spawn(Worker::new(repo, second_registry, config).run_kinds(
+            second_shutdown.clone(),
+            vec![TWO_WORKER_KIND.to_owned(), TWO_WORKER_PROBE_KIND.to_owned()],
+        ));
+        let second_polled =
+            wait_for_signal(&probe_runs, &probe_ran_signal, 1, observation_limit).await;
+        let probe_finished = if second_polled {
+            wait_for_succeeded(&pool, probe_id, observation_limit).await
+        } else {
+            Ok(false)
+        };
+        let rows = sqlx::query_as::<_, (i64, String, i32, bool)>(
+            "SELECT id,state,attempts,COALESCE(lease_expires_at>clock_timestamp(),false)
+             FROM background_job WHERE id=ANY($1) ORDER BY id",
+        )
+        .bind(vec![blocked_id, quick_id, probe_id])
+        .fetch_all(&pool)
+        .await;
+
+        gate.add_permits(1);
+        let blocked_finished = wait_for_succeeded(&pool, blocked_id, observation_limit).await;
+        first_shutdown.cancel();
+        second_shutdown.cancel();
+        let joined = tokio::time::timeout(observation_limit, async {
+            tokio::join!(&mut first, &mut second)
+        })
+        .await;
+        let workers_stopped_cleanly = match joined {
+            Ok((first, second)) => first.is_ok() && second.is_ok(),
+            Err(_) => {
+                first.abort();
+                second.abort();
+                let _ = tokio::join!(first, second);
+                false
+            }
+        };
+        let final_rows = sqlx::query_as::<_, (i64, String, i32, bool, bool)>(
+            "SELECT id,state,attempts,claimed_by IS NULL,lease_expires_at IS NULL
+             FROM background_job WHERE id=ANY($1) ORDER BY id",
+        )
+        .bind(vec![blocked_id, quick_id, probe_id])
+        .fetch_all(&pool)
+        .await;
+
+        // No assertion occurs until both worker tasks have been cancelled and
+        // reaped (or boundedly aborted and reaped), so a failing observation
+        // cannot detach work into isolated-database teardown.
+        assert!(workers_stopped_cleanly, "both workers must stop cleanly");
+        assert!(first_ready, "the first worker must start both claimed jobs");
+        assert!(
+            matches!(initial_lease, Ok(Some(_))),
+            "the blocked job must expose its first live lease: {initial_lease:?}"
+        );
+        assert!(
+            matches!(heartbeat_carried_past_observed_lease, Ok(true)),
+            "the blocked attempt must remain owned beyond its observed lease deadline: \
+             {heartbeat_carried_past_observed_lease:?}"
+        );
+        assert!(
+            second_polled,
+            "the second worker must execute its probe job"
+        );
+        assert!(
+            matches!(probe_finished, Ok(true)),
+            "the probe outcome must durably finish: {probe_finished:?}"
+        );
+        assert!(
+            matches!(blocked_finished, Ok(true)),
+            "the blocked job must durably finish: {blocked_finished:?}"
+        );
+        assert_eq!(blocked_started.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(quick_runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(probe_runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let rows = rows.unwrap();
+        assert_eq!(rows[0], (blocked_id, "running".into(), 1, true));
+        assert_eq!(rows[1], (quick_id, "succeeded".into(), 1, false));
+        assert_eq!(rows[2], (probe_id, "succeeded".into(), 1, false));
+        assert_eq!(
+            final_rows.unwrap(),
+            vec![
+                (blocked_id, "succeeded".into(), 1, true, true),
+                (quick_id, "succeeded".into(), 1, true, true),
+                (probe_id, "succeeded".into(), 1, true, true),
+            ]
+        );
     });
 }
 

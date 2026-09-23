@@ -336,12 +336,13 @@ missing translated dataset attribute, not copy shown in the normal path.
 - **`TestPasswordHasher`** — a non-cryptographic hash (prefix `test:`) so the
   web/HTTP suite never pays for argon2.
 - **`TestObjectStorage`** — in-memory object storage double.
-- **`pool()`** — the shared, migrated connection pool, for wiring routers.
+- **`pool()`** — the shared, migrated connection pool, for harness internals
+  and independent read-only observers; ordinary routers use the scoped `Db`.
 
 For HTTP tests, inject doubles through the test constructor:
 
 ```rust
-let db = Db::from_pool(pool().await);
+let db = tx.db().await;
 let app = bikesnest_web::app_router_with(
     db,
     std::time::Duration::from_secs(2),
@@ -400,12 +401,13 @@ async fn user_builder_persists_a_user(tx: &mut TestTx) {
 
 ### 4. HTTP endpoint (DB-backed, through the real router)
 
-Use `#[db_test]` + `pool()` + `app_router(_with)` + `tower::ServiceExt::oneshot`:
+Use `#[db_test]` + `tx.db()` + `app_router(_with)` + `tower::ServiceExt::oneshot`:
 
 ```rust
 #[db_test]
-async fn healthz_is_alive(_tx: &mut TestTx) {
-    let app = bikesnest_web::app_router(Db::from_pool(pool().await), std::time::Duration::from_secs(2));
+async fn healthz_is_alive(tx: &mut TestTx) {
+    let db = tx.db().await;
+    let app = bikesnest_web::app_router(db, std::time::Duration::from_secs(2));
     let res = app.oneshot(
         Request::builder().uri("/healthz").body(axum::body::Body::empty()).unwrap()
     ).await.unwrap();
