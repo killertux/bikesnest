@@ -243,7 +243,8 @@ pub const DEFAULT_MAPBOX_STYLE_URL: &str = "mapbox://styles/mapbox/streets-v12";
 pub enum MapConfig {
     MapLibre {
         style_url: String,
-        /// Public Mapbox token for the style/tiles; empty for OpenFreeMap.
+        /// Always empty after config resolution. Retained for the shared page
+        /// layout contract; Mapbox-backed styles resolve to [`Self::Mapbox`].
         access_token: String,
     },
     Mapbox {
@@ -511,6 +512,8 @@ pub struct Config {
     pub retention: RetentionPolicy,
     /// Photo pipeline limits.
     pub photo: PhotoConfig,
+    /// Maximum simultaneous image decode/encode operations in this process.
+    pub photo_processing_concurrency: usize,
     /// Shared CPU admission for password hash and verify operations.
     pub password_hash: PasswordHashConfig,
     /// Moderation limits.
@@ -611,6 +614,7 @@ impl Config {
             freshness: freshness_config(&env),
             retention: retention_config(&env),
             photo: photo_config(&env),
+            photo_processing_concurrency: photo_processing_concurrency(&env)?,
             password_hash: password_hash_config(&env)?,
             moderation: moderation_config(&env),
             jobs: job_config(&env),
@@ -811,6 +815,7 @@ impl Config {
             },
             retention: RetentionPolicy::default(),
             photo: PhotoConfig::default(),
+            photo_processing_concurrency: 1,
             password_hash: PasswordHashConfig::default(),
             moderation: ModerationConfig::default(),
             jobs: JobConfig {
@@ -1026,22 +1031,29 @@ fn resolve_map_config(
     style_url: Option<String>,
     map_token: Option<String>,
     fallback_token: Option<String>,
-) -> MapConfig {
+) -> Result<MapConfig, ConfigError> {
     let style_url = style_url.unwrap_or_else(|| DEFAULT_MAP_STYLE_URL.to_string());
-    let access_token = if is_mapbox_style(&style_url) {
-        map_token.or(fallback_token).unwrap_or_default()
+    if is_mapbox_style(&style_url) {
+        let access_token = map_token
+            .or(fallback_token)
+            .ok_or(ConfigError::MissingEnv("MAPBOX_MAP_ACCESS_TOKEN"))?;
+        Ok(MapConfig::Mapbox {
+            style_url,
+            access_token,
+        })
     } else {
-        // Non-Mapbox style (e.g. OpenFreeMap) needs no token; keep it off the page.
-        String::new()
-    };
-    MapConfig::MapLibre {
-        style_url,
-        access_token,
+        // MapLibre v6 does not consume Mapbox browser tokens or mapbox://
+        // styles. Non-Mapbox styles stay token-free and use MapLibre.
+        Ok(MapConfig::MapLibre {
+            style_url,
+            access_token: String::new(),
+        })
     }
 }
 
-/// Map half of the location-provider profile. Without `LOCATION_PROVIDER`,
-/// preserve the existing `MAP_STYLE_URL`/MapLibre behavior.
+/// Map half of the location-provider profile. Without `LOCATION_PROVIDER`, a
+/// legacy Mapbox style selects Mapbox GL JS and requires its browser token;
+/// every other `MAP_STYLE_URL` selects token-free MapLibre.
 fn map_config(env: &EnvSource<'_>) -> Result<MapConfig, ConfigError> {
     match env
         .string("LOCATION_PROVIDER")
@@ -1063,11 +1075,11 @@ fn map_config(env: &EnvSource<'_>) -> Result<MapConfig, ConfigError> {
             "LOCATION_PROVIDER",
             format!("unknown provider {other:?}; expected fake, mapbox or google"),
         )),
-        None => Ok(resolve_map_config(
+        None => resolve_map_config(
             env.string("MAP_STYLE_URL"),
             env.string("MAPBOX_MAP_ACCESS_TOKEN"),
             env.string("MAPBOX_ACCESS_TOKEN"),
-        )),
+        ),
     }
 }
 
@@ -1126,6 +1138,26 @@ fn photo_config(env: &EnvSource<'_>) -> PhotoConfig {
             .u8("PHOTO_DERIVATIVE_QUALITY")
             .unwrap_or(bikesnest_domain::DERIVATIVE_QUALITY),
     }
+}
+
+fn photo_processing_concurrency(env: &EnvSource<'_>) -> Result<usize, ConfigError> {
+    let key = "PHOTO_PROCESSING_CONCURRENCY";
+    let value = match env.string(key) {
+        Some(raw) => raw
+            .parse::<usize>()
+            .map_err(|_| ConfigError::invalid(key, "must be a positive integer"))?,
+        None => 1,
+    };
+    if value == 0 {
+        return Err(ConfigError::invalid(key, "must be greater than zero"));
+    }
+    if value > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err(ConfigError::invalid(
+            key,
+            "exceeds the semaphore implementation limit",
+        ));
+    }
+    Ok(value)
 }
 
 fn password_hash_config(env: &EnvSource<'_>) -> Result<PasswordHashConfig, ConfigError> {
@@ -1353,6 +1385,29 @@ mod tests {
             Config::from_lookup(&lookup(&[
                 DB,
                 ("PASSWORD_HASH_CONCURRENCY", too_large.as_str()),
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn photo_processing_concurrency_is_bounded_and_configurable() {
+        assert_eq!(config(&[DB]).photo_processing_concurrency, 1);
+        assert_eq!(
+            config(&[DB, ("PHOTO_PROCESSING_CONCURRENCY", "3")]).photo_processing_concurrency,
+            3
+        );
+        for value in ["0", "-1", "not-a-number"] {
+            assert!(
+                Config::from_lookup(&lookup(&[DB, ("PHOTO_PROCESSING_CONCURRENCY", value)]))
+                    .is_err()
+            );
+        }
+        let too_large = usize::MAX.to_string();
+        assert!(
+            Config::from_lookup(&lookup(&[
+                DB,
+                ("PHOTO_PROCESSING_CONCURRENCY", too_large.as_str()),
             ]))
             .is_err()
         );
@@ -1874,7 +1929,7 @@ mod tests {
 
     #[test]
     fn map_style_defaults_to_streets_with_matching_csp_origin() {
-        let c = resolve_map_config(None, None, None);
+        let c = resolve_map_config(None, None, None).unwrap();
         let MapConfig::MapLibre {
             style_url,
             access_token,
@@ -1888,26 +1943,33 @@ mod tests {
     }
 
     #[test]
-    fn mapbox_style_pulls_token() {
+    fn legacy_mapbox_style_selects_mapbox_renderer_and_pulls_token() {
         let c = resolve_map_config(
             Some("mapbox://styles/u/s".to_string()),
             Some("public-map-tok".to_string()),
             Some("geo-tok".to_string()),
-        );
+        )
+        .unwrap();
         // The dedicated map token wins; the geocoder token is only a fallback.
         assert!(matches!(
             c,
-            MapConfig::MapLibre { access_token, .. } if access_token == "public-map-tok"
+            MapConfig::Mapbox { access_token, .. } if access_token == "public-map-tok"
         ));
 
         let fallback = resolve_map_config(
             Some("https://api.mapbox.com/styles/v1/u/s".to_string()),
             None,
             Some("geo-tok".to_string()),
-        );
+        )
+        .unwrap();
         assert!(matches!(
             fallback,
-            MapConfig::MapLibre { access_token, .. } if access_token == "geo-tok"
+            MapConfig::Mapbox { access_token, .. } if access_token == "geo-tok"
+        ));
+
+        assert!(matches!(
+            resolve_map_config(Some("mapbox://styles/u/s".to_string()), None, None),
+            Err(ConfigError::MissingEnv("MAPBOX_MAP_ACCESS_TOKEN"))
         ));
     }
 
@@ -1919,7 +1981,8 @@ mod tests {
             Some("https://tiles.example/style.json".to_string()),
             None,
             Some("geo-tok".to_string()),
-        );
+        )
+        .unwrap();
         assert!(matches!(
             c,
             MapConfig::MapLibre { access_token, .. } if access_token.is_empty()

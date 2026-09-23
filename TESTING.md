@@ -168,6 +168,12 @@ the timestamp/PID/counter name makes such leftovers identifiable for manual
 removal. Test tasks must still be joined or canceled and transaction locks
 released before their closure returns.
 
+`run_isolated_unmigrated_database_test` uses the same target validation,
+unique-name ownership and cleanup path but supplies an empty database. It is
+reserved for forward-upgrade tests that first run an exact older subset of the
+committed SQLx migration set and then run the current migrator; ordinary tests
+must use the migrated runner.
+
 Regression examples: `infrastructure/tests/transaction_scope_test.rs` verifies
 repository commit isolation, failed-savepoint recovery, outer rollback after
 success/panic, and invalidation of surviving clones. `public_attribution_test.rs`

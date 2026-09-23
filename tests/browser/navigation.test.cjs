@@ -108,12 +108,25 @@ before(async () => {
       const url = new URL(req.url, 'http://localhost');
       if (url.pathname.startsWith('/static/')) {
         const path = url.pathname.slice(1);
+        if (path.endsWith('js/maplibre-loader.mjs')) {
+          await new Promise(r => setTimeout(r, 250));
+          res.setHeader('Content-Type', 'text/javascript');
+          return res.end('window.testSdk = true; window.maplibregl = {};');
+        }
         if (/map-provider-.*\.js$/.test(path)) {
+          if (url.searchParams.has('actual')) {
+            res.setHeader('Content-Type', 'text/javascript');
+            return res.end(await source('web/' + path));
+          }
           await new Promise(r => setTimeout(r, 150));
           res.setHeader('Content-Type', 'text/javascript');
           return res.end(providerStub);
         }
-        if (/vendor\/map(lib|box).*\.js$/.test(path)) {
+        if (/vendor\/maplibre-gl(?:-shared|-worker)?\.mjs$/.test(path)) {
+          res.setHeader('Content-Type', 'text/javascript');
+          return res.end(await source('web/' + path));
+        }
+        if (/vendor\/mapbox-gl\.js$/.test(path)) {
           if (url.searchParams.has('actual')) {
             res.setHeader('Content-Type', 'text/javascript');
             return res.end(await source('web/' + path));
@@ -125,19 +138,37 @@ before(async () => {
         res.setHeader('Content-Type', path.endsWith('.js') ? 'text/javascript' : 'text/css');
         return res.end(await source('web/' + path));
       }
+      if (url.pathname === '/test-map-style-empty.json' || url.pathname === '/test-map-style-failed.json') {
+        const failed = url.pathname.endsWith('failed.json');
+        res.setHeader('Content-Type', 'application/json');
+        return res.end(JSON.stringify(failed
+          ? {version: 8, sources: {broken: {type: 'vector', tiles: ['/missing/{z}/{x}/{y}.pbf']}}, layers: [{id: 'broken', type: 'circle', source: 'broken', 'source-layer': 'missing'}]}
+          : {version: 8, sources: {}, layers: []}));
+      }
       const [, kind = 'plain', provider = 'google'] = url.pathname.split('/');
+      const mapboxConnect = (kind === 'sdk' || kind === 'sdk-fail') && provider === 'mapbox'
+        ? ' https://api.mapbox.com https://events.mapbox.com'
+        : '';
       res.setHeader('Content-Type', 'text/html');
-      res.setHeader('Content-Security-Policy', "script-src 'nonce-test-nonce' 'strict-dynamic'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; worker-src 'self' blob:; object-src 'none'");
+      res.setHeader('Content-Security-Policy', "script-src 'nonce-test-nonce' 'strict-dynamic'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'" + mapboxConnect + "; worker-src 'self' blob:; object-src 'none'");
       if (kind === 'sdk' || kind === 'sdk-fail') {
         const global = provider === 'mapbox' ? 'mapboxgl' : 'maplibregl';
         const style = kind === 'sdk-fail'
           ? '{version:8,sources:{broken:{type:"vector",tiles:["/missing/{z}/{x}/{y}.pbf"]}},layers:[{id:"broken",type:"circle",source:"broken","source-layer":"missing"}]}'
           : '{version:8,sources:{},layers:[]}';
-        return res.end('<!doctype html><div id="map" style="width:200px;height:200px"></div>' +
-          '<script nonce="test-nonce" src="/static/vendor/' + provider + '-gl.js?actual=1"></script>' +
-          '<script nonce="test-nonce">var sdk=' + global + ';' +
-          (provider === 'mapbox' ? 'sdk.accessToken="";' : '') +
-          'window.actualMap=new sdk.Map({container:"map",style:' + style + ',center:[0,0],zoom:1,attributionControl:false});' +
+        if (provider === 'maplibre') {
+          return res.end('<!doctype html><div id="map" style="width:200px;height:200px"></div>' +
+            '<script type="module" nonce="test-nonce">import * as sdk from "/static/vendor/maplibre-gl.mjs";' +
+            'sdk.setWorkerUrl("/static/vendor/maplibre-gl-worker.mjs");' +
+            'window.actualMap=new sdk.Map({container:"map",style:' + style + ',center:[0,0],zoom:1,attributionControl:false});' +
+            'window.actualMap.on("load",function(){window.sdkReady=true});window.actualMap.on("error",function(){window.sdkFailed=true})</script>');
+        }
+        return res.end('<!doctype html><body data-map-style-url="/test-map-style-' + (kind === 'sdk-fail' ? 'failed' : 'empty') + '.json"' +
+          ' data-map-access-token="browser-mapbox-test-token"><div id="map" style="width:200px;height:200px"></div>' +
+          '<script nonce="test-nonce" src="/static/vendor/mapbox-gl.js?actual=1"></script>' +
+          '<script nonce="test-nonce" src="/static/js/map-provider-mapbox.js?actual=1"></script>' +
+          '<script nonce="test-nonce">var adapted=window.BikesNestMapProvider.createMap(document.getElementById("map"),{center:{lat:0,lon:0},zoom:1,navigation:false});' +
+          'window.actualMap=adapted.raw;window.sdkToken=' + global + '.accessToken;' +
           'window.actualMap.on("load",function(){window.sdkReady=true});window.actualMap.on("error",function(){window.sdkFailed=true})</script>');
       }
       let html = (await pageHtml(kind === 'english' ? 'plain' : kind, provider))
@@ -485,17 +516,42 @@ for (const provider of ['maplibre', 'mapbox']) {
   test(provider + ': actual vendored SDK constructs and loads a local empty map under CSP', async () => {
     const page = await browser.newPage();
     const violations = [];
+    const workerRequests = [];
+    const mapboxTokenRequests = [];
+    if (provider === 'mapbox') {
+      // Fulfil SDK telemetry/session requests locally: prove the configured
+      // browser token reaches Mapbox's request boundary without contacting it.
+      await page.route(/https:\/\/(?:api|events)\.mapbox\.com\/.*/, route => {
+        mapboxTokenRequests.push(route.request().url());
+        return route.fulfill({ status: 204, body: '' });
+      });
+    }
     page.on('console', message => {
       if (message.text().includes('Content Security Policy')) violations.push(message.text());
+    });
+    page.on('request', request => {
+      if (request.url().includes('maplibre-gl-worker.mjs')) workerRequests.push(request.url());
     });
     await page.goto(origin + '/sdk/' + provider);
     await page.waitForFunction(() => window.sdkReady === true);
     assert.equal(await page.evaluate(() => !!window.actualMap.getCanvas()), true);
+    if (provider === 'maplibre') assert.equal(workerRequests.length > 0, true);
+    if (provider === 'mapbox') {
+      assert.equal(await page.evaluate(() => window.sdkToken), 'browser-mapbox-test-token');
+      await page.waitForFunction(() => performance.getEntriesByType('resource').some(entry =>
+        entry.name.includes('mapbox.com/')));
+      assert.equal(mapboxTokenRequests.length > 0, true);
+      assert.equal(mapboxTokenRequests.every(url => new URL(url).searchParams.get('access_token') === 'browser-mapbox-test-token'), true);
+    }
     assert.deepEqual(violations, []);
     await page.close();
   });
   test(provider + ': actual vendored SDK surfaces a failed local tile request', async () => {
     const page = await browser.newPage();
+    if (provider === 'mapbox') {
+      await page.route(/https:\/\/(?:api|events)\.mapbox\.com\/.*/, route =>
+        route.fulfill({ status: 204, body: '' }));
+    }
     await page.goto(origin + '/sdk-fail/' + provider);
     await page.waitForFunction(() => window.sdkFailed === true);
     assert.equal(await page.evaluate(() => !!window.actualMap.getCanvas()), true);

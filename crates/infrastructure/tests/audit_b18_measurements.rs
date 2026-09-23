@@ -461,7 +461,7 @@ async fn measure_export(tx: &mut TestTx, profile: ExportProfile) {
 fn b18_media_representative_and_20mp_release_measurement() {
     run_db_test(async |_tx| {
         let limits = PhotoLimits::default();
-        let processor = LocalImageProcessor::new(limits);
+        let processor = LocalImageProcessor::new(limits, 1);
         let representative = include_bytes!("../../../web/static/img/hero-bike-parking.jpg");
         assert!(representative.len() <= limits.max_bytes);
 

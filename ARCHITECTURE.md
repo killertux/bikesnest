@@ -150,9 +150,10 @@ CPU-heavy adapters use process-local admission before entering Tokio's blocking
 pool. Password hash and verify operations share one bounded execution budget,
 a finite waiting budget, and a finite admission timeout; interactive login
 still waits synchronously for its result and is never durable work. Image
-decode/encode retains its owned semaphore permit inside the blocking closure,
-so cancelling an HTTP future cannot make still-running CPU or decoded-image
-memory disappear from capacity accounting.
+decode/encode has a separately configurable process concurrency limit (default
+one) and retains its owned semaphore permit inside the blocking closure, so
+cancelling an HTTP future cannot make still-running CPU or decoded-image memory
+disappear from capacity accounting.
 
 Providers are selected from environment variables in `config.rs` and wired into
 the router in `crates/web/src/wiring.rs` — the one module that names them.

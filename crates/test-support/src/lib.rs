@@ -141,6 +141,22 @@ fn is_loopback_test_host(host: &str) -> bool {
 /// and panic, but a process kill can still leave the uniquely named database
 /// behind for an operator to remove.
 pub fn run_isolated_database_test(f: impl AsyncFnOnce(PgPool)) -> String {
+    run_isolated_database_test_with_setup(true, f)
+}
+
+/// Run a real multi-connection test in its own empty disposable database.
+///
+/// This is reserved for migration tests that must first build an older schema
+/// from the committed migration set. The closure owns migration setup; the
+/// same loopback/name validation and awaited cleanup guarantees apply.
+pub fn run_isolated_unmigrated_database_test(f: impl AsyncFnOnce(PgPool)) -> String {
+    run_isolated_database_test_with_setup(false, f)
+}
+
+fn run_isolated_database_test_with_setup(
+    migrate_current: bool,
+    f: impl AsyncFnOnce(PgPool),
+) -> String {
     let base_url = database_url();
     let base_options = sqlx::postgres::PgConnectOptions::from_str(&base_url)
         .unwrap_or_else(|_| panic!("test-support: invalid validated test database URL"));
@@ -181,7 +197,7 @@ pub fn run_isolated_database_test(f: impl AsyncFnOnce(PgPool)) -> String {
             .connect_with(isolated_options)
             .await
             .map_err(|_| "connect")?;
-        if sqlx::migrate!("../../migrations").run(&pool).await.is_err() {
+        if migrate_current && sqlx::migrate!("../../migrations").run(&pool).await.is_err() {
             pool.close().await;
             return Err("migrate");
         }

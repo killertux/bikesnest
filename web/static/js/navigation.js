@@ -17,7 +17,7 @@
     if (url.origin !== location.origin || url.search || url.hash) return false;
     var path = url.pathname.replace(/^\/static\/h\/[0-9a-f]{10}\//, "/static/");
     if (node.tagName === "SCRIPT") {
-      return /^\/static\/(vendor\/(maplibre-gl|mapbox-gl)\.js|js\/(map-provider-(maplibre|mapbox|google)|search|details-map|pin-picker)\.js)$/.test(path);
+      return /^\/static\/(vendor\/mapbox-gl\.js|js\/maplibre-loader\.mjs|js\/(map-provider-(maplibre|mapbox|google)|search|details-map|pin-picker)\.js)$/.test(path);
     }
     return /^\/static\/(vendor\/(maplibre-gl|mapbox-gl)\.css|css\/map\.css)$/.test(path);
   }
@@ -43,6 +43,7 @@
       if (node.tagName === "SCRIPT") {
         el.src = url;
         el.async = false;
+        if (node.type) el.type = node.type;
         if (documentNonce) el.nonce = documentNonce;
       }
       else { el.rel = "stylesheet"; el.href = url; }

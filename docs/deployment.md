@@ -68,6 +68,7 @@ All knobs are documented in `.env.example`; production sets them as real secrets
 | `JOBS_MAX_ATTEMPTS` / `JOBS_BACKOFF_BASE_MS` | retry budget (default 5) and exponential-backoff base (default 2000) before dead-letter |
 | `JOBS_HISTORY_RETENTION_DAYS` | `jobs.gc` deletes `succeeded`/`failed` rows older than this (default 7) |
 | `PASSWORD_HASH_CONCURRENCY` / `PASSWORD_HASH_QUEUE_CAPACITY` / `PASSWORD_HASH_ADMISSION_TIMEOUT_MS` | shared Argon2 hash+verify running budget, finite waiter count, and waiter deadline (defaults 2 / 8 / 2000; queue 0 disables waiting) |
+| `PHOTO_PROCESSING_CONCURRENCY` | process-wide simultaneous image decode/encode limit (default `1`). Keep at `1` until a release capacity test proves memory headroom for a higher value |
 | `CSP_TILE_HOSTS` / `CSP_GEOCODE_HOSTS` | extra origins allowed by the strict CSP for MapLibre tiles / browser geocoding. Required Mapbox and Google Maps origins are added automatically for their profiles |
 | `CSP_MEDIA_HOSTS` | object-storage origin(s) allowed in the CSP `img-src` that parking photos are served from as direct pre-signed URLs (dev: `http://localhost:9000`; AWS: `https://<bucket>.s3.<region>.amazonaws.com`) |
 | `APP_ENV` | `production` → JSON structured logs (machine-parseable, forward to a log aggregator) **and the startup validation described below** |
@@ -94,6 +95,16 @@ are bounded by a two-second deadline. These are conservative process defaults,
 not a production latency SLO: measure the deployed CPU and memory limit, then
 tune all three values together. Queue capacity zero is supported when immediate
 overload rejection is preferred.
+
+Image processing uses a separate semaphore with a conservative default of one
+decode/encode at a time per process. A 20 MP input decodes to about 60 MB of RGB
+pixels and the B18 audit harness observed an approximately 151 MiB absolute
+single-process high-water mark on its test runtime. That high-water mark is not
+an additive per-request prediction. Before increasing
+`PHOTO_PROCESSING_CONCURRENCY`, the release owner must record the deployed
+container memory limit, replica/process layout, baseline RSS, and concurrent
+20 MP load evidence with adequate headroom. Started blocking work retains its
+permit after HTTP cancellation.
 
 **Never** put secrets in the image; the `.dockerignore` excludes `.env*`.
 
@@ -241,6 +252,12 @@ documented below and must be replaced before enabling sign-in in production.
   Autocomplete predictions and the selected Place Details request share a
   random session token. Google requires a browser key, a server key, and a map
   ID; absence of any one is a startup error.
+
+Legacy deployments without `LOCATION_PROVIDER` may still set `MAP_STYLE_URL`.
+A `mapbox://` or `api.mapbox.com` style selects Mapbox GL JS and requires
+`MAPBOX_MAP_ACCESS_TOKEN` (with `MAPBOX_ACCESS_TOKEN` accepted only as the
+legacy fallback). Other style URLs select MapLibre and never expose either
+token to that SDK.
 
 The hosted geocoder sees the typed address and, for Google autocomplete, the
 random session token. It receives no BikesNest account identity, cookie, or

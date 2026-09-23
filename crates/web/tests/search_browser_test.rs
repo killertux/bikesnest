@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bikesnest_domain::ParkingType;
-use bikesnest_infrastructure::{Db, FakeEmailProvider, InMemoryRateLimiter};
+use bikesnest_infrastructure::{Db, FakeEmailProvider, InMemoryRateLimiter, MapConfig};
 use bikesnest_test_support::{
     ParkingBuilder, TestObjectStorage, TestPasswordHasher, run_isolated_database_test, test_config,
 };
@@ -69,6 +69,10 @@ fn search_state_in_real_browser() {
         let mut config = test_config();
         config.base_url = origin.clone();
         config.static_root = root.join("web/static");
+        config.map = MapConfig::MapLibre {
+            style_url: format!("{origin}/test-map-style.json"),
+            access_token: String::new(),
+        };
         config.jobs.enabled = false;
         let app = app_router_with(
             Arc::new(config),
@@ -81,6 +85,16 @@ fn search_state_in_real_browser() {
                 storage: Arc::new(TestObjectStorage::new()),
                 detail_reads: None,
             },
+        )
+        .route(
+            "/test-map-style.json",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "version": 8,
+                    "sources": {},
+                    "layers": []
+                }))
+            }),
         );
         let _server = TestServer(tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve browser app");

@@ -11,7 +11,9 @@ argon2 = "0.5"
 async-trait = { workspace = true }
 aws-config = "1.11.0"
 aws-credential-types = "1.3.0"
-aws-sdk-s3 = "1.144.0"
+# The generated SDK's default `rustls` feature selects its legacy Hyper 0.14 /
+# rustls 0.21 connector in addition to the maintained default HTTPS client.
+aws-sdk-s3 = { version = "1.144.0", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 aws-smithy-types = "1.6.2"
 bikesnest-application = { workspace = true }
 bikesnest-domain = { workspace = true }

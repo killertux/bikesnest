@@ -4,14 +4,12 @@
 
   var cfg = document.body ? document.body.dataset : {};
   var styleUrl = cfg.mapStyleUrl || "https://tiles.openfreemap.org/styles/liberty";
-  var accessToken = cfg.mapAccessToken || "";
 
   function position(value) {
     return [value.lon, value.lat];
   }
 
   function MapLibreAdapter(el, options) {
-    if (accessToken) window.maplibregl.accessToken = accessToken;
     this.raw = new window.maplibregl.Map({
       container: el,
       style: styleUrl,

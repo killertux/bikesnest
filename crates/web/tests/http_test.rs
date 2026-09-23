@@ -7524,9 +7524,9 @@ async fn search_page_loads_maplibre_once_with_a_preconnect(tx: &mut TestTx) {
     let (status, body) = get(tx, "/search?q=x").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        body.matches("maplibre-gl.js").count(),
+        body.matches("maplibre-loader.mjs").count(),
         1,
-        "maplibre-gl.js must load exactly once: {body}"
+        "maplibre-loader.mjs must load exactly once: {body}"
     );
     assert!(
         body.contains(r#"rel="preconnect""#),
@@ -7552,9 +7552,9 @@ async fn parking_details_page_loads_maplibre_once_with_a_preconnect(tx: &mut Tes
     let (status, body) = get(tx, &format!("/parking/{}", created.id())).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        body.matches("maplibre-gl.js").count(),
+        body.matches("maplibre-loader.mjs").count(),
         1,
-        "maplibre-gl.js must load exactly once: {body}"
+        "maplibre-loader.mjs must load exactly once: {body}"
     );
     assert!(
         body.contains(r#"rel="preconnect""#),

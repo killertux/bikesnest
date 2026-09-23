@@ -86,7 +86,23 @@ const deadline = setTimeout(() => {
     context.setDefaultTimeout(10_000);
     const page = await context.newPage();
     const requests = [];
+    const mapModuleRequests = [];
+    const mapModuleFailures = [];
+    const pageErrors = [];
     const gates = [];
+    page.on('pageerror', error => pageErrors.push(error.message));
+    page.on('request', request => {
+      const url = new URL(request.url());
+      if (url.origin === target.origin && /maplibre-(?:loader|gl(?:-shared|-worker)?)\.mjs$/.test(url.pathname)) {
+        mapModuleRequests.push(url.pathname);
+      }
+    });
+    page.on('requestfailed', request => {
+      const url = new URL(request.url());
+      if (url.origin === target.origin && /\.mjs$/.test(url.pathname)) {
+        mapModuleFailures.push(`${url.pathname}: ${request.failure()?.errorText || 'failed'}`);
+      }
+    });
     await context.route('**/*', async route => {
       const request = route.request();
       const url = new URL(request.url());
@@ -116,6 +132,21 @@ const deadline = setTimeout(() => {
 
     await page.goto(origin + '/search?lat=-33.930000&lon=-70.630000&radius=1000');
     await page.locator('#search-filter-panel').waitFor();
+    await page.locator('[aria-controls="search-map-panel"]').click();
+    await page.locator('[data-map-status]').waitFor({ state: 'hidden' });
+    assert.equal(await page.evaluate(() => window.maplibregl.accessToken), undefined,
+      'the MapLibre/OpenFreeMap path remains token-free');
+    assert.ok(mapModuleRequests.some(path => /^\/static\/h\/[0-9a-f]{10}\/js\/maplibre-loader\.mjs$/.test(path)),
+      'the real router serves the small loader through its immutable hashed URL');
+    for (const path of [
+      '/static/vendor/maplibre-gl.mjs',
+      '/static/vendor/maplibre-gl-shared.mjs',
+      '/static/vendor/maplibre-gl-worker.mjs',
+    ]) {
+      assert.ok(mapModuleRequests.includes(path), `the coherent MapLibre module graph requests ${path}`);
+    }
+    assert.deepEqual(mapModuleFailures, []);
+    assert.deepEqual(pageErrors, []);
     mutation.assertApplied();
     const rack = page.locator('#search-filter-form input[name="type"][value="rack"]');
     if (!await rack.isVisible()) await page.getByRole('button', { name: 'Filters' }).click();

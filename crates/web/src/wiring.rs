@@ -152,7 +152,10 @@ pub fn app_router_with<H: PasswordHasher + Clone + 'static>(
         freshness: config.freshness,
     });
     let photo_service = PhotoService::new(PhotoDeps {
-        processor: Box::new(LocalImageProcessor::new(config.photo)),
+        processor: Box::new(LocalImageProcessor::new(
+            config.photo,
+            config.photo_processing_concurrency,
+        )),
         repository: Box::new(SqlxPhotoRepository::new(db.clone())),
         storage: Box::new(SharedObjectStorage::new(storage.clone())),
         rate_limiter: Box::new(SharedRateLimiter::new(rate_limiter.clone())),

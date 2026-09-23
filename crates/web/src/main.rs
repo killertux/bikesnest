@@ -66,7 +66,10 @@ async fn main() {
                 std::process::exit(1);
             });
             let storage = S3ObjectStorage::from_config(&config.storage);
-            let processor = bikesnest_infrastructure::LocalImageProcessor::new(config.photo);
+            let processor = bikesnest_infrastructure::LocalImageProcessor::new(
+                config.photo,
+                config.photo_processing_concurrency,
+            );
             match bikesnest_infrastructure::parking::seed_mock(&db, &storage, &processor).await {
                 Ok(n) => {
                     println!(
@@ -281,7 +284,10 @@ async fn seed_full_fresh(config: &Config, db: &Db) -> Result<FullFreshSummary, S
     let deleted_objects = bikesnest_infrastructure::reset_all_data(db, &storage)
         .await
         .map_err(|err| err.to_string())?;
-    let processor = bikesnest_infrastructure::LocalImageProcessor::new(config.photo);
+    let processor = bikesnest_infrastructure::LocalImageProcessor::new(
+        config.photo,
+        config.photo_processing_concurrency,
+    );
     let parking_locations = bikesnest_infrastructure::parking::seed_mock(db, &storage, &processor)
         .await
         .map_err(|err| err.to_string())?;

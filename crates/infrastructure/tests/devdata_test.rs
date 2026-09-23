@@ -15,7 +15,7 @@ async fn seed_mock_backs_photos_ratings_geo_spread_and_is_idempotent(
 ) {
     let db = tx.db().await;
     let storage = TestObjectStorage::new();
-    let processor = LocalImageProcessor::new(PhotoLimits::default());
+    let processor = LocalImageProcessor::new(PhotoLimits::default(), 1);
 
     let seeded = seed_mock(&db, &storage, &processor)
         .await

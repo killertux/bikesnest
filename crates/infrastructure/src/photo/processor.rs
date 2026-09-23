@@ -4,8 +4,8 @@
 //! Decoding and the two JPEG encodes are pure CPU work on images of up to 20
 //! megapixels, so they run on `tokio::task::spawn_blocking` — inline, a handful
 //! of concurrent uploads would occupy every runtime worker and stall the whole
-//! server, `/healthz` included. A [`Semaphore`] sized to the machine's
-//! parallelism bounds how many run at once, so an upload burst *queues* instead
+//! server, `/healthz` included. A [`Semaphore`] sized from explicit process
+//! configuration bounds how many run at once, so an upload burst *queues* instead
 //! of spawning an unbounded number of blocking tasks (each of which allocates
 //! several times the decoded image).
 
@@ -31,14 +31,18 @@ pub struct LocalImageProcessor {
 }
 
 impl LocalImageProcessor {
-    pub fn new(limits: PhotoLimits) -> Self {
-        let parallelism = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .max(1);
+    pub fn new(limits: PhotoLimits, concurrency: usize) -> Self {
+        assert!(
+            concurrency > 0,
+            "image processing concurrency must be positive"
+        );
+        assert!(
+            concurrency <= Semaphore::MAX_PERMITS,
+            "image processing concurrency exceeds the semaphore implementation limit"
+        );
         Self {
             limits,
-            permits: Arc::new(Semaphore::new(parallelism)),
+            permits: Arc::new(Semaphore::new(concurrency)),
             #[cfg(test)]
             blocking_hook: None,
         }
@@ -177,6 +181,23 @@ mod admission_tests {
     use bikesnest_application::ImageProcessor;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex};
+
+    #[test]
+    fn constructor_rejects_out_of_range_concurrency() {
+        assert!(
+            std::panic::catch_unwind(|| LocalImageProcessor::new(PhotoLimits::default(), 0))
+                .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(|| {
+                LocalImageProcessor::new(
+                    PhotoLimits::default(),
+                    Semaphore::MAX_PERMITS.saturating_add(1),
+                )
+            })
+            .is_err()
+        );
+    }
 
     struct Gate {
         entered: AtomicUsize,

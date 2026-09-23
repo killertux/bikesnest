@@ -190,7 +190,7 @@ impl PageLayout {
     }
 
     /// Resolves `path` (relative to `static_root`, forward-slash separated —
-    /// e.g. `"css/app.css"`, `"vendor/maplibre-gl.js"`) to its content-hashed
+    /// e.g. `"css/app.css"`, `"js/maplibre-loader.mjs"`) to its content-hashed
     /// `/static/h/<hash>/<path>` URL. Falls back to the plain
     /// `/static/<path>` when the asset manifest hasn't been built yet or the
     /// path isn't in it, so a template call here never produces a broken
