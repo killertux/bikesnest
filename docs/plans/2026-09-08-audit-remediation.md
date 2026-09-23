@@ -2,7 +2,7 @@
 
 Date: 2026-09-08. Baseline: `7aa243c`. Working branch: `fix/audit-remediation`, isolated worktree `/tmp/bikesnest-audit-remediation`.
 
-Source: [full review](../reviews/2026-09-08-app-review.md). This is the execution ledger, not a replacement for the audit evidence.
+Source: [full review](../reviews/2026-09-08-app-review.md). This is the progress record, not a replacement for the audit evidence.
 
 ## Scope and decisions
 
@@ -24,7 +24,7 @@ One batch at a time; no implementation of the next batch before the current gate
 3. Implementation agent records files, tests actually run, outcomes, residual risks, migrations and deployment considerations. Lead checks scope and prepares a stable diff.
 4. Spawn a **separate GPT Sol reviewer** to inspect the diff independently, run targeted validation and check regressions/security/invariants. Reviewer does not implement the next batch.
 5. Any correctness, security, untested acceptance criterion or unrelated-change finding returns to implementation. Reviewer rechecks corrections. A missing test environment is not a pass.
-6. Lead accepts only when required checks pass and material findings are resolved. Save a review record under `docs/reviews/remediation/`, update this ledger, and checkpoint a local commit.
+6. Lead accepts only when required checks pass and material findings are resolved. Save a review record under `docs/reviews/remediation/`, update this progress record, and checkpoint a local commit.
 7. Advance to the next queued batch. Operational/legal gates can be marked `awaiting-authority/evidence` with concrete owner/input; do not pretend they are fixed or block unrelated safe implementation.
 
 Statuses: `queued`, `implementing`, `reviewing`, `changes-requested`, `accepted`, `awaiting-authority/evidence`. Accepted means reviewed code, **not deployed**.
@@ -57,7 +57,7 @@ Statuses: `queued`, `implementing`, `reviewing`, `changes-requested`, `accepted`
 | B16b | Sol | Independent races and full-stack behavior tests (test gaps) | Disposable DB lanes for approval/suspension/reset/worker races; real rendered CSRF/search journeys; fail original bug cases; tests cannot claim foreign jobs; measured runtime baseline and parallel-repeat reliability | accepted |
 | B17 | Terra | CI advisories and measured test ergonomics (dependency/test findings) | RustSec + npm advisory checks, reviewed expiring exceptions; fast DB-free lane; builds vs execution measured; preserve asset/image checks; no blind dependency upgrades or test-runner churn | accepted |
 | B18 | Sol | Additional worker use for expensive noninteractive work | Measure export/media latency and sizes; queued exports with pending/ready/auth download lifecycle if material; media queue only with durable quarantine/privacy controls; record explicit measurement-backed decision, not an unjustified rewrite | accepted |
-| B19 | Sol reviewer + lead/owner | Integrated release and external evidence gates | Full isolated suite, browser matrix, image build, migrations fresh+upgrade; remediate or explicitly re-review every unexpired B17 advisory exception; counsel/provider/edge/DNS/restore checklist; staged rollout/rollback plan; production deployment/reconciliation only after explicit authorization | queued |
+| B19 | Sol reviewer + lead/owner | Integrated release and external evidence gates | Full isolated suite, browser matrix, image build, migrations fresh+upgrade; remediate or explicitly re-review every unexpired B17 advisory exception; counsel/provider/edge/DNS/restore checklist; staged rollout/rollback plan; production deployment/reconciliation only after explicit authorization | awaiting-authority/evidence |
 
 ## Batch dependencies and scope boundaries
 
@@ -73,7 +73,7 @@ Statuses: `queued`, `implementing`, `reviewing`, `changes-requested`, `accepted`
 - B16 extends tests continuously added in every batch; it is not permission to defer required regressions until the end.
 - B18 is explicitly conditional on evidence: findings recommended considering queues, not queuing every task. Interactive search/auth and atomic proposal publication stay synchronous.
 
-## Coverage ledger
+## Coverage matrix
 
 Every actionable audit ID is assigned; duplicates share batches.
 
@@ -129,7 +129,38 @@ These remain explicit until the owner supplies evidence or approves action:
 
 ## Progress log
 
-- B18 checkpoint: `498d6ef`. B19 is next, limited to integrated release
+- B19 local/source checkpoint `e0ac245` passed independent GPT Sol review after
+  one bounded correction round from accepted B18 baseline `11cbf00`. The
+  reviewer found that the first MapLibre 6 bridge exposed a non-extensible ESM
+  namespace while the adapter still assigned a browser token. The final source
+  keeps MapLibre token-free and routes legacy Mapbox styles to the existing
+  Mapbox SDK; real Chromium proved the configured token on locally intercepted
+  Mapbox requests without contacting the provider. Five RustSec paths and the
+  direct critical MapLibre advisory were remediated; SQLx defaults were removed,
+  but its retained macro metadata still
+  locks an inactive unpatched RSA package, so one exact exception remains with
+  an updated 2026-10-23 expiry/removal decision. Fresh cargo-audit reports only
+  that finding. A fresh npm audit is an explicit release blocker because both
+  live-registry escalation requests were rejected pending direct user approval;
+  the 6.11.1 lock/tree and official fix are recorded but are not misreported as
+  a fresh scan. MapLibre's ESM/shared/worker topology passed actual Chromium
+  CSP, hard-load, lazy-navigation and retry coverage. Image processing is now
+  configured independently from the runtime CPU count, defaults to one, rejects
+  zero/over-maximum values, and preserves cancellation permit ownership; actual
+  production memory/capacity remains an external staging gate. The isolated
+  workspace passed 761 tests with 0 failures and 10 expected ignores, then all
+  six ignored renderer/browser targets passed explicitly. Fresh 1–29 and real
+  27–29 upgrade paths, local S3/Valkey, frontend deterministic rebuild,
+  browser 28/28, pinned-Rust-1.95 Docker image, all-target/all-feature check,
+  strict Clippy, formatting and diff checks passed. See the
+  [B19 handoff](../reviews/remediation/B19-handoff.md) and independent
+  [B19 review](../reviews/remediation/B19-review.md) for the staged
+  rollout/rollback plan and unsatisfied npm plus
+  owner/counsel/provider/edge/DNS/restore evidence matrix. The local/source
+  gate is complete; release readiness remains blocked and no production action
+  occurred.
+
+- B18 checkpoint: `498d6ef` handed off to B19, limited to integrated release
   validation, advisory resolution/re-review, external-evidence accounting and
   a staged rollout/rollback plan. Production deployment, reconciliation,
   provider/edge/DNS changes, policy publication and restore execution remain
@@ -236,7 +267,7 @@ These remain explicit until the owner supplies evidence or approves action:
 
 - B15b late source review: lead and separate Sol confirmed a post-precheck policy-activation race where only new registrations revalidated terms, exposing Conflict versus neutral success for existing addresses. Correction requires common authoritative validation without existing-account acknowledgement backfill. Reviewer raised a draft-snapshot lock-order concern; the current source inspection confirms account then policy ordering in registration and all proof paths. Lock-order/parity regressions and independent final verification remain required. Normal browser success does not prove these races safe.
 
-- B15b test-environment recovery: shared tests encountered SQLx `VersionMismatch(28)` after a draft migration revision. The old disposable database was preserved, with no checksum/ledger rewrite. Lead verified the audit-only container and unused name, then created `bikesnest_test_audit_b15b_20260914` on the same loopback `127.0.0.1:55439`, owned by `bikesnest_test`, for remaining checks. Migration 0028 is now frozen; subsequent schema corrections must be forward migrations. No production database was accessed. Lead workspace all-target check passed.
+- B15b test-environment recovery: shared tests encountered SQLx `VersionMismatch(28)` after a draft migration revision. The old disposable database was preserved, with no checksum or migration-history rewrite. Lead verified the audit-only container and unused name, then created `bikesnest_test_audit_b15b_20260914` on the same loopback `127.0.0.1:55439`, owned by `bikesnest_test`, for remaining checks. Migration 0028 is now frozen; subsequent schema corrections must be forward migrations. No production database was accessed. Lead workspace all-target check passed.
 
 - B15b lead browser harness passed against a fresh owned database (1 test, 5.60s execution): EN boosted/mobile and PT native/desktop, stale forms, exact current/future documents, separate current/upcoming notices, cross-locale acknowledgement, persisted proof and zero fabricated privacy consent. Targeted strict Clippy passed. This is draft integration evidence, not batch acceptance; transaction/race/privacy checks and full independent review remain pending. Global activation defaults off and no policy was published or notification sent.
 
@@ -368,7 +399,7 @@ These remain explicit until the owner supplies evidence or approves action:
 
 - B06b stable implementation handed to independent Sol reviewer: implementer reports application auth 30/30, infrastructure auth 27/27, job/dispatcher 17/17, HTTP 172/172, Resend 5/5, web check, formatting/diff and strict application/infrastructure/web Clippy passing. No migration. See [B06b handoff](../reviews/remediation/B06b-handoff.md). Draft recovery/provider findings reported resolved; acceptance awaits independent verification.
 
-- B06b draft milestone: one application `AuthOutbox` port and post-commit dispatcher; SQL adapter shares connection-local mail admission and registration recovery preserves existing credentials. Initial compile checks reported passing. Lead draft checks require active-lease recovery without new mail, unique inline claim ownership, permanent-error terminal handling, bounded retry/backoff/no-claim semantics, and secret-free decode errors. Provider semantics and real rollback/retry tests remain in progress; no review gate passed.
+- B06b draft state: one application `AuthOutbox` port and post-commit dispatcher; SQL adapter shares connection-local mail admission and registration recovery preserves existing credentials. Initial compile checks reported passing. Lead draft checks require active-lease recovery without new mail, unique inline claim ownership, permanent-error terminal handling, bounded retry/backoff/no-claim semantics, and secret-free decode errors. Provider semantics and real rollback/retry tests remain in progress; no review gate passed.
 
 - B06a checkpoint: `5728a46`. B06b assigned to GPT Sol `b06a_corrections` (reused implementation thread, independent reviewer remains separate) after acceptance. Scope is transactional auth outbox and delivery semantics; B07 execution modes/supervision and B14 templates/notices remain later batches.
 
