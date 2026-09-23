@@ -129,6 +129,11 @@ These remain explicit until the owner supplies evidence or approves action:
 
 ## Progress log
 
+- B17 checkpoint: `70b2985`. B18 is next, limited to measuring export/media
+  latency and size before deciding whether either path needs durable queued
+  execution. No queue rewrite is justified without material evidence, and the
+  accepted B17 advisory exceptions remain B19 release blockers.
+
 - B17 gate passed after one independent-review correction round. The npm v2
   validator now proves that every direct or transitive vulnerability resolves
   to an exact GHSA and cross-checks inventory and severity summaries; the
