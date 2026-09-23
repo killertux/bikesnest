@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "exceptions": [
+    {
+      "ecosystem": "npm",
+      "advisory": "GHSA-JRC7-96C5-Q579",
+      "owner": "BikesNest security maintainers",
+      "reviewed_by": "Audit remediation lead",
+      "reviewed_at": "2026-09-23",
+      "rationale": "The strict self-script CSP without unsafe-inline protects the MapLibre profile, but remote third-party styles can reach the sanitizer; complete the breaking v6 ESM migration before B19 release or deployment.",
+      "expires": "2026-10-07"
+    },
+    {
+      "ecosystem": "rustsec",
+      "advisory": "RUSTSEC-2026-0285",
+      "owner": "BikesNest security maintainers",
+      "reviewed_by": "Audit remediation lead",
+      "reviewed_at": "2026-09-23",
+      "rationale": "A compatible rustls 0.23.45 fix exists; separately update and test it promptly and before B19. This exception does not claim the TLS parsing issue is safe while the affected release remains in the lockfile.",
+      "expires": "2026-10-07"
+    },
+    {
+      "ecosystem": "rustsec",
+      "advisory": "RUSTSEC-2026-0258",
+      "owner": "BikesNest security maintainers",
+      "reviewed_by": "Audit remediation lead",
+      "reviewed_at": "2026-09-23",
+      "rationale": "This is only in the legacy AWS SDK HTTP stack and is a low denial-of-service risk, but a reachable AWS client path remains possible; migrate the AWS stack or path before B19.",
+      "expires": "2026-10-23"
+    },
+    {
+      "ecosystem": "rustsec",
+      "advisory": "RUSTSEC-2026-0104",
+      "owner": "BikesNest security maintainers",
+      "reviewed_by": "Audit remediation lead",
+      "reviewed_at": "2026-09-23",
+      "rationale": "This old webpki line is only via legacy AWS and rustls 0.21; the application does not configure CRLs, but parsing risk remains until the AWS TLS stack is upgraded before B19.",
+      "expires": "2026-10-23"
+    },
+    {
+      "ecosystem": "rustsec",
+      "advisory": "RUSTSEC-2026-0098",
+      "owner": "BikesNest security maintainers",
+      "reviewed_by": "Audit remediation lead",
+      "reviewed_at": "2026-09-23",
+      "rationale": "This old webpki line is only via legacy AWS and rustls 0.21; name-constraint attacks need CA misissuance, but the AWS TLS stack must be upgraded before B19.",
+      "expires": "2026-10-23"
+    },
+    {
+      "ecosystem": "rustsec",
+      "advisory": "RUSTSEC-2026-0099",
+      "owner": "BikesNest security maintainers",
+      "reviewed_by": "Audit remediation lead",
+      "reviewed_at": "2026-09-23",
+      "rationale": "This old webpki line is only via legacy AWS and rustls 0.21; wildcard name-constraint attacks need CA misissuance, but the AWS TLS stack must be upgraded before B19.",
+      "expires": "2026-10-23"
+    },
+    {
+      "ecosystem": "rustsec",
+      "advisory": "RUSTSEC-2023-0071",
+      "owner": "BikesNest security maintainers",
+      "reviewed_by": "Audit remediation lead",
+      "reviewed_at": "2026-09-23",
+      "rationale": "RSA is a lockfile-only inactive sqlx-mysql 0.8.6 artifact for this target; prune that unused resolution if feasible or upgrade when fixed, and re-review before enabling any feature that reaches it.",
+      "expires": "2026-10-23"
+    }
+  ]
+}

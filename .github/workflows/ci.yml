@@ -42,6 +42,64 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+  advisory-checks:
+    name: Advisory checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install pinned RustSec scanner
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Test advisory-report validation
+        run: node scripts/verify-advisories.test.cjs
+      - name: Check RustSec advisories
+        shell: bash
+        run: |
+          set +e
+          cargo audit --json > /tmp/cargo-audit.json
+          scan_status=$?
+          set -e
+          node scripts/verify-advisories.cjs \
+            --ecosystem rustsec \
+            --report /tmp/cargo-audit.json \
+            --scanner-exit "$scan_status"
+      - name: Check npm advisories
+        shell: bash
+        run: |
+          set +e
+          npm audit --json > /tmp/npm-audit.json
+          scan_status=$?
+          set -e
+          node scripts/verify-advisories.cjs \
+            --ecosystem npm \
+            --report /tmp/npm-audit.json \
+            --scanner-exit "$scan_status"
+
+  db-free-tests:
+    name: DB-free tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@v2
+      - name: Compile DB-free test binaries (warm CI cache when restored)
+        run: time cargo test -p bikesnest-domain -p bikesnest-application --no-run --locked
+      - name: Execute DB-free tests (after this runner's compile phase)
+        run: time cargo test -p bikesnest-domain -p bikesnest-application --locked
+
   test:
     name: Tests
     runs-on: ubuntu-latest
@@ -115,16 +173,24 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - name: Install CSRF browser dependencies
+      - name: Install ignored-browser test dependencies
         run: |
           npm ci
           npx playwright install --with-deps chromium
       - name: Run workspace tests
         run: cargo test --workspace --locked
+      - name: Visually check rendered email in Chromium
+        run: env -u BIKESNEST_BROWSER_MUTANT cargo test -p bikesnest-infrastructure --test email_renderer_visual_test --locked -- --ignored
+      - name: Test rendered contribution journey in Chromium
+        run: env -u BIKESNEST_BROWSER_MUTANT cargo test -p bikesnest-web --test contribution_browser_test --locked -- --ignored
       - name: Test rendered CSRF lifecycle in Chromium
-        run: cargo test -p bikesnest-web --test csrf_browser_test --locked -- --ignored
+        run: env -u BIKESNEST_BROWSER_MUTANT cargo test -p bikesnest-web --test csrf_browser_test --locked -- --ignored
+      - name: Test rendered policy journey in Chromium
+        run: env -u BIKESNEST_BROWSER_MUTANT cargo test -p bikesnest-web --test policy_browser_test --locked -- --ignored
+      - name: Test rendered profile journey in Chromium
+        run: env -u BIKESNEST_BROWSER_MUTANT cargo test -p bikesnest-web --test profile_browser_test --locked -- --ignored
       - name: Test rendered search synchronization in Chromium
-        run: cargo test -p bikesnest-web --test search_browser_test --locked -- --ignored
+        run: env -u BIKESNEST_BROWSER_MUTANT cargo test -p bikesnest-web --test search_browser_test --locked -- --ignored
 
   frontend-assets:
     name: Frontend assets

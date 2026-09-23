@@ -55,9 +55,9 @@ Statuses: `queued`, `implementing`, `reviewing`, `changes-requested`, `accepted`
 | B15b | Sol | Terms-version acknowledgement/material-change notices (`LEG-04`) | Version + timestamp recorded for applicable agreement, no conflation with blanket privacy consent; recoverable notification/ack flow; migrations and tests; actual notification/policy publication awaits owner-approved wording | accepted |
 | B16a | Sol | Complete transaction-scope migration (`ENG-03`) | Remaining sequential repositories use acquire; HTTP router shares scoped Db; remove cleanup only after migration; panic leaves no fixture; no leaked process-global locks; explicit inventory reaches zero unexplained legacy writes | accepted |
 | B16b | Sol | Independent races and full-stack behavior tests (test gaps) | Disposable DB lanes for approval/suspension/reset/worker races; real rendered CSRF/search journeys; fail original bug cases; tests cannot claim foreign jobs; measured runtime baseline and parallel-repeat reliability | accepted |
-| B17 | Terra | CI advisories and measured test ergonomics (dependency/test findings) | RustSec + npm advisory checks, reviewed expiring exceptions; fast DB-free lane; builds vs execution measured; preserve asset/image checks; no blind dependency upgrades or test-runner churn | queued |
+| B17 | Terra | CI advisories and measured test ergonomics (dependency/test findings) | RustSec + npm advisory checks, reviewed expiring exceptions; fast DB-free lane; builds vs execution measured; preserve asset/image checks; no blind dependency upgrades or test-runner churn | accepted |
 | B18 | Sol | Additional worker use for expensive noninteractive work | Measure export/media latency and sizes; queued exports with pending/ready/auth download lifecycle if material; media queue only with durable quarantine/privacy controls; record explicit measurement-backed decision, not an unjustified rewrite | queued |
-| B19 | Sol reviewer + lead/owner | Integrated release and external evidence gates | Full isolated suite, browser matrix, image build, migrations fresh+upgrade; counsel/provider/edge/DNS/restore checklist; staged rollout/rollback plan; production deployment/reconciliation only after explicit authorization | queued |
+| B19 | Sol reviewer + lead/owner | Integrated release and external evidence gates | Full isolated suite, browser matrix, image build, migrations fresh+upgrade; remediate or explicitly re-review every unexpired B17 advisory exception; counsel/provider/edge/DNS/restore checklist; staged rollout/rollback plan; production deployment/reconciliation only after explicit authorization | queued |
 
 ## Batch dependencies and scope boundaries
 
@@ -128,6 +128,39 @@ These remain explicit until the owner supplies evidence or approves action:
 5. Release window, migration/backfill review, exact production recurring-job reconciliation and separately approved deployment.
 
 ## Progress log
+
+- B17 gate passed after one independent-review correction round. The npm v2
+  validator now proves that every direct or transitive vulnerability resolves
+  to an exact GHSA and cross-checks inventory and severity summaries; the
+  RustSec validator cross-checks count, list, finding shape and exact IDs. The
+  original three fail-open reproductions and the broader malformed-report
+  matrix now reject, while fresh npm1/RustSec6 reports pass only through seven
+  narrow expiring exceptions. Independent Sol passed the validator 7/7 on
+  Node 20 and 24, DB-free tests 182/182, syntax, formatting and diff/scope
+  guards. Implementer evidence covers all six explicitly wired ignored browser
+  tests. See [review](../reviews/remediation/B17-review.md) and
+  [handoff](../reviews/remediation/B17-handoff.md). CI/source accepted only;
+  every exception remains a B19 release blocker and nothing was deployed. B18
+  is next.
+
+- B17 independent review requested parser-integrity corrections: the original
+  JSON reader did not prove every npm v2 vulnerability resolved to an exact
+  advisory and omitted RustSec `count` validation. The bounded correction now
+  validates npm summaries/inventory/direct+transitive `via` resolution and
+  RustSec count/finding/ID invariants, with seven direct regressions; saved
+  live npm1/RustSec6 reports still pass exact exception validation. Same Sol
+  re-review remains required; B17 stays reviewing and nothing is deployed.
+
+- B17 implementation frozen for independent review: CI now has fail-closed
+  RustSec/npm JSON-report validation with one expiring reviewed-exception
+  register; an explicit DB-free domain/application compile-versus-execution
+  lane; and all six ignored renderer/browser tests explicitly invoked with the
+  browser mutant unset. Asset rebuild/diff/navigation and Docker gates remain.
+  Local scans found one critical npm advisory and six RustSec advisories. The
+  remediation lead reviewed narrow per-ID exceptions with fixed expiry/removal
+  criteria; every one is a B19 release blocker, not a safety claim. No
+  dependency upgrade was made. See [B17 handoff](../reviews/remediation/B17-handoff.md).
+  Acceptance pending; no deployment or provider action.
 
 - B16b checkpoint: `9e6edd4`. B17 is next, scoped to fail-closed RustSec/npm advisory gates with reviewed expiring exceptions, an explicit DB-free lane, measured build-versus-execution documentation, and complete explicit ignored-browser CI coverage. Preserve the existing asset/image gates and avoid dependency upgrades or runner churn.
 
