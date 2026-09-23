@@ -56,7 +56,7 @@ Statuses: `queued`, `implementing`, `reviewing`, `changes-requested`, `accepted`
 | B16a | Sol | Complete transaction-scope migration (`ENG-03`) | Remaining sequential repositories use acquire; HTTP router shares scoped Db; remove cleanup only after migration; panic leaves no fixture; no leaked process-global locks; explicit inventory reaches zero unexplained legacy writes | accepted |
 | B16b | Sol | Independent races and full-stack behavior tests (test gaps) | Disposable DB lanes for approval/suspension/reset/worker races; real rendered CSRF/search journeys; fail original bug cases; tests cannot claim foreign jobs; measured runtime baseline and parallel-repeat reliability | accepted |
 | B17 | Terra | CI advisories and measured test ergonomics (dependency/test findings) | RustSec + npm advisory checks, reviewed expiring exceptions; fast DB-free lane; builds vs execution measured; preserve asset/image checks; no blind dependency upgrades or test-runner churn | accepted |
-| B18 | Sol | Additional worker use for expensive noninteractive work | Measure export/media latency and sizes; queued exports with pending/ready/auth download lifecycle if material; media queue only with durable quarantine/privacy controls; record explicit measurement-backed decision, not an unjustified rewrite | queued |
+| B18 | Sol | Additional worker use for expensive noninteractive work | Measure export/media latency and sizes; queued exports with pending/ready/auth download lifecycle if material; media queue only with durable quarantine/privacy controls; record explicit measurement-backed decision, not an unjustified rewrite | accepted |
 | B19 | Sol reviewer + lead/owner | Integrated release and external evidence gates | Full isolated suite, browser matrix, image build, migrations fresh+upgrade; remediate or explicitly re-review every unexpired B17 advisory exception; counsel/provider/edge/DNS/restore checklist; staged rollout/rollback plan; production deployment/reconciliation only after explicit authorization | queued |
 
 ## Batch dependencies and scope boundaries
@@ -128,6 +128,45 @@ These remain explicit until the owner supplies evidence or approves action:
 5. Release window, migration/backfill review, exact production recurring-job reconciliation and separately approved deployment.
 
 ## Progress log
+
+- B18 gate passed after one bounded evidence-record correction round. Independent
+  Sol reran all four optimized measurements in separate processes and confirmed
+  exports remained below the documented triggers: representative assembly
+  2.096 ms p95, heavy assembly 57.641 ms p95, 18,955,133 B compact output,
+  conservative generation/persistence RSS +94,300 KiB, and isolated typed
+  download/pretty RSS +72,552 KiB. Media remained at 71.909 ms representative
+  and 542.113 ms for the exact 20 MP fixture. Focused privacy/export/photo/HTTP
+  tests, workspace check, strict Clippy, formatting and diff checks passed. The
+  review corrected threshold chronology, proposal-rate math, query counts,
+  exported-favorite labels and RSS/JSON-text methodology without moving any
+  threshold or changing production behavior. See the
+  [B18 review](../reviews/remediation/B18-review.md). Synchronous export/media
+  processing is accepted with the documented monitoring and B19 capacity
+  risks; no deployment, provider, policy-publication or production-database
+  action occurred. B19 is next.
+
+- B18 bounded evidence-record corrections are frozen for same-reviewer
+  re-review from checkpoint `3f3056b` after the
+  [changes-requested review](../reviews/remediation/B18-review.md). The complete
+  export thresholds (representative p95 >1 s, heavy p95 >3 s, compact output
+  >25 MiB, or request-phase RSS increase >128 MiB) and media thresholds
+  (representative p95 >1 s or synthetic upper-envelope p95 >5 s) are now
+  documented and were held fixed before the fresh independent reruns, which
+  remained below every threshold. Separate-process optimized implementation
+  measurements keep exports synchronous: the heavy envelope produced 18.94 MB
+  compact JSON, assembled at 59.749 ms p95, persisted in 255.031 ms, and the
+  conservative generation/persistence approximation increased RSS by 92.3 MiB;
+  it includes a measurement-only compact serialization in addition to the
+  production create conversion. Current typed download + pretty serialization
+  increased RSS by 89.6 MiB. An earlier approximately 141 MiB combined HWM
+  mixed phases and allocator retention and is explicitly superseded, not a
+  queue trigger. Media also stays synchronous: representative p95 was 74.097 ms
+  and synthetic 20 MP p95 544.292 ms, while a privacy-safe durable raw
+  quarantine does not exist. Unbounded account history and missing
+  export-specific admission remain monitoring/re-evaluation risks; deployment
+  CPU-count memory-capacity validation remains a B19 gate. See the
+  [B18 handoff](../reviews/remediation/B18-handoff.md). No deployment, provider,
+  policy-publication or production-database action occurred.
 
 - B17 checkpoint: `70b2985`. B18 is next, limited to measuring export/media
   latency and size before deciding whether either path needs durable queued
