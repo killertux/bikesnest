@@ -129,6 +129,12 @@ These remain explicit until the owner supplies evidence or approves action:
 
 ## Progress log
 
+- B18 checkpoint: `498d6ef`. B19 is next, limited to integrated release
+  validation, advisory resolution/re-review, external-evidence accounting and
+  a staged rollout/rollback plan. Production deployment, reconciliation,
+  provider/edge/DNS changes, policy publication and restore execution remain
+  separately authorized actions.
+
 - B18 gate passed after one bounded evidence-record correction round. Independent
   Sol reran all four optimized measurements in separate processes and confirmed
   exports remained below the documented triggers: representative assembly
