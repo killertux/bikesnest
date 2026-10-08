@@ -673,9 +673,11 @@ impl AuthService {
     // -----------------------------------------------------------------------
 
     /// Register an account. Returning `Ok` whether the email is taken or not
-    /// (no-existence-leak). A pending account may resume its already-admitted
-    /// delivery or receive a repaired token/outbox; other existing states stay
-    /// neutral and the caller renders the same response either way.
+    /// (no-existence-leak). Re-registering a still-pending address replaces
+    /// its password with this submission, revokes its sessions, retires its
+    /// earlier verification links and sends a fresh one: an unverified
+    /// registration proves nothing about who owns the mailbox. Other existing
+    /// states stay neutral and the caller renders the same response either way.
     pub async fn register(
         &self,
         ip: &str,

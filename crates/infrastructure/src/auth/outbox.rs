@@ -96,25 +96,74 @@ async fn audit(
         .bind(user_id).bind(action).bind(user_id.to_string()).fetch_one(&mut **tx).await
 }
 
-async fn recover_registration(
+/// A still-unverified account proves nothing about who chose its password:
+/// anyone can register any address. Re-registering a pending address therefore
+/// replaces the stored credential (and display name) with the latest
+/// submission, revokes every session the earlier registrant opened, and
+/// retires every verification link minted for the earlier credential. Only a
+/// link sent after the latest credential write can activate the account, and
+/// only the mailbox owner receives it.
+async fn replace_pending_credential(
     conn: &mut PgConnection,
     user_id: i64,
-) -> Result<Option<AdmittedAuthMail>, AuthError> {
-    let row: Option<(i64, serde_json::Value)> = sqlx::query_as(
-        r#"SELECT j.id,j.payload FROM background_job j
-        JOIN email_verification_tokens t ON t.user_id=j.mail_account_id AND t.token_hash=j.mail_token_hash
-        WHERE j.kind='email.send' AND j.mail_account_id=$1 AND j.mail_purpose='verify'
-          AND j.payload <> '{}'::jsonb AND t.used_at IS NULL AND t.expires_at>clock_timestamp()
-          AND ((j.state='running' AND j.lease_expires_at>clock_timestamp())
-               OR (j.state IN ('pending','running') AND j.attempts<j.max_attempts))
-        ORDER BY j.id DESC LIMIT 1"#,
-    ).bind(user_id).fetch_optional(conn).await.map_err(|error| db_err("auth_outbox.recover", error))?;
-    row.map(|(job_id, payload)| {
-        serde_json::from_value(payload)
-            .map(|message| AdmittedAuthMail { job_id, message })
-            .map_err(|_| AuthError::Internal)
-    })
-    .transpose()
+    new: &NewAccount<'_>,
+    at: DateTime<Utc>,
+) -> Result<(), AuthError> {
+    let updated = sqlx::query(
+        "UPDATE authentication_identities SET credential_hash=$2
+         WHERE user_id=$1 AND provider='password'",
+    )
+    .bind(user_id)
+    .bind(new.password_hash)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| db_err("auth_outbox.register", e))?;
+    if updated.rows_affected() != 1 {
+        return Err(AuthError::Internal);
+    }
+    sqlx::query("UPDATE users SET display_name=$2,updated_at=now() WHERE id=$1")
+        .bind(user_id)
+        .bind(new.display_name)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| db_err("auth_outbox.register", e))?;
+    revoke_sessions(conn, user_id, at, "auth_outbox.register").await?;
+    retire_verification_tokens(conn, user_id, at, "auth_outbox.register").await
+}
+
+async fn revoke_sessions(
+    conn: &mut PgConnection,
+    user_id: i64,
+    at: DateTime<Utc>,
+    context: &'static str,
+) -> Result<(), AuthError> {
+    sqlx::query("UPDATE sessions SET revoked_at=$2 WHERE user_id=$1 AND revoked_at IS NULL")
+        .bind(user_id)
+        .bind(at)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| db_err(context, e))?;
+    Ok(())
+}
+
+/// Retire every outstanding email-verification token (including pending
+/// email-change tokens) for an account whose credential or address just
+/// changed, so a link minted under the old state cannot be redeemed later.
+async fn retire_verification_tokens(
+    conn: &mut PgConnection,
+    user_id: i64,
+    at: DateTime<Utc>,
+    context: &'static str,
+) -> Result<(), AuthError> {
+    sqlx::query(
+        "UPDATE email_verification_tokens SET used_at=$2 WHERE user_id=$1 AND used_at IS NULL",
+    )
+    .bind(user_id)
+    .bind(at)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| db_err(context, e))?;
+    Ok(())
 }
 
 fn db_err(context: &'static str, error: sqlx::Error) -> AuthError {
@@ -204,12 +253,7 @@ impl AuthOutbox for SqlxAuthOutbox {
                     .map_err(|e| db_err("auth_outbox.register", e))?;
                 return Ok(None);
             }
-            if let Some(mail) = recover_registration(&mut tx, user_id).await? {
-                tx.commit()
-                    .await
-                    .map_err(|e| db_err("auth_outbox.register", e))?;
-                return Ok(Some(mail));
-            }
+            replace_pending_credential(&mut tx, user_id, &new, at).await?;
             sqlx::query(
                 r#"UPDATE background_job SET state='failed',payload='{}',
                    payload_redacted_at=COALESCE(payload_redacted_at,clock_timestamp()),
@@ -452,16 +496,13 @@ impl AuthOutbox for SqlxAuthOutbox {
         .execute(&mut *tx)
         .await
         .map_err(|e| db_err("auth_outbox.confirm_email", e))?;
-        if changed {
-            sqlx::query(
-                "UPDATE sessions SET revoked_at=$2 WHERE user_id=$1 AND revoked_at IS NULL",
-            )
-            .bind(user_id)
-            .bind(at)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| db_err("auth_outbox.confirm_email", e))?;
+        // An address change, or the first verification of a pending account,
+        // ends every session: a pending session may belong to whoever
+        // pre-registered the address, not to the mailbox owner verifying now.
+        if changed || state == "PENDING_EMAIL_VERIFICATION" {
+            revoke_sessions(&mut tx, user_id, at, "auth_outbox.confirm_email").await?;
         }
+        retire_verification_tokens(&mut tx, user_id, at, "auth_outbox.confirm_email").await?;
         let action = if changed {
             "auth.email_changed"
         } else {
@@ -582,6 +623,8 @@ impl AuthOutbox for SqlxAuthOutbox {
         .execute(&mut *tx)
         .await
         .map_err(|e| db_err("auth_outbox.complete_password_reset", e))?;
+        retire_verification_tokens(&mut tx, user_id, at, "auth_outbox.complete_password_reset")
+            .await?;
         let audit_id = audit(&mut tx, user_id, "auth.password_changed")
             .await
             .map_err(|e| db_err("auth_outbox.complete_password_reset", e))?;
@@ -690,6 +733,7 @@ impl AuthOutbox for SqlxAuthOutbox {
         .execute(&mut *tx)
         .await
         .map_err(|e| db_err("auth_outbox.change_password", e))?;
+        retire_verification_tokens(&mut tx, user_id.0, at, "auth_outbox.change_password").await?;
         let audit_id = audit(&mut tx, user_id.0, "auth.password_changed")
             .await
             .map_err(|e| db_err("auth_outbox.change_password", e))?;

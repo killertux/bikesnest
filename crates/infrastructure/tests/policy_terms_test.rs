@@ -599,6 +599,7 @@ fn existing_registration_recovery_never_fabricates_a_terms_acknowledgement() {
         };
         let email = UserEmail::parse("legacy-retry@example.test").unwrap();
         let token = VerificationToken::new([0x72; 32]);
+        let retry = VerificationToken::new([0x73; 32]);
         let outbox = SqlxAuthOutbox::new(db, 3);
         outbox
             .register(
@@ -625,9 +626,9 @@ fn existing_registration_recovery_never_fabricates_a_terms_acknowledgement() {
                     state: AccountState::PendingEmailVerification,
                     locale: LocaleCode::En,
                 },
-                &token,
+                &retry,
                 Utc::now(),
-                verification_message(&email, &token),
+                verification_message(&email, &retry),
                 Some(&acceptance),
             )
             .await
@@ -640,8 +641,8 @@ fn existing_registration_recovery_never_fabricates_a_terms_acknowledgement() {
             "SELECT credential_hash FROM authentication_identities WHERE provider='password' AND provider_subject=$1",
         ).bind(email.as_str()).fetch_one(&pool).await.unwrap();
         assert_eq!(
-            stored_hash, "hash",
-            "recovery never overwrites an existing credential"
+            stored_hash, "different-hash",
+            "re-registering a pending address replaces its unverified credential"
         );
     });
 }

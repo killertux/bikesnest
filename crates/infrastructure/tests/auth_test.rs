@@ -464,7 +464,7 @@ async fn registration_commits_account_token_outbox_and_audit_together(
 }
 
 #[db_test]
-async fn registration_retry_recovers_or_repairs_without_overwriting_account(
+async fn registration_retry_replaces_pending_credential_and_revokes_earlier_access(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
     let db = tx.db().await;
@@ -473,7 +473,7 @@ async fn registration_retry_recovers_or_repairs_without_overwriting_account(
     let outbox = SqlxAuthOutbox::new(db.clone(), 3);
     let new = || NewAccount {
         email: &email,
-        display_name: None,
+        display_name: Some("pre-registrant"),
         password_hash: "original-hash",
         state: AccountState::PendingEmailVerification,
         locale: LocaleCode::En,
@@ -489,12 +489,22 @@ async fn registration_retry_recovers_or_repairs_without_overwriting_account(
         .await
         .unwrap()
         .unwrap();
+    // The first registrant can sign in while pending; that session must not
+    // survive someone else (possibly the real mailbox owner) re-registering.
+    let user_id = UserId(admitted.message.account_id);
+    let sessions = SqlxSessionStore::new(db.clone());
+    let pending_session = SessionId::new([0x95; 32]);
+    let now = Utc::now();
+    sessions
+        .create(user_id, &pending_session, &CsrfToken::new([0x96; 32]), now)
+        .await
+        .unwrap();
     let retry = VerificationToken::new([0x94; 32]);
-    let recovered = outbox
+    let reissued = outbox
         .register(
             NewAccount {
                 email: &email,
-                display_name: Some("overwrite"),
+                display_name: Some("mailbox owner"),
                 password_hash: "replacement-hash",
                 state: AccountState::PendingEmailVerification,
                 locale: LocaleCode::PtBr,
@@ -507,15 +517,41 @@ async fn registration_retry_recovers_or_repairs_without_overwriting_account(
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(recovered.job_id, admitted.job_id);
-    assert_eq!(recovered.message, admitted.message);
-    let identity:(String,String)=sqlx::query_as("SELECT credential_hash,u.locale FROM authentication_identities i JOIN users u ON u.id=i.user_id WHERE u.email=$1 AND i.provider='password'").bind(email.as_str()).fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
-    assert_eq!(identity, ("original-hash".into(), "en".into()));
+    assert_ne!(reissued.job_id, admitted.job_id);
+    assert_eq!(reissued.message.account_id, user_id.0);
+    assert_eq!(reissued.message.locale, LocaleCode::En);
+    let identity: (String, String, Option<String>) = sqlx::query_as("SELECT credential_hash,u.locale,u.display_name FROM authentication_identities i JOIN users u ON u.id=i.user_id WHERE u.email=$1 AND i.provider='password'").bind(email.as_str()).fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
+    assert_eq!(
+        identity,
+        (
+            "replacement-hash".into(),
+            "en".into(),
+            Some("mailbox owner".into())
+        )
+    );
+    assert!(
+        sessions
+            .resolve(&pending_session, Utc::now())
+            .await
+            .unwrap()
+            .is_none(),
+        "the earlier registrant's pending session is revoked"
+    );
+    assert!(
+        confirm_email(&db, &first, Utc::now())
+            .await
+            .unwrap()
+            .is_none(),
+        "a link minted for the replaced credential can no longer activate the account"
+    );
+    assert_eq!(unused_verification_tokens(&db, user_id).await, 1);
+    let admitted = reissued;
     sqlx::query("UPDATE background_job SET state='pending',attempts=max_attempts WHERE id=$1")
         .bind(admitted.job_id)
         .execute(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
+    let third = VerificationToken::new([0x97; 32]);
     let repaired = outbox
         .register(
             NewAccount {
@@ -525,9 +561,9 @@ async fn registration_retry_recovers_or_repairs_without_overwriting_account(
                 state: AccountState::PendingEmailVerification,
                 locale: LocaleCode::PtBr,
             },
-            &retry,
+            &third,
             Utc::now(),
-            verification_message(UserId(0), email.as_str(), &retry),
+            verification_message(UserId(0), email.as_str(), &third),
             None,
         )
         .await
@@ -630,12 +666,12 @@ async fn registration_recovery_case(
             .unwrap();
 
     let second = VerificationToken::new([suffix.as_bytes()[0].wrapping_add(1); 32]);
-    let recovered = outbox
+    let reissued = outbox
         .register(
             NewAccount {
                 email: &email,
-                display_name: Some("Must not overwrite"),
-                password_hash: "must-not-overwrite",
+                display_name: Some("Replacement name"),
+                password_hash: "replacement-hash",
                 state: AccountState::PendingEmailVerification,
                 locale: LocaleCode::PtBr,
             },
@@ -655,45 +691,48 @@ async fn registration_recovery_case(
     .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
-    assert_eq!(account_after, account_before);
+    assert_eq!(
+        account_after,
+        (
+            account_before.0,
+            Some("Replacement name".into()),
+            "en".into(),
+            "replacement-hash".into()
+        )
+    );
+    // Whatever state the earlier delivery is in, its link was minted for the
+    // replaced credential: it is retired and a fresh link is issued.
     let old_token_after: (String, String, DateTime<Utc>, Option<DateTime<Utc>>) =
         sqlx::query_as("SELECT token_hash,email,expires_at,used_at FROM email_verification_tokens WHERE token_hash=$1")
             .bind(&old_token_before.0)
             .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
-    assert_eq!(old_token_after, old_token_before);
+    assert_eq!(old_token_after.0, old_token_before.0);
+    assert_eq!(old_token_after.1, old_token_before.1);
+    assert_eq!(old_token_after.2, old_token_before.2);
+    assert!(old_token_after.3.is_some(), "the earlier link is retired");
 
-    if matches!(
-        state,
-        RecoveryState::ActiveRunning | RecoveryState::ActiveRunningExhausted
-    ) {
-        assert_eq!(recovered.job_id, admitted.job_id);
-        assert_eq!(recovered.message, admitted.message);
-        let old_job_after = sqlx::query_as("SELECT id,state,attempts,max_attempts,payload,claimed_by FROM background_job WHERE id=$1")
-            .bind(admitted.job_id).fetch_optional(&mut *db.acquire().await.unwrap()).await.unwrap();
-        assert_eq!(old_job_after, old_job_before);
-        let token_count: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM email_verification_tokens WHERE user_id=$1")
-                .bind(account_before.0)
-                .fetch_one(&mut *db.acquire().await.unwrap())
-                .await
-                .unwrap();
-        assert_eq!(token_count, 1);
-    } else {
-        assert_ne!(recovered.job_id, admitted.job_id);
-        assert_eq!(recovered.message.account_id, account_before.0);
-        assert_eq!(recovered.message.locale, LocaleCode::En);
-        let new_row: (String, String, i64, String) = sqlx::query_as("SELECT t.token_hash,t.email,j.id,j.state FROM email_verification_tokens t JOIN background_job j ON j.mail_token_hash=t.token_hash WHERE j.id=$1")
-            .bind(recovered.job_id).fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
-        assert_ne!(new_row.0, old_token_before.0);
-        assert_eq!(new_row.1, email.as_str());
-        assert_eq!(new_row.2, recovered.job_id);
-        assert_eq!(new_row.3, "pending");
-        let old_job_after = sqlx::query_as("SELECT id,state,attempts,max_attempts,payload,claimed_by FROM background_job WHERE id=$1")
-            .bind(admitted.job_id).fetch_optional(&mut *db.acquire().await.unwrap()).await.unwrap();
-        assert_eq!(old_job_after, old_job_before);
-    }
+    assert_ne!(reissued.job_id, admitted.job_id);
+    assert_eq!(reissued.message.account_id, account_before.0);
+    assert_eq!(reissued.message.locale, LocaleCode::En);
+    let new_row: (String, String, i64, String, Option<DateTime<Utc>>) = sqlx::query_as("SELECT t.token_hash,t.email,j.id,j.state,t.used_at FROM email_verification_tokens t JOIN background_job j ON j.mail_token_hash=t.token_hash WHERE j.id=$1")
+        .bind(reissued.job_id).fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
+    assert_ne!(new_row.0, old_token_before.0);
+    assert_eq!(new_row.1, email.as_str());
+    assert_eq!(new_row.2, reissued.job_id);
+    assert_eq!(new_row.3, "pending");
+    assert!(new_row.4.is_none());
+    // An in-flight delivery row is left to its worker; its retired token makes
+    // the worker drop it instead of sending a dead link.
+    let old_job_after = sqlx::query_as(
+        "SELECT id,state,attempts,max_attempts,payload,claimed_by FROM background_job WHERE id=$1",
+    )
+    .bind(admitted.job_id)
+    .fetch_optional(&mut *db.acquire().await.unwrap())
+    .await
+    .unwrap();
+    assert_eq!(old_job_after, old_job_before);
 }
 
 #[db_test]
@@ -713,13 +752,13 @@ async fn registration_recovery_repairs_failed_work(tx: &mut bikesnest_test_suppo
     registration_recovery_case(tx, "failed", RecoveryState::Failed).await;
 }
 #[db_test]
-async fn registration_recovery_preserves_active_running_work(
+async fn registration_retry_supersedes_active_running_work(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
     registration_recovery_case(tx, "active", RecoveryState::ActiveRunning).await;
 }
 #[db_test]
-async fn registration_recovery_preserves_active_exhausted_work(
+async fn registration_retry_supersedes_active_exhausted_work(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
     registration_recovery_case(tx, "exhausted", RecoveryState::ActiveRunningExhausted).await;
@@ -1299,6 +1338,243 @@ async fn pending_account_confirmation_activates_without_changing_identity(
     assert!(
         confirm_email(&db, &token, now).await.unwrap().is_none(),
         "confirmation remains single-use"
+    );
+}
+
+#[db_test]
+async fn first_verification_revokes_sessions_opened_while_pending(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let email = UserEmail::parse(&unique_email("pending-session")).unwrap();
+    let token = VerificationToken::new([0x31; 32]);
+    let admitted = SqlxAuthOutbox::new(db.clone(), 3)
+        .register(
+            NewAccount {
+                email: &email,
+                display_name: None,
+                password_hash: "pre-registrant-hash",
+                state: AccountState::PendingEmailVerification,
+                locale: LocaleCode::En,
+            },
+            &token,
+            Utc::now(),
+            verification_message(UserId(0), email.as_str(), &token),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let user_id = UserId(admitted.message.account_id);
+    let sessions = SqlxSessionStore::new(db.clone());
+    let pending_session = SessionId::new([0x32; 32]);
+    let now = Utc::now();
+    sessions
+        .create(user_id, &pending_session, &CsrfToken::new([0x33; 32]), now)
+        .await
+        .unwrap();
+    assert!(
+        sessions
+            .resolve(&pending_session, now)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    let outcome = confirm_email(&db, &token, now).await.unwrap().unwrap();
+    assert!(!outcome.email_changed);
+    assert!(
+        sessions
+            .resolve(&pending_session, now)
+            .await
+            .unwrap()
+            .is_none(),
+        "a session opened before the mailbox owner verified must not survive activation"
+    );
+}
+
+#[db_test]
+async fn confirming_one_link_retires_every_other_outstanding_link(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let accounts = SqlxAccountRepository::new(db.clone());
+    let tokens = SqlxTokenStore::new(db.clone());
+    let email = UserEmail::parse(&unique_email("older-link")).unwrap();
+    let user_id = accounts
+        .create(NewAccount {
+            email: &email,
+            display_name: None,
+            password_hash: "hash",
+            state: AccountState::PendingEmailVerification,
+            locale: LocaleCode::En,
+        })
+        .await
+        .unwrap();
+    let now = Utc::now();
+    let older = VerificationToken::new([0x34; 32]);
+    let newer = VerificationToken::new([0x35; 32]);
+    for token in [&older, &newer] {
+        assert!(
+            tokens
+                .issue_verification(
+                    user_id,
+                    email.as_str(),
+                    token,
+                    now,
+                    AccountState::PendingEmailVerification,
+                )
+                .await
+                .unwrap()
+        );
+    }
+    assert!(confirm_email(&db, &newer, now).await.unwrap().is_some());
+    assert_eq!(unused_verification_tokens(&db, user_id).await, 0);
+
+    // A pending email-change link issued before a later confirmation dies too.
+    let change_to = UserEmail::parse(&unique_email("older-link-change")).unwrap();
+    let change = VerificationToken::new([0x36; 32]);
+    let reverify = VerificationToken::new([0x37; 32]);
+    assert!(
+        tokens
+            .issue_verification(
+                user_id,
+                change_to.as_str(),
+                &change,
+                now,
+                AccountState::Active
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        tokens
+            .issue_verification(
+                user_id,
+                email.as_str(),
+                &reverify,
+                now,
+                AccountState::Active
+            )
+            .await
+            .unwrap()
+    );
+    assert!(confirm_email(&db, &reverify, now).await.unwrap().is_some());
+    assert!(confirm_email(&db, &older, now).await.unwrap().is_none());
+    assert!(confirm_email(&db, &change, now).await.unwrap().is_none());
+    assert_eq!(
+        accounts.find_by_id(user_id).await.unwrap().unwrap().email,
+        email
+    );
+}
+
+#[db_test]
+async fn password_change_retires_pending_email_change_links(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let accounts = SqlxAccountRepository::new(db.clone());
+    let tokens = SqlxTokenStore::new(db.clone());
+    let sessions = SqlxSessionStore::new(db.clone());
+    let email = UserEmail::parse(&unique_email("pw-change-link")).unwrap();
+    let user_id = accounts
+        .create(NewAccount {
+            email: &email,
+            display_name: None,
+            password_hash: "old-hash",
+            state: AccountState::Active,
+            locale: LocaleCode::En,
+        })
+        .await
+        .unwrap();
+    let now = Utc::now();
+    let current = SessionId::new([0x38; 32]);
+    sessions
+        .create(user_id, &current, &CsrfToken::new([0x39; 32]), now)
+        .await
+        .unwrap();
+    let change_to = UserEmail::parse(&unique_email("pw-change-link-attacker")).unwrap();
+    let change = VerificationToken::new([0x3a; 32]);
+    assert!(
+        tokens
+            .issue_verification(
+                user_id,
+                change_to.as_str(),
+                &change,
+                now,
+                AccountState::Active
+            )
+            .await
+            .unwrap()
+    );
+    let notice = EmailMessage::linked(
+        user_id,
+        email.as_str(),
+        LocaleCode::En,
+        EmailKind::PasswordChanged {
+            account_link: "https://bikesnest.test/login".into(),
+            notification_id: "pw-change-link".into(),
+        },
+    );
+    assert!(
+        SqlxAuthOutbox::new(db.clone(), 3)
+            .change_password(user_id, "old-hash", "new-hash", &current, now, notice)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(unused_verification_tokens(&db, user_id).await, 0);
+    assert!(confirm_email(&db, &change, now).await.unwrap().is_none());
+    assert_eq!(
+        accounts.find_by_id(user_id).await.unwrap().unwrap().email,
+        email
+    );
+}
+
+#[db_test]
+async fn password_reset_retires_pending_email_change_links(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let accounts = SqlxAccountRepository::new(db.clone());
+    let tokens = SqlxTokenStore::new(db.clone());
+    let email = UserEmail::parse(&unique_email("reset-link")).unwrap();
+    let user_id = accounts
+        .create(NewAccount {
+            email: &email,
+            display_name: None,
+            password_hash: "old-hash",
+            state: AccountState::Active,
+            locale: LocaleCode::En,
+        })
+        .await
+        .unwrap();
+    let now = Utc::now();
+    let change_to = UserEmail::parse(&unique_email("reset-link-attacker")).unwrap();
+    let change = VerificationToken::new([0x3b; 32]);
+    assert!(
+        tokens
+            .issue_verification(
+                user_id,
+                change_to.as_str(),
+                &change,
+                now,
+                AccountState::Active
+            )
+            .await
+            .unwrap()
+    );
+    let reset = VerificationToken::new([0x3c; 32]);
+    assert!(tokens.issue_reset(user_id, &reset, now).await.unwrap());
+    assert_eq!(
+        complete_reset(&db, &reset, "new-hash", now).await.unwrap(),
+        Some(user_id)
+    );
+    assert_eq!(unused_verification_tokens(&db, user_id).await, 0);
+    assert!(confirm_email(&db, &change, now).await.unwrap().is_none());
+    assert_eq!(
+        accounts.find_by_id(user_id).await.unwrap().unwrap().email,
+        email
     );
 }
 
