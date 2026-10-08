@@ -24,8 +24,8 @@ pub const CSRF_HEADER: &str = "x-csrf-token";
 /// because the middleware cannot parse a multipart body without consuming the
 /// stream the handler's `Multipart` extractor needs.
 pub const CSRF_QUERY: &str = "csrf";
-/// Name of the anonymous double-submit CSRF cookie ( — protects pre-session
-/// requests like login/register/reset, which have no session row yet).
+/// Name of the anonymous double-submit CSRF cookie. It protects pre-session
+/// requests (login, register, password reset), which have no session row yet.
 pub const ANON_CSRF_COOKIE: &str = "__Host-csrf";
 
 /// How much of a urlencoded body the CSRF middleware buffers to find the `csrf`

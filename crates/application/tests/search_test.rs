@@ -604,24 +604,24 @@ async fn browse_passes_the_box_and_every_filter_to_the_reader() {
     // The box the reader got is the box the caller gets back — the view layer
     // frames the map with it, so they must not be two different boxes.
     assert_eq!(seen[0], bounds);
-    assert_eq!(seen[0].west, -49.30);
-    assert_eq!(seen[0].south, -25.45);
-    assert_eq!(seen[0].east, -49.25);
-    assert_eq!(seen[0].north, -25.41);
-    assert_eq!(seen[0].limit, bikesnest_application::BROWSE_MARKER_CAP);
+    assert_eq!(seen[0].west(), -49.30);
+    assert_eq!(seen[0].south(), -25.45);
+    assert_eq!(seen[0].east(), -49.25);
+    assert_eq!(seen[0].north(), -25.41);
+    assert_eq!(seen[0].limit(), bikesnest_application::BROWSE_MARKER_CAP);
     assert_eq!(
-        seen[0].filters.cost,
+        seen[0].filters().cost,
         Some(bikesnest_application::CostFilter::Free)
     );
     assert_eq!(
-        seen[0].filters.types,
+        seen[0].filters().types,
         vec![
             bikesnest_domain::ParkingType::Rack,
             bikesnest_domain::ParkingType::Locker
         ]
     );
-    assert_eq!(seen[0].filters.security_all, vec!["cctv".to_string()]);
-    assert!(seen[0].filters.open_now);
+    assert_eq!(seen[0].filters().security_all, vec!["cctv".to_string()]);
+    assert!(seen[0].filters().open_now);
 }
 
 #[test]

@@ -11,6 +11,7 @@ pub mod auth;
 pub mod community;
 pub mod destination;
 pub mod email;
+pub mod job_health;
 pub mod jobs;
 pub mod moderation;
 pub mod photo;
@@ -41,6 +42,10 @@ pub use community::{
 };
 pub use destination::{DestinationError, GeocodeBudget, ResolveDestination};
 pub use email::{EmailError, EmailKind, EmailMessage, EmailProvider, EmailQueue};
+pub use job_health::{
+    JOB_LATE_AFTER_SECS, JobHealth, JobHealthError, JobHealthReader, JobHealthReport,
+    JobHealthService, JobQueueSummary, RecurringJobStatus,
+};
 pub use jobs::{JOB_EMAIL_SEND, JOB_JOBS_GC, JOB_RETENTION, JobError, JobHandler, JobPayload};
 pub use moderation::{
     ModerationDeps, ModerationError, ModerationRepository, ModerationService, NewReport, Proposal,

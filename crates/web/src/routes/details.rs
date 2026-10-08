@@ -310,7 +310,7 @@ pub(crate) async fn parking_details(
             render(page, StatusCode::OK)
         }
         Ok(None) => not_found_page(&headers, &state.map, &auth, tr),
-        Err(_) => internal_error(&headers, &state.map, &auth, tr),
+        Err(e) => internal_error(&headers, &state.map, &auth, tr, &e),
     }
 }
 

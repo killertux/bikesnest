@@ -357,7 +357,7 @@ pub(crate) async fn search(
         Err(bikesnest_application::SearchError::Geocode(_)) => {
             results_notice(tr, "search.geocode_unavailable")
         }
-        Err(_) => return internal_error(&headers, &state.map, &auth, tr),
+        Err(e) => return internal_error(&headers, &state.map, &auth, tr, &e),
     };
 
     render_search(&state, tr, &auth, &params, results, is_htmx, StatusCode::OK)
@@ -405,7 +405,7 @@ async fn browse(
         Err(bikesnest_application::SearchError::BoundsNotPaginated) => {
             notice("search.browse.no_pages")
         }
-        Err(_) => internal_error(headers, &state.map, auth, tr),
+        Err(e) => internal_error(headers, &state.map, auth, tr, &e),
     }
 }
 

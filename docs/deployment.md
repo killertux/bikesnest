@@ -52,10 +52,12 @@ All knobs are documented in `.env.example`; production sets them as real secrets
 | `DB_STATEMENT_TIMEOUT_MS` | `statement_timeout` on every pooled connection (default `5000`). Migrations are exempt; a long maintenance run through the app — e.g. `retention` on a large database — may need a higher value |
 | `DB_IDLE_IN_TX_TIMEOUT_MS` | `idle_in_transaction_session_timeout` (default `10000`), so a transaction abandoned by a crashed client releases its connection |
 | `BIND_ADDR` | default `0.0.0.0:8080` |
+| `PROBE_TIMEOUT_MS` | deadline for the `/readyz` database probe (default `2000`); a slower answer reports not-ready |
 | `TRUSTED_PROXY_HOPS` | how many reverse proxies in front of the app may be trusted to have appended to `X-Forwarded-For`; `0` (default) uses the TCP peer address only. See the reverse-proxy guidance below |
 | `BASE_URL` | the public origin, e.g. `https://bikesnest.com` — builds links + canonical URLs. **Must be reachable** |
 | `MEDIA_ROOT` | directory the **development e-mail outbox** writes to (`EMAIL_PROVIDER=fake` only; default `media`). No longer a media directory: media lives in the S3 bucket, and the retention orphan sweep lists the bucket |
 | `S3_ENDPOINT` | **Object storage:** the S3-compatible endpoint. Unset defaults to `http://localhost:9000` (RustFS) in development only; set it empty for the standard AWS endpoint. **Required in production** |
+| `S3_PUBLIC_ENDPOINT` | browser-facing endpoint presigned GET URLs are signed for. Set it when `S3_ENDPOINT` is a private container/DNS name the browser cannot reach; defaults to `S3_ENDPOINT` |
 | `S3_REGION` / `S3_BUCKET` | region (default `us-east-1`) + bucket name (development default `bikesnest`; **required in production**) |
 | `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | S3 credentials (development default RustFS `rustfsadmin`; production rejects it and `minioadmin` outright) |
 | `TLS_ON` | set `true` to emit HSTS behind a real TLS terminator |
@@ -72,25 +74,31 @@ All knobs are documented in `.env.example`; production sets them as real secrets
 | `CSP_TILE_HOSTS` / `CSP_GEOCODE_HOSTS` | extra origins allowed by the strict CSP for MapLibre tiles / browser geocoding. Required Mapbox and Google Maps origins are added automatically for their profiles (Google's only on map pages) |
 | `CSP_MEDIA_HOSTS` | object-storage origin(s) allowed in the CSP `img-src` that parking photos are served from as direct pre-signed URLs (dev: `http://localhost:9000`; AWS: `https://<bucket>.s3.<region>.amazonaws.com`) |
 
-Every `CSP_*` entry must be a bare origin — `http://` or `https://`, a host
-(optionally `*.`-prefixed) and an optional `:port`, comma-separated. A path, a
-`;`, whitespace, a control character or a CSP keyword fails startup with an
-error naming the variable, in every environment.
 | `APP_ENV` | `production` → JSON structured logs (machine-parseable, forward to a log aggregator) **and the startup validation described below** |
 | `STATIC_ROOT` | directory `/static` is served from; the image sets `/app/web/static`. Unset falls back to `web/static` beside the working directory, then to the compile-time path |
 | `LOCATION_PROVIDER` | **Location stack:** `google` \| `mapbox` \| `fake` (default `fake`). One value selects direct geocoding, autocomplete, suggestion resolution, and map rendering |
 | `MAPBOX_GEOCODING_ACCESS_TOKEN` | server-side Mapbox geocoding token; required by the Mapbox profile |
+| `GEOCODER` / `MAP_STYLE_URL` / `MAPBOX_ACCESS_TOKEN` | **legacy aliases**, read only when `LOCATION_PROVIDER` is unset: `GEOCODER` (`fake` \| `mapbox` \| `google`) selects the geocoder, `MAP_STYLE_URL` selects the map renderer (a `mapbox://` or `api.mapbox.com` style selects Mapbox GL JS), and `MAPBOX_ACCESS_TOKEN` is the fallback for both Mapbox tokens. New deployments set `LOCATION_PROVIDER` and the explicit token names instead (see "Providers" below) |
 | `MAPBOX_MAP_ACCESS_TOKEN` / `MAPBOX_STYLE_URL` | URL-restricted browser token and Mapbox GL style for the Mapbox profile |
 | `GOOGLE_MAPS_SERVER_API_KEY` | server key for Geocoding API and Places API (New); required by the Google profile |
 | `GOOGLE_MAPS_BROWSER_API_KEY` / `GOOGLE_MAP_ID` | HTTP-referrer-restricted Maps JavaScript API key and cloud map ID; required by the Google profile |
 | `RATE_GEOCODE_PER_IP` / `RATE_GEOCODE_WINDOW_SECS` | shared per-IP budget for provider-backed direct searches, autocomplete, and place resolution (default 60 per 15 min); over budget the endpoint answers 429 before calling the provider |
 | `EMAIL_PROVIDER` | `smtp` or `resend` in production (not `fake`) |
 | `SMTP_*` / `RESEND_API_KEY` / `RESEND_FROM` | the chosen email backend |
+| `SMTP_TLS` | `true` connects to the relay with STARTTLS (default `false`, which suits the dev Mailpit). Set it for every real relay |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` | `seed-admin` bootstrap (run once) |
 | `POLICY_OPERATOR_NAME` / `POLICY_OPERATOR_CNPJ` / `POLICY_OPERATOR_ADDRESS` / `POLICY_CONTACT_EMAIL` | **Legal pages**: the controller's legal name, CNPJ, registered address and privacy contact e-mail, substituted into `policies/*.md` by `seed-policies`. The seeder refuses to run with any of them unset |
 | `POLICY_VERSION` / `POLICY_EFFECTIVE_AT` | version label + effective date of the policy text being seeded; bump the version whenever `policies/*.md` change |
+| `POLICY_ACKNOWLEDGEMENT_ENABLED` | fleet-wide gate for versioned terms acknowledgement at signup and the material-change notices (default `false`; must be an explicit boolean). Keep it `false` until the owner and counsel approve the workflow, and set the same value on every serving instance. Cannot be combined with `GOOGLE_OAUTH_ENABLED=true`. See `docs/policy-publication.md` |
+| `POLICY_TERMS_MATERIAL_NOTICE` | `seed-policies` marks the seeded terms rows as a material change (default `false`; explicit boolean). It only marks rows; it sends no e-mail |
+| `EXPORT_TTL_HOURS` | how long a personal-data export stays downloadable (default `24`) |
 | `DELETED_ACCOUNT_PURGE_AFTER_DAYS` | `30` in production (decision, `docs/retention-policy.md`); `INACTIVE_ACCOUNT_ANONYMIZE_AFTER_DAYS` stays `0` |
 | `REC_*`, `FRESHNESS_*`, `PHOTO_*`, `MOD_*`, `RETENTION_*` | tuning constants (see `.env.example`) |
+
+Every `CSP_*` entry must be a bare origin — `http://` or `https://`, a host
+(optionally `*.`-prefixed) and an optional `:port`, comma-separated. A path, a
+`;`, whitespace, a control character or a CSP keyword fails startup with an
+error naming the variable, in every environment.
 
 The password default permits two simultaneous Argon2id operations. At the
 unchanged 19 MiB memory parameter this is a nominal 38 MiB working-allocation
@@ -103,7 +111,7 @@ overload rejection is preferred.
 
 Image processing uses a separate semaphore with a conservative default of one
 decode/encode at a time per process. A 20 MP input decodes to about 60 MB of RGB
-pixels and the B18 audit harness observed an approximately 151 MiB absolute
+pixels and an audit harness observed an approximately 151 MiB absolute
 single-process high-water mark on its test runtime. That high-water mark is not
 an additive per-request prediction. Before increasing
 `PHOTO_PROCESSING_CONCURRENCY`, the release owner must record the deployed
@@ -430,13 +438,64 @@ The previous binary cannot start once this release's migrations are applied
 release can finish and reschedule a row whose schedule is already persisted, but
 cannot recreate or safely repair a missing/legacy row. Keep the
 persisted schedules intact, use the documented manual retention command only
-with explicit operational approval, and roll forward promptly. Alert separately
-on each built-in's completion timestamp and state, lateness beyond its expected
-next run, a non-null `last_error` on a recurring row together with a
-`finished_at` (its last success) older than one schedule interval, and
-recurring-bootstrap errors. A scheduled `failed` state now only occurs for an
-invalid schedule. Richer history/metrics need a separate change. HTTP readiness alone does not establish that background
-retention is healthy.
+with explicit operational approval, and roll forward promptly. A scheduled
+`failed` state now only occurs for an invalid schedule.
+
+### Job health and alerts
+
+HTTP readiness alone does not establish that background work is healthy:
+`/readyz` stays green while a worker is down or a recurring job fails every
+run. Admins can open **`/admin/jobs`** (linked from the moderation dashboard),
+which shows each recurring job's last success (`finished_at`), next run
+(`run_at`), lateness, attempts and `last_error`, plus one-off queue pressure,
+and refreshes itself every minute. A recurring row is flagged:
+
+| Status | Meaning |
+|---|---|
+| Late | `pending` and more than 15 minutes past its `run_at`: nothing is claiming it |
+| Stuck | `running` with an expired lease: the claiming worker is gone |
+| Failing | on schedule, but the last occurrence failed (`last_error` is set) |
+| Stopped | a recurring row in a terminal state (only an invalid schedule does this) |
+
+Alert on the same facts from SQL (read-only; run it from your monitoring
+system's Postgres check, every few minutes). Each query returns rows only when
+something needs attention:
+
+```sql
+-- Recurring jobs that are late, stuck, stopped, or whose last success is
+-- older than two schedule intervals (both built-ins run every 86,400 s).
+SELECT kind, state, run_at, finished_at AS last_success, attempts, max_attempts,
+       last_error, lease_expires_at
+FROM background_job
+WHERE schedule IS NOT NULL
+  AND (
+       (state = 'pending' AND run_at < now() - interval '15 minutes')
+    OR (state = 'running' AND lease_expires_at < now())
+    OR state IN ('failed', 'succeeded')
+    OR (finished_at IS NULL AND created_at < now() - interval '2 days')
+    OR finished_at < now() - 2 * make_interval(secs => (schedule->>'every_seconds')::double precision)
+  );
+
+-- Recurring jobs whose latest occurrence failed (warning, not page-worthy on
+-- its own: the next occurrence may succeed).
+SELECT kind, run_at, finished_at AS last_success, last_error
+FROM background_job
+WHERE schedule IS NOT NULL AND last_error IS NOT NULL;
+
+-- One-off queue pressure: jobs waiting more than 15 minutes past due, and
+-- jobs dead-lettered in the last 24 hours (for example undeliverable mail).
+SELECT
+  (SELECT count(*) FROM background_job
+    WHERE state = 'pending' AND schedule IS NULL
+      AND run_at < now() - interval '15 minutes') AS overdue_pending,
+  (SELECT count(*) FROM background_job
+    WHERE state = 'failed' AND schedule IS NULL
+      AND finished_at > now() - interval '24 hours') AS failed_last_day;
+```
+
+The `every_seconds` comparison applies to interval schedules; a `cron` row
+(none ship today) yields `NULL` there and is covered by the lateness clause.
+Also alert on the worker's recurring-bootstrap error log lines.
 
 ## 5d. Transactional email goes through the queue
 

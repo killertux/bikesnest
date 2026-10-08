@@ -36,8 +36,9 @@ use axum::routing::{get, post};
 use crate::state::AppState;
 
 use admin::{
-    admin_audit, admin_privacy_request_fulfill, admin_privacy_requests, admin_role_post,
-    admin_user_contributions, admin_user_restore, admin_user_suspend, admin_users,
+    admin_audit, admin_jobs, admin_jobs_status, admin_privacy_request_fulfill,
+    admin_privacy_requests, admin_role_post, admin_user_contributions, admin_user_restore,
+    admin_user_suspend, admin_users,
 };
 use api::{address_suggestions_api, geocode_api, resolve_address_suggestion_api};
 use auth::{
@@ -263,6 +264,8 @@ pub(crate) fn routes(state: &AppState) -> Router<AppState> {
             get(admin_user_contributions),
         )
         .route("/admin/audit", get(admin_audit))
+        .route("/admin/jobs", get(admin_jobs))
+        .route("/admin/jobs/status", get(admin_jobs_status))
         // Content-hashed assets: a more specific static segment
         // ("h") than the `/static/{*rest}` the `nest_service` below expands
         // to, so this route wins the match for any hashed URL. Validates the

@@ -10,9 +10,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bikesnest_application::{
     AuthService, CheckReadiness, CommunityParkingDetails, ContributionError, ContributionService,
-    FreshnessConfig, GetParkingDetails, ListingProposal, ModerationService, ObjectStorage,
-    ParkingPhotoReader, PendingProposalSummary, PhotoService, PrivacyService, RateLimiter,
-    ReaderError, ResolveDestination, SearchParking, SitemapReader, StoredPhoto,
+    FreshnessConfig, GetParkingDetails, JobHealthService, ListingProposal, ModerationService,
+    ObjectStorage, ParkingPhotoReader, PendingProposalSummary, PhotoService, PrivacyService,
+    RateLimiter, ReaderError, ResolveDestination, SearchParking, SitemapReader, StoredPhoto,
 };
 use bikesnest_domain::{ParkingLocation, RevisionSummary, UserId};
 use bikesnest_infrastructure::{Config, MapConfig};
@@ -130,6 +130,8 @@ pub struct AppState {
     pub photo: Arc<PhotoService>,
     pub moderation: Arc<ModerationService>,
     pub privacy: Arc<PrivacyService>,
+    /// Admin background-job health (recurring jobs, queue pressure).
+    pub jobs: Arc<JobHealthService>,
     pub policy: Arc<dyn bikesnest_application::PolicyReader>,
     pub terms: Arc<dyn bikesnest_application::TermsAcknowledgementStore>,
     /// Security/CSP header policy, built once from the configured origins.

@@ -114,7 +114,7 @@ ports and returns domain results; it never touches HTTP, SQL, or filesystem
 directly. Examples: `SearchParking`, `ResolveDestination` (the per-client
 geocode budget: a destination the geocoder already holds is free, anything else
 is charged first), `ContributionService`, `AuthService`, `ModerationService`,
-`PhotoService`, `RetentionJob`, the job `Worker`.
+`PhotoService`, `RetentionJob`, `JobHealthService`, the job `Worker`.
 
 **Ports** (the full list of `trait`s the application declares):
 
@@ -143,6 +143,7 @@ is charged first), `ContributionService`, `AuthService`, `ModerationService`,
 | `TimezoneResolver` | coordinate → IANA timezone |
 | `DatabaseProbe` | readiness DB check |
 | `JobHandler` | background job execution |
+| `JobHealthReader` | recurring-job and queue health for the admin `/admin/jobs` view |
 
 ### Infrastructure (`crates/infrastructure`)
 
@@ -150,8 +151,9 @@ The adapters: `Sqlx*` repositories for every persistence port, `Config::from_env
 (reads `.env`), `GoogleGeocoder`/`MapboxGeocoder`/`FakeGeocoder`, `S3ObjectStorage`,
 `LocalImageProcessor`, `FakeOAuthProvider`, email impls
 (`fake`/`smtp`/`resend`), `ValKeyRateLimiter`/`InMemoryRateLimiter`,
-`OfflineTimezoneResolver`, `SystemClock`, `OsRngTokenGenerator`,
-`Argon2PasswordHasher`, `SqlxJobRepository` + `Worker`, the `devdata`/seeders
+`OfflineTimezoneResolver`, `SystemClock`, `RealTokenGenerator`,
+`Argon2PasswordHasher`, `SqlxJobRepository` + `Worker` + `SqlxJobHealthReader`,
+the `devdata`/seeders
 (`seed-mock`, `seed-admin`, `seed-policies`, `seed-full-fresh`), and `Db`/`probe`.
 
 CPU-heavy adapters use process-local admission before entering Tokio's blocking
@@ -208,17 +210,27 @@ The router is split three ways:
   `details`, `auth` (accounts), `community` (add/edit/propose),
   `reviews` (review/verify/parked-here/favorite + the account activity lists),
   `photo` (upload and photo queue), `moderation` (reports and queues),
-  `admin` (users, audit, privacy requests), `privacy` (export/delete),
+  `admin` (users, audit, privacy requests, job health), `privacy` (export/delete),
   `legal` (policy pages), `api` (address autocomplete/geocode JSON),
-  `csp_report` (the CSP violation sink), plus `common` (shared
-  render/fragment helpers) and `errors` (the styled 404/500 family).
+  `csp_report` (the CSP violation sink), `contribution_form` (the add/edit
+  form's wire grammar and editors), plus `common` (shared render/fragment
+  helpers) and `errors` (the styled 404/500 family, which logs the error
+  chain of every 500 it renders).
   `routes/mod.rs` holds the URL → handler table. Two tests guard the shape: no
   file over 1200 lines, and neither `AppState` nor anything under `routes/` may
   name a repository, a pool or an adapter.
 
-`lib.rs` holds the Askama view-model structs; `i18n.rs` holds the en + pt-BR
-catalogs; `security.rs` the headers/CSP; `observability.rs` the JSON structured
-logging; `markdown.rs` the sanitizing renderer for the legal pages.
+`pages/` holds the Askama page and fragment structs, one module per slice
+(`layout` with `PageLayout` and the error page, `discovery`, `account`,
+`community`, `moderation`); `view/` holds the builders that turn application
+results into those view models (`format` for the shared label, number and date
+helpers, then `search`, `community`, `moderation`, `admin`, `privacy`). Both are
+re-exported from `lib.rs`, so callers name `crate::HomePage` and `view::…`.
+Numbers are formatted per locale there (pt-BR uses a decimal comma for prices,
+distances and ratings). `i18n.rs` re-exports the en + pt-BR catalogs;
+`security.rs` the headers/CSP; `observability.rs` the JSON structured logging;
+`markdown.rs` the sanitizing renderer for the legal pages; `htmx.rs` decides
+which requests may be answered with a fragment.
 
 The parking profile has server-rendered Current version, Version history, and
 Pending approvals tabs. Its `DetailReads` facade delegates to existing
@@ -312,10 +324,16 @@ Versioned, forward-only migrations in `migrations/`:
 | `0017_indexes.sql` | FK/read-path indexes, narrowing CHECKs |
 | `0018_user_locale.sql` | per-account locale |
 | `0019_photo_key_and_audit_integrity.sql` | non-empty `storage_key`, append-only audit |
-| `0020_open_now_fn.sql` | `bikesnest_is_open_at()` + confirmed-attribute index |
+| `0020_open_now_fn.sql` + `0021_rename_open_now_fn.sql` | `bikesnest_is_open_at()` + confirmed-attribute index |
+| `0022_listing_collaboration.sql` | proposal votes and collaboration metadata (aggregates only on public pages) |
+| `0023_public_contribution_names.sql` + `0025_public_names_default_on.sql` | opt-in, then default-on, public contribution names |
 | `0024_approve_all_parking_edits.sql` | allow detail-edit proposals alongside moves and existence changes |
+| `0026_mail_job_lifecycle.sql` + `0027_security_notice_mail.sql` | account-linked transactional mail and security notices on `background_job` |
 | `0028_terms_acknowledgement.sql` | immutable policy releases plus exact terms presentation/acknowledgement evidence |
 | `0029_policy_version_id_immutable.sql` | preserve the exact published policy row id during its one allowed supersession update |
+| `0030_users_last_active_at.sql` | durable per-account activity timestamp for inactivity retention |
+| `0031_proposal_escalation.sql` | mark a proposal that reached its approvals but could not publish for a moderator decision |
+| `0033_fk_lookup_indexes.sql` | foreign-key lookup indexes for cascading deletes (`0032` is unused) |
 
 Key modeling notes:
 
@@ -410,6 +428,9 @@ Key modeling notes:
   (e.g. security feature codes), the web layer maps them to localized labels.
 - **Background jobs:** Postgres queue with independent durable-admission and
   worker-execution modes; the worker may run beside HTTP or via the dedicated
-  `worker` command.
+  `worker` command. Readiness covers only the database; `/admin/jobs` (admin
+  only) and the alert SQL in `docs/deployment.md` cover the background half:
+  each recurring job's last success, lateness and last error, plus one-off
+  queue pressure.
 - **SEO:** `robots.txt`, `sitemap.xml`, canonical/meta/OG, `hreflang`,
   `noindex` support.

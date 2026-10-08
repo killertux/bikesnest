@@ -1,4 +1,4 @@
-//! Image processing (M4): decode → apply EXIF orientation → re-encode JPEG →
+//! Image processing: decode → apply EXIF orientation → re-encode JPEG →
 //! thumbnail. The raw upload is never stored; only these derivatives are.
 //!
 //! Decoding and the two JPEG encodes are pure CPU work on images of up to 20

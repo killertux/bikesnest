@@ -1,24 +1,27 @@
 //! Admin-only pages: the user directory and its role/state actions, the
-//! audit-log viewer and the manual privacy-request queue.
+//! audit-log viewer, the manual privacy-request queue and the background-job
+//! health view.
 
 use axum::extract::{Form, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
-use bikesnest_application::{AuditFilter, AuthError};
+use bikesnest_application::{AuditFilter, AuthError, JobHealthError};
 use bikesnest_domain::{Role, UserId};
 
 use crate::auth::Auth;
+use crate::htmx::{is_fragment_request, vary_fragment};
 use crate::i18n::{Locale, Translator};
 use crate::state::AppState;
 use crate::view;
 use crate::{
-    AdminAuditPage, AdminPrivacyRequestsPage, AdminUserContributionsPage, AdminUsersPage,
-    PageLayout,
+    AdminAuditPage, AdminJobsPage, AdminJobsStatusVm, AdminPrivacyRequestsPage,
+    AdminUserContributionsPage, AdminUsersPage, PageLayout,
 };
 
 use super::common::{
     DEFAULT_PAGE_LIMIT, parse_after_id, parse_datetime, render, urlencoding_query,
 };
+use super::errors::{error_page, internal_error};
 
 /// POST /admin/users/{id}/suspend — ADMIN-only; revokes sessions + audits.
 pub(crate) async fn admin_user_suspend(
@@ -439,5 +442,85 @@ pub(crate) async fn admin_privacy_request_fulfill(
     match state.privacy.fulfill_request(admin, id).await {
         Ok(()) => Redirect::to("/admin/privacy-requests?fulfilled=1").into_response(),
         Err(_) => Redirect::to("/admin/privacy-requests?error=1").into_response(),
+    }
+}
+
+/// GET /admin/jobs — ADMIN-only background-job health: each recurring job's
+/// last success, next run, lateness, attempts and last error, plus one-shot
+/// queue pressure.
+pub(crate) async fn admin_jobs(
+    State(state): State<AppState>,
+    locale: Locale,
+    auth: Auth,
+    headers: HeaderMap,
+) -> Response {
+    let tr = Translator::new(locale);
+    let admin = match auth.require_role(Role::Admin) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    match state.jobs.report(admin).await {
+        Ok(report) => render(
+            AdminJobsPage {
+                layout: PageLayout::for_request(
+                    tr.t("admin.jobs.title").to_string(),
+                    "admin",
+                    &auth,
+                    &state.map,
+                ),
+                tr,
+                health: view::job_health_vm(tr, &report),
+            },
+            StatusCode::OK,
+        ),
+        Err(err) => job_health_error(&headers, &state, &auth, tr, &err),
+    }
+}
+
+/// GET /admin/jobs/status — the region `/admin/jobs` polls. Only a real
+/// fragment request gets the partial; anything else is sent to the page.
+pub(crate) async fn admin_jobs_status(
+    State(state): State<AppState>,
+    locale: Locale,
+    auth: Auth,
+    headers: HeaderMap,
+) -> Response {
+    let tr = Translator::new(locale);
+    let admin = match auth.require_role(Role::Admin) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if !is_fragment_request(&headers) {
+        return Redirect::to("/admin/jobs").into_response();
+    }
+    match state.jobs.report(admin).await {
+        Ok(report) => vary_fragment(render(
+            AdminJobsStatusVm {
+                tr,
+                health: view::job_health_vm(tr, &report),
+            },
+            StatusCode::OK,
+        )),
+        Err(err) => job_health_error(&headers, &state, &auth, tr, &err),
+    }
+}
+
+fn job_health_error(
+    headers: &HeaderMap,
+    state: &AppState,
+    auth: &Auth,
+    tr: Translator,
+    err: &JobHealthError,
+) -> Response {
+    match err {
+        JobHealthError::Forbidden => error_page(
+            headers,
+            &state.map,
+            auth,
+            tr,
+            StatusCode::FORBIDDEN,
+            "error.forbidden",
+        ),
+        JobHealthError::Read(_) => internal_error(headers, &state.map, auth, tr, err),
     }
 }

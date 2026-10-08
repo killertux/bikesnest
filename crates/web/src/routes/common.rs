@@ -118,7 +118,10 @@ pub(crate) fn render<T: Template>(template: T, status: StatusCode) -> Response {
             response
         }
         // A render failure is a bug; keep the fallback minimal (no template).
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response(),
+        Err(e) => {
+            tracing::error!(category = "template_render", error = %e, "template render failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
+        }
     }
 }
 

@@ -1,0 +1,8 @@
+{% extends "layouts/base.html" %}
+{% block content %}
+<section class="mx-auto max-w-shell px-4 py-12 lg:px-8">
+  <h1 class="font-display text-2xl font-bold tracking-tight">{{ tr.t("admin.jobs.title") }}</h1>
+  <p class="mt-1 text-sm text-muted">{{ tr.t("admin.jobs.subtitle") }}</p>
+  {% include "partials/admin_jobs_status.html" %}
+</section>
+{% endblock %}

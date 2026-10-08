@@ -4,17 +4,25 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly advisory scan, so a newly published advisory (or an expiring
+  # exception in ci/advisory-exceptions.json) surfaces without a push. Only
+  # the advisory job runs on this trigger; every other job skips it.
+  schedule:
+    - cron: "17 6 * * 1"
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # The scheduled scan gets its own group so it neither cancels nor is
+  # cancelled by a push to main.
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'schedule' && 'schedule' || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   format:
     name: Format
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -29,6 +37,7 @@ jobs:
 
   clippy:
     name: Clippy
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -86,6 +95,7 @@ jobs:
 
   db-free-tests:
     name: DB-free tests
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -102,6 +112,7 @@ jobs:
 
   test:
     name: Tests
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -197,6 +208,7 @@ jobs:
 
   frontend-assets:
     name: Frontend assets
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -220,6 +232,7 @@ jobs:
 
   docker:
     name: Docker image
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

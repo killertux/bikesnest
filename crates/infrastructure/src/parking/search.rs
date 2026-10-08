@@ -489,12 +489,12 @@ impl SqlxParkingSearchReader {
         query: &BoundsQuery,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<BoundsPage, ReaderError> {
-        let (cost, types, security_all) = filter_binds(&query.filters);
+        let (cost, types, security_all) = filter_binds(query.filters());
         let total = self
             .bounds_count(query, &cost, &types, &security_all, now)
             .await?;
         let total = usize::try_from(total).unwrap_or(0);
-        if total > query.limit {
+        if total > query.limit() {
             let clusters = self
                 .bounds_clusters(query, &cost, &types, &security_all, now)
                 .await?;
@@ -536,13 +536,13 @@ impl SqlxParkingSearchReader {
             "#
         );
         let total: (i64,) = sqlx::query_as(&sql)
-            .bind(query.west)
-            .bind(query.south)
-            .bind(query.east)
-            .bind(query.north)
+            .bind(query.west())
+            .bind(query.south())
+            .bind(query.east())
+            .bind(query.north())
             .bind(cost.clone())
             .bind(types.clone())
-            .bind(query.filters.open_now)
+            .bind(query.filters().open_now)
             .bind(security_all.clone())
             .bind(now)
             .fetch_one(&mut *conn)
@@ -551,7 +551,7 @@ impl SqlxParkingSearchReader {
         Ok(total.0)
     }
 
-    /// The viewport's rows, nearest the centre first, capped at `query.limit`.
+    /// The viewport's rows, nearest the centre first, capped at `query.limit()`.
     ///
     /// Same shape as the keyset page above and for the same reason: the ids
     /// and their distances are picked in a `MATERIALIZED` CTE so the codes
@@ -621,18 +621,18 @@ impl SqlxParkingSearchReader {
             "#
         );
         let rows: Vec<SearchRow> = sqlx::query_as(&sql)
-            .bind(query.west)
-            .bind(query.south)
-            .bind(query.east)
-            .bind(query.north)
+            .bind(query.west())
+            .bind(query.south())
+            .bind(query.east())
+            .bind(query.north())
             .bind(cost.clone())
             .bind(types.clone())
-            .bind(query.filters.open_now)
+            .bind(query.filters().open_now)
             .bind(security_all.clone())
             .bind(now)
             .bind(center.lat())
             .bind(center.lon())
-            .bind(query.limit as i64)
+            .bind(query.limit() as i64)
             .fetch_all(&mut *conn)
             .await
             .map_err(|e| reader_err("search.bounds_page", e))?;
@@ -677,13 +677,13 @@ impl SqlxParkingSearchReader {
             "#
         );
         let rows: Vec<ClusterRow> = sqlx::query_as(&sql)
-            .bind(query.west)
-            .bind(query.south)
-            .bind(query.east)
-            .bind(query.north)
+            .bind(query.west())
+            .bind(query.south())
+            .bind(query.east())
+            .bind(query.north())
             .bind(cost.clone())
             .bind(types.clone())
-            .bind(query.filters.open_now)
+            .bind(query.filters().open_now)
             .bind(security_all.clone())
             .bind(now)
             .bind(query.cell_deg())

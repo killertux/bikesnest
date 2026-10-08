@@ -153,9 +153,19 @@ async fn bootstrap_claim_execute_finish_and_restart_recur(tx: &mut bikesnest_tes
     assert_eq!(schedule, Some(json!({"every_seconds": 1})));
     assert!(run_at > Utc::now());
     assert!(finished_at.is_some());
+
+    // Let the next occurrence come due without waiting for the wall clock:
+    // move the persisted run time into the past. The next occurrence is
+    // computed from the real clock again, so it still lands after `run_at`.
+    sqlx::query(
+        "UPDATE background_job SET run_at = clock_timestamp() - interval '1 second' WHERE id=$1",
+    )
+    .bind(id)
+    .execute(&mut *conn)
+    .await
+    .unwrap();
     drop(conn);
 
-    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
     let mut claimed = repo
         .claim_kinds(
             1,

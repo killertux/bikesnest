@@ -72,6 +72,12 @@ async fn real_search(
 /// box's centre *is* the patch origin and a fixture's distance from it is the
 /// distance the fixture was placed at.
 fn bounds_at(k: f64, half: f64, limit: usize) -> BoundsQuery {
+    bounds_with(k, half, limit, Filters::default())
+}
+
+/// [`bounds_at`] with filters. A `BoundsQuery` is only ever built by `parse`,
+/// so the filters go in there too.
+fn bounds_with(k: f64, half: f64, limit: usize, filters: Filters) -> BoundsQuery {
     let o = test_origin(k);
     BoundsQuery::parse(
         &format!(
@@ -81,7 +87,7 @@ fn bounds_at(k: f64, half: f64, limit: usize) -> BoundsQuery {
             o.lon() + half,
             o.lat() + half
         ),
-        Filters::default(),
+        filters,
         limit,
     )
     .expect("a valid test box")
@@ -1134,14 +1140,28 @@ async fn in_bounds_returns_the_envelope_only_and_measures_from_its_centre(tx: &m
     assert!(page.items.iter().all(|i| i.sort_key.is_none()));
 
     // The filters are the radius search's filters, applied to the same box.
-    let mut free_only = bounds_at(20.0, 0.01, 200);
-    free_only.filters.cost = Some(CostFilter::Free);
+    let free_only = bounds_with(
+        20.0,
+        0.01,
+        200,
+        Filters {
+            cost: Some(CostFilter::Free),
+            ..Filters::default()
+        },
+    );
     let page = real_bounds(&db, &free_only).await.unwrap();
     assert_eq!(page.total, 1);
     assert_eq!(page.items[0].name, "Inside centre");
 
-    let mut lockers_only = bounds_at(20.0, 0.01, 200);
-    lockers_only.filters.types = vec![ParkingType::Locker];
+    let lockers_only = bounds_with(
+        20.0,
+        0.01,
+        200,
+        Filters {
+            types: vec![ParkingType::Locker],
+            ..Filters::default()
+        },
+    );
     let page = real_bounds(&db, &lockers_only).await.unwrap();
     assert_eq!(page.total, 0, "every fixture here is a rack");
     assert!(page.items.is_empty());

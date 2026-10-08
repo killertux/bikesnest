@@ -14,9 +14,10 @@ use std::sync::Arc;
 use axum::{Router, middleware};
 use bikesnest_application::{
     AuthMailDispatcher, AuthService, CheckReadiness, ContributionDeps, ContributionService,
-    DatabaseProbe, EmailProvider, GeocodeBudget, Geocoder, GetParkingDetails, ModerationDeps,
-    ModerationService, ObjectStorage, ParkingPhotoReader, PasswordHasher, PhotoDeps, PhotoService,
-    PrivacyDeps, PrivacyService, RateLimiter, ResolveDestination, SearchParking,
+    DatabaseProbe, EmailProvider, GeocodeBudget, Geocoder, GetParkingDetails, JobHealthService,
+    ModerationDeps, ModerationService, ObjectStorage, ParkingPhotoReader, PasswordHasher,
+    PhotoDeps, PhotoService, PrivacyDeps, PrivacyService, RateLimiter, ResolveDestination,
+    SearchParking,
 };
 use bikesnest_infrastructure::probe::SqlxDatabaseProbe;
 use bikesnest_infrastructure::{
@@ -25,9 +26,9 @@ use bikesnest_infrastructure::{
     S3ObjectStorage, SharedObjectStorage, SharedRateLimiter, SqlxAccountRepository,
     SqlxAnonymizationRepository, SqlxAuditLog, SqlxAuditLogReader, SqlxAuthOutbox,
     SqlxContributionHistoryReader, SqlxExportRepository, SqlxFavoriteRepository,
-    SqlxModerationRepository, SqlxParkingContributionRepository, SqlxParkingDetailsReader,
-    SqlxParkingPhotoReader, SqlxParkingSearchReader, SqlxPhotoRepository, SqlxPolicyReader,
-    SqlxPrivacyRequestRepository, SqlxReportRepository, SqlxReviewPhotosReader,
+    SqlxJobHealthReader, SqlxModerationRepository, SqlxParkingContributionRepository,
+    SqlxParkingDetailsReader, SqlxParkingPhotoReader, SqlxParkingSearchReader, SqlxPhotoRepository,
+    SqlxPolicyReader, SqlxPrivacyRequestRepository, SqlxReportRepository, SqlxReviewPhotosReader,
     SqlxReviewRepository, SqlxSessionStore, SqlxSitemapReader, SqlxTokenStore,
     SqlxVerificationRepository, SystemClock, caching_geocoder_from_config, email_from_config,
     rate_limiter_from_config,
@@ -221,6 +222,10 @@ pub fn app_router_with<H: PasswordHasher + Clone + 'static>(
         photo: Arc::new(photo_service),
         moderation: Arc::new(moderation_service),
         privacy: Arc::new(privacy_service),
+        jobs: Arc::new(JobHealthService::new(
+            Box::new(SqlxJobHealthReader::new(db.clone())),
+            Box::new(SystemClock),
+        )),
         policy: policy_reader,
         terms: terms_store,
         security: SecurityHeaders::new(&config.security, &config.map, config.tls_on),

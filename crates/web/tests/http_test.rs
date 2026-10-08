@@ -5662,17 +5662,15 @@ fn route_handlers_never_reach_for_infrastructure() {
 
 /// The router used to be one 5k-line module. Nothing in the web crate should
 /// grow back into that: a slice that outgrows this limit wants splitting.
-/// `view.rs` (the view-model builders) is the one file still over it.
+/// There are no exemptions.
 #[test]
 fn no_web_source_file_is_longer_than_1200_lines() {
     const LIMIT: usize = 1200;
-    const EXEMPT: &[&str] = &["view.rs"];
 
     let mut offenders = Vec::new();
     for (path, contents) in web_sources() {
-        let name = path.file_name().unwrap().to_string_lossy().to_string();
         let lines = contents.lines().count();
-        if lines > LIMIT && !EXEMPT.contains(&name.as_str()) {
+        if lines > LIMIT {
             offenders.push(format!("{}: {lines} lines", path.display()));
         }
     }
@@ -9013,7 +9011,7 @@ async fn login_wrong_password_banner_is_an_alert(tx: &mut bikesnest_test_support
 /// `AuthError::EmailTaken` is defined but `AuthService::register` never
 /// returns it: a taken email is deliberately answered exactly like a fresh
 /// one (`Ok(())`, no mail sent) so the response cannot be used to enumerate
-/// registered addresses ( — see the comment in
+/// registered addresses (see the comment in
 /// `crates/application/src/auth.rs`'s `register`). `register_field_error`'s
 /// `EmailTaken => Some("email")` arm therefore has no live producer through
 /// this form; the same field association is exercised here through
@@ -9728,4 +9726,86 @@ fn verification_token_to(
         .captures(&mail.text)
         .unwrap()[1]
         .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Admin background-job health
+// ---------------------------------------------------------------------------
+
+#[db_test]
+async fn job_health_page_is_admin_only_and_shows_recurring_jobs(tx: &mut TestTx) {
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
+    sqlx::query(
+        "INSERT INTO background_job (kind, payload, schedule, run_at, attempts, last_error, idempotency_key)
+         VALUES ('test.web.health.late', '{}', '{\"every_seconds\": 3600}',
+                 clock_timestamp() - interval '2 hours', 1, 'job failed: probe', 'test:web:health:late')",
+    )
+    .execute(&mut *db.acquire().await.unwrap())
+    .await
+    .unwrap();
+
+    let (s, _) = get_c(&app, "/admin/jobs", None).await;
+    assert!(
+        matches!(s, StatusCode::SEE_OTHER | StatusCode::FOUND),
+        "anonymous is sent to sign in: {s}"
+    );
+    let mod_cookie = moderator_cookie(&db, &app, &email, "jobs-mod@example.com").await;
+    let (s, _) = get_c(&app, "/admin/jobs", Some(&mod_cookie)).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "moderators cannot see job health");
+    let (s, _, _) = request_h(
+        &app,
+        "GET",
+        "/admin/jobs/status",
+        Some(&mod_cookie),
+        HX_FRAGMENT,
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "nor its fragment");
+
+    let admin = admin_cookie(&db, &app, &email, "jobs-admin@example.com").await;
+    let (s, body) = get_c(&app, "/admin/jobs", Some(&admin)).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(is_document(&body), "a whole page");
+    assert!(
+        body.contains(r#"data-job-kind="test.web.health.late" data-job-status="late""#),
+        "the overdue recurring job is flagged late: {body}"
+    );
+    assert!(body.contains("job failed: probe"), "last_error is shown");
+    assert!(body.contains("overdue"), "lateness is shown");
+    assert!(body.contains(r#"data-job-health="attention""#));
+    assert!(
+        body.contains(r#"hx-get="/admin/jobs/status""#),
+        "the region polls"
+    );
+}
+
+#[db_test]
+async fn job_health_fragment_endpoint_answers_only_fragment_requests(tx: &mut TestTx) {
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
+    let admin = admin_cookie(&db, &app, &email, "jobs-frag-admin@example.com").await;
+
+    // A real fragment request gets the region, not a document.
+    let (s, head, body) =
+        request_h(&app, "GET", "/admin/jobs/status", Some(&admin), HX_FRAGMENT).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(!is_document(&body), "fragment, not a page: {body}");
+    assert!(body.contains(r#"id="job-health""#));
+    assert!(vary_of(&head).contains("hx-request"), "{head:?}");
+
+    // A plain GET, a boosted navigation and a history restore all get the page.
+    for headers in [
+        &[][..],
+        &[("HX-Request", "true"), ("HX-Boosted", "true")][..],
+        &[
+            ("HX-Request", "true"),
+            ("HX-History-Restore-Request", "true"),
+        ][..],
+    ] {
+        let (s, head, _) =
+            request_h(&app, "GET", "/admin/jobs/status", Some(&admin), headers).await;
+        assert_eq!(s, StatusCode::SEE_OTHER, "{headers:?}");
+        assert_eq!(location_of(&head), "/admin/jobs", "{headers:?}");
+    }
 }

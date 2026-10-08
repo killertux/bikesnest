@@ -50,8 +50,8 @@ pub use geocoding::{
 pub use job::{
     ClaimedJob, EXHAUSTED_LEASE_ERROR, ExhaustedLease, JOBS_GC_RECURRING_KEY, JobRegistry,
     JobRepoError, JobServices, RETENTION_RECURRING_KEY, RecurringKind,
-    RecurringRegistrationOutcome, SendEmailHandler, SqlxJobRepository, Worker, WorkerDiagnostics,
-    job_services,
+    RecurringRegistrationOutcome, SendEmailHandler, SqlxJobHealthReader, SqlxJobRepository, Worker,
+    WorkerDiagnostics, job_services,
 };
 pub use moderation::{SqlxAuditLogReader, SqlxModerationRepository, SqlxReportRepository};
 pub use parking::{

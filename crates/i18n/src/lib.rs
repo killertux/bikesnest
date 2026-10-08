@@ -1057,8 +1057,14 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
             "The service is temporarily unavailable. Please try again in a moment.",
             "O serviço está temporariamente indisponível. Tente novamente em instantes.",
         ),
+        "error.network" => (
+            "Couldn't reach BikesNest. Check your connection and try again.",
+            "Não foi possível conectar ao BikesNest. Verifique sua conexão e tente de novo.",
+        ),
+        "error.network_retry" => ("Try again", "Tentar de novo"),
+        "error.network_dismiss" => ("Dismiss", "Dispensar"),
 
-        // --- auth: register / login (A1/A2) -------------------------------
+        // --- auth: register / login --------------------------------------
         "auth.register_title" => ("Create your account", "Crie sua conta"),
         "auth.register_subtitle" => (
             "A community account keeps your contributions and the map honest.",
@@ -1118,7 +1124,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
             "Reenviar e-mail de verificação",
         ),
 
-        // --- auth: password reset (A4/A5) ---------------------------------
+        // --- auth: password reset ----------------------------------------
         "auth.reset_title" => ("Reset your password", "Redefinir sua senha"),
         "auth.reset_subtitle" => (
             "Enter your email and we will send a reset link if it exists.",
@@ -1934,6 +1940,52 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "admin.audit.metadata" => ("Metadata", "Metadados"),
         "admin.audit.when" => ("When", "Quando"),
         "admin.audit.next" => ("Next page", "Próxima página"),
+        // --- admin: background-job health --------------------------------
+        "admin.jobs.title" => ("Background jobs", "Tarefas em segundo plano"),
+        "admin.jobs.subtitle" => (
+            "Whether the recurring jobs keep up and the queue drains. Times are UTC.",
+            "Se as tarefas recorrentes estão em dia e a fila está sendo processada. Horários em UTC.",
+        ),
+        "admin.jobs.checked_at" => ("Checked at", "Verificado em"),
+        "admin.jobs.all_healthy" => (
+            "All background jobs are on schedule.",
+            "Todas as tarefas em segundo plano estão em dia.",
+        ),
+        "admin.jobs.attention" => (
+            "Some background work needs attention.",
+            "Algumas tarefas em segundo plano precisam de atenção.",
+        ),
+        "admin.jobs.recurring" => ("Recurring jobs", "Tarefas recorrentes"),
+        "admin.jobs.empty" => (
+            "No recurring jobs are registered. Is a worker running?",
+            "Nenhuma tarefa recorrente registrada. Há um worker em execução?",
+        ),
+        "admin.jobs.kind" => ("Job", "Tarefa"),
+        "admin.jobs.status" => ("Status", "Situação"),
+        "admin.jobs.schedule" => ("Schedule", "Agenda"),
+        "admin.jobs.schedule.every" => ("Every {d}", "A cada {d}"),
+        "admin.jobs.last_success" => ("Last success", "Último sucesso"),
+        "admin.jobs.next_run" => ("Next run", "Próxima execução"),
+        "admin.jobs.overdue" => ("{d} overdue", "{d} de atraso"),
+        "admin.jobs.attempts" => ("Attempts", "Tentativas"),
+        "admin.jobs.last_error" => ("Last error", "Último erro"),
+        "admin.jobs.queue" => ("One-off jobs", "Tarefas avulsas"),
+        "admin.jobs.overdue_pending" => (
+            "Waiting more than 15 minutes past due",
+            "Aguardando há mais de 15 minutos do horário",
+        ),
+        "admin.jobs.failed_last_day" => (
+            "Gave up in the last 24 hours",
+            "Abandonadas nas últimas 24 horas",
+        ),
+        "admin.jobs.health.dead" => ("Stopped", "Parada"),
+        "admin.jobs.health.stuck" => ("Stuck", "Travada"),
+        "admin.jobs.health.late" => ("Late", "Atrasada"),
+        "admin.jobs.health.failing" => ("Failing", "Falhando"),
+        "admin.jobs.health.running" => ("Running", "Em execução"),
+        "admin.jobs.health.healthy" => ("On schedule", "Em dia"),
+        "moderation.dashboard.link.jobs" => ("Background jobs", "Tarefas em segundo plano"),
+        // --- end admin: background-job health ----------------------------
         "pagination.more" => ("Load more", "Carregar mais"),
         "audit.system" => ("System", "Sistema"),
         "audit.result.success" => ("Success", "Sucesso"),

@@ -995,8 +995,10 @@ fn worker_claims_only_capacity_and_heartbeats_every_active_lease() {
         let config = JobConfig {
             batch_size: 2,
             poll_interval: std::time::Duration::from_millis(5),
-            lease_ttl: std::time::Duration::from_millis(120),
-            handler_timeout: std::time::Duration::from_secs(5),
+            // Long enough that a slow CI host still heartbeats (every ttl/3)
+            // well before expiry; the sleep below outlasts one whole TTL.
+            lease_ttl: std::time::Duration::from_secs(1),
+            handler_timeout: std::time::Duration::from_secs(10),
             ..JobConfig::default()
         };
         let shutdown = CancellationToken::new();
@@ -1014,7 +1016,9 @@ fn worker_claims_only_capacity_and_heartbeats_every_active_lease() {
         repo.enqueue(CAPACITY_KIND, &json!({}), Utc::now(), Some(3), None)
             .await
             .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Past the original lease: both rows are only still leased because
+        // their heartbeats extended them.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         let states:(i64,i64,i64)=sqlx::query_as("SELECT count(*) FILTER(WHERE state='running'),count(*) FILTER(WHERE state='pending'),count(*) FILTER(WHERE state='running' AND lease_expires_at>clock_timestamp()) FROM background_job WHERE kind=$1").bind(CAPACITY_KIND).fetch_one(&pool).await.unwrap();
         assert_eq!(states, (2, 1, 2));
         assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 2);
@@ -1583,8 +1587,8 @@ fn heartbeat_ownership_loss_cancels_the_active_handler() {
         let config = JobConfig {
             batch_size: 1,
             poll_interval: std::time::Duration::from_secs(5),
-            lease_ttl: std::time::Duration::from_millis(90),
-            handler_timeout: std::time::Duration::from_secs(5),
+            lease_ttl: std::time::Duration::from_secs(1),
+            handler_timeout: std::time::Duration::from_secs(10),
             ..JobConfig::default()
         };
         let worker = Worker::new(repo, registry, config);
@@ -1597,7 +1601,8 @@ fn heartbeat_ownership_loss_cancels_the_active_handler() {
             .execute(&pool)
             .await
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        // The next heartbeat (every ttl/3) notices the lost lease.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while active.load(std::sync::atomic::Ordering::SeqCst) != 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
