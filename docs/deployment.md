@@ -341,15 +341,23 @@ times are UTC.
 - **Recurring** jobs never go terminal: on success the worker recomputes
   `run_at` from `schedule` (`{"every_seconds":N}` or a UTC `{"cron":"…"}`) and
   resets the row to `pending`.
-- **Retries** use exponential backoff + jitter; after `JOBS_MAX_ATTEMPTS` a job
-  is dead-lettered to `failed` (kept with `last_error` for inspection).
+- **Retries** use exponential backoff + jitter; after `JOBS_MAX_ATTEMPTS` a
+  *one-shot* job is dead-lettered to `failed` (kept with `last_error` for
+  inspection). A *recurring* job never goes terminal on a handler failure: when
+  an occurrence uses up its attempts (or fails permanently), `last_error` is
+  recorded, an error is logged, attempts reset, and the row returns to
+  `pending` at its next scheduled run.
 - **`jobs.gc`** (itself a recurring job) deletes one-shot `succeeded`/`failed`
-  rows older than `JOBS_HISTORY_RETENTION_DAYS` (default 7). Scheduled terminal
-  rows are retained for reconciliation and explicit operator recovery. The
+  rows older than `JOBS_HISTORY_RETENTION_DAYS` (default 7). Scheduled rows are
+  never GC'd. The
   built-ins currently have `{}` payloads; any future sensitive recurring payload
   needs a separate minimization and retention review before registration.
 - **At-least-once**: a worker crash leaves the job leasable; it is re-claimed
-  after the lease. Handlers must be idempotent.
+  after the lease, but only while `attempts < max_attempts`. A job that crashed
+  or hung on its final attempt is finalized at the next claim instead (one-shot
+  to `failed`, recurring to its next run, both with a `last_error` saying the
+  lease expired after the final attempt), so a crash loop cannot re-run a job
+  such as an email forever. Handlers must be idempotent.
 - On a multi-instance deploy claims are safe because `SKIP LOCKED` assigns
   disjoint rows. A web-only instance sets `JOBS_RUN_WORKER=false` while keeping
   `JOBS_DURABLE_ENQUEUE=true`, and a separate `bikesnest-web worker` process
@@ -370,12 +378,13 @@ never overwritten. Any key collision with a different kind, payload or non-NULL
 schedule is logged and left untouched. Startup continues processing independent
 queue work while retrying reconciliation on later polls.
 
-A legacy failed row with a NULL schedule is reactivated once. If a recurring
-row exhausts attempts after its schedule has been installed, subsequent boots
-leave it failed with its error intact: investigate and explicitly recover it
-instead of relying on restart loops. Scheduled terminal rows are excluded from
-history GC so this evidence and policy are not bypassed. The legacy
-`cargo run -- retention` subcommand remains a manual escape hatch.
+On boot, a scheduled row left `failed` by an older release is revived: it
+returns to `pending` with a fresh attempt budget at its next scheduled run,
+keeping `last_error` and `finished_at` as evidence. A legacy failed row with a
+NULL schedule is reactivated to run now. A failing retention step no longer
+skips the later steps; the run records `result=failure` in its audit event and
+is retried. The legacy `cargo run -- retention` subcommand remains a manual
+escape hatch.
 
 Before a rollout, use a read-only preflight scoped to the two exact stable keys;
 inspect `kind`, `payload`, `state`, `schedule`, `run_at`, `attempts`,
@@ -392,11 +401,10 @@ cannot recreate or safely repair a missing/legacy row. Keep the
 persisted schedules intact, use the documented manual retention command only
 with explicit operational approval, and roll forward promptly. Alert separately
 on each built-in's completion timestamp and state, lateness beyond its expected
-next run, a scheduled `failed` state, and recurring-bootstrap errors. For a
-successfully rescheduled pending row, `finished_at` is its last success; once a
-later attempt becomes `failed`, that column is the failed completion time and
-must not be reported as last-success history. Richer history/metrics need a
-separate change. HTTP readiness alone does not establish that background
+next run, a non-null `last_error` on a recurring row together with a
+`finished_at` (its last success) older than one schedule interval, and
+recurring-bootstrap errors. A scheduled `failed` state now only occurs for an
+invalid schedule. Richer history/metrics need a separate change. HTTP readiness alone does not establish that background
 retention is healthy.
 
 ## 5d. Transactional email goes through the queue

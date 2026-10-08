@@ -6,7 +6,11 @@
 //! A worker that dies mid-run leaves its job `state = 'running'` with a lease
 //! that keeps counting down; once `lease_expires_at` is in the past, `claim`
 //! treats that row exactly like a fresh `pending` one and reclaims it
-//! (at-least-once). Every post-claim update (`finish_success`, `retry`, `fail`)
+//! (at-least-once) — but only while `attempts < max_attempts`. An expired
+//! lease whose final attempt is already spent is never reclaimed: `claim`
+//! first finalizes it (one-shot → `failed`, recurring → rescheduled `pending`
+//! at its next occurrence), so a job that crashes or hangs the process cannot
+//! loop forever. Every post-claim update (`finish_success`, `retry`, `fail`)
 //! is scoped to `claimed_by = <the calling worker>`, so if the original
 //! (zombie) worker wakes up after its lease has already been reassigned, its
 //! stale write returns `LostOwnership` instead of clobbering the new claim.
@@ -39,8 +43,25 @@ pub enum RecurringRegistrationOutcome {
     PendingScheduleRepaired,
     TerminalReactivated,
     RunningPreserved,
-    FailedPreserved,
+    /// A scheduled row that was dead-lettered (by a release that still failed
+    /// recurring jobs terminally) is put back on its schedule.
+    FailedRevived,
 }
+
+/// An expired-lease row whose attempt budget was already spent, finalized by
+/// [`SqlxJobRepository::claim`] instead of being reclaimed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExhaustedLease {
+    pub id: i64,
+    pub kind: String,
+    /// `Some(next run)` when a recurring row was rescheduled; `None` when a
+    /// one-shot row was dead-lettered.
+    pub rescheduled_at: Option<DateTime<Utc>>,
+}
+
+/// `last_error` recorded on a row whose lease expired after its final attempt.
+pub const EXHAUSTED_LEASE_ERROR: &str =
+    "lease expired after the final attempt (worker crashed or the handler hung)";
 
 /// A row claimed by a worker, ready to run.
 #[derive(Debug, sqlx::FromRow)]
@@ -141,6 +162,19 @@ pub(crate) async fn enqueue_mail_on(
         .fetch_optional(conn).await?)
 }
 
+/// Shared `UPDATE … SET` for dead-lettering (`$1` = id, `$2` = error); callers
+/// append their own `WHERE`. Mail payloads and recipient metadata are scrubbed
+/// on the terminal transition.
+const DEAD_LETTER_SET: &str = r#"
+    UPDATE background_job
+    SET state = 'failed', finished_at = now(), last_error = $2,
+        payload = CASE WHEN kind = 'email.send' THEN '{}'::jsonb ELSE payload END,
+        payload_redacted_at = CASE WHEN kind = 'email.send' THEN COALESCE(payload_redacted_at,now()) ELSE payload_redacted_at END,
+        mail_recipient_hash = CASE WHEN kind = 'email.send' THEN NULL ELSE mail_recipient_hash END,
+        mail_transition_audit_id = CASE WHEN kind = 'email.send' THEN NULL ELSE mail_transition_audit_id END,
+        claimed_by = NULL, lease_expires_at = NULL, heartbeat_at = NULL, updated_at = now()
+"#;
+
 /// A job-queue handle bound to the application's PostgreSQL pool.
 #[derive(Clone)]
 pub struct SqlxJobRepository {
@@ -192,8 +226,10 @@ impl SqlxJobRepository {
     /// Only an exact kind/payload match can be repaired. Active leases are
     /// preserved. A legacy running row without a schedule asks startup to retry
     /// after it finishes, because that worker's claimed snapshot is still
-    /// one-shot. Scheduled failed rows remain dead-lettered for explicit
-    /// operator recovery; legacy unscheduled failures are reactivated once.
+    /// one-shot. A scheduled `failed` row (left by an older release that
+    /// dead-lettered recurring jobs) is revived on its next scheduled run with
+    /// a fresh attempt budget, keeping `last_error`/`finished_at` as evidence;
+    /// legacy unscheduled failures are reactivated to run at `run_at`.
     pub async fn register_recurring(
         &self,
         kind: &str,
@@ -208,13 +244,13 @@ impl SqlxJobRepository {
                 "kind/key must be non-empty and max_attempts must be positive".into(),
             ));
         }
-        let next = crate::job::schedule::next_run_at(Some(schedule), run_at)
-            .map_err(|e| JobRepoError::InvalidRecurring(e.to_string()))?;
-        if next.is_none() {
+        let Some(next) = crate::job::schedule::next_run_at(Some(schedule), run_at)
+            .map_err(|e| JobRepoError::InvalidRecurring(e.to_string()))?
+        else {
             return Err(JobRepoError::InvalidRecurring(
                 "schedule must produce a future run".into(),
             ));
-        }
+        };
 
         let mut conn = self.db.acquire().await?;
         let mut tx = conn.begin().await?;
@@ -283,7 +319,21 @@ impl SqlxJobRepository {
                 .await?;
                 RecurringRegistrationOutcome::PendingScheduleRepaired
             }
-            ("failed", false) => RecurringRegistrationOutcome::FailedPreserved,
+            ("failed", false) => {
+                sqlx::query(
+                    r#"UPDATE background_job
+                       SET state='pending', attempts=0, run_at=$2, max_attempts=$3,
+                           claimed_by=NULL, lease_expires_at=NULL,
+                           heartbeat_at=NULL, started_at=NULL, updated_at=now()
+                       WHERE id=$1"#,
+                )
+                .bind(id)
+                .bind(next)
+                .bind(max_attempts)
+                .execute(&mut *tx)
+                .await?;
+                RecurringRegistrationOutcome::FailedRevived
+            }
             ("succeeded" | "failed", true) | ("succeeded", false) => {
                 sqlx::query(
                     r#"UPDATE background_job
@@ -352,8 +402,11 @@ impl SqlxJobRepository {
         Ok(id)
     }
 
-    /// Atomically claim up to `batch` due, unleased `pending` jobs for this
-    /// worker, giving each a lease of `lease_ttl`. Returns the claimed rows.
+    /// Atomically claim up to `batch` due, unleased `pending` jobs (or
+    /// expired-lease `running` jobs with attempts left) for this worker, giving
+    /// each a lease of `lease_ttl`. Returns the claimed rows. Expired leases
+    /// with no attempts left are finalized first (see
+    /// [`Self::finalize_exhausted_leases`]).
     ///
     /// Claims across every `kind` — what production always wants (one queue,
     /// every registered handler). Tests that seed rows of their own kind
@@ -394,6 +447,14 @@ impl SqlxJobRepository {
         lease_ttl: std::time::Duration,
         kinds: Option<&[&str]>,
     ) -> Result<Vec<ClaimedJob>, JobRepoError> {
+        for reaped in self.finalize_exhausted_leases(kinds).await? {
+            tracing::error!(
+                job_id = reaped.id,
+                kind = %reaped.kind,
+                rescheduled_at = ?reaped.rescheduled_at,
+                "job lease expired after its final attempt; not reclaimed"
+            );
+        }
         // Not a compile-time-checked `query_as!` (this crate builds without a
         // database; see the module-level note), so branching the SQL text on
         // whether a kind filter was asked for costs nothing extra.
@@ -406,7 +467,9 @@ impl SqlxJobRepository {
             r#"
             WITH candidate AS (
                 SELECT id FROM background_job
-                WHERE (state = 'pending' OR (state = 'running' AND lease_expires_at < clock_timestamp()))
+                WHERE (state = 'pending'
+                       OR (state = 'running' AND lease_expires_at < clock_timestamp()
+                           AND attempts < max_attempts))
                   AND run_at <= clock_timestamp()
                   {kind_clause}
                 ORDER BY run_at, id
@@ -437,6 +500,73 @@ impl SqlxJobRepository {
             .await
             .map_err(JobRepoError::Db)?;
         Ok(rows)
+    }
+
+    /// Finalize `running` rows whose lease has expired *and* whose attempt
+    /// budget is spent, so they are neither reclaimed nor left `running`
+    /// forever. A one-shot row is dead-lettered exactly like [`Self::fail`]
+    /// (mail payloads redacted); a recurring row is put back to `pending` at
+    /// its next scheduled occurrence with attempts reset (an unparseable
+    /// schedule dead-letters instead). `kinds` scopes the sweep like
+    /// [`Self::claim_kinds`]. Returns what was finalized.
+    pub async fn finalize_exhausted_leases(
+        &self,
+        kinds: Option<&[&str]>,
+    ) -> Result<Vec<ExhaustedLease>, JobRepoError> {
+        let kind_clause = if kinds.is_some() {
+            "AND kind = ANY($1)"
+        } else {
+            ""
+        };
+        let select = format!(
+            r#"SELECT id, kind, schedule FROM background_job
+               WHERE state = 'running' AND lease_expires_at < clock_timestamp()
+                 AND attempts >= max_attempts {kind_clause}
+               ORDER BY id
+               FOR UPDATE SKIP LOCKED
+               LIMIT 100"#
+        );
+        let mut conn = self.db.acquire().await?;
+        let mut tx = conn.begin().await?;
+        let mut query = sqlx::query_as::<_, (i64, String, Option<Value>)>(&select);
+        if let Some(kinds) = kinds {
+            let owned: Vec<String> = kinds.iter().map(|k| (*k).to_string()).collect();
+            query = query.bind(owned);
+        }
+        let rows = query.fetch_all(&mut *tx).await?;
+        let mut finalized = Vec::with_capacity(rows.len());
+        for (id, kind, schedule) in rows {
+            let next = crate::job::schedule::next_run_at(schedule.as_ref(), Utc::now())
+                .ok()
+                .flatten();
+            if let Some(next) = next {
+                sqlx::query(
+                    r#"UPDATE background_job
+                       SET state = 'pending', attempts = 0, run_at = $2, last_error = $3,
+                           claimed_by = NULL, lease_expires_at = NULL, heartbeat_at = NULL,
+                           started_at = NULL, updated_at = now()
+                       WHERE id = $1"#,
+                )
+                .bind(id)
+                .bind(next)
+                .bind(EXHAUSTED_LEASE_ERROR)
+                .execute(&mut *tx)
+                .await?;
+            } else {
+                sqlx::query(&format!("{DEAD_LETTER_SET} WHERE id = $1"))
+                    .bind(id)
+                    .bind(EXHAUSTED_LEASE_ERROR)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            finalized.push(ExhaustedLease {
+                id,
+                kind,
+                rescheduled_at: next,
+            });
+        }
+        tx.commit().await?;
+        Ok(finalized)
     }
 
     /// Refresh a running job's lease (called on a timer while a long handler runs).
@@ -566,24 +696,53 @@ impl SqlxJobRepository {
         }
     }
 
+    /// Recurring-job failure that must not go terminal: the attempt budget for
+    /// this occurrence is spent (or the handler reported a permanent error),
+    /// so record `error`, reset `attempts` and put the row back to `pending`
+    /// at `next_run_at`, its next scheduled occurrence. `finished_at` keeps
+    /// the last *successful* run. Scoped to `claimed_by = worker_id` (see
+    /// [`Self::finish_success`]).
+    pub async fn reschedule_after_failure(
+        &self,
+        id: i64,
+        worker_id: &str,
+        error: &str,
+        next_run_at: DateTime<Utc>,
+    ) -> Result<(), JobRepoError> {
+        let mut conn = self.db.acquire().await?;
+        let result = sqlx::query(
+            r#"
+            UPDATE background_job
+            SET state = 'pending', attempts = 0, run_at = $2, last_error = $3,
+                claimed_by = NULL, lease_expires_at = NULL, heartbeat_at = NULL,
+                started_at = NULL, updated_at = now()
+            WHERE id = $1 AND state='running' AND claimed_by = $4
+              AND schedule IS NOT NULL AND lease_expires_at > clock_timestamp()
+            "#,
+        )
+        .bind(id)
+        .bind(next_run_at)
+        .bind(error)
+        .bind(worker_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(JobRepoError::Db)?;
+        if result.rows_affected() == 1 {
+            Ok(())
+        } else {
+            Err(JobRepoError::LostOwnership(id))
+        }
+    }
+
     /// Dead-letter a job: mark it `failed` with `error` for inspection. The row
     /// is later removed by `jobs.gc`. Scoped to `claimed_by = worker_id` (see
     /// [`Self::finish_success`]).
     pub async fn fail(&self, id: i64, worker_id: &str, error: &str) -> Result<(), JobRepoError> {
         let mut conn = self.db.acquire().await?;
-        let result = sqlx::query(
-            r#"
-            UPDATE background_job
-            SET state = 'failed', finished_at = now(), last_error = $2,
-                payload = CASE WHEN kind = 'email.send' THEN '{}'::jsonb ELSE payload END,
-                payload_redacted_at = CASE WHEN kind = 'email.send' THEN COALESCE(payload_redacted_at,now()) ELSE payload_redacted_at END,
-                mail_recipient_hash = CASE WHEN kind = 'email.send' THEN NULL ELSE mail_recipient_hash END,
-                mail_transition_audit_id = CASE WHEN kind = 'email.send' THEN NULL ELSE mail_transition_audit_id END,
-                claimed_by = NULL, lease_expires_at = NULL, heartbeat_at = NULL, updated_at = now()
-            WHERE id = $1 AND state='running' AND claimed_by = $3
-              AND lease_expires_at > clock_timestamp()
-            "#,
-        )
+        let result = sqlx::query(&format!(
+            "{DEAD_LETTER_SET} WHERE id = $1 AND state='running' AND claimed_by = $3 \
+             AND lease_expires_at > clock_timestamp()"
+        ))
         .bind(id)
         .bind(error)
         .bind(worker_id)

@@ -14,6 +14,9 @@ pub use registry::{
     JOBS_GC_RECURRING_KEY, JobRegistry, JobServices, JobsGcHandler, RETENTION_RECURRING_KEY,
     RecurringKind, RetentionJobHandler, job_services,
 };
-pub use repo::{ClaimedJob, JobRepoError, RecurringRegistrationOutcome, SqlxJobRepository};
+pub use repo::{
+    ClaimedJob, EXHAUSTED_LEASE_ERROR, ExhaustedLease, JobRepoError, RecurringRegistrationOutcome,
+    SqlxJobRepository,
+};
 pub use schedule::{backoff_ms, next_run_at};
 pub use worker::{Worker, WorkerDiagnostics};

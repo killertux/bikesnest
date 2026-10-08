@@ -375,6 +375,8 @@ impl Worker {
                             "job failed; retry persisted"
                         );
                     }
+                } else if self.reschedule_recurring_failure(&job, &e, now).await {
+                    // Recurring: this occurrence is spent, the schedule is not.
                 } else {
                     // Give the handler its say before the row goes terminal:
                     // only it can decode the payload (e.g. which email, to
@@ -395,6 +397,11 @@ impl Worker {
                 }
             }
             Err(JobError::Permanent(e)) => {
+                if self.reschedule_recurring_failure(&job, &e, now).await {
+                    heartbeat.abort();
+                    let _ = heartbeat.await;
+                    return;
+                }
                 self.run_dead_letter_hook(
                     handler,
                     job.payload.clone(),
@@ -412,6 +419,37 @@ impl Worker {
         }
         heartbeat.abort();
         let _ = heartbeat.await;
+    }
+
+    /// A recurring job never goes terminal on a handler failure: once an
+    /// occurrence has spent its attempts (or failed permanently) the error is
+    /// recorded and the row is moved to its next scheduled run with a fresh
+    /// attempt budget, so a transient outage cannot stop e.g. retention for
+    /// good. Returns `false` for one-shot jobs (and for an unparseable
+    /// schedule), which the caller dead-letters as before.
+    async fn reschedule_recurring_failure(
+        &self,
+        job: &ClaimedJob,
+        error: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> bool {
+        let Ok(Some(next)) = next_run_at(job.schedule.as_ref(), now) else {
+            return false;
+        };
+        match self
+            .repo
+            .reschedule_after_failure(job.id, &job.owner, error, next)
+            .await
+        {
+            Ok(()) => tracing::error!(
+                attempt = job.attempts,
+                %error,
+                next_run_at = %next,
+                "recurring job failed this occurrence; rescheduled to its next run"
+            ),
+            Err(_) => self.note_failure("outcome_write_failed", Some(job.id), Some(&job.kind)),
+        }
+        true
     }
 
     async fn run_dead_letter_hook(

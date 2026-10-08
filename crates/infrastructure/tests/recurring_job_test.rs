@@ -195,7 +195,7 @@ async fn bootstrap_claim_execute_finish_and_restart_recur(tx: &mut bikesnest_tes
 }
 
 #[db_test]
-async fn exact_legacy_rows_are_repaired_without_resetting_scheduled_failures(
+async fn exact_legacy_rows_are_repaired_and_scheduled_failures_revived(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
     let db = tx.db().await;
@@ -281,12 +281,15 @@ async fn exact_legacy_rows_are_repaired_without_resetting_scheduled_failures(
         assert_eq!(repeated.run_at, stable_run_at);
     }
 
+    // A scheduled row an older release dead-lettered is revived on its next
+    // scheduled run with a fresh budget; its error and last-success time stay.
     let failed_key = "test:recurring:scheduled-failed";
     let mut conn = db.acquire().await.unwrap();
-    sqlx::query("INSERT INTO background_job(kind,payload,state,run_at,schedule,idempotency_key,attempts,last_error,finished_at) VALUES($1,'{}','failed',$2,$3,$4,5,'still broken',$2)")
-        .bind(LEGACY_KIND).bind(now).bind(json!({"every_seconds": 60})).bind(failed_key)
-        .execute(&mut *conn).await.unwrap();
+    let failed_id: i64 = sqlx::query_scalar("INSERT INTO background_job(kind,payload,state,run_at,schedule,idempotency_key,attempts,last_error,finished_at,claimed_by) VALUES($1,'{}','failed',$2,$3,$4,5,'still broken',$2,'old-worker') RETURNING id")
+        .bind(LEGACY_KIND).bind(now - Duration::days(3)).bind(json!({"every_seconds": 60})).bind(failed_key)
+        .fetch_one(&mut *conn).await.unwrap();
     drop(conn);
+    let first_failed = stored(&db, failed_key).await;
     let outcome = repo
         .register_recurring(
             LEGACY_KIND,
@@ -298,8 +301,24 @@ async fn exact_legacy_rows_are_repaired_without_resetting_scheduled_failures(
         )
         .await
         .unwrap();
-    assert_eq!(outcome, RecurringRegistrationOutcome::FailedPreserved);
-    let first_failed = stored(&db, failed_key).await;
+    assert_eq!(outcome, RecurringRegistrationOutcome::FailedRevived);
+    let revived = stored(&db, failed_key).await;
+    assert_eq!(revived.id, failed_id);
+    assert_eq!(revived.state, "pending");
+    assert_eq!(revived.attempts, 0);
+    assert_eq!(revived.max_attempts, 5);
+    assert_eq!(revived.claimed_by, None);
+    assert_eq!(revived.lease_expires_at, None);
+    assert_eq!(
+        revived
+            .run_at
+            .signed_duration_since(now + Duration::seconds(60))
+            .num_microseconds(),
+        Some(0),
+        "revived on its next scheduled occurrence"
+    );
+    assert_eq!(revived.last_error.as_deref(), Some("still broken"));
+    assert_eq!(revived.finished_at, first_failed.finished_at);
     assert_eq!(
         repo.register_recurring(
             LEGACY_KIND,
@@ -311,26 +330,9 @@ async fn exact_legacy_rows_are_repaired_without_resetting_scheduled_failures(
         )
         .await
         .unwrap(),
-        RecurringRegistrationOutcome::FailedPreserved
+        RecurringRegistrationOutcome::HealthyPreserved
     );
-    let mut conn = db.acquire().await.unwrap();
-    let (state, attempts, error): (String, i32, Option<String>) = sqlx::query_as(
-        "SELECT state,attempts,last_error FROM background_job WHERE idempotency_key=$1",
-    )
-    .bind(failed_key)
-    .fetch_one(&mut *conn)
-    .await
-    .unwrap();
-    assert_eq!(
-        (state.as_str(), attempts, error.as_deref()),
-        ("failed", 5, Some("still broken"))
-    );
-    drop(conn);
-    let repeated_failed = stored(&db, failed_key).await;
-    assert_eq!(repeated_failed.id, first_failed.id);
-    assert_eq!(repeated_failed.run_at, first_failed.run_at);
-    assert_eq!(repeated_failed.finished_at, first_failed.finished_at);
-    assert_eq!(repeated_failed.last_error, first_failed.last_error);
+    assert_eq!(stored(&db, failed_key).await, revived);
     repo.gc(now + Duration::days(8)).await.unwrap();
     let mut conn = db.acquire().await.unwrap();
     let exists: bool =
@@ -339,7 +341,142 @@ async fn exact_legacy_rows_are_repaired_without_resetting_scheduled_failures(
             .fetch_one(&mut *conn)
             .await
             .unwrap();
-    assert!(exists, "GC must retain scheduled dead-letter evidence");
+    assert!(exists, "GC never deletes a scheduled row");
+}
+
+/// Fails every run; transient or permanent.
+struct FailingRecurringHandler {
+    kind: &'static str,
+    permanent: bool,
+}
+
+#[async_trait]
+impl JobHandler for FailingRecurringHandler {
+    fn kind(&self) -> &'static str {
+        self.kind
+    }
+
+    async fn run(&self, _payload: &JobPayload) -> Result<(), JobError> {
+        if self.permanent {
+            Err(JobError::Permanent("object store down".into()))
+        } else {
+            Err(JobError::Failed("object store down".into()))
+        }
+    }
+}
+
+#[db_test]
+async fn recurring_job_that_exhausts_attempts_is_rescheduled_not_dead_lettered(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let repo = SqlxJobRepository::new(db.clone());
+    for (kind, key, permanent) in [
+        (
+            "test.recurring.exhausted.transient",
+            "test:recurring:exhausted:transient",
+            false,
+        ),
+        (
+            "test.recurring.exhausted.permanent",
+            "test:recurring:exhausted:permanent",
+            true,
+        ),
+    ] {
+        let schedule = json!({"every_seconds": 3600});
+        let worker = Worker::new(
+            repo.clone(),
+            Arc::new(JobRegistry::new(
+                vec![Box::new(FailingRecurringHandler { kind, permanent })],
+                vec![RecurringKind {
+                    job_kind: kind,
+                    payload: json!({}),
+                    schedule: schedule.clone(),
+                    idempotency_key: key,
+                    max_attempts: 2,
+                }],
+            )),
+            JobConfig::default(),
+        );
+        worker.bootstrap().await.unwrap();
+        // Due now, with one attempt already spent: the next claim is the last.
+        let mut conn = db.acquire().await.unwrap();
+        sqlx::query("UPDATE background_job SET run_at=now()-interval '1 second', attempts=1, finished_at=now()-interval '1 day' WHERE idempotency_key=$1")
+            .bind(key).execute(&mut *conn).await.unwrap();
+        drop(conn);
+        let before = stored(&db, key).await;
+        let mut claimed = repo
+            .claim_kinds(1, worker.id(), std::time::Duration::from_secs(60), &[kind])
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].attempts, claimed[0].max_attempts);
+        let started = Utc::now();
+        worker.process_claimed(claimed.pop().unwrap()).await;
+        assert_eq!(worker.diagnostics().observable_failures(), 0);
+
+        let after = stored(&db, key).await;
+        assert_eq!(after.id, before.id);
+        assert_eq!(
+            after.state, "pending",
+            "{kind}: a recurring row never goes terminal"
+        );
+        assert_eq!(
+            after.attempts, 0,
+            "{kind}: a fresh budget for the next occurrence"
+        );
+        assert_eq!(after.schedule, Some(schedule));
+        assert_eq!(after.claimed_by, None);
+        assert_eq!(after.lease_expires_at, None);
+        assert_eq!(after.last_error.as_deref(), Some("object store down"));
+        assert_eq!(
+            after.finished_at, before.finished_at,
+            "finished_at stays the last success"
+        );
+        assert!(
+            after.run_at >= started + Duration::seconds(3600)
+                && after.run_at <= Utc::now() + Duration::seconds(3600),
+            "{kind}: rescheduled to the next occurrence, got {}",
+            after.run_at
+        );
+        assert_eq!(
+            worker.bootstrap().await.map_err(|e| e.to_string()),
+            Ok(()),
+            "boot reconciliation keeps the rescheduled row"
+        );
+        assert_eq!(stored(&db, key).await, after);
+    }
+}
+
+#[db_test]
+async fn exhausted_expired_recurring_lease_is_rescheduled_not_reclaimed(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    const KIND: &str = "test.recurring.exhausted-lease";
+    const KEY: &str = "test:recurring:exhausted-lease";
+    let db = tx.db().await;
+    let repo = SqlxJobRepository::new(db.clone());
+    let mut conn = db.acquire().await.unwrap();
+    sqlx::query("INSERT INTO background_job(kind,payload,state,run_at,schedule,idempotency_key,attempts,max_attempts,claimed_by,lease_expires_at) VALUES($1,'{}','running',now()-interval '1 hour',$2,$3,3,3,'crashed-worker',now()-interval '1 second')")
+        .bind(KIND).bind(json!({"every_seconds": 600})).bind(KEY)
+        .execute(&mut *conn).await.unwrap();
+    drop(conn);
+    let started = Utc::now();
+    let claimed = repo
+        .claim_kinds(10, "reclaimer", std::time::Duration::from_secs(60), &[KIND])
+        .await
+        .unwrap();
+    assert!(claimed.is_empty(), "an exhausted lease is never reclaimed");
+    let row = stored(&db, KEY).await;
+    assert_eq!(row.state, "pending");
+    assert_eq!(row.attempts, 0);
+    assert_eq!(row.claimed_by, None);
+    assert_eq!(row.lease_expires_at, None);
+    assert_eq!(
+        row.last_error.as_deref(),
+        Some(bikesnest_infrastructure::EXHAUSTED_LEASE_ERROR)
+    );
+    assert!(row.run_at >= started + Duration::seconds(600));
 }
 
 #[db_test]

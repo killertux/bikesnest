@@ -589,6 +589,115 @@ async fn claim_reclaims_a_crashed_workers_running_job(tx: &mut bikesnest_test_su
 }
 
 #[db_test]
+async fn exhausted_expired_lease_is_not_reclaimed_and_is_dead_lettered(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let r = SqlxJobRepository::new(db.clone());
+    let kind = format!(
+        "test.{}.exhausted_expired_lease_is_not_reclaimed.{}",
+        module_path!(),
+        std::process::id()
+    );
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        ids.push(
+            r.enqueue(&kind, &json!({"n": 1}), Utc::now(), Some(3), None)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    let (exhausted, spare) = (ids[0], ids[1]);
+    // Both crashed mid-run with expired leases; only `spare` has budget left.
+    sqlx::query(
+        "UPDATE background_job SET state='running', claimed_by='dead-worker',
+            lease_expires_at=now() - interval '1 second',
+            attempts=CASE WHEN id=$1 THEN 3 ELSE 2 END WHERE id = ANY($2)",
+    )
+    .bind(exhausted)
+    .bind(&ids)
+    .execute(&mut *db.acquire().await.unwrap())
+    .await
+    .unwrap();
+
+    let claimed = r
+        .claim_kinds(10, "worker-b", std::time::Duration::from_secs(60), &[&kind])
+        .await
+        .unwrap();
+    assert_eq!(
+        claimed.iter().map(|j| j.id).collect::<Vec<_>>(),
+        vec![spare],
+        "only the expired lease with attempts left is reclaimed"
+    );
+    assert_eq!(claimed[0].attempts, 3);
+
+    #[derive(sqlx::FromRow)]
+    struct Finalized {
+        state: String,
+        claimed_by: Option<String>,
+        attempts: i32,
+        lease_expires_at: Option<chrono::DateTime<Utc>>,
+        last_error: Option<String>,
+        finished_at: Option<chrono::DateTime<Utc>>,
+        payload: serde_json::Value,
+    }
+    let Finalized {
+        state,
+        claimed_by,
+        attempts,
+        lease_expires_at: lease,
+        last_error,
+        finished_at,
+        payload,
+    } = sqlx::query_as(
+        "SELECT state, claimed_by, attempts, lease_expires_at, last_error, finished_at, payload FROM background_job WHERE id=$1",
+    )
+    .bind(exhausted)
+    .fetch_one(&mut *db.acquire().await.unwrap())
+    .await
+    .unwrap();
+    assert_eq!(
+        state, "failed",
+        "an exhausted expired lease is dead-lettered"
+    );
+    assert_eq!(claimed_by, None);
+    assert_eq!(lease, None);
+    assert_eq!(attempts, 3, "no further attempt was burned");
+    assert_eq!(
+        last_error.as_deref(),
+        Some(bikesnest_infrastructure::EXHAUSTED_LEASE_ERROR)
+    );
+    assert!(finished_at.is_some());
+    assert_eq!(
+        payload,
+        json!({"n": 1}),
+        "non-mail payload kept for inspection"
+    );
+
+    // Once `worker-b`'s lease on `spare` (now at its final attempt) expires,
+    // that row too is finalized instead of reclaimed.
+    sqlx::query(
+        "UPDATE background_job SET lease_expires_at=now() - interval '1 second' WHERE id=$1",
+    )
+    .bind(spare)
+    .execute(&mut *db.acquire().await.unwrap())
+    .await
+    .unwrap();
+    let claimed = r
+        .claim_kinds(10, "worker-c", std::time::Duration::from_secs(60), &[&kind])
+        .await
+        .unwrap();
+    assert!(claimed.is_empty());
+    let state: String = sqlx::query_scalar("SELECT state FROM background_job WHERE id=$1")
+        .bind(spare)
+        .fetch_one(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(state, "failed");
+}
+
+#[db_test]
 async fn finish_success_reports_lost_ownership_for_the_wrong_claimant(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
