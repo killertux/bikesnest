@@ -451,7 +451,9 @@ pub struct DetailsPage {
     pub reasons: Vec<view::ReasonVm>,
     /// A one-time notice banner (post-action confirmation, e.g. "will be reviewed").
     pub notice: Option<String>,
-    /// The location's  moderation state code (ACTIVE/PENDING_REVIEW/…). Public
+    pub error_notice: Option<String>,
+    pub search_href: String,
+    /// The location's moderation state code (ACTIVE/PENDING_REVIEW/…). Public
     /// viewers only ever reach ACTIVE; moderators see a banner for the rest.
     pub moderation_state: &'static str,
     /// Whether the viewer is a moderator/admin (sees the hidden/invalid banner).
@@ -584,6 +586,8 @@ impl DetailsPage {
             own_rating: 0,
             reasons: Vec::new(),
             notice: None,
+            error_notice: None,
+            search_href: "/search".to_string(),
             moderation_state: loc.moderation_state().as_code(),
             is_moderator: auth.user.as_ref().is_some_and(|u| {
                 u.has_role(bikesnest_domain::Role::Moderator)
@@ -1012,6 +1016,7 @@ pub struct ParkingEditPage {
     /// Which input(s) a rejected submission belongs to.
     pub field_errors: view::FieldErrors,
     pub notice: Option<String>,
+    pub proposals: routes::contribution_form::ProposalFormsVm,
 }
 
 /// Write or edit a review.

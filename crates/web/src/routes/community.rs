@@ -22,8 +22,8 @@ use crate::{PageLayout, ParkingEditPage, ParkingNewConfirmPage, ParkingNewPage};
 
 use super::common::render;
 use super::contribution_form::{
-    ContributionForm, DayFields, HoursError, hours_editor_vm, hours_fields_from, parse_hours,
-    parse_security, security_editor_vm, security_fields_from,
+    ContributionForm, DayFields, HoursError, ProposalFormsVm, hours_editor_vm, hours_fields_from,
+    parse_hours, parse_security, security_editor_vm, security_fields_from,
 };
 use super::errors::not_found_page;
 use super::moderation::non_empty;
@@ -292,10 +292,11 @@ pub(crate) fn parking_edit_page_vm(
         lat: loc.point().lat(),
         lon: loc.point().lon(),
         error,
-        // The two callers (a fresh GET, and re-rendering after a version
-        // conflict) never reject one particular input — nothing to flag.
+        // The callers (a fresh GET, a version conflict, a rejected proposal)
+        // never reject one particular input of this form — nothing to flag.
         field_errors: view::FieldErrors::new(),
         notice,
+        proposals: ProposalFormsVm::at(loc.point().lat(), loc.point().lon()),
     }
 }
 
@@ -753,6 +754,7 @@ pub(crate) fn edit_page_vm(
         error,
         field_errors,
         notice,
+        proposals: ProposalFormsVm::at(point.lat(), point.lon()),
     }
 }
 
@@ -785,18 +787,47 @@ pub(crate) async fn parking_proposal_post(
         Ok(u) => u,
         Err(resp) => return resp,
     };
+    // The same 404 gate as the edit form; the listing also seeds the edit page
+    // a rejected proposal is re-rendered on.
+    let Some(current) = state
+        .details
+        .execute(id)
+        .await
+        .ok()
+        .flatten()
+        .filter(|v| v.location.moderation_state() == ModerationState::Active)
+    else {
+        return not_found_page(&headers, &state.map, &auth, tr);
+    };
+    let reject = |kind: Option<ProposalKind>, key: &str, status: StatusCode| {
+        proposal_rejected(
+            &state.map,
+            tr,
+            &auth,
+            &current.location,
+            &form,
+            kind,
+            tr.t(key).to_string(),
+            status,
+        )
+    };
     let kind = match ProposalKind::from_code(&form.kind) {
+        Ok(ProposalKind::EditDetails) | Err(_) => {
+            return reject(None, "profile.proposal_error", StatusCode::BAD_REQUEST);
+        }
         Ok(k) => k,
-        Err(_) => return axum::response::Redirect::to(&format!("/parking/{id}")).into_response(),
     };
     let change = match kind {
-        ProposalKind::EditDetails => return proposal_error(id),
         ProposalKind::MoveLocation => {
-            let Ok(lat) = form.lat.trim().parse::<f64>() else {
-                return proposal_error(id);
-            };
-            let Ok(lon) = form.lon.trim().parse::<f64>() else {
-                return proposal_error(id);
+            let (Ok(lat), Ok(lon)) = (
+                form.lat.trim().parse::<f64>(),
+                form.lon.trim().parse::<f64>(),
+            ) else {
+                return reject(
+                    Some(kind),
+                    "edit.move.error.coordinates",
+                    StatusCode::BAD_REQUEST,
+                );
             };
             ProposedChange::MoveLocation {
                 lat,
@@ -804,14 +835,26 @@ pub(crate) async fn parking_proposal_post(
                 timezone: non_empty(&form.timezone),
             }
         }
-        ProposalKind::ChangeExistence => match parse_proposed_existence(&form.existence) {
-            Some(exists) => ProposedChange::ChangeExistence { exists },
-            None => return proposal_error(id),
+        // A published spot can only be proposed gone; "it still exists" would
+        // file a proposal that changes nothing (the service refuses it too).
+        _ => match parse_proposed_existence(&form.existence) {
+            Some(false) => ProposedChange::ChangeExistence { exists: false },
+            Some(true) => {
+                return reject(
+                    Some(kind),
+                    "edit.remove.error.exists",
+                    StatusCode::BAD_REQUEST,
+                );
+            }
+            None => {
+                return reject(
+                    Some(kind),
+                    "edit.remove.error.required",
+                    StatusCode::BAD_REQUEST,
+                );
+            }
         },
     };
-    if change == ProposedChange::Unknown {
-        return proposal_error(id);
-    }
     let proposed = ProposalPayload::new(change, Some(&form.reason)).to_json();
     match state
         .contributions
@@ -823,8 +866,64 @@ pub(crate) async fn parking_proposal_post(
         Err(ContributionError::LocationNotActive) => {
             not_found_page(&headers, &state.map, &auth, tr)
         }
-        Err(_) => proposal_error(id),
+        Err(e) => {
+            let status = match e {
+                ContributionError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+                _ => contribution_error_status(&e, StatusCode::BAD_REQUEST),
+            };
+            proposal_rejected(
+                &state.map,
+                tr,
+                &auth,
+                &current.location,
+                &form,
+                Some(kind),
+                contribution_error_message(tr, &e),
+                status,
+            )
+        }
     }
+}
+
+/// The edit page, pre-filled from the published listing, with a rejected
+/// proposal's input kept and its error shown next to the form that sent it.
+#[allow(clippy::too_many_arguments)]
+fn proposal_rejected(
+    map: &MapConfig,
+    tr: Translator,
+    auth: &Auth,
+    loc: &ParkingLocation,
+    form: &ProposalForm,
+    kind: Option<ProposalKind>,
+    message: String,
+    status: StatusCode,
+) -> Response {
+    let mut page = parking_edit_page_vm(
+        edit_parking_layout(map, tr, auth),
+        tr,
+        loc.id(),
+        loc.version(),
+        loc,
+        None,
+        None,
+    );
+    match kind {
+        Some(ProposalKind::MoveLocation) => {
+            page.proposals.move_lat = form.lat.clone();
+            page.proposals.move_lon = form.lon.clone();
+            page.proposals.move_timezone = form.timezone.clone();
+            page.proposals.move_reason = form.reason.clone();
+            page.proposals.move_error = Some(message);
+        }
+        Some(ProposalKind::ChangeExistence) => {
+            page.proposals.removal_confirmed =
+                parse_proposed_existence(&form.existence) == Some(false);
+            page.proposals.removal_reason = form.reason.clone();
+            page.proposals.removal_error = Some(message);
+        }
+        _ => page.error = Some(message),
+    }
+    render(page, status)
 }
 
 /// Read the existence radio on the "propose removal" form.
@@ -844,8 +943,8 @@ pub(crate) fn parse_proposed_existence(raw: &str) -> Option<bool> {
     }
 }
 
-/// The proposal forms live on the details/edit page; a rejected submission
-/// returns there with an error flag rather than rendering a bare 400.
+/// Proposal votes are cast from the details page; a rejected vote returns
+/// there with an error flag (shown as an alert) rather than a bare 400.
 pub(crate) fn proposal_error(id: i64) -> Response {
     axum::response::Redirect::to(&format!("/parking/{id}?proposal_error=1")).into_response()
 }

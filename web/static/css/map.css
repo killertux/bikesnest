@@ -173,5 +173,3 @@
   border-color: var(--color-accent-strong);
   box-shadow: 0 0 0 2px var(--color-accent-strong);
 }
-
-[x-cloak] { display: none !important; }

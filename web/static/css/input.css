@@ -28,6 +28,13 @@
   --color-fresh: oklch(58% 0.13 155);
   --color-aging: oklch(68% 0.12 75);
   --color-stale: oklch(55% 0.16 35);
+  /* Text on the freshness tints (`bg-fresh/10` and the like). The base hues
+     are for dots and fills; they read at only 2.6-4.5:1 as text on their own
+     10-12% tint. These pass 4.5:1 on that tint over both --color-surface and
+     --color-bg (fresh 4.9, aging 5.2, stale 5.4 at worst). */
+  --color-fresh-strong: oklch(49% 0.11 155);
+  --color-aging-strong: oklch(50% 0.10 75);
+  --color-stale-strong: oklch(49% 0.15 35);
   --color-danger: oklch(47% 0.17 30);
   --color-danger-soft: oklch(47% 0.17 30 / 0.08);
 
@@ -48,6 +55,11 @@
   --radius-xl: 16px;
 }
 
+/* Alpine removes `x-cloak` once a component initialises; until then the
+   element stays hidden, so menus and panels never flash open on load. It
+   lives here rather than in map.css so every page gets it. */
+[x-cloak] { display: none !important; }
+
 body {
   font-size: 16px;
   line-height: 1.6;
@@ -58,8 +70,7 @@ body {
    ported verbatim). Plain CSS outside any `@layer`, so it always wins over
    a Tailwind utility on the same element regardless of source order or
    specificity — including a stray `outline-none`/`focus:outline-none` that
-   was never meant to suppress the *keyboard* focus ring in the first place
-   (WP21 accessibility pass). */
+   was never meant to suppress the *keyboard* focus ring in the first place. */
 :focus-visible {
   outline: 2px solid var(--color-accent-strong);
   outline-offset: 2px;

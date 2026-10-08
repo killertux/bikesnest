@@ -9,7 +9,7 @@
   </div>
 
   {% if notice.is_some() %}
-    <div class="mb-4 max-w-2xl rounded-lg border border-aging/30 bg-aging/10 px-4 py-3 text-sm text-aging">{{ notice.as_deref().unwrap_or("") }}</div>
+    <div class="mb-4 max-w-2xl rounded-lg border border-aging/30 bg-aging/10 px-4 py-3 text-sm text-aging-strong">{{ notice.as_deref().unwrap_or("") }}</div>
   {% endif %}
 
   {% if items.is_empty() %}

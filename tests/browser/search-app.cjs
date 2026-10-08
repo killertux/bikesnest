@@ -252,9 +252,18 @@ const deadline = setTimeout(() => {
     assert.equal(await page.locator('#search-filter-state input[name="type"]').count(), 0);
     assert.equal(await page.locator('#search-filter-state input[name="security"]').count(), 0);
     assert.ok((await page.locator('#results').innerText()).includes('Search browser locker'));
+    // Filters replace the current history entry instead of pushing one per
+    // checkbox; the pager still pushes, which gives the history restoration
+    // below an entry to return to.
+    const waitForPagerSettle = await armHtmxEvent(page, 'htmx:after:settle');
+    await page.getByRole('link', { name: 'Next page' }).click();
+    await waitForPagerSettle();
+    const historyLength = await page.evaluate(() => history.length);
     const waitForRackSettle = await armHtmxEvent(page, 'htmx:after:settle');
     await page.locator('#search-filter-form input[name="type"][value="rack"]').check();
     await waitForRackSettle();
+    assert.equal(await page.evaluate(() => history.length), historyLength,
+      'a filter change replaces the history entry');
 
     // Hold an older fragment across a full history body restoration. Its
     // disconnected source will make htmx retarget lifecycle events to the

@@ -6,7 +6,7 @@
   <p class="mt-1 text-sm text-muted">{{ tr.t("admin.privacy_requests.subtitle") }}</p>
 
   {% if notice.is_some() %}
-    <div class="mt-4 max-w-2xl rounded-lg border border-fresh/30 bg-fresh/10 px-4 py-3 text-sm text-fresh">{{ notice.as_deref().unwrap_or("") }}</div>
+    <div class="mt-4 max-w-2xl rounded-lg border border-fresh/30 bg-fresh/10 px-4 py-3 text-sm text-fresh-strong">{{ notice.as_deref().unwrap_or("") }}</div>
   {% endif %}
 
   {% if items.is_empty() %}
@@ -28,7 +28,7 @@
                 {% if item.is_overdue %}
                   <span class="rounded-full bg-danger/10 px-2 py-0.5 font-medium text-danger">{{ item.deadline_label }}</span>
                 {% else %}
-                  <span class="rounded-full bg-aging/10 px-2 py-0.5 font-medium text-aging">{{ item.deadline_label }}</span>
+                  <span class="rounded-full bg-aging/10 px-2 py-0.5 font-medium text-aging-strong">{{ item.deadline_label }}</span>
                 {% endif %}
               {% endif %}
             </div>

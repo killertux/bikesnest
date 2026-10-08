@@ -108,6 +108,7 @@
       <p class="mt-2 text-sm text-muted">{{ tr.t("edit.sensitive.body") }}</p>
       <div class="mt-4 grid gap-3 sm:grid-cols-2">
         <form action="/parking/{{ id }}/proposal" method="post" class="rounded-xl border border-border bg-surface p-4"
+              aria-labelledby="move-title"
               x-data="pinPicker"
               data-empty="{{ tr.t("form.picked_none") }}"
               data-locate-failed="{{ tr.t("form.locate_failed") }}"
@@ -118,8 +119,11 @@
               data-geocode-failed="{{ tr.t("form.geocode_failed") }}">
           <input type="hidden" name="csrf" value="{{ layout.csrf }}" />
           <input type="hidden" name="kind" value="move_location" />
-          <label class="mb-1 block text-sm font-medium">{{ tr.t("edit.move.title") }}</label>
+          <h3 id="move-title" class="mb-1 text-sm font-medium">{{ tr.t("edit.move.title") }}</h3>
           <p class="text-xs text-muted">{{ tr.t("form.pin_hint") }}</p>
+          {% if let Some(msg) = proposals.move_error %}
+            <p id="move-error" role="alert" class="mt-2 rounded-lg border border-danger/30 bg-danger-soft px-3 py-2 text-sm text-danger">{{ msg }}</p>
+          {% endif %}
 
           {# The same picker as the add form: a rider proposing a correction
              should not have to read a decimal latitude off a map app either.
@@ -131,7 +135,7 @@
                @bikesnest:pin="onPin"></div>
           <div data-map-status class="absolute inset-0 flex items-center justify-center rounded-lg bg-surface/90 p-3 text-center text-xs text-muted" role="status"
                data-loading="{{ tr.t("map.loading") }}" data-failed="{{ tr.t("map.failed") }}" data-retry="{{ tr.t("map.retry") }}">{{ tr.t("map.loading") }}</div></div>
-          <p class="mt-2 text-xs text-muted">{{ tr.t("form.picked") }}: <span x-text="coords">{{ lat }}, {{ lon }}</span></p>
+          <p class="mt-2 text-xs text-muted">{{ tr.t("form.picked") }}: <span x-text="coords">{{ proposals.move_lat }}, {{ proposals.move_lon }}</span></p>
           <p x-show="message" class="mt-1 text-xs font-medium text-danger" x-text="message"></p>
           <button type="button" @click="useLocation"
                   :disabled="locating"
@@ -140,45 +144,51 @@
             <span x-show="locating" class="text-muted">…</span>
           </button>
 
-          <details class="mt-3 rounded-lg border border-border px-2 py-1.5">
+          <details class="mt-3 rounded-lg border border-border px-2 py-1.5"{% if proposals.move_error.is_some() %} open{% endif %}>
             <summary class="cursor-pointer text-xs font-medium">{{ tr.t("form.advanced") }}</summary>
             <label class="mt-2 flex items-center gap-2 text-sm text-muted" for="move_lat">
               {{ tr.t("new.field.lat") }}
-              <input id="move_lat" name="lat" type="number" step="any" value="{{ lat }}" class="w-full rounded-lg border border-border px-2 py-1" />
+              <input id="move_lat" name="lat" type="number" step="any" value="{{ proposals.move_lat }}"
+                     {% if proposals.move_error.is_some() %}data-form-error-focus autofocus aria-invalid="true" aria-describedby="move-error"{% endif %}
+                     class="w-full rounded-lg border border-border px-2 py-1" />
             </label>
             <label class="mt-2 flex items-center gap-2 text-sm text-muted" for="move_lon">
               {{ tr.t("new.field.lon") }}
-              <input id="move_lon" name="lon" type="number" step="any" value="{{ lon }}" class="w-full rounded-lg border border-border px-2 py-1" />
+              <input id="move_lon" name="lon" type="number" step="any" value="{{ proposals.move_lon }}" class="w-full rounded-lg border border-border px-2 py-1" />
             </label>
             <label class="mt-2 flex items-center gap-2 text-sm text-muted" for="move_tz">
               {{ tr.t("new.field.tz") }}
-              <input id="move_tz" name="timezone" class="w-full rounded-lg border border-border px-2 py-1" />
+              <input id="move_tz" name="timezone" value="{{ proposals.move_timezone }}" class="w-full rounded-lg border border-border px-2 py-1" />
             </label>
           </details>
 
           <label class="mt-2 block text-sm text-muted">{{ tr.t("edit.reason") }}
-            <input name="reason" class="mt-1 w-full rounded-lg border border-border px-2 py-1" />
+            <input name="reason" value="{{ proposals.move_reason }}" class="mt-1 w-full rounded-lg border border-border px-2 py-1" />
           </label>
           <button type="submit" class="mt-3 w-full rounded-lg border border-border px-4 py-2 text-sm font-medium hover:border-accent">{{ tr.t("edit.move.submit") }}</button>
         </form>
         <form action="/parking/{{ id }}/proposal" method="post" class="rounded-xl border border-border bg-surface p-4">
           <input type="hidden" name="csrf" value="{{ layout.csrf }}" />
           <input type="hidden" name="kind" value="change_existence" />
-          <label class="mb-1 block text-sm font-medium">{{ tr.t("edit.remove.title") }}</label>
-          <label class="mt-2 flex items-center gap-2 text-sm text-muted">
-            {# The payload's own codes. These radios used to post the
-               *verification* vocabulary, which the moderation queue read as
-               "still exists" — inverting every removal proposal. #}
-            <input type="radio" name="existence" value="removed" class="rounded-full border-border" />
-            {{ tr.t("verify.no_longer_exists") }}
-          </label>
-          <label class="mt-2 flex items-center gap-2 text-sm text-muted">
-            <input type="radio" name="existence" value="exists" class="rounded-full border-border" />
-            {{ tr.t("verify.info_changed") }}
-          </label>
-          <label class="mt-2 block text-sm text-muted">{{ tr.t("edit.reason") }}
-            <input name="reason" class="mt-1 w-full rounded-lg border border-border px-2 py-1" />
-          </label>
+          {# A published spot can only be proposed gone: "it still exists"
+             would file a proposal that changes nothing, so the server refuses
+             it. A rider whose spot merely changed is sent to the form above. #}
+          <fieldset>
+            <legend class="mb-1 text-sm font-medium">{{ tr.t("edit.remove.title") }}</legend>
+            {% if let Some(msg) = proposals.removal_error %}
+              <p id="removal-error" role="alert" class="mt-2 rounded-lg border border-danger/30 bg-danger-soft px-3 py-2 text-sm text-danger">{{ msg }}</p>
+            {% endif %}
+            <label for="existence-removed" class="mt-2 flex items-center gap-2 text-sm">
+              <input id="existence-removed" type="checkbox" name="existence" value="removed" required
+                     {% if proposals.removal_confirmed %}checked{% endif %}
+                     {% if proposals.removal_error.is_some() %}data-form-error-focus autofocus aria-invalid="true" aria-describedby="removal-error"{% endif %}
+                     class="rounded border-border" />
+              {{ tr.t("edit.remove.confirm") }}
+            </label>
+            <p class="mt-2 text-xs text-muted">{{ tr.t("edit.remove.details_hint") }} <a href="#name" class="font-medium text-accent-strong underline underline-offset-2">{{ tr.t("edit.remove.details_link") }}</a></p>
+          </fieldset>
+          <label for="removal-reason" class="mt-2 block text-sm text-muted">{{ tr.t("edit.reason") }}</label>
+          <input id="removal-reason" name="reason" value="{{ proposals.removal_reason }}" class="mt-1 w-full rounded-lg border border-border px-2 py-1" />
           <button type="submit" class="mt-3 w-full rounded-lg border border-border px-4 py-2 text-sm font-medium hover:border-accent">{{ tr.t("edit.remove.submit") }}</button>
         </form>
       </div>

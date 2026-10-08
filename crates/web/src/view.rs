@@ -256,9 +256,9 @@ pub struct CardVm {
     /// Presigned URL of the location's own primary photo (object storage), when
     /// one exists; the template prefers this over the positional `image`.
     pub photo_url: Option<String>,
-    /// Illustrative fallback photo (per type) when a location has no photo yet.
+    /// Illustrative fallback photo (per type) when a location has no photo
+    /// yet. Decorative: it is not a picture of this spot, so it has no alt text.
     pub image: &'static str,
-    pub image_alt: &'static str,
 }
 
 impl CardVm {
@@ -268,7 +268,7 @@ impl CardVm {
         freshness: FreshnessCategory,
         photo_url: Option<String>,
     ) -> Self {
-        let (image, image_alt) = image_for(s.parking_type);
+        let image = image_for(s.parking_type);
         let security_chips: Vec<String> = s
             .security_yes
             .iter()
@@ -306,27 +306,19 @@ impl CardVm {
             lon: s.point.lon(),
             photo_url,
             image,
-            image_alt,
         }
     }
 }
 
 /// Deterministic fallback photo per parking type (photos from the approved
 /// design export). Used only when a location has no photo of its own.
-fn image_for(ty: ParkingType) -> (&'static str, &'static str) {
+fn image_for(ty: ParkingType) -> &'static str {
     match ty {
-        ParkingType::Rack => (
-            "/static/img/street-rack-mint-bike.jpg",
-            "Mint-green city bicycle locked to a street bike rack",
-        ),
-        ParkingType::ParkingFacility | ParkingType::Indoor | ParkingType::Secured => (
-            "/static/img/square-bike-rows.jpg",
-            "Row of bicycles parked under trees in a sunny public square",
-        ),
-        ParkingType::Locker | ParkingType::Other => (
-            "/static/img/mtb-pair-rack.jpg",
-            "Two mountain bikes resting on a simple metal bike rack",
-        ),
+        ParkingType::Rack => "/static/img/street-rack-mint-bike.jpg",
+        ParkingType::ParkingFacility | ParkingType::Indoor | ParkingType::Secured => {
+            "/static/img/square-bike-rows.jpg"
+        }
+        ParkingType::Locker | ParkingType::Other => "/static/img/mtb-pair-rack.jpg",
     }
 }
 
@@ -667,6 +659,8 @@ pub struct ReviewVm {
     pub id: i64,
     pub rating: u8,
     pub stars: String,
+    /// The rating as words ("4 of 5 stars") for screen readers; `stars` is hidden.
+    pub stars_label: String,
     pub body: String,
     pub created_label: String,
     pub author_label: String,
@@ -689,6 +683,9 @@ pub fn review_vm(
         id: r.id,
         rating: r.rating.value(),
         stars,
+        stars_label: t
+            .t("review.stars_label")
+            .replace("{n}", &r.rating.value().to_string()),
         body: r.body.as_str().to_string(),
         created_label,
         author_label: r
@@ -990,7 +987,7 @@ pub struct ReportVm {
     pub state_label: &'static str,
     /// The badge's complete Tailwind class list. Built here rather than
     /// interpolated in the template (`bg-{{ color }}` never survives Tailwind's
-    /// content scan, F-L7).
+    /// content scan).
     pub state_badge_class: &'static str,
     pub reporter_label: String,
     pub claimed_by_label: String,
@@ -1052,17 +1049,17 @@ fn report_state_label(t: Translator, s: bikesnest_domain::ReportState) -> &'stat
 
 /// The complete badge classes per report state. A `bg-{{ color }}` built in the
 /// template would never reach Tailwind's content scanner, so the class list is
-/// spelled out here (F-L7).
+/// spelled out here.
 fn report_state_badge_class(s: bikesnest_domain::ReportState) -> &'static str {
     match s {
         bikesnest_domain::ReportState::Open => {
             "rounded-full bg-danger/10 px-2 py-0.5 font-medium text-danger"
         }
         bikesnest_domain::ReportState::UnderReview => {
-            "rounded-full bg-aging/10 px-2 py-0.5 font-medium text-aging"
+            "rounded-full bg-aging/10 px-2 py-0.5 font-medium text-aging-strong"
         }
         bikesnest_domain::ReportState::Resolved | bikesnest_domain::ReportState::Dismissed => {
-            "rounded-full bg-fresh/10 px-2 py-0.5 font-medium text-fresh"
+            "rounded-full bg-fresh/10 px-2 py-0.5 font-medium text-fresh-strong"
         }
     }
 }
@@ -1250,6 +1247,8 @@ pub struct ProposalVm {
     /// The location moved on since this was written: approving it will be
     /// refused by the repository, so the queue says so up front.
     pub is_stale: bool,
+    /// Six community approvals that could not publish: a moderator decides.
+    pub is_escalated: bool,
     /// The stored payload could not be read; approving requires the moderator
     /// to supply every value.
     pub needs_manual_review: bool,
@@ -1396,6 +1395,7 @@ pub fn proposal_vm(t: Translator, p: &bikesnest_application::Proposal) -> Propos
         diff,
         map,
         is_stale: p.is_stale(),
+        is_escalated: p.escalated_at.is_some(),
         needs_manual_review: p.change == ProposedChange::Unknown,
         form_lat,
         form_lon,

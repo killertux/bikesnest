@@ -22,7 +22,7 @@
             <td class="py-3 pr-4 font-mono text-xs text-fg">{{ item.effective_label }}</td>
             <td class="py-3">
               {% if item.is_current %}
-                <span class="rounded-full bg-fresh/12 px-2.5 py-1 text-xs font-medium text-fresh">{{ tr.t("policy.current") }}</span>
+                <span class="rounded-full bg-fresh/12 px-2.5 py-1 text-xs font-medium text-fresh-strong">{{ tr.t("policy.current") }}</span>
               {% else %}
                 <span class="text-xs text-muted">{{ tr.t("policy.superseded") }}</span>
               {% endif %}

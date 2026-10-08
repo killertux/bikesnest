@@ -3,7 +3,7 @@
 <section class="mx-auto max-w-shell px-4 py-12 lg:px-8">
   <h1 class="font-display text-2xl font-bold tracking-tight">{{ tr.t("admin.users_title") }}</h1>
   {% if notice.is_some() %}
-    <div class="mt-4 max-w-2xl rounded-lg border border-fresh/30 bg-fresh/10 px-4 py-3 text-sm text-fresh">{{ notice.as_deref().unwrap_or("") }}</div>
+    <div class="mt-4 max-w-2xl rounded-lg border border-fresh/30 bg-fresh/10 px-4 py-3 text-sm text-fresh-strong">{{ notice.as_deref().unwrap_or("") }}</div>
   {% endif %}
   {% if error.is_some() %}
     <div class="mt-4 max-w-2xl rounded-lg border border-danger/30 bg-danger/10 px-4 py-3 text-sm text-danger" role="alert">{{ error.as_deref().unwrap_or("") }}</div>
@@ -52,7 +52,7 @@
                       class="btn-compact rounded border border-border px-1.5 text-[11px] text-muted hover:text-fg"
                       data-show="{{ tr.t("admin.email.show") }}" data-hide="{{ tr.t("admin.email.hide") }}">{{ tr.t("admin.email.show") }}</button>
             </span>
-            {% if !u.is_verified %}<span class="ml-1 rounded-full bg-aging/10 px-2 py-0.5 text-xs text-aging">{{ tr.t("account.unverified") }}</span>{% endif %}
+            {% if !u.is_verified %}<span class="ml-1 rounded-full bg-aging/10 px-2 py-0.5 text-xs text-aging-strong">{{ tr.t("account.unverified") }}</span>{% endif %}
           </td>
           <td class="px-4 py-3 text-muted">{{ u.state_label }}</td>
           <td class="px-4 py-3 text-muted">{{ u.roles_label }}</td>
@@ -71,7 +71,7 @@
                 <form action="/admin/users/{{ u.id }}/role" method="post" hx-confirm="{{ u.confirm_grant_admin }}" class="inline"><input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="action" value="grant"><input type="hidden" name="role" value="ADMIN"><button type="submit" class="rounded bg-accent/10 btn-compact px-2 text-xs font-medium text-accent-strong">{{ tr.t("admin.grant_admin") }}</button></form>
               {% endif %}
               {% if u.state == "SUSPENDED" %}
-                <form action="/admin/users/{{ u.id }}/restore" method="post" hx-confirm="{{ u.confirm_restore }}" class="inline"><input type="hidden" name="csrf" value="{{ layout.csrf }}"><button type="submit" class="rounded bg-fresh/10 btn-compact px-2 text-xs font-medium text-fresh">{{ tr.t("admin.restore") }}</button></form>
+                <form action="/admin/users/{{ u.id }}/restore" method="post" hx-confirm="{{ u.confirm_restore }}" class="inline"><input type="hidden" name="csrf" value="{{ layout.csrf }}"><button type="submit" class="rounded bg-fresh/10 btn-compact px-2 text-xs font-medium text-fresh-strong">{{ tr.t("admin.restore") }}</button></form>
               {% else %}
                 <form action="/admin/users/{{ u.id }}/suspend" method="post" hx-confirm="{{ u.confirm_suspend }}" class="inline"><input type="hidden" name="csrf" value="{{ layout.csrf }}"><button type="submit" class="rounded bg-danger/10 btn-compact px-2 text-xs font-medium text-danger">{{ tr.t("admin.suspend") }}</button></form>
               {% endif %}

@@ -11,7 +11,7 @@
   {% if let Some(notice) = notice %}
     {# The no-JS landing banner: a moderation action redirects a whole-document
        caller back here with `?done=…` instead of answering with a toast. #}
-    <div class="mt-4 rounded-lg border border-fresh/30 bg-fresh/10 px-4 py-3 text-sm text-fresh" role="status">{{ notice }}</div>
+    <div class="mt-4 rounded-lg border border-fresh/30 bg-fresh/10 px-4 py-3 text-sm text-fresh-strong" role="status">{{ notice }}</div>
   {% endif %}
 
   {% if items.is_empty() %}
@@ -75,7 +75,7 @@
                     hx-target="#moderation-feedback" hx-swap="innerHTML" class="contents">
                 <input type="hidden" name="csrf" value="{{ layout.csrf }}" />
                 {% if p.available %}
-                  <button type="submit" class="rounded-lg bg-fresh/10 px-4 py-2 text-sm font-medium text-fresh hover:bg-fresh/20">{{ tr.t("moderation.approve") }}</button>
+                  <button type="submit" class="rounded-lg bg-fresh/10 px-4 py-2 text-sm font-medium text-fresh-strong hover:bg-fresh/20">{{ tr.t("moderation.approve") }}</button>
                 {% else %}
                   <button type="submit" disabled aria-disabled="true"
                           title="{{ tr.t("moderation.photo_unavailable_hint") }}"

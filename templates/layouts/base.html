@@ -87,32 +87,34 @@
           >
             <button
               type="button" @click="toggle" :aria-expanded="open"
-              aria-haspopup="true" aria-controls="account-menu"
+              aria-controls="account-menu"
               class="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-medium text-fg hover:bg-[oklch(20%_0.02_240_/_0.05)]"
             >
               {{ tr.t("account.nav") }}
               <svg aria-hidden="true" class="h-3.5 w-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6" /></svg>
             </button>
-            <div
-              id="account-menu" role="menu" aria-label="{{ tr.t("nav.account_menu_aria") }}"
+            {# A disclosure, not an ARIA menu: plain links and a button the
+               Tab key already reaches, so no arrow-key handling is promised. #}
+            <nav
+              id="account-menu" aria-label="{{ tr.t("nav.account_menu_aria") }}"
               x-show="open" x-cloak @click="close" style="display: none"
               class="absolute right-0 top-full z-50 mt-2 w-56 rounded-xl border border-border bg-surface p-1.5 shadow-pop"
             >
-              <a role="menuitem" href="/account" class="block rounded-lg px-3 py-2 text-sm text-fg hover:bg-bg">{{ tr.t("account.nav") }}</a>
-              <a role="menuitem" href="/account/favorites" class="block rounded-lg px-3 py-2 text-sm text-fg hover:bg-bg">{{ tr.t("nav.favorites") }}</a>
-              <a role="menuitem" href="/account/contributions" class="block rounded-lg px-3 py-2 text-sm text-fg hover:bg-bg">{{ tr.t("nav.contributions") }}</a>
+              <a href="/account" class="block rounded-lg px-3 py-2 text-sm text-fg hover:bg-bg">{{ tr.t("account.nav") }}</a>
+              <a href="/account/favorites" class="block rounded-lg px-3 py-2 text-sm text-fg hover:bg-bg">{{ tr.t("nav.favorites") }}</a>
+              <a href="/account/contributions" class="block rounded-lg px-3 py-2 text-sm text-fg hover:bg-bg">{{ tr.t("nav.contributions") }}</a>
               {% if layout.is_moderator %}
-              <a role="menuitem" href="/moderation" class="block rounded-lg px-3 py-2 text-sm text-fg hover:bg-bg">{{ tr.t("nav.moderation") }}</a>
+              <a href="/moderation" class="block rounded-lg px-3 py-2 text-sm text-fg hover:bg-bg">{{ tr.t("nav.moderation") }}</a>
               {% endif %}
               {% if layout.is_admin %}
-              <a role="menuitem" href="/admin/users" class="block rounded-lg px-3 py-2 text-sm text-fg hover:bg-bg">{{ tr.t("nav.admin") }}</a>
-              <a role="menuitem" href="/admin/audit" class="block rounded-lg px-3 py-2 text-sm text-fg hover:bg-bg">{{ tr.t("nav.audit") }}</a>
+              <a href="/admin/users" class="block rounded-lg px-3 py-2 text-sm text-fg hover:bg-bg">{{ tr.t("nav.admin") }}</a>
+              <a href="/admin/audit" class="block rounded-lg px-3 py-2 text-sm text-fg hover:bg-bg">{{ tr.t("nav.audit") }}</a>
               {% endif %}
               <form action="/logout" method="post" class="mt-1 border-t border-border pt-1">
                 <input type="hidden" name="csrf" value="{{ layout.csrf }}">
-                <button type="submit" role="menuitem" class="block w-full rounded-lg px-3 py-2 text-left text-sm text-muted hover:bg-bg hover:text-fg">{{ tr.t("auth.logout") }}</button>
+                <button type="submit" class="block w-full rounded-lg px-3 py-2 text-left text-sm text-muted hover:bg-bg hover:text-fg">{{ tr.t("auth.logout") }}</button>
               </form>
-            </div>
+            </nav>
             {# No-JS fallback: the dropdown above stays hidden (x-cloak) when
                Alpine never runs, so the same links render inline here — a
                `<noscript>` block is only shown by the browser when scripting
@@ -140,10 +142,12 @@
           <a href="/register" class="rounded-lg bg-accent-strong px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-accent-dark">{{ tr.t("auth.signup") }}</a>
         {% endif %}
       </div>
+      {# A stable name plus `aria-expanded`: "Open menu" would still be
+         announced while the menu is open. #}
       <button
-        @click="toggle" :aria-expanded="open"
+        type="button" @click="toggle" :aria-expanded="open"
         class="grid h-10 w-10 place-items-center rounded-lg border border-border md:hidden"
-        aria-controls="mobile-menu" aria-label="{{ tr.t("menu.open") }}"
+        aria-controls="mobile-menu" aria-label="{{ tr.t("menu.toggle") }}"
       >
         <svg aria-hidden="true" class="h-5 w-5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16" /><path d="M4 12h16" /><path d="M4 18h16" /></svg>
       </button>

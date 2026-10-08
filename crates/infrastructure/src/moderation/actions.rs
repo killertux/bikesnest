@@ -137,6 +137,7 @@ struct ProposalRow {
     current_snapshot: serde_json::Value,
     status: String,
     created_at: DateTime<Utc>,
+    escalated_at: Option<DateTime<Utc>>,
 }
 
 /// The columns every proposal read needs. The join already visits
@@ -149,7 +150,7 @@ const PROPOSAL_COLUMNS: &str = r#"
     l.lat AS current_lat, l.lon AS current_lon, l.timezone AS current_timezone,
     l.moderation_state AS current_state,
     COALESCE((SELECT snapshot FROM parking_revision WHERE location_id=l.id AND version=l.version), '{}'::jsonb) AS current_snapshot,
-    p.status, p.created_at
+    p.status, p.created_at, p.escalated_at
 "#;
 
 #[derive(sqlx::FromRow)]
@@ -478,8 +479,11 @@ impl ModerationRepository for SqlxModerationRepository {
         Ok(())
     }
 
-    /// Oldest first (`id ASC`), same reasoning as `report.list`: a FIFO queue
-    /// with a simple, exact keyset cursor.
+    /// Escalated proposals first (six approvals that could not publish are
+    /// waiting on a moderator), then oldest first (`id ASC`), same reasoning
+    /// as `report.list`. The keyset cursor stays a bare `after_id`: the
+    /// cursor row's own escalation flag is looked up, so `(flag, id)` is the
+    /// exact sort key. An unknown cursor id counts as not escalated.
     async fn list_pending_proposals(
         &self,
         after_id: Option<i64>,
@@ -493,8 +497,15 @@ impl ModerationRepository for SqlxModerationRepository {
             SELECT {PROPOSAL_COLUMNS}
             FROM parking_proposal p
             JOIN parking_location l ON l.id = p.location_id
-            WHERE p.status = 'PENDING' AND ($1::bigint IS NULL OR p.id > $1::bigint)
-            ORDER BY p.id ASC
+            WHERE p.status = 'PENDING'
+              AND ($1::bigint IS NULL OR (p.escalated_at IS NULL, p.id) > (
+                  COALESCE(
+                      (SELECT c.escalated_at IS NULL FROM parking_proposal c WHERE c.id = $1::bigint),
+                      true
+                  ),
+                  $1::bigint
+              ))
+            ORDER BY (p.escalated_at IS NULL) ASC, p.id ASC
             LIMIT $2
             "#
         );
@@ -635,6 +646,7 @@ fn map_proposal(r: ProposalRow) -> Result<Proposal, ModerationError> {
         current_snapshot: r.current_snapshot,
         status: ProposalStatus::from_code(&r.status).map_err(ModerationError::from)?,
         created_at: r.created_at,
+        escalated_at: r.escalated_at,
     })
 }
 
@@ -665,7 +677,7 @@ async fn insert_revision(
 }
 
 /// Read an after-state snapshot (name/address/type/cost/point/tz/hours/security/
-/// moderation_state) for a location row — following the  snapshot shape —
+/// moderation_state) for a location row — following the revision snapshot shape —
 /// reading the unchanged hours + security rows from the open transaction.
 async fn snapshot_with(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,

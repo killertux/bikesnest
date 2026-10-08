@@ -175,6 +175,9 @@ pub struct Proposal {
     pub current_snapshot: serde_json::Value,
     pub status: ProposalStatus,
     pub created_at: DateTime<Utc>,
+    /// Set when the proposal reached the community approval threshold but its
+    /// payload could not be merged: it now waits on a moderator's decision.
+    pub escalated_at: Option<DateTime<Utc>>,
 }
 
 impl Proposal {

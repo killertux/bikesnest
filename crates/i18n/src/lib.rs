@@ -214,7 +214,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
             "Create an account to add a spot",
             "Crie uma conta para adicionar uma vaga",
         ),
-        "menu.open" => ("Open menu", "Abrir menu"),
+        "menu.toggle" => ("Main menu", "Menu principal"),
         "lang.group" => ("Language", "Idioma"),
         "lang.pt_aria" => ("Português (Brasil)", "Português (Brasil)"),
         "lang.en_aria" => ("English", "English"),
@@ -686,7 +686,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "search.count.one" => ("1 parking spot", "1 vaga"),
         "search.count.other" => ("{n} parking spots", "{n} vagas"),
         "search.map.show" => ("Show map", "Mostrar mapa"),
-        "search.map.hide" => ("Show list", "Mostrar lista"),
+        "search.map.hide" => ("Hide map", "Ocultar mapa"),
         "search.map.recenter" => ("Recenter", "Recentralizar"),
         "search.map.title" => ("Map", "Mapa"),
         "map.loading" => ("Loading map…", "Carregando mapa…"),
@@ -1360,13 +1360,32 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "edit.move.title" => ("Move the pin", "Mover o ponto"),
         "edit.move.submit" => ("Propose new location", "Propor novo local"),
         "edit.remove.title" => ("Remove / mark gone", "Remover / marcar como sumido"),
-        "edit.remove.submit" => ("Propose change", "Propor mudança"),
+        "edit.remove.submit" => ("Propose removal", "Propor remoção"),
+        "edit.remove.confirm" => ("This spot no longer exists", "Esta vaga não existe mais"),
+        "edit.remove.details_hint" => (
+            "Is it still there, with different details?",
+            "Ela ainda existe, mas com outros detalhes?",
+        ),
+        "edit.remove.details_link" => ("Edit the details instead.", "Edite os detalhes."),
+        "edit.remove.error.required" => (
+            "Confirm that the spot no longer exists to propose its removal.",
+            "Confirme que a vaga não existe mais para propor a remoção.",
+        ),
+        "edit.remove.error.exists" => (
+            "This spot is already listed. To correct it, edit its details instead.",
+            "Esta vaga já está cadastrada. Para corrigi-la, edite os detalhes.",
+        ),
+        "edit.move.error.coordinates" => (
+            "Enter a valid latitude and longitude, or pick the spot on the map.",
+            "Informe uma latitude e longitude válidas ou escolha o ponto no mapa.",
+        ),
         "edit.reason" => ("Reason", "Motivo"),
 
         // --- reviews ------------------------------------------------------
         "review.title" => ("Write a review", "Escrever uma avaliação"),
         "review.subtitle" => ("How was it to park here?", "Como foi estacionar aqui?"),
         "review.rating" => ("Rating", "Avaliação"),
+        "review.stars_label" => ("{n} of 5 stars", "{n} de 5 estrelas"),
         "review.select" => ("Choose a rating", "Escolha uma nota"),
         "review.body" => ("Your review", "Sua avaliação"),
         "review.length_hint" => (
@@ -1798,6 +1817,14 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "proposal.map.aria" => (
             "Map showing the current and proposed positions of the pin.",
             "Mapa mostrando as posições atual e proposta do ponto.",
+        ),
+        "proposal.escalated.badge" => (
+            "Approved, needs a moderator",
+            "Aprovada, precisa de moderação",
+        ),
+        "proposal.escalated.hint" => (
+            "The community approved this proposal, but it could not be published automatically. Approve it with corrected values, or reject it.",
+            "A comunidade aprovou esta proposta, mas ela não pôde ser publicada automaticamente. Aprove-a com valores corrigidos ou rejeite-a.",
         ),
         "proposal.stale.badge" => ("Out of date", "Desatualizada"),
         "proposal.stale.hint" => (

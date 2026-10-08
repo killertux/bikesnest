@@ -526,6 +526,62 @@ async fn proposal_list_keyset_pagination_is_disjoint_and_stable(
     let _ = tx;
 }
 
+/// Escalated proposals (six approvals that could not publish) lead the queue,
+/// each group oldest first, and the bare `after_id` cursor walks that order
+/// with no gap or repeat across the escalated/regular boundary.
+#[db_test]
+async fn escalated_proposals_lead_the_queue_and_the_cursor_follows(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let proposer = scoped_user(&db, "b5a-escalated-queue@example.com", "USER").await;
+    let loc = ParkingBuilder::new()
+        .with_name("Escalated Queue Spot")
+        .with_fixture_tag("b5a-escalated-queue")
+        .create(&mut db.acquire().await.unwrap())
+        .await
+        .unwrap()
+        .id();
+    let mut ids = Vec::new();
+    for _ in 0..4 {
+        let (pid,): (i64,) = sqlx::query_as(
+            "INSERT INTO parking_proposal (location_id, proposer_id, base_version, kind, proposed, status) \
+             VALUES ($1, $2, 1, 'change_existence', '{\"existence\":\"removed\"}', 'PENDING') RETURNING id")
+            .bind(loc).bind(proposer).fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
+        ids.push(pid);
+    }
+    let (a, b, c, d) = (ids[0], ids[1], ids[2], ids[3]);
+    sqlx::query("UPDATE parking_proposal SET escalated_at = now() WHERE id = ANY($1)")
+        .bind(vec![a, c])
+        .execute(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+
+    let repo = SqlxModerationRepository::new(db.clone());
+    let mut seen = Vec::new();
+    let mut escalated = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = repo.list_pending_proposals(cursor, 2).await.unwrap();
+        for p in &page {
+            if ids.contains(&p.id) {
+                seen.push(p.id);
+                if p.escalated_at.is_some() {
+                    escalated.push(p.id);
+                }
+            }
+        }
+        if page.len() < 2 {
+            break;
+        }
+        cursor = page.last().map(|p| p.id);
+    }
+    assert_eq!(seen, vec![a, c, b, d], "escalated first, each group by id");
+    assert_eq!(escalated, vec![a, c], "the flag reaches the read model");
+
+    let _ = tx;
+}
+
 /// `queue_counts()` reads four global tables the whole suite shares, so a
 /// before/after delta taken via two separate pool connections can be thrown
 /// off by another test's concurrent commits (this happened in practice: a
