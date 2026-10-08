@@ -63,7 +63,7 @@
       <h2 class="font-display mt-4 text-xl font-semibold">{{ tr.t("search.empty.title") }}</h2>
       <p class="mx-auto mt-2 max-w-sm text-[15px] text-muted">{{ tr.t("search.empty.body") }}</p>
       <div class="mt-6 flex flex-wrap items-center justify-center gap-3">
-        <a href="/search" class="rounded-xl border border-border bg-surface px-5 py-2.5 text-sm font-medium text-fg transition-colors hover:border-fg">{{ tr.t("search.filters.clear") }}</a>
+        <a data-search-clear href="{{ form.clear_filters_url() }}" hx-get="{{ form.clear_filters_url() }}" hx-target="#results" hx-swap="innerHTML" hx-sync="#results:replace" hx-push-url="true" hx-indicator="#results-indicator" class="rounded-xl border border-border bg-surface px-5 py-2.5 text-sm font-medium text-fg transition-colors hover:border-fg">{{ tr.t("search.filters.clear") }}</a>
         {% if can_contribute %}
           <a href="/parking/new" class="rounded-xl bg-accent-strong px-5 py-2.5 text-sm font-medium text-white transition-colors hover:bg-accent-dark">{{ tr.t("nav.add_spot") }}</a>
         {% else if !is_authenticated %}
@@ -95,6 +95,7 @@
           hx-get="{{ url }}"
           hx-target="#results"
           hx-swap="innerHTML"
+          hx-sync="#results:replace"
           hx-push-url="true"
           class="inline-flex items-center gap-1.5 rounded-lg border border-border bg-surface px-4 py-2 text-sm font-medium text-fg transition-colors hover:border-fg"
         >

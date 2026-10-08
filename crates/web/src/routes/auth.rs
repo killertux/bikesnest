@@ -4,12 +4,10 @@
 use axum::extract::{Form, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use bikesnest_application::AuthError;
+use bikesnest_application::{AuthError, TermsAcceptance};
 use bikesnest_domain::{Role, UserEmail};
 
-use crate::auth::{
-    Auth, anon_csrf_token, clear_session_cookie, random_state_hex, set_session_cookie,
-};
+use crate::auth::{Auth, clear_session_cookie, random_state_hex, set_session_cookie};
 use crate::client_ip::ClientIp;
 use crate::htmx;
 use crate::i18n::{Locale, Translator};
@@ -75,6 +73,37 @@ pub(crate) struct RegisterForm {
     display_name: String,
     #[serde(default)]
     password: String,
+    #[serde(default)]
+    terms_policy_id: Option<i64>,
+    #[serde(default)]
+    terms_version: String,
+}
+
+async fn registration_terms(
+    state: &AppState,
+    locale: Locale,
+) -> Result<Option<bikesnest_application::PolicyDocument>, ()> {
+    if !state.config.policy.acknowledgement_enabled {
+        return Ok(None);
+    }
+    let requested = locale.html_lang();
+    match state
+        .policy
+        .current(bikesnest_domain::PolicyKind::Terms, requested)
+        .await
+    {
+        Ok(Some(document)) => Ok(Some(document)),
+        Ok(None) if requested != bikesnest_application::POLICY_FALLBACK_LOCALE => state
+            .policy
+            .current(
+                bikesnest_domain::PolicyKind::Terms,
+                bikesnest_application::POLICY_FALLBACK_LOCALE,
+            )
+            .await
+            .map_err(|_| ())
+            .and_then(|document| document.ok_or(()).map(Some)),
+        Ok(None) | Err(_) => Err(()),
+    }
 }
 
 pub(crate) async fn register_page(
@@ -86,16 +115,29 @@ pub(crate) async fn register_page(
         return axum::response::Redirect::to("/account").into_response();
     }
     let tr = Translator::new(locale);
-    let token = anon_csrf_token();
+    let token = auth.csrf_value();
+    let terms = match registration_terms(&state, locale).await {
+        Ok(terms) => terms,
+        Err(()) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     render_anon(
         RegisterPage {
             layout: PageLayout::new(&state.map, tr.t("auth.register_title").to_string(), "auth")
+                .csp_nonce(auth.csp_nonce.clone())
                 .csrf(token.clone()),
             tr,
             email: String::new(),
             display_name: String::new(),
             error: None,
             field_errors: view::FieldErrors::new(),
+            terms_required: terms.is_some(),
+            terms_policy_id: terms.as_ref().map_or(0, |d| d.id),
+            terms_version: terms
+                .as_ref()
+                .map_or_else(String::new, |d| d.version.clone()),
+            terms_url: terms
+                .as_ref()
+                .map_or_else(String::new, |d| format!("/terms/versions/{}", d.id)),
         },
         &token,
     )
@@ -118,44 +160,112 @@ pub(crate) async fn register_post(
     } else {
         Some(form.display_name.trim())
     };
+    let terms = if state.config.policy.acknowledgement_enabled {
+        let current = match registration_terms(&state, locale).await {
+            Ok(Some(current)) => current,
+            Ok(None) => return StatusCode::CONFLICT.into_response(),
+            Err(()) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        if form.terms_policy_id != Some(current.id) || current.version != form.terms_version {
+            return render_stale_registration(&state, locale, &auth, form, current).await;
+        }
+        Some(TermsAcceptance {
+            policy_version_id: current.id,
+            version: form.terms_version.clone(),
+            shown_locale: current.locale,
+        })
+    } else {
+        None
+    };
     match state
         .auth
-        .register(
+        .register_accepting_terms(
             &ip,
             &form.email,
             display_name,
             &form.password,
             locale_code(locale),
+            terms,
         )
         .await
     {
         Ok(()) => axum::response::Redirect::to("/login?registered=1").into_response(),
         Err(err) => {
-            // Re-render with a fresh double-submit CSRF token so the next POST validates.
-            let token = anon_csrf_token();
+            let token = auth.csrf_value();
             let message = auth_error_message(tr, &err);
             let field_errors = match register_field_error(&err) {
                 Some(field) => view::FieldErrors::single(field, message.clone()),
                 None => view::FieldErrors::new(),
             };
-            render_anon(
+            let terms = match registration_terms(&state, locale).await {
+                Ok(terms) => terms,
+                Err(()) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
+            let status =
+                if err == AuthError::Conflict && state.config.policy.acknowledgement_enabled {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::OK
+                };
+            let mut response = render_anon(
                 RegisterPage {
                     layout: PageLayout::new(
                         &state.map,
                         tr.t("auth.register_title").to_string(),
                         "auth",
                     )
+                    .csp_nonce(auth.csp_nonce.clone())
                     .csrf(token.clone()),
                     tr,
                     email: form.email,
                     display_name: form.display_name,
                     error: Some(message),
                     field_errors,
+                    terms_required: terms.is_some(),
+                    terms_policy_id: terms.as_ref().map_or(0, |d| d.id),
+                    terms_version: terms
+                        .as_ref()
+                        .map_or_else(String::new, |d| d.version.clone()),
+                    terms_url: terms
+                        .as_ref()
+                        .map_or_else(String::new, |d| format!("/terms/versions/{}", d.id)),
                 },
                 &token,
-            )
+            );
+            *response.status_mut() = status;
+            response
         }
     }
+}
+
+async fn render_stale_registration(
+    state: &AppState,
+    locale: Locale,
+    auth: &Auth,
+    form: RegisterForm,
+    current: bikesnest_application::PolicyDocument,
+) -> Response {
+    let tr = Translator::new(locale);
+    let token = auth.csrf_value();
+    let mut response = render_anon(
+        RegisterPage {
+            layout: PageLayout::new(&state.map, tr.t("auth.register_title").to_string(), "auth")
+                .csp_nonce(auth.csp_nonce.clone())
+                .csrf(token.clone()),
+            tr,
+            email: form.email,
+            display_name: form.display_name,
+            error: Some(tr.t("terms.notice.stale").to_string()),
+            field_errors: view::FieldErrors::new(),
+            terms_required: true,
+            terms_policy_id: current.id,
+            terms_version: current.version,
+            terms_url: format!("/terms/versions/{}", current.id),
+        },
+        &token,
+    );
+    *response.status_mut() = StatusCode::CONFLICT;
+    response
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -222,10 +332,11 @@ pub(crate) async fn login_page(
         return axum::response::Redirect::to(&login_destination(&q.next)).into_response();
     }
     let tr = Translator::new(locale);
-    let token = anon_csrf_token();
+    let token = auth.csrf_value();
     render_anon(
         LoginPage {
             layout: PageLayout::new(&state.map, tr.t("auth.login_title").to_string(), "auth")
+                .csp_nonce(auth.csp_nonce.clone())
                 .csrf(token.clone()),
             tr,
             email: String::new(),
@@ -267,10 +378,10 @@ pub(crate) async fn login_post(
         // reply never reveals which of the two it was.
         // The submitted email is NOT echoed back, so the failure response is
         // byte-identical whether or not the account exists — and it still
-        // carries a fresh double-submit CSRF token for the next attempt.
+        // carries the same anonymous CSRF context for the next attempt.
         Err(_) => {
             tracing::warn!("login failed"); // no email/IP/PII in the log field
-            let token = anon_csrf_token();
+            let token = auth.csrf_value();
             let message = tr.t("auth.error.invalid_credentials").to_string();
             // Never disclose which of the two was wrong: both inputs are
             // flagged with the same generic message rather
@@ -285,6 +396,7 @@ pub(crate) async fn login_post(
                         tr.t("auth.login_title").to_string(),
                         "auth",
                     )
+                    .csp_nonce(auth.csp_nonce.clone())
                     .csrf(token.clone()),
                     tr,
                     email: String::new(),
@@ -320,14 +432,16 @@ pub(crate) struct VerifyParams {
 pub(crate) async fn verify_email(
     State(state): State<AppState>,
     locale: Locale,
+    auth: Auth,
     Query(q): Query<VerifyParams>,
 ) -> Response {
     let tr = Translator::new(locale);
     let Some(token) = q.token.filter(|t| !t.is_empty()) else {
-        let t = anon_csrf_token();
+        let t = auth.csrf_value();
         return render_anon(
             VerifyEmailPage {
                 layout: PageLayout::new(&state.map, tr.t("auth.verify_title").to_string(), "auth")
+                    .csp_nonce(auth.csp_nonce.clone())
                     .csrf(t.clone()),
                 tr,
                 success: false,
@@ -339,7 +453,7 @@ pub(crate) async fn verify_email(
     match state.auth.verify_email(&token).await {
         Ok(()) => axum::response::Redirect::to("/login?verified=1").into_response(),
         Err(err) => {
-            let t = anon_csrf_token();
+            let t = auth.csrf_value();
             render_anon(
                 VerifyEmailPage {
                     layout: PageLayout::new(
@@ -347,6 +461,7 @@ pub(crate) async fn verify_email(
                         tr.t("auth.verify_title").to_string(),
                         "auth",
                     )
+                    .csp_nonce(auth.csp_nonce.clone())
                     .csrf(t.clone()),
                     tr,
                     success: false,
@@ -368,6 +483,7 @@ pub(crate) async fn verify_resend(
     State(state): State<AppState>,
     locale: Locale,
     ClientIp(ip): ClientIp,
+    auth: Auth,
     Form(form): Form<ResendForm>,
 ) -> Response {
     let tr = Translator::new(locale);
@@ -377,7 +493,7 @@ pub(crate) async fn verify_resend(
     match state.auth.resend_verification(&ip, &email).await {
         Ok(()) => axum::response::Redirect::to("/login?resend=1").into_response(),
         Err(err) => {
-            let t = anon_csrf_token();
+            let t = auth.csrf_value();
             render_anon(
                 LoginPage {
                     layout: PageLayout::new(
@@ -385,6 +501,7 @@ pub(crate) async fn verify_resend(
                         tr.t("auth.login_title").to_string(),
                         "auth",
                     )
+                    .csp_nonce(auth.csp_nonce.clone())
                     .csrf(t.clone()),
                     tr,
                     email: String::new(),
@@ -415,6 +532,7 @@ pub(crate) struct ResetSent {
 pub(crate) async fn password_reset_page(
     State(state): State<AppState>,
     locale: Locale,
+    auth: Auth,
     Query(q): Query<ResetSent>,
 ) -> Response {
     let tr = Translator::new(locale);
@@ -423,10 +541,11 @@ pub(crate) async fn password_reset_page(
     } else {
         None
     };
-    let token = anon_csrf_token();
+    let token = auth.csrf_value();
     render_anon(
         PasswordResetPage {
             layout: PageLayout::new(&state.map, tr.t("auth.reset_title").to_string(), "auth")
+                .csp_nonce(auth.csp_nonce.clone())
                 .csrf(token.clone()),
             tr,
             email: String::new(),
@@ -441,6 +560,7 @@ pub(crate) async fn password_reset_post(
     State(state): State<AppState>,
     locale: Locale,
     ClientIp(ip): ClientIp,
+    auth: Auth,
     Form(form): Form<ResetRequestForm>,
 ) -> Response {
     let tr = Translator::new(locale);
@@ -450,7 +570,7 @@ pub(crate) async fn password_reset_post(
     match state.auth.request_password_reset(&ip, &email).await {
         Ok(()) => axum::response::Redirect::to("/password-reset?sent=1").into_response(),
         Err(err) => {
-            let t = anon_csrf_token();
+            let t = auth.csrf_value();
             render_anon(
                 PasswordResetPage {
                     layout: PageLayout::new(
@@ -458,6 +578,7 @@ pub(crate) async fn password_reset_post(
                         tr.t("auth.reset_title").to_string(),
                         "auth",
                     )
+                    .csp_nonce(auth.csp_nonce.clone())
                     .csrf(t.clone()),
                     tr,
                     email: form.email,
@@ -473,14 +594,16 @@ pub(crate) async fn password_reset_post(
 pub(crate) async fn password_reset_new(
     State(state): State<AppState>,
     locale: Locale,
+    auth: Auth,
     Query(q): Query<VerifyParams>,
 ) -> Response {
     let tr = Translator::new(locale);
     let token = q.token.unwrap_or_default();
-    let t = anon_csrf_token();
+    let t = auth.csrf_value();
     render_anon(
         PasswordResetNewPage {
             layout: PageLayout::new(&state.map, tr.t("auth.reset_new_title").to_string(), "auth")
+                .csp_nonce(auth.csp_nonce.clone())
                 .csrf(t.clone()),
             tr,
             token,
@@ -501,13 +624,14 @@ pub(crate) struct ResetNewForm {
 pub(crate) async fn password_reset_new_post(
     State(state): State<AppState>,
     locale: Locale,
+    auth: Auth,
     Form(form): Form<ResetNewForm>,
 ) -> Response {
     let tr = Translator::new(locale);
     match state.auth.reset_password(&form.token, &form.password).await {
         Ok(()) => axum::response::Redirect::to("/login?reset=1").into_response(),
         Err(err) => {
-            let t = anon_csrf_token();
+            let t = auth.csrf_value();
             render_anon(
                 PasswordResetNewPage {
                     layout: PageLayout::new(
@@ -515,6 +639,7 @@ pub(crate) async fn password_reset_new_post(
                         tr.t("auth.reset_new_title").to_string(),
                         "auth",
                     )
+                    .csp_nonce(auth.csp_nonce.clone())
                     .csrf(t.clone()),
                     tr,
                     token: form.token,
@@ -577,6 +702,8 @@ pub(crate) struct AccountNotices {
     email_pending: Option<String>,
     #[serde(default)]
     attribution_saved: Option<String>,
+    #[serde(default)]
+    terms_acknowledged: Option<String>,
 }
 
 pub(crate) async fn account(
@@ -596,8 +723,27 @@ pub(crate) async fn account(
         Some(tr.t("account.email_pending").to_string())
     } else if q.attribution_saved.is_some() {
         Some(tr.t("account.attribution.saved").to_string())
+    } else if q.terms_acknowledged.is_some() {
+        Some(tr.t("terms.notice.acknowledged").to_string())
     } else {
         None
+    };
+    let terms_notices = if state.config.policy.acknowledgement_enabled {
+        match super::legal::pending_terms_notices(&state, user.id, locale).await {
+            Ok(items) => items
+                .into_iter()
+                .map(|item| crate::TermsNoticeVm {
+                    url: format!("/account/terms-notice/{}", item.document.id),
+                    version: item.document.version,
+                    effective_label: view::iso_datetime_label(tr, item.document.effective_at),
+                    effective_at: item.document.effective_at.to_rfc3339(),
+                    future: !item.may_acknowledge,
+                })
+                .collect(),
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    } else {
+        Vec::new()
     };
     render(
         AccountPage {
@@ -617,6 +763,7 @@ pub(crate) async fn account(
             is_verified: user.is_verified,
             roles_label: format_roles(tr, user.roles.clone()),
             notice,
+            terms_notices,
         },
         StatusCode::OK,
     )

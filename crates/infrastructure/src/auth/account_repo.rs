@@ -20,6 +20,27 @@ impl SqlxAccountRepository {
         Self { db }
     }
 
+    /// Administrative bootstrap-only credential replacement. Interactive
+    /// password transitions use the transactional auth outbox instead.
+    pub(crate) async fn set_seed_password(&self, id: UserId, hash: &str) -> Result<(), AuthError> {
+        sqlx::query(
+            "UPDATE authentication_identities SET credential_hash = $2
+             WHERE user_id = $1 AND provider = 'password'",
+        )
+        .bind(id.0)
+        .bind(hash)
+        .execute(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("account.acquire", e))?,
+        )
+        .await
+        .map_err(|e| db_err("account.set_seed_password", e))?;
+        Ok(())
+    }
+
     async fn load_user(&self, row: UserRow) -> Result<User, AuthError> {
         let email = UserEmail::parse(&row.email).map_err(|_| AuthError::Internal)?;
         let account_state =
@@ -290,66 +311,117 @@ impl AccountRepository for SqlxAccountRepository {
         Ok(())
     }
 
-    async fn confirm_email(
-        &self,
-        id: UserId,
-        at: DateTime<Utc>,
-        email: &UserEmail,
-    ) -> Result<(), AuthError> {
+    async fn suspend_by_admin(&self, id: UserId, actor: UserId) -> Result<bool, AuthError> {
         let mut conn = self
             .db
             .acquire()
             .await
-            .map_err(|e| db_err("account.confirm_email", e))?;
+            .map_err(|e| db_err("account.suspend", e))?;
         let mut tx = conn
             .begin()
             .await
-            .map_err(|e| db_err("account.confirm_email", e))?;
-        // email_verified_at + advance to Active + (if different) switch the
-        // canonical email, all in one transaction.
-        sqlx::query(
-            "UPDATE users SET email = $2, email_verified_at = $3, account_state = 'ACTIVE',
-             updated_at = now() WHERE id = $1",
+            .map_err(|e| db_err("account.suspend", e))?;
+        let state = sqlx::query_scalar::<_, String>(
+            "SELECT account_state FROM users WHERE id = $1 FOR UPDATE",
         )
         .bind(id.0)
-        .bind(email.as_str())
-        .bind(at)
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(|e| db_err("account.confirm_email", e))?;
-        // Keep the password identity's subject in sync with the canonical email.
-        sqlx::query(
-            "UPDATE authentication_identities SET provider_subject = $2
-             WHERE user_id = $1 AND provider = 'password'",
+        .map_err(|e| db_err("account.suspend", e))?;
+        if !matches!(
+            state.as_deref(),
+            Some("ACTIVE" | "PENDING_EMAIL_VERIFICATION")
+        ) {
+            return Ok(false);
+        }
+        let updated = sqlx::query(
+            "UPDATE users SET account_state = 'SUSPENDED', suspended_at = now(), updated_at = now()
+             WHERE id = $1 AND account_state IN ('ACTIVE', 'PENDING_EMAIL_VERIFICATION')",
         )
         .bind(id.0)
-        .bind(email.as_str())
         .execute(&mut *tx)
         .await
-        .map_err(|e| db_err("account.confirm_email", e))?;
+        .map_err(|e| db_err("account.suspend", e))?;
+        if updated.rows_affected() != 1 {
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| db_err("account.suspend", e))?;
+        sqlx::query(
+            "UPDATE email_verification_tokens SET used_at = now()
+             WHERE user_id = $1 AND used_at IS NULL",
+        )
+        .bind(id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| db_err("account.suspend", e))?;
+        sqlx::query(
+            "UPDATE password_reset_tokens SET used_at = now()
+             WHERE user_id = $1 AND used_at IS NULL",
+        )
+        .bind(id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| db_err("account.suspend", e))?;
+        sqlx::query(
+            "INSERT INTO audit_events
+                (actor_user_id, action, target_type, target_id, result, metadata)
+             VALUES ($1, 'user.suspended', 'user', $2, 'success', '{}'::jsonb)",
+        )
+        .bind(actor.0)
+        .bind(id.0.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| db_err("account.suspend", e))?;
         tx.commit()
             .await
-            .map_err(|e| db_err("account.confirm_email", e))?;
-        Ok(())
+            .map_err(|e| db_err("account.suspend", e))?;
+        Ok(true)
     }
 
-    async fn set_password(&self, id: UserId, hash: &str) -> Result<(), AuthError> {
-        sqlx::query(
-            "UPDATE authentication_identities SET credential_hash = $2
-             WHERE user_id = $1 AND provider = 'password'",
+    async fn restore_by_admin(&self, id: UserId, actor: UserId) -> Result<bool, AuthError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("account.restore", e))?;
+        let mut tx = conn
+            .begin()
+            .await
+            .map_err(|e| db_err("account.restore", e))?;
+        let updated = sqlx::query(
+            "UPDATE users
+             SET account_state = CASE WHEN email_verified_at IS NULL
+                     THEN 'PENDING_EMAIL_VERIFICATION' ELSE 'ACTIVE' END,
+                 suspended_at = NULL, updated_at = now()
+             WHERE id = $1 AND account_state = 'SUSPENDED'",
         )
         .bind(id.0)
-        .bind(hash)
-        .execute(
-            &mut *self
-                .db
-                .acquire()
-                .await
-                .map_err(|e| db_err("account.acquire", e))?,
-        )
+        .execute(&mut *tx)
         .await
-        .map_err(|e| db_err("account.set_password", e))?;
-        Ok(())
+        .map_err(|e| db_err("account.restore", e))?;
+        if updated.rows_affected() != 1 {
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO audit_events
+                (actor_user_id, action, target_type, target_id, result, metadata)
+             VALUES ($1, 'user.restored', 'user', $2, 'success', '{}'::jsonb)",
+        )
+        .bind(actor.0)
+        .bind(id.0.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| db_err("account.restore", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| db_err("account.restore", e))?;
+        Ok(true)
     }
 
     async fn set_locale(&self, id: UserId, locale: LocaleCode) -> Result<(), AuthError> {

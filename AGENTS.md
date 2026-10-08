@@ -39,9 +39,9 @@ that data. Bilingual (en + pt-BR). Works on mobile and desktop browsers.
 |---|---|
 | Cargo workspace definition | `Cargo.toml` (workspace members + shared deps + lints) |
 | Pure domain rules & value objects | `crates/domain/src/` (`parking.rs`, `community.rs`, `auth.rs`, `moderation.rs`, `photo.rs`, `privacy.rs`, `hours.rs`, `freshness.rs`, `lib.rs`) |
-| Use cases + ports (traits) | `crates/application/src/` (`search.rs`, `community.rs`, `auth.rs`, `moderation.rs`, `photo.rs`, `privacy.rs`, `jobs.rs`, `ports.rs`, …) |
-| SQLx persistence & providers | `crates/infrastructure/src/` (`db.rs`, `config.rs`, `storage.rs`, `geocoding.rs`, `devdata.rs`, `probe.rs`, plus `auth/`, `community/`, `email/`, `job/`, `moderation/`, `parking/`, `photo/`, `privacy/`, `timezone/`) |
-| HTTP server, routes, handlers, view models | `crates/web/src/` (`main.rs` entry point, `wiring.rs` composition root, `state.rs` `AppState`, `routes/` one module per slice — `mod.rs` route table, `public`, `search`, `details`, `auth`, `community`, `reviews`, `photo`, `moderation`, `admin`, `privacy`, `legal`, `common`, `errors` — `lib.rs` templates/view models, `i18n.rs`, `auth.rs`, `security.rs`, `observability.rs`, `markdown.rs`, `view.rs`) |
+| Use cases + ports (traits) | `crates/application/src/` (`search.rs`, `community.rs`, `auth.rs` including `AuthOutbox`/post-commit mail dispatch, `moderation.rs`, `photo.rs`, `privacy.rs` including versioned policy reads and terms proof, `jobs.rs`, `ports.rs`, …) |
+| SQLx persistence & providers | `crates/infrastructure/src/` (`db.rs`, `config.rs`, `cpu.rs` shared blocking-work admission, `storage.rs`, `geocoding.rs`, `devdata.rs`, `probe.rs`, plus `auth/`, `community/`, `email/`, `job/`, `moderation/`, `parking/`, `photo/`, `privacy/`, `timezone/`) |
+| HTTP server, routes, handlers, view models | `crates/web/src/` (`main.rs` entry point, `wiring.rs` composition root, `state.rs` `AppState` plus the tab-scoped `DetailReads` facade, `routes/` one module per slice — `mod.rs` route table, `public`, `search`, `details`, `auth`, `community`, `reviews`, `photo`, `moderation`, `admin`, `privacy`, `legal`, `common`, `errors` — `lib.rs` templates/view models, `i18n.rs`, `auth.rs`, `security.rs`, `observability.rs`, `markdown.rs`, `view.rs`) |
 | Database schema | `migrations/` (numbered `NNNN_*.sql`, forward-only) |
 | Templates | `templates/` (`layouts/`, `pages/`, `components/`, `partials/`) |
 | Frontend assets | `web/static/` (`css/`, `js/`, `vendor/`, `img/`) |
@@ -66,9 +66,10 @@ cargo run -p bikesnest-web -- seed-admin  # create admin (ADMIN_EMAIL/ADMIN_PASS
 cargo run -p bikesnest-web -- seed-policies  # version legal pages (POLICY_* env)
 cargo run -p bikesnest-web -- retention   # run the retention purge job
 
-cargo test                               # domain + application (no DB)
+cargo test -p bikesnest-domain -p bikesnest-application  # no DB
 docker compose up -d db                  # needed before DB-backed tests
-cargo test --workspace                   # everything incl. #[db_test]
+TEST_DATABASE_URL=postgres://bikesnest:bikesnest@localhost:5432/bikesnest_test \
+  cargo test --workspace                 # everything incl. #[db_test]
 
 npm run build:assets                     # vendor htmx/alpine/maplibre into web/static/vendor
 npm run build:css                        # Tailwind → web/static/css/app.css
@@ -77,15 +78,17 @@ npm run build:css                        # Tailwind → web/static/css/app.css
 ## Conventions & gotchas
 
 - **Lint:** `unsafe_code = "forbid"` (workspace lint). Keep it clean.
-- **`#[db_test]`** runs against real Postgres; requires `docker compose up -d db`.
+- **`#[db_test]`** runs against real Postgres; it requires an explicit
+  `TEST_DATABASE_URL` for a disposable database named `bikesnest_test` or
+  `bikesnest_test_<suffix>`. The harness ignores `DATABASE_URL` and rejects
+  other targets before connecting or applying migrations. See `TESTING.md`.
   Transaction-per-test with automatic rollback. See `TESTING.md`.
 - **Repository tests:** prefer `let db = tx.db().await` before fixture queries.
   Seed through `db.acquire()`, release the lease, and inject `db.clone()` into
   repositories. Repository transactions use savepoints; the harness awaits
-  outer rollback even after a panic. Adapters must use `Db::acquire()`, not
-  `Db::pool()`. Account/review/export adapters are migrated; others still need
-  migration. True multi-connection race tests need separate database isolation,
-  not this single-connection scope. See `TESTING.md` for legacy pooled tests.
+  outer rollback even after a panic. Every ordinary adapter uses
+  `Db::acquire()`, not `Db::pool()`. True multi-connection race tests need a
+  separate disposable database, not this single-connection scope.
 - **Subcommands** dispatch in `crates/web/src/main.rs`; default is `serve`.
   Add a new `Some("…")` arm there for a new CLI command.
 - **Providers are wired in one place:** `crates/web/src/wiring.rs`
@@ -95,13 +98,19 @@ npm run build:css                        # Tailwind → web/static/css/app.css
   a test in `crates/web/tests/http_test.rs` fails if one of them names a
   repository, a pool or a concrete adapter, and another fails if any file in
   `crates/web/src` passes 1200 lines.
-- **Background jobs** are a Postgres-backed queue (`background_job` table)
-  with an in-process worker; handlers live in `crates/infrastructure/src/job/`
-  and implement `bikesnest_application::JobHandler`. Set `JOBS_ENABLED=false` for
-  web-only instances. A test that claims jobs directly (rather than simulating
+- **Background jobs** are a Postgres-backed queue (`background_job` table).
+  Handlers live in `crates/infrastructure/src/job/` and implement
+  `bikesnest_application::JobHandler`. `JOBS_DURABLE_ENQUEUE` controls durable
+  mail handoff independently from `JOBS_RUN_WORKER`; `bikesnest-web worker`
+  runs without binding HTTP. A test that claims jobs directly (rather than simulating
   a claim with a plain `UPDATE`) must use `SqlxJobRepository::claim_kinds` with
   a kind unique to that test, not the unscoped `claim` — see "Job-queue test
   isolation" in `TESTING.md`.
+- **Auth mail is one outbox transaction:** registration, verification resend,
+  reset request, email-change request, and committed password/email-change
+  security notices use `AuthOutbox`; do not split their
+  account/token/audit/job writes or call a provider inside that transaction.
+  Worker-disabled compatibility exact-claims only the admitted job afterward.
 - **New fragment endpoints** need the `is_fragment_request` tests (a request
   without the htmx fragment headers gets a 303 to the whole page, not a bare
   partial — see the `p3_fragment_endpoints_*`/`moderation_fragment_endpoints_*`

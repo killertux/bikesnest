@@ -24,17 +24,18 @@ pub use audit::{
     AuditError, AuditEvent, AuditFilter, AuditLog, AuditLogReader, AuditPage, AuditStoredEvent,
 };
 pub use auth::{
-    AccountRepository, AuthError, AuthService, AuthenticatedUser, Clock, IdentityRecord,
+    AccountRepository, AdmittedAuthMail, AuthError, AuthMailDispatcher, AuthOutbox, AuthService,
+    AuthenticatedUser, Clock, EmailConfirmationOutcome, EmailVerificationOutcome, IdentityRecord,
     LoginOutcome, NewAccount, OAuthProvider, PasswordHasher, ResolvedSession, Session,
-    SessionStore, TokenGenerator, TokenStore, UserActivity, UserSearch,
+    SessionStore, TermsAcceptance, TokenGenerator, TokenStore, UserActivity, UserSearch,
 };
 pub use community::{
     AddParkingLocationOutcome, AttributeSummary, CommunityParkingDetails, ContributionDeps,
     ContributionError, ContributionHistoryReader, ContributionItem, ContributionService,
     DuplicateCandidate, FavoriteItem, FavoriteRepository, ListingProposal, NewParkingLocation,
-    NewProposal, NewVerification, ParkingContributionRepository, ParkingEdit, ProposalVote,
-    ProposalVoteTotals, Reason, Review, ReviewRepository, VerificationRepository,
-    recommendation_reasons,
+    NewProposal, NewVerification, ParkingContributionRepository, ParkingEdit, PendingFieldCue,
+    PendingProposalSummary, ProposalVote, ProposalVoteTotals, Reason, Review, ReviewRepository,
+    VerificationRepository, recommendation_reasons,
 };
 pub use email::{EmailError, EmailKind, EmailMessage, EmailProvider, EmailQueue};
 pub use jobs::{JOB_EMAIL_SEND, JOB_JOBS_GC, JOB_RETENTION, JobError, JobHandler, JobPayload};
@@ -58,10 +59,11 @@ pub use privacy::{
     AnonymizationReport, AnonymizationRepository, Export, ExportAccount, ExportDownload,
     ExportFavorite, ExportPayload, ExportPhoto, ExportProposal, ExportProposalVote, ExportProvider,
     ExportReport, ExportRepository, ExportRequested, ExportReview, ExportReviewRevision,
-    ExportSession, ExportVerification, NewExport, NewPrivacyRequest, POLICY_FALLBACK_LOCALE,
-    PolicyDocument, PolicyReader, PrivacyDeps, PrivacyError, PrivacyRequest,
-    PrivacyRequestRepository, PrivacyService, RetentionConfig, RetentionJob, RetentionRepository,
-    RetentionStep, RetentionSummary,
+    ExportSession, ExportTermsAcknowledgement, ExportTermsPresentation, ExportVerification,
+    NewExport, NewPrivacyRequest, POLICY_FALLBACK_LOCALE, PendingTermsNotice, PolicyDocument,
+    PolicyReader, PrivacyDeps, PrivacyError, PrivacyRequest, PrivacyRequestRepository,
+    PrivacyService, RetentionConfig, RetentionJob, RetentionRepository, RetentionStep,
+    RetentionSummary, TermsAcknowledgementStore, TermsProof,
 };
 pub use rate_limit::{RateLimitError, RateLimiter};
 pub use search::{

@@ -1,27 +1,26 @@
 # Legal review record — privacy, terms, cookies
 
-> Hand this file plus `policies/*.md` to counsel. It records **what product
-> decided on 2026-09-03**, **why**, and **what still needs a lawyer**. The
-> policy drafts were written by the engineering side to cover the information
-> duties of LGPD art. 9 and GDPR arts. 13/14; they are not legal advice and
-> have not been reviewed by counsel.
+> Hand this file plus `policies/*.md` to counsel. It records product proposals,
+> implementation evidence and questions that still need legal review. The
+> policy drafts were written by engineering; they are not legal advice and
+> have not been approved for publication.
 
-## 1. Decisions taken (product)
+## 1. Product state and review status
 
-| Topic | Decision | Where it shows |
+| Topic | Current record | Where it shows |
 |---|---|---|
 | Controller | A Brazilian company (name, CNPJ, address supplied via `POLICY_OPERATOR_*` at seed time) | policy §1, terms intro/§13 |
-| Contact / encarregado | One monitored e-mail (`POLICY_CONTACT_EMAIL`) serves as the LGPD art. 41 channel and the GDPR contact. No separately named DPO | policy §1, §9, §13 |
-| Jurisdictions | LGPD primary; GDPR language included for EEA/UK visitors | policy intro, §6, §9; terms §12 |
-| Hosting / processors | **All outside Brazil (EU and/or US)** | policy §6; `docs/provider-transfer-inventory.md` |
-| Transfer mechanism | ANPD standard contractual clauses via provider DPAs; fallback LGPD art. 33 IX. GDPR: adequacy / DPF / EU SCC | policy §6 |
-| Minimum age | **18+** — avoids LGPD art. 14 and GDPR art. 8 entirely | policy §10, terms §2, sign-up form |
-| Legal bases | contract for account + contributions; legitimate interest for security/moderation/audit; legal obligation for Marco Civil access logs and the rights-request record. **No consent-based processing** | policy §3; `docs/data-processing-inventory.md` |
-| Retention | inactive accounts: **not** auto-anonymized; deleted shells purged 30 days; audit + privacy requests 5 years; access logs 6 months; the rest = §75 technical defaults | policy §7; `docs/retention-policy.md` |
-| Erasure of contributions | account deletion **anonymizes** reviews and other contributions in place: the text stays as published, only the attribution goes. Text a user wants removed goes through the **rectification** request kind, not deletion | policy §7; `docs/retention-policy.md` ("Review bodies on account deletion") |
-| Cookies | 3 first-party essential/functional cookies, no banner, no consent | cookies policy |
-| UGC responsibility | user warrants authorship, no faces/plates/private interiors, no obscene/illegal content; indemnity; perpetual licence; anonymous display | terms §3 |
-| Moderation | photos held until approved; human moderators **plus automated tools (LLM classifiers) disclosed now** even though the automated part ships later; flagged content always goes to a human; review on request | policy §5, terms §4 |
+| Contact / encarregado | Policy templates expose `POLICY_CONTACT_EMAIL`; owner must evidence that the inbox is monitored and counsel must confirm whether a named encarregado/DPO is required | policy §1, §9, §13 |
+| Jurisdictions | LGPD is the primary draft; GDPR/UK GDPR applicability is unresolved and must be assessed from actual territorial scope, not visitor location alone | policy intro, §6, §9; terms §12 |
+| Hosting / providers | Provider, region, contractual role and transfer path must be recorded from the deployed accounts | policy §4/§6; `docs/provider-transfer-inventory.md` |
+| Transfer mechanism | No DPA or transfer mechanism is treated as accepted without owner evidence; counsel must select the applicable mechanism per deployed transfer | policy §6 |
+| Minimum age | Accounts are restricted to **18+**, but that rule does not by itself avoid duties for services likely to be accessed by children or adolescents | policy §10, terms §2, sign-up form |
+| Legal bases | Engineering's proposed mapping is in `docs/data-processing-inventory.md`; counsel must confirm applicability, including whether each legal-obligation claim is supportable | policy §3 |
+| Retention | inactive accounts are not auto-deidentified; deleted shells are configured for purge after 30 days; several other periods and external schedules still require owner/legal evidence | policy §7; `docs/retention-policy.md` |
+| Erasure of contributions | account deletion removes the account link and public attribution; retained free text/photos are not necessarily anonymous. A request about identifying content itself is a separate rights/content-removal assessment | policy §7/§9; `docs/retention-policy.md` |
+| Cookies / local storage / telemetry | App cookies and `bn.search.mapOpen` are documented; observed Cloudflare telemetry must be revalidated against the deployed edge before counsel decides notice/consent requirements | cookies policy; processing/provider inventories |
+| UGC responsibility | user warrants authorship, no faces/plates/private interiors, no obscene/illegal content; indemnity and licence need counsel review; attribution follows the account setting | terms §3 |
+| Moderation | new listings/reviews may publish immediately; existing-fact proposals need six eligible approvals or a moderator; photos need moderator approval. No unimplemented automated classifier is represented as current | policy §5, terms §4 |
 | Takedown channel | report button + contact e-mail; notice must carry URL + reason + contact | terms §4 |
 | Liability | "as is"; explicit no-guarantee of bike safety/theft; limits "to the extent permitted by law" (CDC preserved) | terms §7–§8 |
 | Governing law / forum | Brazil; company's seat, with the consumer's domicile preserved (CDC art. 101 I) and mandatory foreign consumer protections acknowledged | terms §12 |
@@ -30,13 +29,15 @@
 
 - **Purpose:** keep a public UGC map safe — sessions, rate limits, audit trail,
   moderation of photos/texts, handling reports.
-- **Necessity:** no less intrusive way to prevent abuse of a public upload
-  surface; IP/user-agent are used only transiently for limits (not stored by
-  the app); audit rows record *who did what* for accountability.
-- **Impact:** low — no profiling, no marketing, nothing sold; uploader identity
-  is never public; users can object/restrict via the privacy hub.
-- **Safeguards:** §77 minimization to providers, EXIF stripping, access
-  control, retention limits, anonymization on deletion.
+- **Necessity (proposed):** rate limiting and audit support a public upload
+  surface. The app does not persist raw IP/user-agent in its database, but
+  proxy/provider logs and rate-limiter keys must be considered separately.
+- **Impact:** no marketing or profiling is implemented. A display name can be
+  public under the account's attribution setting (enabled by default for new
+  accounts); e-mail and voting identity are not public. User content can itself
+  identify someone.
+- **Safeguards:** provider minimization, EXIF stripping, access control,
+  bounded retention and attribution removal. Counsel must confirm the balance.
 
 ## 3. Points for counsel to confirm or fix
 
@@ -47,33 +48,49 @@
 2. **Encarregado:** we rely on a contact channel rather than a named DPO. If the
    company is not an *agente de tratamento de pequeno porte* (Res. CD/ANPD
    2/2022), a named encarregado may be required — add the name to policy §1.
-3. **International transfers:** confirm the ANPD-SCC-via-DPA approach and the
-   art. 33 IX fallback; tell us if any chosen provider's DPA is insufficient.
-4. **GDPR applicability / art. 27 representative:** we target Brazil; EEA use is
-   incidental. We have **not** appointed an EU representative (art. 27(2)(a)
-   exemption assumed). Confirm.
-5. **Marco Civil art. 15:** we treat the company as an application provider
-   "com fins econômicos" and keep access logs 6 months at the proxy. Confirm
-   applicability and that proxy logs satisfy the "controlled environment" duty.
+3. **International transfers:** identify every deployed provider, its region,
+   legal role and onward transfers; obtain and review the actual contract/DPA;
+   then select the applicable LGPD/GDPR mechanism. None is currently evidenced.
+4. **GDPR/UK GDPR scope and governance:** determine territorial applicability
+   under the relevant primary law. If applicable, assess representative, DPO,
+   supervisory-authority and transfer duties; no exemption is assumed.
+5. **Marco Civil art. 15:** assess whether the company is an application
+   provider "com fins econômicos" and whether a proposed six-month proxy-log
+   schedule would satisfy the "controlled environment" duty. The actual proxy
+   fields and retention enforcement require owner evidence.
 6. **Marco Civil art. 19 after the STF decision (June 2025):** confirm the
    notice-and-takedown duties that apply to a small UGC platform and whether the
    terms §4 channel and our moderation SLA are adequate.
-7. **Automated moderation disclosure:** confirm the art. 20 LGPD / art. 22 GDPR
-   framing (human in the loop, review on request) is enough once the LLM
-   classifier ships; we will add the model provider to the transfer inventory.
-8. **Retention numbers:** 5 years for audit + rights-request records, 30-day
-   shell purge, indefinite anonymized contributions — confirm.
-9. **Age 18+:** confirm no additional verification duty beyond the declaration.
+7. **Future automated moderation:** if a classifier is proposed, assess its
+   necessity, provider transfer, decision effects and notice before it ships;
+   it is not part of the current factual policy.
+8. **Retention numbers:** confirm the proposed 5 years for audit/rights-request
+   records, 30-day shell purge, retained unattributed contributions, backup
+   lifecycle and outage caveats. Retained text/photos may remain personal data.
+9. **Children and adolescents:** the official text of Law 15.211/2025 covers
+   services directed to or likely accessed by children/adolescents, so an 18+
+   declaration is not a complete exemption. Assess probable access, the law's
+   duties and Decree 12.880/2026/current ANPD guidance. Do not introduce routine
+   identity-document collection without a necessity/proportionality assessment.
+10. **Legal bases:** confirm each proposed LGPD/GDPR basis in the processing
+    inventory, including access logs and rights-request records. A Brazilian
+    legal duty is not automatically a GDPR Article 6(1)(c) duty.
 
-## 4. Operational to-dos before launch (not legal, but promised by the text)
+Primary sources reviewed on 2026-09-14: [Law 15.211/2025](https://www.planalto.gov.br/ccivil_03/_ato2023-2026/2025/lei/l15211.htm), [Decree 12.880/2026](https://www.planalto.gov.br/ccivil_03/_ato2023-2026/2026/decreto/d12880.htm), the [ANPD ECA Digital overview and preliminary age-assurance guidance](https://www.gov.br/anpd/pt-br/assuntos/eca-digital/eca-digital-english), and the [official GDPR text](https://eur-lex.europa.eu/eli/reg/2016/679/oj).
 
-- Set `POLICY_OPERATOR_NAME/CNPJ/ADDRESS`, `POLICY_CONTACT_EMAIL`,
-  `POLICY_VERSION`, `POLICY_EFFECTIVE_AT`; run `seed-policies`.
-- Monitor the contact inbox: rights requests (15 days LGPD / 1 month GDPR) and
-  takedown notices.
-- Accept DPAs + record regions per `docs/provider-transfer-inventory.md`.
-- Proxy access-log retention = 6 months; diagnostic logs ≈ 30 days.
+## 4. Publication evidence gate
+
+- Obtain counsel approval and owner evidence before setting
+  `POLICY_OPERATOR_NAME/CNPJ/ADDRESS`, `POLICY_CONTACT_EMAIL`,
+  `POLICY_VERSION` and `POLICY_EFFECTIVE_AT` or running `seed-policies`.
+- Evidence inbox ownership, monitoring/coverage and the applicable response
+  deadlines before publishing the contact promise.
+- Record deployed providers/regions/roles and obtain contractual evidence per
+  `docs/provider-transfer-inventory.md`; route it to counsel before making
+  processor or transfer-mechanism claims.
+- Evidence proxy access-log and diagnostic-log fields, access and retention;
+  the app configuration does not enforce those external schedules.
 - `DELETED_ACCOUNT_PURGE_AFTER_DAYS=30`; keep `INACTIVE_ACCOUNT_ANONYMIZE_AFTER_DAYS=0`.
 - Hide/disable the fake Google login in production.
-- When policy text changes: bump `POLICY_VERSION`, reseed, and notify users
-  before `POLICY_EFFECTIVE_AT` (the policies promise it).
+- After approval, use the controlled version/seed/notification workflow; source
+  edits alone do not alter the policy already served from the database.

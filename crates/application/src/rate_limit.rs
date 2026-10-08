@@ -1,8 +1,7 @@
-//! Rate-limiter port (§45). Introduced in M2 for the authentication endpoints
-//! (login, register, password reset, verification resend) so authentication
-//! never ships without brute-force / account-enumeration protection. The
-//! contribution-endpoint limits (M3) reuse the same port. **Ledger #6:** the
-//! M2 implementation is in-memory; a Redis/shared store replaces it in M7.
+//! Rate-limiter port for authentication and contribution endpoints. Login,
+//! registration, password reset and verification resend
+//! so authentication never ships without brute-force/account-enumeration
+//! protection. Credential-sensitive checks have an explicit failure policy.
 
 use async_trait::async_trait;
 use std::time::Duration;
@@ -22,4 +21,16 @@ pub enum RateLimitError {
 #[async_trait]
 pub trait RateLimiter: Send + Sync {
     async fn check(&self, key: &str, limit: u32, window: Duration) -> Result<bool, RateLimitError>;
+
+    /// Credential-sensitive admission. Implementations with a configurable
+    /// degradation policy override this to fail closed; simple test/in-memory
+    /// limiters share the normal counter behavior.
+    async fn check_sensitive(
+        &self,
+        key: &str,
+        limit: u32,
+        window: Duration,
+    ) -> Result<bool, RateLimitError> {
+        self.check(key, limit, window).await
+    }
 }

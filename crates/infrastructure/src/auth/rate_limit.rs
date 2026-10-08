@@ -1,8 +1,8 @@
-//! Rate-limit stores (****). Both implementations implement the
+//! Rate-limit stores. Both implementations implement the
 //! [`RateLimiter`] port.
 //!
 //! - [`InMemoryRateLimiter`] — per-process sliding-window counter; fine for
-//!   single-instance dev (M2).
+//!   single-instance development.
 //! - [`ValKeyRateLimiter`] — sliding-window counter stored in a ValKey/Redis
 //!   sorted set via an atomic Lua script. Limits aggregate across instances and
 //!   survive restarts. Supports a single node (`VALKEY_URL`) or a cluster
@@ -12,12 +12,10 @@
 //!   error rather than a silent downgrade to the per-process limiter.
 //!
 //! ## Failure mode
-//! The application maps *any* [`RateLimitError`] to "RateLimited" (fail closed).
-//! A ValKey outage would therefore 429 every rate-limited endpoint, taking the
-//! site down. [`ValKeyRateLimiter`] therefore **fails open by default**: on a
-//! connectivity/CAS error it logs a `warn!` and returns `Ok(true)` (allow), so a
-//! ValKey outage degrades protection without an outage. Set `RATE_LIMIT_FAIL_OPEN=false`
-//! to fail closed instead (stricter, but a ValKey outage 429s auth/photo/moderation).
+//! Each ValKey check has a total deadline covering connection, mutex wait and
+//! command execution. General endpoints follow `RATE_LIMIT_FAIL_OPEN`, while
+//! credential-sensitive auth buckets always fail closed. Degradation logs only
+//! allowlisted reason/policy fields, never the bucket key, URL or provider text.
 
 use crate::config::{ConfigError, RateLimiterBackend, RateLimiterConfig};
 
@@ -203,6 +201,7 @@ pub struct ValKeyRateLimiter {
 }
 
 impl ValKeyRateLimiter {
+    const CHECK_TIMEOUT: Duration = Duration::from_millis(500);
     /// A single-node limiter (`VALKEY_URL`, e.g. `valkey://localhost:6379`).
     pub fn single(url: impl Into<String>, fail_open: bool) -> Result<Self, RateLimitError> {
         let url = url.into();
@@ -267,39 +266,63 @@ impl ValKeyRateLimiter {
             }
         }
     }
+
+    async fn check_once(
+        &self,
+        key: &str,
+        limit: u32,
+        window: Duration,
+    ) -> Result<bool, RateLimitError> {
+        let mut conn = self.conn().await?;
+        let now_ms = now_millis();
+        let member = format!("{now_ms}:{:016x}", rand::random::<u64>());
+        let count = match &mut conn {
+            ValKeyConn::Single(c) => run_eval(c, key, limit, window, now_ms, &member).await,
+            ValKeyConn::Cluster(c) => run_eval(c, key, limit, window, now_ms, &member).await,
+        }
+        .map_err(|_| RateLimitError::Unavailable)?;
+        Ok(count == 1)
+    }
 }
 
 #[async_trait]
 impl RateLimiter for ValKeyRateLimiter {
     async fn check(&self, key: &str, limit: u32, window: Duration) -> Result<bool, RateLimitError> {
-        let mut conn = match self.conn().await {
-            Ok(conn) => conn,
-            Err(e) => {
-                tracing::warn!(error = %e, %key, "rate limiter unavailable; failing open");
-                return Ok(true);
-            }
-        };
+        self.check_with_policy(key, limit, window, self.fail_open)
+            .await
+    }
 
-        let now_ms = now_millis();
-        // Unique ZSET member per event (two events in the same millisecond must
-        // not collapse to one member, and members must not collide across app
-        // instances — hence a random suffix).
-        let member = format!("{now_ms}:{:016x}", rand::random::<u64>());
+    async fn check_sensitive(
+        &self,
+        key: &str,
+        limit: u32,
+        window: Duration,
+    ) -> Result<bool, RateLimitError> {
+        self.check_with_policy(key, limit, window, false).await
+    }
+}
 
-        let result = match &mut conn {
-            ValKeyConn::Single(c) => run_eval(c, key, limit, window, now_ms, &member).await,
-            ValKeyConn::Cluster(c) => run_eval(c, key, limit, window, now_ms, &member).await,
-        };
-
-        match result {
-            Ok(1) => Ok(true),
-            Ok(_) => Ok(false),
-            Err(e) => {
-                if self.fail_open {
-                    tracing::warn!(error = %e, %key, "rate limit check failed; failing open");
+impl ValKeyRateLimiter {
+    async fn check_with_policy(
+        &self,
+        key: &str,
+        limit: u32,
+        window: Duration,
+        fail_open: bool,
+    ) -> Result<bool, RateLimitError> {
+        match tokio::time::timeout(Self::CHECK_TIMEOUT, self.check_once(key, limit, window)).await {
+            Ok(Ok(allowed)) => Ok(allowed),
+            result => {
+                let reason = if result.is_err() {
+                    "timeout"
+                } else {
+                    "unavailable"
+                };
+                tracing::warn!(reason, fail_open, "rate limiter check degraded");
+                if fail_open {
                     Ok(true)
                 } else {
-                    Err(RateLimitError::Unexpected(e.to_string()))
+                    Err(RateLimitError::Unavailable)
                 }
             }
         }
@@ -378,6 +401,15 @@ impl RateLimiter for SharedRateLimiter {
     async fn check(&self, key: &str, limit: u32, window: Duration) -> Result<bool, RateLimitError> {
         self.0.check(key, limit, window).await
     }
+
+    async fn check_sensitive(
+        &self,
+        key: &str,
+        limit: u32,
+        window: Duration,
+    ) -> Result<bool, RateLimitError> {
+        self.0.check_sensitive(key, limit, window).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +419,158 @@ impl RateLimiter for SharedRateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::sync::Mutex as StdMutex;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    struct AbortOnDrop(tokio::task::JoinHandle<()>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<StdMutex<Vec<u8>>>);
+
+    struct CapturedWriter(CapturedLog);
+
+    impl Write for CapturedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn read_resp_command(socket: &mut BufReader<tokio::net::TcpStream>) -> Option<String> {
+        let mut line = String::new();
+        socket.read_line(&mut line).await.ok()?;
+        let fields: usize = line.strip_prefix('*')?.trim().parse().ok()?;
+        let mut command = None;
+        for index in 0..fields {
+            line.clear();
+            socket.read_line(&mut line).await.ok()?;
+            let length: usize = line.strip_prefix('$')?.trim().parse().ok()?;
+            let mut value = vec![0_u8; length + 2];
+            tokio::io::AsyncReadExt::read_exact(socket, &mut value)
+                .await
+                .ok()?;
+            if index == 0 {
+                command = Some(String::from_utf8_lossy(&value[..length]).to_uppercase());
+            }
+        }
+        command
+    }
+
+    #[tokio::test]
+    async fn unavailable_valkey_is_bounded_closed_for_credentials_and_open_for_general_work() {
+        let limiter =
+            ValKeyRateLimiter::single("redis://marker-user:marker-secret@127.0.0.1:1", true)
+                .unwrap();
+        let started = Instant::now();
+        assert!(matches!(
+            limiter
+                .check_sensitive("login:ip:hostile@example.test", 5, Duration::from_secs(60))
+                .await,
+            Err(RateLimitError::Unavailable)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            limiter
+                .check("photo:ip:hostile@example.test", 5, Duration::from_secs(60))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn silent_connected_valkey_is_cut_off_by_total_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = AbortOnDrop(tokio::spawn(async move {
+            let mut sockets = tokio::task::JoinSet::new();
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                sockets.spawn(async move {
+                    let _socket = socket;
+                    std::future::pending::<()>().await;
+                });
+            }
+        }));
+        let limiter = ValKeyRateLimiter::single(format!("redis://{address}"), true).unwrap();
+        let started = Instant::now();
+        assert!(matches!(
+            limiter
+                .check_sensitive("opaque", 5, Duration::from_secs(60))
+                .await,
+            Err(RateLimitError::Unavailable)
+        ));
+        assert!(started.elapsed() >= ValKeyRateLimiter::CHECK_TIMEOUT);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(server);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn connected_valkey_command_error_uses_explicit_failure_policy() {
+        let captured = CapturedLog::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || CapturedWriter(writer.clone()))
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let _server = AbortOnDrop(tokio::spawn(async move {
+            let mut sockets = tokio::task::JoinSet::new();
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                sockets.spawn(async move {
+                    let mut socket = BufReader::new(socket);
+                    while let Some(command) = read_resp_command(&mut socket).await {
+                        let response: &[u8] = if command == "EVAL" {
+                            b"-ERR hostile-url-token-marker\r\n"
+                        } else {
+                            b"+OK\r\n"
+                        };
+                        let _ = socket.get_mut().write_all(response).await;
+                    }
+                });
+            }
+        }));
+        let limiter = ValKeyRateLimiter::single(format!("redis://{address}"), true).unwrap();
+        assert!(matches!(
+            limiter
+                .check_sensitive("hostile-email-marker", 5, Duration::from_secs(60))
+                .await,
+            Err(RateLimitError::Unavailable)
+        ));
+        assert!(
+            limiter
+                .check("general", 5, Duration::from_secs(60))
+                .await
+                .unwrap()
+        );
+        let output = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("reason=\"unavailable\""),
+            "captured log: {output:?}"
+        );
+        assert!(output.contains("fail_open=false"));
+        assert!(output.contains("fail_open=true"));
+        assert!(!output.contains("hostile-email-marker"));
+        assert!(!output.contains("hostile-url-token-marker"));
+        assert!(!output.contains(&address.to_string()));
+    }
 
     #[tokio::test]
     async fn the_window_still_limits_and_then_reopens() {

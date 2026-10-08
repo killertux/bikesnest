@@ -51,12 +51,17 @@ impl AnonymizationRepository for SqlxAnonymizationRepository {
         // True only when the deleting user IS an ADMIN *and* no other ADMIN exists.
         // A non-admin must never be blocked by the last-admin guard even if the
         // system happens to have zero admins.
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("anonymize.is_last_admin", e))?;
         let res = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM user_roles WHERE role = 'ADMIN' AND user_id = $1)\
              AND (SELECT count(*) FROM user_roles WHERE role = 'ADMIN' AND user_id <> $1) = 0",
         )
         .bind(user_id.0)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *conn)
         .await
         .map_err(|e| db_err("anonymize.is_last_admin", e))?;
         Ok(res)
@@ -67,12 +72,72 @@ impl AnonymizationRepository for SqlxAnonymizationRepository {
         user_id: UserId,
         now: DateTime<Utc>,
     ) -> Result<AnonymizationReport, PrivacyError> {
-        let mut tx = self
+        self.anonymize_guarded(user_id, now, None)
+            .await?
+            .ok_or(PrivacyError::Internal)
+    }
+}
+
+impl SqlxAnonymizationRepository {
+    /// Retention's variant of [`AnonymizationRepository::anonymize`]: erase
+    /// the account only if it is *still* inactive since `inactive_before` once
+    /// its `users` row is locked. The retention job reads its candidate list
+    /// up front, so an account that signed in after that read must be skipped
+    /// rather than erased. Returns `None` when the account was skipped.
+    pub async fn anonymize_if_inactive(
+        &self,
+        user_id: UserId,
+        inactive_before: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<Option<AnonymizationReport>, PrivacyError> {
+        self.anonymize_guarded(user_id, now, Some(inactive_before))
+            .await
+    }
+
+    async fn anonymize_guarded(
+        &self,
+        user_id: UserId,
+        now: DateTime<Utc>,
+        inactive_before: Option<DateTime<Utc>>,
+    ) -> Result<Option<AnonymizationReport>, PrivacyError> {
+        let mut conn = self
             .db
-            .pool()
+            .acquire()
+            .await
+            .map_err(|e| db_err("anonymize.anonymize", e))?;
+        let mut tx = conn
             .begin()
             .await
             .map_err(|e| db_err("anonymize.anonymize", e))?;
+
+        // Re-check inactivity under the row lock. A login or session refresh
+        // advances `last_active_at` through a trigger that has to update this
+        // same row, so once the lock is held the answer cannot change under
+        // us. A live session seen after `inactive_before` also counts, in case
+        // its trigger write was skipped while the row was busy.
+        if let Some(cutoff) = inactive_before {
+            let still_inactive = sqlx::query_scalar::<_, i64>(
+                r#"
+                SELECT u.id FROM users u
+                WHERE u.id = $1
+                  AND u.account_state <> 'DELETED'
+                  AND u.last_active_at < $2
+                  AND NOT EXISTS (
+                        SELECT 1 FROM sessions s
+                        WHERE s.user_id = u.id AND s.last_seen_at >= $2
+                  )
+                FOR UPDATE OF u
+                "#,
+            )
+            .bind(user_id.0)
+            .bind(cutoff)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| db_err("anonymize.recheck_inactive", e))?;
+            if still_inactive.is_none() {
+                return Ok(None);
+            }
+        }
 
         // The last-admin guard runs here, holding a row lock, rather than as a
         // separate query before the transaction: otherwise two simultaneous
@@ -168,6 +233,23 @@ impl AnonymizationRepository for SqlxAnonymizationRepository {
             .await
             .map_err(|e| db_err("anonymize.anonymize", e))?
             .rows_affected();
+        // The users-row update above is the serialization point shared with
+        // delivery. Redact every durable copy, including terminal history;
+        // cancel pending/running work and release any lease. A worker holding
+        // a preclaimed payload must still pass the account/token checks after
+        // this transaction commits and therefore cannot send it.
+        sqlx::query(
+            r#"UPDATE background_job
+               SET payload='{}'::jsonb,
+                   state=CASE WHEN state IN ('pending','running') THEN 'failed' ELSE state END,
+                   last_error=CASE WHEN state IN ('pending','running','failed') THEN 'account deleted; mail cancelled' ELSE NULL END,
+                   finished_at=CASE WHEN state IN ('pending','running') THEN COALESCE(finished_at,$2) ELSE finished_at END,
+                   claimed_by=NULL, lease_expires_at=NULL, heartbeat_at=NULL,
+                   mail_recipient_hash=NULL, mail_transition_audit_id=NULL,
+                   payload_redacted_at=COALESCE(payload_redacted_at,$2), updated_at=now()
+               WHERE kind='email.send' AND mail_account_id=$1"#,
+        ).bind(user_id.0).bind(now).execute(&mut *tx).await
+            .map_err(|e| db_err("anonymize.anonymize", e))?;
         // Parked-here is personal activity → deleted.
         let parked_here =
             sqlx::query("DELETE FROM verification WHERE user_id = $1 AND kind = 'parked_here'")
@@ -188,6 +270,20 @@ impl AnonymizationRepository for SqlxAnonymizationRepository {
             .await
             .map_err(|e| db_err("anonymize.anonymize", e))?
             .rows_affected();
+        let terms_notice_presentations =
+            sqlx::query("DELETE FROM terms_notice_presentation WHERE user_id = $1")
+                .bind(user_id.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| db_err("anonymize.anonymize", e))?
+                .rows_affected();
+        let terms_acknowledgements =
+            sqlx::query("DELETE FROM terms_acknowledgement WHERE user_id = $1")
+                .bind(user_id.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| db_err("anonymize.anonymize", e))?
+                .rows_affected();
 
         // 2) Community content is retained but unattributed.
         let reviews_anonymized = sqlx::query(
@@ -305,7 +401,7 @@ impl AnonymizationRepository for SqlxAnonymizationRepository {
             .await
             .map_err(|e| db_err("anonymize.anonymize", e))?;
 
-        Ok(AnonymizationReport {
+        Ok(Some(AnonymizationReport {
             identities,
             roles,
             roles_granted_by_anonymized,
@@ -316,6 +412,8 @@ impl AnonymizationRepository for SqlxAnonymizationRepository {
             parked_here,
             exports,
             consent_records,
+            terms_notice_presentations,
+            terms_acknowledgements,
             reviews_anonymized,
             verifications_anonymized,
             proposals_anonymized,
@@ -327,7 +425,7 @@ impl AnonymizationRepository for SqlxAnonymizationRepository {
             audit_events_anonymized,
             audit_targets_anonymized,
             privacy_requests_anonymized,
-        })
+        }))
     }
 }
 

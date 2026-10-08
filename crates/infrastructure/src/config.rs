@@ -93,6 +93,17 @@ impl<'a> EnvSource<'a> {
             })
     }
 
+    fn explicit_bool_or_false(&self, key: &'static str) -> Result<bool, ConfigError> {
+        let Some(raw) = self.raw(key) else {
+            return Ok(false);
+        };
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => Err(ConfigError::invalid(key, "must be an explicit boolean")),
+        }
+    }
+
     fn require(&self, key: &'static str) -> Result<String, ConfigError> {
         self.string(key).ok_or(ConfigError::MissingEnv(key))
     }
@@ -197,7 +208,7 @@ impl Default for GeocodeLimits {
 }
 
 /// S3-compatible object storage. `endpoint` is `None` for the standard AWS
-/// endpoint; development defaults to the compose MinIO.
+/// endpoint; development defaults to the compose RustFS.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct S3Config {
     /// Endpoint used for server-side S3 operations.
@@ -232,7 +243,8 @@ pub const DEFAULT_MAPBOX_STYLE_URL: &str = "mapbox://styles/mapbox/streets-v12";
 pub enum MapConfig {
     MapLibre {
         style_url: String,
-        /// Public Mapbox token for the style/tiles; empty for OpenFreeMap.
+        /// Always empty after config resolution. Retained for the shared page
+        /// layout contract; Mapbox-backed styles resolve to [`Self::Mapbox`].
         access_token: String,
     },
     Mapbox {
@@ -280,6 +292,10 @@ impl Default for FakeOAuthConfig {
 pub struct PolicySeedConfig {
     pub version: String,
     pub effective_at: DateTime<Utc>,
+    /// Whole acknowledgement feature gate. Must be fleet-consistent.
+    pub acknowledgement_enabled: bool,
+    /// Marks the seeded terms release material; inert while the feature gate is off.
+    pub terms_material_notice: bool,
     /// `{{TOKEN}}` → value, for every placeholder whose variable is set.
     pub placeholders: Vec<(&'static str, String)>,
 }
@@ -350,11 +366,33 @@ pub type PhotoConfig = bikesnest_domain::PhotoLimits;
 /// Moderation limits, env-driven with the domain constants as defaults.
 pub type ModerationConfig = bikesnest_domain::ModerationLimits;
 
+/// Process-wide admission for interactive Argon2 hash and verify work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PasswordHashConfig {
+    pub concurrency: usize,
+    pub queue_capacity: usize,
+    pub admission_timeout: Duration,
+}
+
+impl Default for PasswordHashConfig {
+    fn default() -> Self {
+        Self {
+            concurrency: 2,
+            queue_capacity: 8,
+            admission_timeout: Duration::from_secs(2),
+        }
+    }
+}
+
 /// Background job queue knobs. Defaults target a single-instance dev worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JobConfig {
-    /// Spawn the in-process worker loop at startup (false for web-only instances).
+    /// Run the worker loop in the web process. `JOBS_RUN_WORKER` is preferred;
+    /// `JOBS_ENABLED` remains a compatibility alias.
     pub enabled: bool,
+    /// Leave admitted auth mail durable for a worker instead of exact-claiming
+    /// it inline after commit.
+    pub durable_enqueue: bool,
     /// How often the worker polls the queue when idle.
     pub poll_interval: Duration,
     /// How many jobs a worker claims per batch.
@@ -362,6 +400,10 @@ pub struct JobConfig {
     /// Lease length; a running job heartbeats to hold it, and a crashed worker's
     /// lease expires so another worker can re-claim.
     pub lease_ttl: Duration,
+    /// Maximum wall-clock duration of one handler attempt.
+    pub handler_timeout: Duration,
+    /// Maximum time shutdown waits for active handler/outcome tasks.
+    pub shutdown_grace: Duration,
     /// Retry budget per job (overridable per row at enqueue).
     pub max_attempts: i32,
     /// Exponential backoff base; actual delay = base * 2^(attempt-1) + jitter.
@@ -374,12 +416,38 @@ impl Default for JobConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            durable_enqueue: true,
             poll_interval: Duration::from_secs(5),
             batch_size: 4,
             lease_ttl: Duration::from_secs(600),
+            handler_timeout: Duration::from_secs(300),
+            shutdown_grace: Duration::from_secs(30),
             max_attempts: 5,
             backoff_base_ms: 2000,
             history_retention_days: 7,
+        }
+    }
+}
+
+impl JobConfig {
+    pub fn validate(&self) -> Result<(), Vec<&'static str>> {
+        let mut errors = Vec::new();
+        if self.batch_size == 0 {
+            errors.push("JOBS_BATCH_SIZE must be greater than zero");
+        }
+        if self.lease_ttl < Duration::from_millis(3) {
+            errors.push("JOBS_LEASE_TTL_MS must be at least 3");
+        }
+        if self.handler_timeout.is_zero() {
+            errors.push("JOBS_HANDLER_TIMEOUT_MS must be greater than zero");
+        }
+        if self.shutdown_grace.is_zero() {
+            errors.push("JOBS_SHUTDOWN_GRACE_MS must be greater than zero");
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
         }
     }
 }
@@ -444,6 +512,10 @@ pub struct Config {
     pub retention: RetentionPolicy,
     /// Photo pipeline limits.
     pub photo: PhotoConfig,
+    /// Maximum simultaneous image decode/encode operations in this process.
+    pub photo_processing_concurrency: usize,
+    /// Shared CPU admission for password hash and verify operations.
+    pub password_hash: PasswordHashConfig,
     /// Moderation limits.
     pub moderation: ModerationConfig,
     /// Background job queue.
@@ -463,13 +535,16 @@ const DEV_S3_ENDPOINT: &str = "http://localhost:9000";
 /// what `bikesnest_test_support::TestObjectStorage::presigned_get` signs its
 /// URLs under — a single source of truth so the CSP test's rendered-photo
 /// origin and its configured `media_hosts` can never drift apart. Deliberately
-/// not `http://localhost:9000` (the real dev MinIO origin): a test that hits
+/// not `http://localhost:9000` (the real dev RustFS origin): a test that hits
 /// this exact string is asserting on the *test double's* URL shape, not on
-/// dev/MinIO wiring, and `.invalid` (RFC 2606) can never resolve to a real host.
+/// dev/RustFS wiring, and `.invalid` (RFC 2606) can never resolve to a real host.
 pub const TEST_MEDIA_ORIGIN: &str = "http://media.test.invalid";
 pub const DEFAULT_S3_REGION: &str = "us-east-1";
 pub const DEFAULT_S3_BUCKET: &str = "bikesnest";
-const DEV_S3_KEY: &str = "minioadmin";
+const DEV_S3_KEY: &str = "rustfsadmin";
+/// Well-known default credentials of local S3-compatible servers. None may
+/// reach production.
+const DEFAULT_S3_KEYS: [&str; 2] = [DEV_S3_KEY, "minioadmin"];
 const DEFAULT_EMAIL_FROM: &str = "no-reply@bikesnest.local";
 const DEFAULT_POLICY_VERSION: &str = "2026-09-08.1";
 /// Compile-time location of the static assets, used only when neither
@@ -490,6 +565,16 @@ impl Config {
         let env = EnvSource::new(lookup);
         let app_env = AppEnv::parse(env.string("APP_ENV").as_deref());
         let dev = !app_env.is_production();
+        let acknowledgement_enabled =
+            env.explicit_bool_or_false("POLICY_ACKNOWLEDGEMENT_ENABLED")?;
+        let terms_material_notice = env.explicit_bool_or_false("POLICY_TERMS_MATERIAL_NOTICE")?;
+        let google_oauth_enabled = env.bool("GOOGLE_OAUTH_ENABLED").unwrap_or(false);
+        if acknowledgement_enabled && google_oauth_enabled {
+            return Err(ConfigError::invalid(
+                "POLICY_ACKNOWLEDGEMENT_ENABLED",
+                "cannot be enabled with GOOGLE_OAUTH_ENABLED until OAuth captures exact shown terms",
+            ));
+        }
 
         Ok(Self {
             app_env,
@@ -532,14 +617,16 @@ impl Config {
             freshness: freshness_config(&env),
             retention: retention_config(&env),
             photo: photo_config(&env),
+            photo_processing_concurrency: photo_processing_concurrency(&env)?,
+            password_hash: password_hash_config(&env)?,
             moderation: moderation_config(&env),
             jobs: job_config(&env),
-            policy: policy_config(&env),
+            policy: policy_config(&env, acknowledgement_enabled, terms_material_notice),
             admin_seed: AdminSeedConfig {
                 email: env.string("ADMIN_EMAIL"),
                 password: env.string("ADMIN_PASSWORD"),
             },
-            google_oauth_enabled: env.bool("GOOGLE_OAUTH_ENABLED").unwrap_or(false),
+            google_oauth_enabled,
         })
     }
 
@@ -566,7 +653,7 @@ impl Config {
             ));
         }
 
-        // Object storage: the MinIO development defaults must not survive.
+        // Object storage: the development defaults must not survive.
         match self.storage.endpoint.as_deref() {
             Some(e) if !e.is_empty() => {}
             _ => errs.push("S3_ENDPOINT must be set".to_string()),
@@ -580,10 +667,12 @@ impl Config {
         if self.storage.secret_access_key.is_empty() {
             errs.push("S3_SECRET_ACCESS_KEY must be set".to_string());
         }
-        if self.storage.access_key_id == DEV_S3_KEY || self.storage.secret_access_key == DEV_S3_KEY
+        if DEFAULT_S3_KEYS
+            .iter()
+            .any(|key| self.storage.access_key_id == *key || self.storage.secret_access_key == *key)
         {
             errs.push(
-                "S3 credentials must not be the MinIO development defaults (minioadmin)"
+                "S3 credentials must not be development defaults (rustfsadmin/minioadmin)"
                     .to_string(),
             );
         }
@@ -688,7 +777,7 @@ impl Config {
     }
 
     /// A development configuration for tests: fakes everywhere, no network
-    /// dependencies beyond the database and the compose MinIO.
+    /// dependencies beyond the database and the compose RustFS.
     pub fn for_tests(database_url: impl Into<String>) -> Self {
         Self {
             app_env: AppEnv::Development,
@@ -731,14 +820,19 @@ impl Config {
             },
             retention: RetentionPolicy::default(),
             photo: PhotoConfig::default(),
+            photo_processing_concurrency: 1,
+            password_hash: PasswordHashConfig::default(),
             moderation: ModerationConfig::default(),
             jobs: JobConfig {
                 enabled: false,
+                durable_enqueue: false,
                 ..JobConfig::default()
             },
             policy: PolicySeedConfig {
                 version: DEFAULT_POLICY_VERSION.to_string(),
                 effective_at: Utc::now(),
+                acknowledgement_enabled: false,
+                terms_material_notice: false,
                 placeholders: Vec::new(),
             },
             admin_seed: AdminSeedConfig::default(),
@@ -877,7 +971,7 @@ fn rate_limiter_config(env: &EnvSource<'_>) -> RateLimiterConfig {
     }
 }
 
-/// `S3_*`. Development falls back to the compose MinIO so `cargo run` works;
+/// `S3_*`. Development falls back to the compose RustFS so `cargo run` works;
 /// production gets no defaults at all, so anything missing surfaces in
 /// [`Config::validate_for_production`]. An explicitly empty `S3_ENDPOINT` means
 /// "the standard AWS endpoint".
@@ -942,22 +1036,29 @@ fn resolve_map_config(
     style_url: Option<String>,
     map_token: Option<String>,
     fallback_token: Option<String>,
-) -> MapConfig {
+) -> Result<MapConfig, ConfigError> {
     let style_url = style_url.unwrap_or_else(|| DEFAULT_MAP_STYLE_URL.to_string());
-    let access_token = if is_mapbox_style(&style_url) {
-        map_token.or(fallback_token).unwrap_or_default()
+    if is_mapbox_style(&style_url) {
+        let access_token = map_token
+            .or(fallback_token)
+            .ok_or(ConfigError::MissingEnv("MAPBOX_MAP_ACCESS_TOKEN"))?;
+        Ok(MapConfig::Mapbox {
+            style_url,
+            access_token,
+        })
     } else {
-        // Non-Mapbox style (e.g. OpenFreeMap) needs no token; keep it off the page.
-        String::new()
-    };
-    MapConfig::MapLibre {
-        style_url,
-        access_token,
+        // MapLibre v6 does not consume Mapbox browser tokens or mapbox://
+        // styles. Non-Mapbox styles stay token-free and use MapLibre.
+        Ok(MapConfig::MapLibre {
+            style_url,
+            access_token: String::new(),
+        })
     }
 }
 
-/// Map half of the location-provider profile. Without `LOCATION_PROVIDER`,
-/// preserve the existing `MAP_STYLE_URL`/MapLibre behavior.
+/// Map half of the location-provider profile. Without `LOCATION_PROVIDER`, a
+/// legacy Mapbox style selects Mapbox GL JS and requires its browser token;
+/// every other `MAP_STYLE_URL` selects token-free MapLibre.
 fn map_config(env: &EnvSource<'_>) -> Result<MapConfig, ConfigError> {
     match env
         .string("LOCATION_PROVIDER")
@@ -979,11 +1080,11 @@ fn map_config(env: &EnvSource<'_>) -> Result<MapConfig, ConfigError> {
             "LOCATION_PROVIDER",
             format!("unknown provider {other:?}; expected fake, mapbox or google"),
         )),
-        None => Ok(resolve_map_config(
+        None => resolve_map_config(
             env.string("MAP_STYLE_URL"),
             env.string("MAPBOX_MAP_ACCESS_TOKEN"),
             env.string("MAPBOX_ACCESS_TOKEN"),
-        )),
+        ),
     }
 }
 
@@ -1044,6 +1145,77 @@ fn photo_config(env: &EnvSource<'_>) -> PhotoConfig {
     }
 }
 
+fn photo_processing_concurrency(env: &EnvSource<'_>) -> Result<usize, ConfigError> {
+    let key = "PHOTO_PROCESSING_CONCURRENCY";
+    let value = match env.string(key) {
+        Some(raw) => raw
+            .parse::<usize>()
+            .map_err(|_| ConfigError::invalid(key, "must be a positive integer"))?,
+        None => 1,
+    };
+    if value == 0 {
+        return Err(ConfigError::invalid(key, "must be greater than zero"));
+    }
+    if value > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err(ConfigError::invalid(
+            key,
+            "exceeds the semaphore implementation limit",
+        ));
+    }
+    Ok(value)
+}
+
+fn password_hash_config(env: &EnvSource<'_>) -> Result<PasswordHashConfig, ConfigError> {
+    let defaults = PasswordHashConfig::default();
+    let usize_value = |key: &'static str, fallback| -> Result<usize, ConfigError> {
+        match env.string(key) {
+            Some(value) => value
+                .parse()
+                .map_err(|_| ConfigError::invalid(key, "must be a non-negative integer")),
+            None => Ok(fallback),
+        }
+    };
+    let millis = match env.string("PASSWORD_HASH_ADMISSION_TIMEOUT_MS") {
+        Some(value) => value.parse::<u64>().map_err(|_| {
+            ConfigError::invalid(
+                "PASSWORD_HASH_ADMISSION_TIMEOUT_MS",
+                "must be a non-negative integer",
+            )
+        })?,
+        None => defaults.admission_timeout.as_millis() as u64,
+    };
+    let config = PasswordHashConfig {
+        concurrency: usize_value("PASSWORD_HASH_CONCURRENCY", defaults.concurrency)?,
+        queue_capacity: usize_value("PASSWORD_HASH_QUEUE_CAPACITY", defaults.queue_capacity)?,
+        admission_timeout: Duration::from_millis(millis),
+    };
+    if config.concurrency == 0 {
+        return Err(ConfigError::invalid(
+            "PASSWORD_HASH_CONCURRENCY",
+            "must be greater than zero",
+        ));
+    }
+    if config.admission_timeout.is_zero() {
+        return Err(ConfigError::invalid(
+            "PASSWORD_HASH_ADMISSION_TIMEOUT_MS",
+            "must be greater than zero",
+        ));
+    }
+    if config.concurrency > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err(ConfigError::invalid(
+            "PASSWORD_HASH_CONCURRENCY",
+            "exceeds the semaphore implementation limit",
+        ));
+    }
+    if config.queue_capacity > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err(ConfigError::invalid(
+            "PASSWORD_HASH_QUEUE_CAPACITY",
+            "exceeds the semaphore implementation limit",
+        ));
+    }
+    Ok(config)
+}
+
 /// Moderation limits, from env with the domain defaults.
 fn moderation_config(env: &EnvSource<'_>) -> ModerationConfig {
     let d = ModerationConfig::default();
@@ -1063,8 +1235,13 @@ fn moderation_config(env: &EnvSource<'_>) -> ModerationConfig {
 /// Job queue knobs, from env with sane single-instance defaults.
 fn job_config(env: &EnvSource<'_>) -> JobConfig {
     let d = JobConfig::default();
+    let legacy = env.bool("JOBS_ENABLED");
     JobConfig {
-        enabled: env.bool("JOBS_ENABLED").unwrap_or(d.enabled),
+        enabled: env.bool("JOBS_RUN_WORKER").or(legacy).unwrap_or(d.enabled),
+        durable_enqueue: env
+            .bool("JOBS_DURABLE_ENQUEUE")
+            .or(legacy)
+            .unwrap_or(d.durable_enqueue),
         poll_interval: env
             .u64("JOBS_POLL_INTERVAL_MS")
             .map(Duration::from_millis)
@@ -1074,6 +1251,14 @@ fn job_config(env: &EnvSource<'_>) -> JobConfig {
             .u64("JOBS_LEASE_TTL_MS")
             .map(Duration::from_millis)
             .unwrap_or(d.lease_ttl),
+        handler_timeout: env
+            .u64("JOBS_HANDLER_TIMEOUT_MS")
+            .map(Duration::from_millis)
+            .unwrap_or(d.handler_timeout),
+        shutdown_grace: env
+            .u64("JOBS_SHUTDOWN_GRACE_MS")
+            .map(Duration::from_millis)
+            .unwrap_or(d.shutdown_grace),
         max_attempts: env
             .i64("JOBS_MAX_ATTEMPTS")
             .map(|v| v as i32)
@@ -1125,7 +1310,11 @@ fn retention_config(env: &EnvSource<'_>) -> RetentionPolicy {
 
 /// `seed-policies` inputs: version, effective date, and the controller identity
 /// substituted into the `{{TOKEN}}`s of `policies/*.md`.
-fn policy_config(env: &EnvSource<'_>) -> PolicySeedConfig {
+fn policy_config(
+    env: &EnvSource<'_>,
+    acknowledgement_enabled: bool,
+    terms_material_notice: bool,
+) -> PolicySeedConfig {
     PolicySeedConfig {
         version: env
             .string("POLICY_VERSION")
@@ -1138,6 +1327,8 @@ fn policy_config(env: &EnvSource<'_>) -> PolicySeedConfig {
                     .map(|d| d.with_timezone(&Utc))
             })
             .unwrap_or_else(Utc::now),
+        acknowledgement_enabled,
+        terms_material_notice,
         placeholders: crate::privacy::POLICY_PLACEHOLDERS
             .iter()
             .filter_map(|(token, var)| env.string(var).map(|value| (*token, value)))
@@ -1161,6 +1352,70 @@ mod tests {
 
     fn config(pairs: &[(&str, &str)]) -> Config {
         Config::from_lookup(&lookup(pairs)).expect("config parses")
+    }
+
+    #[test]
+    fn password_hash_admission_defaults_overrides_and_rejects_zero_capacity() {
+        assert_eq!(config(&[DB]).password_hash, PasswordHashConfig::default());
+        assert_eq!(
+            config(&[
+                DB,
+                ("PASSWORD_HASH_CONCURRENCY", "3"),
+                ("PASSWORD_HASH_QUEUE_CAPACITY", "7"),
+                ("PASSWORD_HASH_ADMISSION_TIMEOUT_MS", "125"),
+            ])
+            .password_hash,
+            PasswordHashConfig {
+                concurrency: 3,
+                queue_capacity: 7,
+                admission_timeout: Duration::from_millis(125),
+            }
+        );
+        for (key, value) in [
+            ("PASSWORD_HASH_CONCURRENCY", "0"),
+            ("PASSWORD_HASH_ADMISSION_TIMEOUT_MS", "0"),
+            ("PASSWORD_HASH_CONCURRENCY", "-1"),
+            ("PASSWORD_HASH_QUEUE_CAPACITY", "not-a-number"),
+        ] {
+            assert!(Config::from_lookup(&lookup(&[DB, (key, value)])).is_err());
+        }
+        assert_eq!(
+            config(&[DB, ("PASSWORD_HASH_QUEUE_CAPACITY", "0")])
+                .password_hash
+                .queue_capacity,
+            0
+        );
+        let too_large = usize::MAX.to_string();
+        assert!(
+            Config::from_lookup(&lookup(&[
+                DB,
+                ("PASSWORD_HASH_CONCURRENCY", too_large.as_str()),
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn photo_processing_concurrency_is_bounded_and_configurable() {
+        assert_eq!(config(&[DB]).photo_processing_concurrency, 1);
+        assert_eq!(
+            config(&[DB, ("PHOTO_PROCESSING_CONCURRENCY", "3")]).photo_processing_concurrency,
+            3
+        );
+        for value in ["0", "-1", "not-a-number"] {
+            assert!(
+                Config::from_lookup(&lookup(&[DB, ("PHOTO_PROCESSING_CONCURRENCY", value)]))
+                    .is_err()
+            );
+        }
+        let too_large = usize::MAX.to_string();
+        assert!(
+            Config::from_lookup(&lookup(&[
+                DB,
+                ("PHOTO_PROCESSING_CONCURRENCY", too_large.as_str()),
+            ]))
+            .is_err()
+        );
     }
 
     const DB: (&str, &str) = ("DATABASE_URL", "postgres://u:p@localhost/db");
@@ -1253,19 +1508,21 @@ mod tests {
     }
 
     #[test]
-    fn production_rejects_localhost_base_url_and_minio_credentials() {
-        let mut env = production_env();
-        env.retain(|(k, _)| {
-            !matches!(*k, "BASE_URL" | "S3_ACCESS_KEY_ID" | "S3_SECRET_ACCESS_KEY")
-        });
-        env.extend([
-            ("BASE_URL", "http://localhost:8080"),
-            ("S3_ACCESS_KEY_ID", "minioadmin"),
-            ("S3_SECRET_ACCESS_KEY", "minioadmin"),
-        ]);
-        let errs = config(&env).validate_for_production().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("localhost")), "{errs:?}");
-        assert!(errs.iter().any(|e| e.contains("minioadmin")), "{errs:?}");
+    fn production_rejects_localhost_base_url_and_default_s3_credentials() {
+        for default_key in DEFAULT_S3_KEYS {
+            let mut env = production_env();
+            env.retain(|(k, _)| {
+                !matches!(*k, "BASE_URL" | "S3_ACCESS_KEY_ID" | "S3_SECRET_ACCESS_KEY")
+            });
+            env.extend([
+                ("BASE_URL", "http://localhost:8080"),
+                ("S3_ACCESS_KEY_ID", default_key),
+                ("S3_SECRET_ACCESS_KEY", default_key),
+            ]);
+            let errs = config(&env).validate_for_production().unwrap_err();
+            assert!(errs.iter().any(|e| e.contains("localhost")), "{errs:?}");
+            assert!(errs.iter().any(|e| e.contains(default_key)), "{errs:?}");
+        }
     }
 
     #[test]
@@ -1308,10 +1565,10 @@ mod tests {
     fn public_s3_endpoint_can_differ_from_the_internal_endpoint() {
         let cfg = config(&[
             DB,
-            ("S3_ENDPOINT", "http://minio:9000"),
+            ("S3_ENDPOINT", "http://rustfs:9000"),
             ("S3_PUBLIC_ENDPOINT", "http://localhost:9000"),
         ]);
-        assert_eq!(cfg.storage.endpoint.as_deref(), Some("http://minio:9000"));
+        assert_eq!(cfg.storage.endpoint.as_deref(), Some("http://rustfs:9000"));
         assert_eq!(
             cfg.storage.public_endpoint.as_deref(),
             Some("http://localhost:9000")
@@ -1592,7 +1849,24 @@ mod tests {
         assert_eq!(config(&[DB]).jobs, JobConfig::default());
         let cfg = config(&[DB, ("JOBS_ENABLED", "false"), ("JOBS_BATCH_SIZE", "16")]);
         assert!(!cfg.jobs.enabled);
+        assert!(!cfg.jobs.durable_enqueue);
         assert_eq!(cfg.jobs.batch_size, 16);
+        let split = config(&[
+            DB,
+            ("JOBS_ENABLED", "false"),
+            ("JOBS_RUN_WORKER", "false"),
+            ("JOBS_DURABLE_ENQUEUE", "true"),
+        ]);
+        assert!(!split.jobs.enabled);
+        assert!(split.jobs.durable_enqueue);
+        assert!(
+            JobConfig {
+                batch_size: 0,
+                ..JobConfig::default()
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]
@@ -1603,6 +1877,8 @@ mod tests {
             ("POLICY_OPERATOR_NAME", "BikesNest Ltda."),
         ]);
         assert_eq!(cfg.policy.version, "2026-10-01.1");
+        assert!(!cfg.policy.acknowledgement_enabled);
+        assert!(!cfg.policy.terms_material_notice);
         assert_eq!(
             cfg.policy.placeholder("OPERATOR_NAME").as_deref(),
             Some("BikesNest Ltda.")
@@ -1610,11 +1886,57 @@ mod tests {
         assert!(cfg.policy.placeholder("CONTACT_EMAIL").is_none());
     }
 
+    #[test]
+    fn policy_workflow_flags_are_explicit_and_fail_closed_on_invalid_values() {
+        let enabled = config(&[
+            DB,
+            ("POLICY_ACKNOWLEDGEMENT_ENABLED", "yes"),
+            ("POLICY_TERMS_MATERIAL_NOTICE", "1"),
+        ]);
+        assert!(enabled.policy.acknowledgement_enabled);
+        assert!(enabled.policy.terms_material_notice);
+        let disabled = config(&[
+            DB,
+            ("POLICY_ACKNOWLEDGEMENT_ENABLED", "off"),
+            ("POLICY_TERMS_MATERIAL_NOTICE", "false"),
+        ]);
+        assert!(!disabled.policy.acknowledgement_enabled);
+        assert!(!disabled.policy.terms_material_notice);
+        for (key, value) in [
+            ("POLICY_ACKNOWLEDGEMENT_ENABLED", ""),
+            ("POLICY_ACKNOWLEDGEMENT_ENABLED", "tru"),
+            ("POLICY_TERMS_MATERIAL_NOTICE", ""),
+            ("POLICY_TERMS_MATERIAL_NOTICE", "sometimes"),
+        ] {
+            assert!(matches!(
+                Config::from_lookup(&lookup(&[DB, (key, value)])),
+                Err(ConfigError::Invalid { key: failed, .. }) if failed == key
+            ));
+        }
+    }
+
+    #[test]
+    fn terms_acknowledgement_rejects_oauth_bypass() {
+        let err = Config::from_lookup(&lookup(&[
+            DB,
+            ("POLICY_ACKNOWLEDGEMENT_ENABLED", "true"),
+            ("GOOGLE_OAUTH_ENABLED", "true"),
+        ]))
+        .expect_err("OAuth has no exact shown-terms handoff");
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                key: "POLICY_ACKNOWLEDGEMENT_ENABLED",
+                ..
+            }
+        ));
+    }
+
     // --- map style ----------------------------------------------------------
 
     #[test]
     fn map_style_defaults_to_streets_with_matching_csp_origin() {
-        let c = resolve_map_config(None, None, None);
+        let c = resolve_map_config(None, None, None).unwrap();
         let MapConfig::MapLibre {
             style_url,
             access_token,
@@ -1628,26 +1950,33 @@ mod tests {
     }
 
     #[test]
-    fn mapbox_style_pulls_token() {
+    fn legacy_mapbox_style_selects_mapbox_renderer_and_pulls_token() {
         let c = resolve_map_config(
             Some("mapbox://styles/u/s".to_string()),
             Some("public-map-tok".to_string()),
             Some("geo-tok".to_string()),
-        );
+        )
+        .unwrap();
         // The dedicated map token wins; the geocoder token is only a fallback.
         assert!(matches!(
             c,
-            MapConfig::MapLibre { access_token, .. } if access_token == "public-map-tok"
+            MapConfig::Mapbox { access_token, .. } if access_token == "public-map-tok"
         ));
 
         let fallback = resolve_map_config(
             Some("https://api.mapbox.com/styles/v1/u/s".to_string()),
             None,
             Some("geo-tok".to_string()),
-        );
+        )
+        .unwrap();
         assert!(matches!(
             fallback,
-            MapConfig::MapLibre { access_token, .. } if access_token == "geo-tok"
+            MapConfig::Mapbox { access_token, .. } if access_token == "geo-tok"
+        ));
+
+        assert!(matches!(
+            resolve_map_config(Some("mapbox://styles/u/s".to_string()), None, None),
+            Err(ConfigError::MissingEnv("MAPBOX_MAP_ACCESS_TOKEN"))
         ));
     }
 
@@ -1659,7 +1988,8 @@ mod tests {
             Some("https://tiles.example/style.json".to_string()),
             None,
             Some("geo-tok".to_string()),
-        );
+        )
+        .unwrap();
         assert!(matches!(
             c,
             MapConfig::MapLibre { access_token, .. } if access_token.is_empty()

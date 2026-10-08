@@ -340,6 +340,11 @@ impl SqlxParkingSearchReader {
         security_all: &Option<Vec<String>>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<i64, ReaderError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| reader_err("search.count.acquire", e))?;
         let sql = format!(
             r#"
             SELECT count(*)::bigint AS n
@@ -356,7 +361,7 @@ impl SqlxParkingSearchReader {
             .bind(request.filters.open_now)
             .bind(security_all.clone())
             .bind(now)
-            .fetch_one(self.db.pool())
+            .fetch_one(&mut *conn)
             .await
             .map_err(|e| reader_err("search.count", e))?;
         Ok(total.0)
@@ -380,6 +385,11 @@ impl SqlxParkingSearchReader {
         cursor: Option<bikesnest_application::Cursor>,
         limit: usize,
     ) -> Result<Vec<ParkingSummary>, ReaderError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| reader_err("search.page.acquire", e))?;
         let (sort_key, sort_key_joins) = sort_key_sql(request.sort);
         let sql = format!(
             r#"
@@ -462,7 +472,7 @@ impl SqlxParkingSearchReader {
                 .bind(t.stale_days as f64);
         }
         let rows: Vec<SearchRow> = query
-            .fetch_all(self.db.pool())
+            .fetch_all(&mut *conn)
             .await
             .map_err(|e| reader_err("search.page", e))?;
         rows.into_iter().map(summary_of).collect()
@@ -513,6 +523,11 @@ impl SqlxParkingSearchReader {
         security_all: &Option<Vec<String>>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<i64, ReaderError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| reader_err("search.bounds_count.acquire", e))?;
         let sql = format!(
             r#"
             SELECT count(*)::bigint AS n
@@ -530,7 +545,7 @@ impl SqlxParkingSearchReader {
             .bind(query.filters.open_now)
             .bind(security_all.clone())
             .bind(now)
-            .fetch_one(self.db.pool())
+            .fetch_one(&mut *conn)
             .await
             .map_err(|e| reader_err("search.bounds_count", e))?;
         Ok(total.0)
@@ -550,6 +565,11 @@ impl SqlxParkingSearchReader {
         security_all: &Option<Vec<String>>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<ParkingSummary>, ReaderError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| reader_err("search.bounds_page.acquire", e))?;
         let center = query.center();
         let sql = format!(
             r#"
@@ -613,7 +633,7 @@ impl SqlxParkingSearchReader {
             .bind(center.lat())
             .bind(center.lon())
             .bind(query.limit as i64)
-            .fetch_all(self.db.pool())
+            .fetch_all(&mut *conn)
             .await
             .map_err(|e| reader_err("search.bounds_page", e))?;
         rows.into_iter().map(summary_of).collect()
@@ -634,6 +654,11 @@ impl SqlxParkingSearchReader {
         security_all: &Option<Vec<String>>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<Cluster>, ReaderError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| reader_err("search.bounds_clusters.acquire", e))?;
         let sql = format!(
             r#"
             SELECT
@@ -662,7 +687,7 @@ impl SqlxParkingSearchReader {
             .bind(security_all.clone())
             .bind(now)
             .bind(query.cell_deg())
-            .fetch_all(self.db.pool())
+            .fetch_all(&mut *conn)
             .await
             .map_err(|e| reader_err("search.bounds_clusters", e))?;
         Ok(rows

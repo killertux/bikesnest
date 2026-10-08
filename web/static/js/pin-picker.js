@@ -49,12 +49,20 @@
       centerLon = -49.2733;
     }
 
-    var map = provider.createMap(el, {
-      center: { lon: centerLon, lat: centerLat },
-      zoom: picked ? 17 : 14,
-      navigation: true,
-    });
+    var map;
+    var attempt = (el._bnAttempt || 0) + 1;
+    el._bnAttempt = attempt;
+    try {
+      map = provider.createMap(el, { center: { lon: centerLon, lat: centerLat }, zoom: picked ? 17 : 14, navigation: true });
+    } catch (_) {
+      window.BikesNestMaps.report("failed", el);
+      return;
+    }
     window.BikesNestMaps.track(el, map);
+    if (typeof map.onError === "function") map.onError(function () {
+      if (el.isConnected && el._bnAttempt === attempt) window.BikesNestMaps.report("failed", el);
+    });
+    map.onLoad(function () { if (el.isConnected && el._bnAttempt === attempt) window.BikesNestMaps.report("ready", el); });
 
     var markerEl = document.createElement("div");
     markerEl.className = "marker marker-pin";
@@ -66,6 +74,7 @@
     });
 
     function publish(lat, lon) {
+      if (!el.isConnected || el._bnAttempt !== attempt) return;
       if (latInput) latInput.value = lat.toFixed(6);
       if (lonInput) lonInput.value = lon.toFixed(6);
       el.dispatchEvent(
@@ -77,29 +86,32 @@
     }
 
     map.onClick(function (at) {
+      if (!el.isConnected || el._bnAttempt !== attempt) return;
       marker.setPosition(at);
       publish(at.lat, at.lon);
     });
 
-    el.addEventListener("bikesnest:pin-set", function (e) {
+    if (el._bnPinSet) el.removeEventListener("bikesnest:pin-set", el._bnPinSet);
+    el._bnPinSet = function (e) {
+      if (el._bnAttempt !== attempt) return;
       var detail = (e && e.detail) || {};
       var toLat = num(detail.lat);
       var toLon = num(detail.lon);
       if (toLat === null || toLon === null) return;
       marker.setPosition({ lon: toLon, lat: toLat });
       map.jumpTo({ center: { lon: toLon, lat: toLat }, zoom: 17 });
-    });
+    };
+    el.addEventListener("bikesnest:pin-set", el._bnPinSet);
   }
 
   function init() {
     var provider = window.BikesNestMapProvider;
     if (!provider) return;
-    provider.ready().then(initReady).catch(function () {
-      /* Manual latitude/longitude fields remain available. */
-    });
+    provider.ready().then(initReady).catch(function () { window.BikesNestMaps.report("failed"); });
   }
 
   document.addEventListener("bikesnest:maps-ready", init);
+  document.addEventListener("bikesnest:map-retry", init);
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", init);
   } else {

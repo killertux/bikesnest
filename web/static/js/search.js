@@ -256,15 +256,29 @@
     // Browse mode: the box the server answered for is the view, whatever is
     // inside it.
     var bbox = data.bbox && data.bbox.length === 4 ? data.bbox : null;
+    st.center = center;
+    st.zoom = zoom;
 
     if (!st.map) {
-      st.map = provider.createMap(mapEl, { center: center, zoom: zoom, navigation: true });
+      var attempt = (mapEl._bnAttempt || 0) + 1;
+      mapEl._bnAttempt = attempt;
+      try {
+        st.map = provider.createMap(mapEl, { center: center, zoom: zoom, navigation: true });
+      } catch (_) {
+        st.initializing = false;
+        window.BikesNestMaps.report("failed", mapEl);
+        return;
+      }
       window.BikesNestMaps.track(mapEl, st.map);
+      if (typeof st.map.onError === "function") st.map.onError(function () {
+        if (mapEl.isConnected && mapEl._bnAttempt === attempt) window.BikesNestMaps.report("failed", mapEl);
+      });
       var recenter = document.getElementById("recenter");
-      if (recenter) {
+      if (recenter && !recenter._bnBound) {
+        recenter._bnBound = true;
         recenter.addEventListener("click", function () {
           st.ignoreMove++;
-          st.map.flyTo({ center: center, zoom: zoom });
+          if (st.map) st.map.flyTo({ center: st.center, zoom: st.zoom });
         });
       }
       // Only *the viewer's* moves offer a new area to search: the camera moves
@@ -279,6 +293,8 @@
       });
       st.map.onLoad(function () {
         if (!mapEl.isConnected) return;
+        if (mapEl._bnAttempt !== attempt) return;
+        window.BikesNestMaps.report("ready", mapEl);
         renderMarkers(st.map, st, readData() || data, labels);
         if (bbox) {
           st.ignoreMove++;
@@ -321,6 +337,7 @@
       initReady();
     }).catch(function () {
       st.initializing = false;
+      window.BikesNestMaps.report("failed");
     });
   }
 
@@ -346,6 +363,7 @@
   if (!window.__bnSearchBound) {
     window.__bnSearchBound = true;
     document.addEventListener("bikesnest:maps-ready", init);
+    document.addEventListener("bikesnest:map-retry", init);
     document.addEventListener("click", function (e) {
       var card = e.target.closest("[data-parking-id]");
       if (card) select(Number(card.dataset.parkingId));

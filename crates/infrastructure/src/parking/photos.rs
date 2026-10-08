@@ -25,6 +25,30 @@ struct PhotoRow {
 
 #[async_trait]
 impl ParkingPhotoReader for SqlxParkingPhotoReader {
+    async fn photos_page(
+        &self,
+        location_id: i64,
+        limit: i64,
+    ) -> Result<(Vec<StoredPhoto>, i64), ReaderError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| reader_err("parking_photos.page.acquire", e))?;
+        let total:i64=sqlx::query_scalar("SELECT count(*) FROM parking_photo WHERE location_id=$1 AND moderation_state='APPROVED'").bind(location_id).fetch_one(&mut *conn).await.map_err(|e|reader_err("parking_photos.page_count",e))?;
+        let rows=sqlx::query_as::<_,PhotoRow>("SELECT storage_key,thumbnail_key,content_type,alt FROM parking_photo WHERE location_id=$1 AND moderation_state='APPROVED' ORDER BY position,id LIMIT $2").bind(location_id).bind(limit.clamp(1,50)).fetch_all(&mut *conn).await.map_err(|e|reader_err("parking_photos.page",e))?;
+        Ok((
+            rows.into_iter()
+                .map(|r| StoredPhoto {
+                    key: r.storage_key,
+                    thumbnail_key: r.thumbnail_key,
+                    content_type: r.content_type,
+                    alt: r.alt,
+                })
+                .collect(),
+            total,
+        ))
+    }
     async fn pending_count(&self, location_id: i64) -> Result<i64, ReaderError> {
         let mut conn = self
             .db

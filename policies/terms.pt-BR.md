@@ -29,7 +29,7 @@ Ao enviar Conteúdo, você declara e garante que:
 
 ### 3.3 Licença que você nos concede
 
-Você mantém a titularidade do seu Conteúdo. Para que o serviço funcione, você nos concede uma licença **mundial, não exclusiva, gratuita, irrevogável e por prazo indeterminado** para hospedar, armazenar, reproduzir, adaptar (redimensionar, recortar, gerar miniaturas e remover metadados), publicar, exibir e distribuir o Conteúdo como parte do BikesNest e de seu acervo colaborativo, inclusive após a exclusão da sua conta. Seu nome de exibição aparece em novas avaliações e propostas de alteração conforme a configuração de visibilidade da sua conta, ativada por padrão para novas contas e que pode ser desativada a qualquer momento. Contribuições anteriores anônimas continuam anônimas. As contribuições permanecem no acervo, anonimizadas, depois que sua conta for excluída. Veja na [Política de Privacidade](/privacy) como funciona a visibilidade do nome.
+Você mantém a titularidade do seu Conteúdo. Para que o serviço funcione, você nos concede uma licença **mundial, não exclusiva, gratuita, irrevogável e por prazo indeterminado** para hospedar, armazenar, reproduzir, adaptar (redimensionar, recortar, gerar miniaturas e remover metadados), publicar, exibir e distribuir o Conteúdo como parte do BikesNest e de seu acervo colaborativo, inclusive após a exclusão da sua conta. Seu nome de exibição aparece em novas avaliações e propostas de alteração conforme a configuração de visibilidade da sua conta, ativada por padrão para novas contas e que pode ser desativada a qualquer momento. Contribuições anteriores anônimas continuam anônimas. Depois da exclusão da conta, as contribuições retidas deixam de ser vinculadas à conta ou à atribuição do nome de exibição; seus textos livres ou imagens não ficam, por isso, garantidamente anônimos. Veja na [Política de Privacidade](/privacy) como funciona a visibilidade do nome e como solicitar providências sobre o próprio conteúdo retido.
 
 ### 3.4 Indenização
 
@@ -37,8 +37,8 @@ Na medida permitida pela lei, você nos indenizará por perdas, danos, despesas 
 
 ## 4. Moderação, denúncias e remoção
 
-- **Fotos ficam retidas até aprovação.** Nenhuma foto é publicada antes de passar pela moderação. Outros tipos de Conteúdo podem ser publicados imediatamente e revisados depois.
-- A moderação é feita por **moderadores humanos** e pode ser apoiada por **ferramentas automatizadas**, inclusive modelos de inteligência artificial que classificam imagens e textos para identificar violações destes Termos. Conteúdo sinalizado automaticamente é encaminhado a um moderador.
+- **Fotos ficam retidas até aprovação de um moderador.** Novos locais de estacionamento e avaliações podem ser publicados imediatamente. Uma proposta de alteração de um fato de estacionamento já publicado só é publicada após seis aprovações elegíveis da comunidade ou uma decisão de moderador.
+- A moderação é feita por **moderadores humanos**.
 - Podemos, a nosso critério e sem aviso prévio, **recusar, ocultar, remover ou marcar como inválido** qualquer Conteúdo, e **suspender ou encerrar** contas que violem estes Termos ou a lei. Não temos obrigação de monitorar todo o Conteúdo, mas podemos fazê-lo.
 - **Denúncias.** Qualquer pessoa pode denunciar um local, foto ou avaliação pelo botão *Denunciar* na página correspondente ou pelo e-mail **{{CONTACT_EMAIL}}**. Para notificações de conteúdo ilícito ou que viole direitos de terceiros, informe o endereço (URL) do Conteúdo, a descrição da violação e seus dados de contato; analisaremos e tomaremos as medidas cabíveis, inclusive a remoção.
 - **Revisão.** Se discordar de uma decisão de moderação, escreva para {{CONTACT_EMAIL}}; uma pessoa revisará o caso.
@@ -67,7 +67,7 @@ Na medida máxima permitida pela lei aplicável, inclusive o Código de Defesa d
 
 ## 9. Encerramento
 
-Você pode excluir sua conta a qualquer momento em *Conta → Privacidade e dados*. Seus dados de identidade são removidos e suas contribuições permanecem no acervo, anonimizadas (seção 3.3). Podemos suspender ou encerrar sua conta em caso de violação destes Termos ou da lei, ou se o serviço for descontinuado. As seções 3.3, 3.4, 7, 8 e 12 permanecem em vigor após o encerramento.
+Você pode excluir sua conta a qualquer momento em *Conta → Privacidade e dados*. A identidade da conta e a atribuição do nome de exibição são removidas das contribuições retidas, como descrito na seção 3.3; isso não reescreve seus textos ou imagens. Podemos suspender ou encerrar sua conta em caso de violação destes Termos ou da lei, ou se o serviço for descontinuado. As seções 3.3, 3.4, 7, 8 e 12 permanecem em vigor após o encerramento.
 
 ## 10. Privacidade
 

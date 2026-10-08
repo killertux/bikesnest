@@ -21,10 +21,15 @@ impl SqlxSitemapReader {
 impl SitemapReader for SqlxSitemapReader {
     /// Ordered by id so the emitted sitemap is stable between requests.
     async fn active_parking_ids(&self) -> Result<Vec<i64>, ReaderError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| reader_err("sitemap.active_parking_ids", e))?;
         sqlx::query_scalar(
             "SELECT id FROM parking_location WHERE moderation_state = 'ACTIVE' ORDER BY id",
         )
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *conn)
         .await
         .map_err(|e| reader_err("sitemap.active_parking_ids", e))
     }

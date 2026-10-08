@@ -26,6 +26,7 @@
   MapboxAdapter.prototype.onLoad = function (handler) {
     this.raw.on("load", handler);
   };
+  MapboxAdapter.prototype.onError = function (handler) { this.raw.on("error", handler); };
   MapboxAdapter.prototype.onMoveEnd = function (handler) {
     this.raw.on("moveend", handler);
   };

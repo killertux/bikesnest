@@ -42,36 +42,94 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+  advisory-checks:
+    name: Advisory checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install pinned RustSec scanner
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Test advisory-report validation
+        run: node scripts/verify-advisories.test.cjs
+      - name: Check RustSec advisories
+        shell: bash
+        run: |
+          set +e
+          cargo audit --json > /tmp/cargo-audit.json
+          scan_status=$?
+          set -e
+          node scripts/verify-advisories.cjs \
+            --ecosystem rustsec \
+            --report /tmp/cargo-audit.json \
+            --scanner-exit "$scan_status"
+      - name: Check npm advisories
+        shell: bash
+        run: |
+          set +e
+          npm audit --json > /tmp/npm-audit.json
+          scan_status=$?
+          set -e
+          node scripts/verify-advisories.cjs \
+            --ecosystem npm \
+            --report /tmp/npm-audit.json \
+            --scanner-exit "$scan_status"
+
+  db-free-tests:
+    name: DB-free tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@v2
+      - name: Compile DB-free test binaries (warm CI cache when restored)
+        run: time cargo test -p bikesnest-domain -p bikesnest-application --no-run --locked
+      - name: Execute DB-free tests (after this runner's compile phase)
+        run: time cargo test -p bikesnest-domain -p bikesnest-application --locked
+
   test:
     name: Tests
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      DATABASE_URL: postgres://bikesnest:bikesnest@localhost:5432/bikesnest
+      TEST_DATABASE_URL: postgres://bikesnest_test:bikesnest_test@localhost:5432/bikesnest_test_ci
       S3_ENDPOINT: http://localhost:9000
       S3_REGION: us-east-1
       S3_BUCKET: bikesnest
-      S3_ACCESS_KEY_ID: minioadmin
-      S3_SECRET_ACCESS_KEY: minioadmin
+      S3_ACCESS_KEY_ID: rustfsadmin
+      S3_SECRET_ACCESS_KEY: rustfsadmin
       VALKEY_URL: valkey://localhost:6379
       CSP_MEDIA_HOSTS: http://localhost:9000
       S3_TEST_ENDPOINT: http://localhost:9000
       S3_TEST_REGION: us-east-1
       S3_TEST_BUCKET: bikesnest
-      S3_TEST_ACCESS_KEY_ID: minioadmin
-      S3_TEST_SECRET_ACCESS_KEY: minioadmin
+      S3_TEST_ACCESS_KEY_ID: rustfsadmin
+      S3_TEST_SECRET_ACCESS_KEY: rustfsadmin
       VALKEY_TEST_URL: valkey://localhost:6379
     services:
       postgres:
         image: postgis/postgis:17-3.5
         env:
-          POSTGRES_USER: bikesnest
-          POSTGRES_PASSWORD: bikesnest
-          POSTGRES_DB: bikesnest
+          POSTGRES_USER: bikesnest_test
+          POSTGRES_PASSWORD: bikesnest_test
+          POSTGRES_DB: bikesnest_test_ci
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U bikesnest -d bikesnest"
+          --health-cmd "pg_isready -U bikesnest_test -d bikesnest_test_ci"
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
@@ -86,33 +144,56 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@v4
-      - name: Start MinIO
+      - name: Start RustFS
         run: |
-          docker run -d --name minio -p 9000:9000 \
-            -e MINIO_ROOT_USER=minioadmin \
-            -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio server /data
-      - name: Wait for MinIO
+          docker run -d --name rustfs -p 9000:9000 \
+            -e RUSTFS_ACCESS_KEY=rustfsadmin \
+            -e RUSTFS_SECRET_KEY=rustfsadmin \
+            rustfs/rustfs:1.0.0
+      - name: Wait for RustFS
         run: |
           for i in $(seq 1 30); do
-            if curl -sf http://localhost:9000/minio/health/live >/dev/null; then
+            if curl -sf http://localhost:9000/health >/dev/null; then
               exit 0
             fi
             sleep 1
           done
-          echo "::error::MinIO did not become healthy in time"
+          docker logs rustfs
+          echo "::error::RustFS did not become healthy in time"
           exit 1
       - name: Create test bucket
-        run: |
-          docker run --rm --network host --entrypoint sh minio/mc -c \
-            "mc alias set local http://localhost:9000 minioadmin minioadmin && mc mb --ignore-existing local/bikesnest"
+        env:
+          AWS_ACCESS_KEY_ID: rustfsadmin
+          AWS_SECRET_ACCESS_KEY: rustfsadmin
+          AWS_DEFAULT_REGION: us-east-1
+        run: aws --endpoint-url http://localhost:9000 s3 mb s3://bikesnest
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install ignored-browser test dependencies
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
       - name: Run workspace tests
         run: cargo test --workspace --locked
+      - name: Visually check rendered email in Chromium
+        run: env -u BIKESNEST_BROWSER_MUTANT cargo test -p bikesnest-infrastructure --test email_renderer_visual_test --locked -- --ignored
+      - name: Test rendered contribution journey in Chromium
+        run: env -u BIKESNEST_BROWSER_MUTANT cargo test -p bikesnest-web --test contribution_browser_test --locked -- --ignored
+      - name: Test rendered CSRF lifecycle in Chromium
+        run: env -u BIKESNEST_BROWSER_MUTANT cargo test -p bikesnest-web --test csrf_browser_test --locked -- --ignored
+      - name: Test rendered policy journey in Chromium
+        run: env -u BIKESNEST_BROWSER_MUTANT cargo test -p bikesnest-web --test policy_browser_test --locked -- --ignored
+      - name: Test rendered profile journey in Chromium
+        run: env -u BIKESNEST_BROWSER_MUTANT cargo test -p bikesnest-web --test profile_browser_test --locked -- --ignored
+      - name: Test rendered search synchronization in Chromium
+        run: env -u BIKESNEST_BROWSER_MUTANT cargo test -p bikesnest-web --test search_browser_test --locked -- --ignored
 
   frontend-assets:
     name: Frontend assets

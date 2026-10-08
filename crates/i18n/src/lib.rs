@@ -193,6 +193,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "a11y.report_filter" => ("Report state filter", "Filtro de estado do relato"),
         "a11y.results_pages" => ("Results pages", "Páginas de resultados"),
         "a11y.dialog_photo_title" => ("Photo", "Foto"),
+        "a11y.page_changed" => ("Page changed", "Página alterada"),
         "nav.how" => ("How it works", "Como funciona"),
         "nav.spots" => ("Parking spots", "Vagas de bike"),
         "nav.community" => ("Community", "Comunidade"),
@@ -354,6 +355,9 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "collab.overview" => ("Overview", "Visão geral"),
         "collab.proposals" => ("Proposals", "Propostas"),
         "profile.current" => ("Current version", "Versão atual"),
+        "profile.tab.current" => ("Current", "Atual"),
+        "profile.tab.history" => ("History", "Histórico"),
+        "profile.tab.approvals" => ("Pending", "Pendentes"),
         "profile.approved" => ("Approved", "Aprovada"),
         "profile.rejected" => ("Rejected", "Rejeitada"),
         "profile.superseded" => ("Superseded", "Substituída"),
@@ -364,17 +368,38 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         ),
         "profile.history" => ("Version history", "Versões anteriores"),
         "profile.approvals" => ("Pending approvals", "Aprovações pendentes"),
+        "profile.data_unavailable" => (
+            "This community information is temporarily unavailable. Published parking details remain available.",
+            "Estas informações da comunidade estão temporariamente indisponíveis. Os dados publicados da vaga continuam disponíveis.",
+        ),
+        "profile.loaded_total" => ("Showing {shown} of {total}", "Exibindo {shown} de {total}"),
+        "profile.load_more" => ("Show more", "Mostrar mais"),
+        "details.photo_alt" => ("Photo of {name}", "Foto de {name}"),
+        "details.review_photo_alt" => ("Review photo", "Foto da avaliação"),
+        "details.review_media_unavailable" => (
+            "Review photos are temporarily unavailable.",
+            "As fotos da avaliação estão temporariamente indisponíveis.",
+        ),
         "profile.pending" => ("Change pending", "Alteração pendente"),
         "profile.edit_details" => ("Update parking details", "Atualizar informações da vaga"),
         "profile.version" => ("Version", "Versão"),
         "profile.history_empty" => ("No saved versions yet.", "Nenhuma versão salva ainda."),
         "profile.history_hint" => (
-            "Published versions. Open a version to see its saved information.",
-            "Versões publicadas. Abra uma versão para ver as informações salvas.",
+            "Only published versions saved by BikesNest appear here. Open one to inspect its saved snapshot.",
+            "Apenas versões publicadas salvas pelo BikesNest aparecem aqui. Abra uma para consultar o registro salvo.",
         ),
         "profile.no_changes" => (
             "No differences from the current version.",
             "Nenhuma diferença em relação à versão atual.",
+        ),
+        "collab.vote.sign_in" => ("Sign in to vote", "Entre para votar"),
+        "collab.vote.verify" => (
+            "Verify your email to vote",
+            "Verifique seu e-mail para votar",
+        ),
+        "collab.vote.own" => (
+            "You cannot vote on your own proposal.",
+            "Você não pode votar na sua própria proposta.",
         ),
         "profile.proposal_error" => (
             "This change could not be recorded. Refresh the page and try again.",
@@ -510,6 +535,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
             "Atualização sugerida para a vaga",
         ),
         "collab.approve" => ("Approve", "Aprovar"),
+        "collab.approval_progress" => ("{n} of 6 approvals", "{n} de 6 aprovações"),
         "collab.reject" => ("Reject", "Rejeitar"),
         "collab.votes" => ("Vote totals", "Totais de votos"),
         "collab.approvals" => ("approvals", "aprovações"),
@@ -663,6 +689,26 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "search.map.hide" => ("Show list", "Mostrar lista"),
         "search.map.recenter" => ("Recenter", "Recentralizar"),
         "search.map.title" => ("Map", "Mapa"),
+        "map.loading" => ("Loading map…", "Carregando mapa…"),
+        "map.failed" => (
+            "The map could not load. You can still use the address and links on this page.",
+            "Não foi possível carregar o mapa. Você ainda pode usar o endereço e os links desta página.",
+        ),
+        "map.retry" => ("Retry map", "Tentar mapa novamente"),
+        "search.location.loading" => ("Getting your location…", "Obtendo sua localização…"),
+        "search.location.unavailable" => (
+            "Your location is unavailable. Enter a destination instead.",
+            "Sua localização não está disponível. Informe um destino.",
+        ),
+        "search.location.timeout" => (
+            "Location request timed out. Enter a destination instead.",
+            "A solicitação de localização expirou. Informe um destino.",
+        ),
+        "search.location.denied" => (
+            "Location permission was not granted. Enter a destination instead.",
+            "A permissão de localização não foi concedida. Informe um destino.",
+        ),
+        "search.location.destination" => ("Enter a destination", "Informar destino"),
         "search.map.pins" => (
             "Numbered pins match the list",
             "Os pinos numerados batem com a lista",
@@ -728,6 +774,10 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "search.missing" => (
             "Type a destination (or use your location) to find parking nearby.",
             "Digite um destino (ou use sua localização) para encontrar vagas por perto.",
+        ),
+        "search.invalid" => (
+            "That search link is invalid. Check it and try again.",
+            "Esse link de busca é inválido. Confira e tente novamente.",
         ),
         "search.geocode_unavailable" => (
             "The location service is temporarily unavailable. Try again in a moment.",
@@ -806,10 +856,24 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "details.breadcrumb.home" => ("Home", "Início"),
         "details.breadcrumb.search" => ("Parking", "Vagas"),
         "details.badge.community" => ("Community verified", "Verificado pela comunidade"),
-        "details.navigate.google" => ("Open in Google Maps", "Abrir no Google Maps"),
-        "details.navigate.osm" => ("Open in OpenStreetMap", "Abrir no OpenStreetMap"),
+        "details.navigate.google" => (
+            "Cycling directions in Google Maps",
+            "Rotas de bicicleta no Google Maps",
+        ),
+        "details.navigate.osm" => (
+            "Open location in OpenStreetMap",
+            "Abrir local no OpenStreetMap",
+        ),
+        "details.map.title" => ("Map and directions", "Mapa e rotas"),
+        "details.map.fallback" => (
+            "Open the location in another map provider.",
+            "Abra o local em outro provedor de mapas.",
+        ),
         "details.facts.title" => ("Key facts", "Informações principais"),
         "details.facts.cost" => ("Cost", "Custo"),
+        "details.facts.open_now" => ("Open now", "Aberto agora"),
+        "details.facts.type" => ("Parking type", "Tipo de vaga"),
+        "details.facts.last_verified" => ("Last verified", "Última verificação"),
         "details.facts.security" => ("Security", "Segurança"),
         "details.facts.freshness" => ("Freshness", "Atualidade"),
         "details.facts.rating" => ("Rating", "Avaliação"),
@@ -819,6 +883,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "details.security.yes" => ("Yes", "Sim"),
         "details.security.no" => ("No", "Não"),
         "details.security.unknown" => ("Unknown", "Não informado"),
+        "details.security.other" => ("Other security details", "Outros detalhes de segurança"),
         "details.gallery.empty" => ("No photos yet", "Sem fotos ainda"),
         "details.gallery.empty_hint" => (
             "Photos help riders recognize a spot. Adding them arrives with community accounts.",
@@ -832,6 +897,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         // photo's own caption is optional, so the thumbnail's accessible name
         // cannot rely on it alone.
         "gallery.view_photo" => ("View photo", "Ver foto"),
+        "gallery.view_loaded" => ("View loaded photos ({n})", "Ver fotos carregadas ({n})"),
         "details.add_nearby" => (
             "Missing a spot around here?",
             "Faltou alguma vaga por aqui?",
@@ -961,6 +1027,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
             "Your session expired or this form is stale. Reload the page and try again.",
             "Sua sessão expirou ou este formulário está desatualizado. Recarregue a página e tente de novo.",
         ),
+        "error.reload" => ("Reload safely", "Recarregar com segurança"),
         "error.method_not_allowed" => (
             "That action is not available here.",
             "Essa ação não está disponível aqui.",
@@ -1333,7 +1400,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
 
         // --- Confidence ---------------------------------------------
         "confidence.title" => ("Confidence", "Confiança"),
-        "confidence.reported" => ("Reported", "Reportado"),
+        "confidence.reported" => ("Not yet confirmed", "Ainda não confirmado"),
         "confidence.verified" => ("Verified", "Verificado"),
         "confidence.recently_verified" => ("Recently verified", "Verificado há pouco"),
         "confidence.stale" => ("Stale", "Desatualizado"),
@@ -1344,8 +1411,8 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         ),
         "confidence.disputes" => ("disputes:", "disputas:"),
         "confidence.parked_here_count" => (
-            "Riders who parked here:",
-            "Ciclistas que estacionaram aqui:",
+            "Riders who said they parked here:",
+            "Ciclistas que disseram ter estacionado aqui:",
         ),
 
         // --- Verification --------------------------------------------
@@ -1381,7 +1448,11 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         ),
 
         // --- recommended because -----------------------------------------
-        "details.recommend.title" => ("Recommended because", "Recomendado porque"),
+        "details.recommend.title" => ("Optional listing signals", "Sinais opcionais da vaga"),
+        "details.recommend.hint" => (
+            "These current listing signals are not a guarantee.",
+            "Estes sinais atuais da vaga não são uma garantia.",
+        ),
         "reason.distance" => ("Close to your destination", "Perto do seu destino"),
         "reason.security" => ("Security attributes", "Itens de segurança"),
         "reason.rating" => ("Rated by riders", "Avaliado por ciclistas"),
@@ -1454,6 +1525,15 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
             "Uma foto ajuda a reconhecer a vaga. Envie apenas fotos que você tirou do próprio local e evite rostos de pessoas e placas de veículos. Você é responsável pelo que envia; as fotos passam por revisão de moderadores e ferramentas automáticas antes de aparecer.",
         ),
         "photo.upload.submit" => ("Upload photo", "Enviar foto"),
+        "photo.upload.file_label" => ("Image file", "Arquivo de imagem"),
+        "photo.upload.alt_label" => (
+            "Image description (optional)",
+            "Descrição da imagem (opcional)",
+        ),
+        "photo.upload.alt_hint" => (
+            "Describe what helps riders recognize this parking spot.",
+            "Descreva o que ajuda ciclistas a reconhecer este local.",
+        ),
         "photo.upload.pending_notice" => (
             "Photo submitted — it appears once a moderator approves it.",
             "Foto enviada — ela aparece assim que um moderador a aprovar.",
@@ -1820,6 +1900,29 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "policy.back" => ("Back to policy", "Voltar à política"),
         "policy.current" => ("Current", "Atual"),
         "policy.superseded" => ("Superseded", "Substituída"),
+        "terms.notice.title" => ("Review the terms", "Revise os termos"),
+        "terms.notice.current" => (
+            "Updated terms need your acknowledgement",
+            "Termos atualizados precisam da sua confirmação",
+        ),
+        "terms.notice.future" => (
+            "A future terms update is available",
+            "Uma atualização futura dos termos está disponível",
+        ),
+        "terms.notice.review" => ("Review this version", "Revisar esta versão"),
+        "terms.notice.future_body" => (
+            "These terms are not effective yet. You can review them now; acknowledgement is available only after they take effect.",
+            "Estes termos ainda não estão em vigor. Você pode revisá-los agora; a confirmação só estará disponível depois da entrada em vigor.",
+        ),
+        "terms.notice.ack" => ("Acknowledge these terms", "Confirmar estes termos"),
+        "terms.notice.acknowledged" => (
+            "Terms acknowledgement recorded.",
+            "Confirmação dos termos registrada.",
+        ),
+        "terms.notice.stale" => (
+            "The applicable terms changed. Review the current version before continuing.",
+            "Os termos aplicáveis mudaram. Revise a versão atual antes de continuar.",
+        ),
         "privacy.kind" => ("Kind", "Tipo"),
         "privacy.state" => ("State", "Estado"),
         "privacy.hub_title" => ("Privacy & data", "Privacidade e dados"),
@@ -1953,24 +2056,53 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
 
         // --- transactional email ------------------------------------------
         // Rendered by the `email.send` job handler in the recipient's stored
-        // locale. `{app}` is the product name; `{link}` the single-use URL.
+        // locale. `{app}` is the product name; links and expiry are structured
+        // renderer fields, so legacy messages never imply a duration.
         "email.verify.subject" => ("Confirm your {app} email", "Confirme seu e-mail no {app}"),
         "email.verify.body" => (
-            "Welcome to {app}. Confirm your email address to activate your account:\n\n{link}\n\nIf you did not create an account, you can ignore this email.",
-            "Bem-vindo ao {app}. Confirme seu endereço de e-mail para ativar sua conta:\n\n{link}\n\nSe você não criou uma conta, pode ignorar este e-mail.",
+            "Welcome to {app}. Confirm your email address to activate your account. If you did not create an account, you can ignore this email.",
+            "Bem-vindo ao {app}. Confirme seu endereço de e-mail para ativar sua conta. Se você não criou uma conta, pode ignorar este e-mail.",
         ),
         "email.reset.subject" => ("Reset your {app} password", "Redefina sua senha do {app}"),
         "email.reset.body" => (
-            "We received a request to reset your {app} password. Choose a new one here:\n\n{link}\n\nIf you did not ask for this, you can safely ignore this email.",
-            "Recebemos um pedido para redefinir sua senha do {app}. Escolha uma nova senha aqui:\n\n{link}\n\nSe não foi você que pediu, pode ignorar este e-mail com segurança.",
+            "We received a request to reset your {app} password. If you did not ask for this, you can safely ignore this email.",
+            "Recebemos um pedido para redefinir sua senha do {app}. Se não foi você que pediu, pode ignorar este e-mail com segurança.",
         ),
         "email.change.subject" => (
             "Confirm your new {app} email",
             "Confirme seu novo e-mail no {app}",
         ),
         "email.change.body" => (
-            "Confirm this address to finish changing the email on your {app} account:\n\n{link}\n\nIf you did not ask for this change, ignore this email — your current address stays as it is.",
-            "Confirme este endereço para concluir a troca de e-mail da sua conta no {app}:\n\n{link}\n\nSe você não pediu essa troca, ignore este e-mail — seu endereço atual continua o mesmo.",
+            "Confirm this address to finish changing the email on your {app} account. If you did not ask for this change, ignore this email — your current address stays as it is.",
+            "Confirme este endereço para concluir a troca de e-mail da sua conta no {app}. Se você não pediu essa troca, ignore este e-mail — seu endereço atual continua o mesmo.",
+        ),
+        "email.password_changed.subject" => (
+            "Your {app} password was changed",
+            "Sua senha do {app} foi alterada",
+        ),
+        "email.password_changed.body" => (
+            "Your {app} password was changed. If this was not you, secure your account now.",
+            "Sua senha do {app} foi alterada. Se não foi você, proteja sua conta agora.",
+        ),
+        "email.email_changed.subject" => (
+            "Your {app} email address was changed",
+            "Seu endereço de e-mail no {app} foi alterado",
+        ),
+        "email.email_changed.body" => (
+            "Your {app} email address was changed. If this was not you, secure your account now.",
+            "Seu endereço de e-mail no {app} foi alterado. Se não foi você, proteja sua conta agora.",
+        ),
+        "email.cta.verify" => ("Confirm email", "Confirmar e-mail"),
+        "email.cta.reset" => ("Reset password", "Redefinir senha"),
+        "email.cta.change" => ("Confirm email change", "Confirmar troca de e-mail"),
+        "email.cta.account" => ("Review your account", "Revisar sua conta"),
+        "email.fallback" => (
+            "If the button does not work, copy and paste this link into your browser:",
+            "Se o botão não funcionar, copie e cole este link no navegador:",
+        ),
+        "email.expires" => (
+            "This link expires at {expires} UTC.",
+            "Este link expira em {expires} UTC.",
         ),
         // Unknown key: a visible marker (all real keys are defined above, so
         // this only appears when a template references a typo'd key).
@@ -1985,13 +2117,23 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
 /// tests below (and `bikesnest_infrastructure::email::templates`) fail loudly
 /// when one is renamed away.
 #[cfg(test)]
-const EMAIL_KEYS: [&str; 6] = [
+const EMAIL_KEYS: [&str; 16] = [
     "email.verify.subject",
     "email.verify.body",
     "email.reset.subject",
     "email.reset.body",
     "email.change.subject",
     "email.change.body",
+    "email.password_changed.subject",
+    "email.password_changed.body",
+    "email.email_changed.subject",
+    "email.email_changed.body",
+    "email.cta.verify",
+    "email.cta.reset",
+    "email.cta.change",
+    "email.cta.account",
+    "email.fallback",
+    "email.expires",
 ];
 
 #[cfg(test)]
@@ -2029,15 +2171,19 @@ mod tests {
         }
     }
 
-    /// Every body must keep the `{link}` placeholder the renderer substitutes;
-    /// losing it would send a verification mail with no way to verify.
+    /// Credential copy remains separate from the action URL. The renderer owns
+    /// adding the exact queued link to both the plain-text and HTML alternatives,
+    /// so catalog text must not carry a stale placeholder or hard-coded URL.
     #[test]
-    fn email_bodies_keep_the_link_placeholder() {
+    fn email_credential_bodies_do_not_embed_action_links() {
         for key in ["email.verify.body", "email.reset.body", "email.change.body"] {
             for locale in [Locale::En, Locale::PtBr] {
+                let body = msg(locale, key);
                 assert!(
-                    msg(locale, key).contains("{link}"),
-                    "{key} lost its {{link}} placeholder for {}",
+                    !body.contains("{link}")
+                        && !body.contains("http://")
+                        && !body.contains("https://"),
+                    "{key} embeds an action link for {}",
                     locale.code()
                 );
             }

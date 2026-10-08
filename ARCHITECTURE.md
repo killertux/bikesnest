@@ -131,7 +131,7 @@ directly. Examples: `SearchParking`, `ContributionService`, `AuthService`,
 | `ImageProcessor` | decode → EXIF-strip → re-encode → thumbnail |
 | `PhotoRepository` | photo lifecycle + moderation queue |
 | `ReportRepository` / `ModerationRepository` | reports + moderation actions |
-| `ExportRepository` / `PrivacyRequestRepository` / `AnonymizationRepository` / `RetentionRepository` / `PolicyReader` | privacy & retention |
+| `ExportRepository` / `PrivacyRequestRepository` / `AnonymizationRepository` / `RetentionRepository` / `PolicyReader` / `TermsAcknowledgementStore` | privacy, retention, immutable policy reads, and exact terms presentation/acknowledgement proof |
 | `TimezoneResolver` | coordinate → IANA timezone |
 | `DatabaseProbe` | readiness DB check |
 | `JobHandler` | background job execution |
@@ -146,8 +146,35 @@ The adapters: `Sqlx*` repositories for every persistence port, `Config::from_env
 `Argon2PasswordHasher`, `SqlxJobRepository` + `Worker`, the `devdata`/seeders
 (`seed-mock`, `seed-admin`, `seed-policies`, `seed-full-fresh`), and `Db`/`probe`.
 
+CPU-heavy adapters use process-local admission before entering Tokio's blocking
+pool. Password hash and verify operations share one bounded execution budget,
+a finite waiting budget, and a finite admission timeout; interactive login
+still waits synchronously for its result and is never durable work. Image
+decode/encode has a separately configurable process concurrency limit (default
+one) and retains its owned semaphore permit inside the blocking closure, so
+cancelling an HTTP future cannot make still-running CPU or decoded-image memory
+disappear from capacity accounting.
+
 Providers are selected from environment variables in `config.rs` and wired into
 the router in `crates/web/src/wiring.rs` — the one module that names them.
+
+Transactional mail jobs carry canonical account and purpose plus either token-
+hash/expiry evidence or a recipient digest and successful-transition audit
+reference for a credential-free security notice. Queue admission, delayed delivery and account anonymization
+serialize on the `users` row. Delivery revalidates either the exact unused,
+unexpired token and recipient or the notice's audit/digest/state authority
+while holding that lock through a bounded provider call; terminal outcomes,
+deletion and the expiry-retention sweep redact the
+recipient/link payload. Provider acceptance is the external recall boundary,
+not a distributed exactly-once guarantee. Registration, resend, reset request
+and email-change request use one `AuthOutbox` port whose SQL adapter commits the
+auth transition, applicable audit and lifecycle row together. Post-commit
+dispatch either leaves that row for the worker or exact-claims it for inline
+compatibility; provider I/O never occurs inside the auth transaction.
+Successful password replacement queues a warning to the current canonical
+address; a confirmed address change queues one to the locked old address.
+These notices follow the same at-least-once lifecycle, and terminalization or
+account deletion clears their payload, recipient digest, and audit reference.
 
 ### Web (`crates/web`)
 
@@ -183,7 +210,13 @@ catalogs; `security.rs` the headers/CSP; `observability.rs` the JSON structured
 logging; `markdown.rs` the sanitizing renderer for the legal pages.
 
 The parking profile has server-rendered Current version, Version history, and
-Pending approvals tabs. `web::profile` builds localized field diffs and saved
+Pending approvals tabs. Its `DetailReads` facade delegates to existing
+application ports but keeps route orchestration injectable: every tab reads a
+compact pending-field/photo summary, Current alone reads the bounded gallery
+and community/review page, Version history alone reads paged snapshots, and
+Pending approvals alone reads full proposal diffs. Page totals are independent
+of the loaded page size; a failed collaboration read renders an unavailable
+state while the published parking facts remain readable. `web::profile` builds localized field diffs and saved
 revision values. Field-level pending links lead to the relevant proposal;
 unapproved values never replace published facts. `listing_collaboration.html`
 renders proposal diffs and voting, while `parking_versions.html` renders saved
@@ -227,14 +260,22 @@ Persistent htmx, Alpine and app scripts load once from the layout head. Whole-pa
 boosted navigation uses a body sync swap to reset page-local state; targeted
 fragment swaps retain their declared behavior. The visibility extension in
 `web/static/js/navigation.js` preserves Alpine-owned `x-show` display during
-fragment morphs.
+fragment morphs. Full-document responses carry an inert metadata record through
+htmx's request-local swap context; after the body swap it synchronizes language,
+title, canonical and social metadata, announces the new heading, and moves focus
+there. Fragment swaps do not run that document/focus transition.
 
 Map pages declare an inert `template[data-map-assets]` containing their hashed
 stylesheet, SDK, adapter and consumer URLs. The navigation lifecycle loads these
 in order, caches successful loads, and signals consumers after swaps (including
-history restoration). Failed downloads can retry on subsequent navigation or
-reconnection. Map adapters expose `destroy`; detached maps and resize observers
-are disposed, while search-result fragment updates retain the live map.
+history restoration). Loading and render failures have localized page-level
+status and same-page retry; attempt fencing prevents detached or superseded maps
+from changing the current page's status. Map adapters expose `destroy`; detached
+maps and resize observers are disposed, while search-result fragment updates
+retain the live map and contribution retries retain the form's coordinates.
+Home, search and pin-picker geolocation requests have a finite timeout, distinct
+denied/timeout/unavailable messages, and ignore callbacks after their page is
+detached; typed address and coordinate controls remain the fallback.
 
 ## Data model
 
@@ -262,8 +303,17 @@ Versioned, forward-only migrations in `migrations/`:
 | `0019_photo_key_and_audit_integrity.sql` | non-empty `storage_key`, append-only audit |
 | `0020_open_now_fn.sql` | `bikesnest_is_open_at()` + confirmed-attribute index |
 | `0024_approve_all_parking_edits.sql` | allow detail-edit proposals alongside moves and existence changes |
+| `0028_terms_acknowledgement.sql` | immutable policy releases plus exact terms presentation/acknowledgement evidence |
+| `0029_policy_version_id_immutable.sql` | preserve the exact published policy row id during its one allowed supersession update |
 
 Key modeling notes:
+
+- **Terms evidence is not privacy consent.** When the fleet-wide feature gate
+  is enabled, signup records the exact currently effective terms row in the
+  account/outbox transaction. Existing accounts get recoverable current and
+  nearest-future material notices without a service lockout. A presentation
+  timestamp proves only that the server prepared the response, never receipt
+  or reading. See [`docs/policy-publication.md`](docs/policy-publication.md).
 
 - **Timestamps are UTC**; opening hours are wall-clock ranges in the location's
   timezone; "open now" is computed in that timezone.
@@ -288,8 +338,9 @@ Key modeling notes:
   processed derivatives are stored (the original is discarded); EXIF is
   stripped at processing time.
 - **`background_job`** stores durable one-shot + recurring jobs; an in-process
-  worker claims with `FOR UPDATE SKIP LOCKED`, retries with exponential
-  backoff, and dead-letters after `JOBS_MAX_ATTEMPTS`.
+  worker claims only free execution capacity with `FOR UPDATE SKIP LOCKED`.
+  Every active attempt has a unique fenced lease, heartbeat and deadline;
+  retries use exponential backoff and exhaust into a dead letter.
 
 ## Request lifecycle (happy path)
 
@@ -307,20 +358,40 @@ Key modeling notes:
 
 - **Repository test isolation:** `Db` can explicitly wrap a test-owned SQLx
   transaction. `Db::acquire()` leases that connection, and nested SQLx
-  transactions become savepoints. Production still uses the ordinary pool.
+  transactions become savepoints. All ordinary repositories and real test
+  routers use this same acquisition seam; production-backed `Db` values still
+  acquire from their ordinary pool. The migration runner alone detaches a
+  connection so its timeout settings cannot return to request handling.
   Test-support awaits outer rollback (including after panic) and invalidates
   surviving handles. This is not a substitute for multi-connection race tests;
-  see `TESTING.md` for the incremental adapter migration.
+  those use a separately created disposable database through the bounded
+  isolated runner described in `TESTING.md`.
 
 - **Security:** strict CSP (nonce-free, Alpine CSP build), security headers,
   CSRF synchronizer token, HttpOnly/Secure/SameSite=Lax sessions hashed at
   rest, argon2id passwords, deny-by-default authorization, server-side
-  self-resolve guard on reports. See `crates/web/src/security.rs`.
+  self-resolve guard on reports. Dynamic responses are `private, no-store`
+  because even public HTML embeds a per-session CSRF token. The pinned and
+  shipped htmx 4.0.0 network-restores history and does not implement a
+  localStorage snapshot cache; the installed-library browser regression guards
+  that version-dependent property. Only successful static assets retain
+  explicit cacheable policies. The currently enforced CSP remains the known
+  provider-compatible baseline. Each HTML response also carries a fresh nonce
+  on trusted script elements and a nonce/`strict-dynamic` candidate in
+  `Content-Security-Policy-Report-Only`; Google alone retains its documented
+  `unsafe-eval` exception there. Promotion waits on live Google and edge-beacon
+  validation. Dynamic map loaders retain the original document nonce and never
+  trust swapped manifests or request headers. See `crates/web/src/security.rs`.
 - **Observability:** `APP_ENV=production` → JSON structured logs; PII-free.
-- **Rate limiting:** sliding-window via ValKey (Lua atomic, fail-open by
-  default), shared across auth/photo/contribution/moderation.
+- **Rate limiting:** sliding-window via ValKey (Lua atomic, bounded provider
+  deadline). General traffic may follow the configured fail-open policy;
+  credential-sensitive auth uses the port's explicit fail-closed check, with
+  allowlisted degradation logging that excludes bucket keys/provider errors;
+  one store remains shared across auth/photo/contribution/moderation.
 - **i18n:** all user-facing strings in the catalog; the domain exposes codes
   (e.g. security feature codes), the web layer maps them to localized labels.
-- **Background jobs:** Postgres queue + in-process worker (`JOBS_ENABLED`).
+- **Background jobs:** Postgres queue with independent durable-admission and
+  worker-execution modes; the worker may run beside HTTP or via the dedicated
+  `worker` command.
 - **SEO:** `robots.txt`, `sitemap.xml`, canonical/meta/OG, `hreflang`,
   `noindex` support.

@@ -1,4 +1,4 @@
-use bikesnest_infrastructure::{Config, Db, S3ObjectStorage};
+use bikesnest_infrastructure::{Config, Db, S3ObjectStorage, email_from_config};
 use bikesnest_web::{RouterDeps, app_router_with};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -36,7 +36,7 @@ async fn main() {
     // any connection attempt: a misconfigured deploy sees the whole list of
     // missing settings first, not a database error.
     let subcommand = std::env::args().nth(1);
-    if matches!(subcommand.as_deref(), None | Some("serve"))
+    if matches!(subcommand.as_deref(), None | Some("serve") | Some("worker"))
         && let Err(problems) = config.validate_for_production()
     {
         eprintln!("refusing to start: APP_ENV=production requires the following settings");
@@ -45,6 +45,9 @@ async fn main() {
         }
         eprintln!("see docs/deployment.md (startup validation) and .env.example");
         std::process::exit(1);
+    }
+    if matches!(subcommand.as_deref(), None | Some("serve") | Some("worker")) {
+        validate_job_config(&config);
     }
 
     let db = Db::connect_with(&config.database_url, &config.db)
@@ -63,7 +66,10 @@ async fn main() {
                 std::process::exit(1);
             });
             let storage = S3ObjectStorage::from_config(&config.storage);
-            let processor = bikesnest_infrastructure::LocalImageProcessor::new(config.photo);
+            let processor = bikesnest_infrastructure::LocalImageProcessor::new(
+                config.photo,
+                config.photo_processing_concurrency,
+            );
             match bikesnest_infrastructure::parking::seed_mock(&db, &storage, &processor).await {
                 Ok(n) => {
                     println!(
@@ -82,7 +88,13 @@ async fn main() {
                 eprintln!("migration error: {err}");
                 std::process::exit(1);
             });
-            match bikesnest_infrastructure::seed_admin(&db, &config.admin_seed).await {
+            match bikesnest_infrastructure::seed_admin(
+                &db,
+                &config.admin_seed,
+                config.password_hash,
+            )
+            .await
+            {
                 Ok(bikesnest_infrastructure::auth::seed::SeedOutcome::Created) => {
                     println!("admin account created");
                 }
@@ -170,15 +182,16 @@ async fn main() {
                 }
             }
         }
+        Some("worker") => run_worker_only(config, db).await,
         _ => serve(config, db).await,
     }
 }
 
 struct PreparedPolicy {
     kind: bikesnest_domain::PolicyKind,
-    kind_code: &'static str,
     locale: &'static str,
     content: String,
+    requires_acknowledgement: bool,
 }
 
 struct FullFreshSummary {
@@ -210,9 +223,10 @@ fn prepare_policies(config: &Config) -> Result<Vec<PreparedPolicy>, String> {
             policies.push(PreparedPolicy {
                 kind: bikesnest_domain::PolicyKind::from_code(kind_code)
                     .expect("valid policy kind"),
-                kind_code,
                 locale,
                 content,
+                requires_acknowledgement: kind_code == "terms"
+                    && config.policy.terms_material_notice,
             });
         }
     }
@@ -224,19 +238,20 @@ async fn seed_prepared_policies(
     config: &Config,
     policies: &[PreparedPolicy],
 ) -> Result<(), String> {
-    for policy in policies {
-        bikesnest_infrastructure::seed_policy(
-            db,
-            policy.kind,
-            policy.locale,
-            &config.policy.version,
-            config.policy.effective_at,
-            &policy.content,
-        )
+    let documents: Vec<_> = policies
+        .iter()
+        .map(|policy| bikesnest_infrastructure::SeedPolicyDocument {
+            kind: policy.kind,
+            locale: policy.locale,
+            version: &config.policy.version,
+            effective_at: config.policy.effective_at,
+            content: &policy.content,
+            requires_acknowledgement: policy.requires_acknowledgement,
+        })
+        .collect();
+    bikesnest_infrastructure::seed_policy_release(db, &documents)
         .await
-        .map_err(|err| format!("{} ({}): {err}", policy.kind_code, policy.locale))?;
-    }
-    Ok(())
+        .map_err(|err| format!("policy release: {err}"))
 }
 
 fn validate_admin_seed(config: &Config) -> Result<(), String> {
@@ -269,11 +284,14 @@ async fn seed_full_fresh(config: &Config, db: &Db) -> Result<FullFreshSummary, S
     let deleted_objects = bikesnest_infrastructure::reset_all_data(db, &storage)
         .await
         .map_err(|err| err.to_string())?;
-    let processor = bikesnest_infrastructure::LocalImageProcessor::new(config.photo);
+    let processor = bikesnest_infrastructure::LocalImageProcessor::new(
+        config.photo,
+        config.photo_processing_concurrency,
+    );
     let parking_locations = bikesnest_infrastructure::parking::seed_mock(db, &storage, &processor)
         .await
         .map_err(|err| err.to_string())?;
-    bikesnest_infrastructure::seed_admin(db, &config.admin_seed)
+    bikesnest_infrastructure::seed_admin(db, &config.admin_seed, config.password_hash)
         .await
         .map_err(|err| err.to_string())?;
     seed_prepared_policies(db, config, &policies).await?;
@@ -284,6 +302,122 @@ async fn seed_full_fresh(config: &Config, db: &Db) -> Result<FullFreshSummary, S
     })
 }
 
+fn build_worker(
+    config: &Config,
+    db: Db,
+    email: Arc<dyn bikesnest_application::EmailProvider>,
+) -> bikesnest_infrastructure::Worker {
+    let storage: Arc<dyn bikesnest_application::ObjectStorage> =
+        Arc::new(S3ObjectStorage::from_config(&config.storage));
+    let services = bikesnest_infrastructure::job_services(db, config, storage, email);
+    bikesnest_infrastructure::Worker::new(services.repo, services.registry, config.jobs)
+}
+
+fn validate_job_config(config: &Config) {
+    if let Err(problems) = config.jobs.validate() {
+        eprintln!("invalid background-job configuration:");
+        for problem in problems {
+            eprintln!("  - {problem}");
+        }
+        std::process::exit(1);
+    }
+}
+
+async fn run_worker_only(config: Config, db: Db) {
+    validate_job_config(&config);
+    if let Err(err) = db.migrate().await {
+        eprintln!("migration error: {err}");
+        std::process::exit(1);
+    }
+    let email: Arc<dyn bikesnest_application::EmailProvider> =
+        Arc::from(email_from_config(&config.email).unwrap_or_else(|err| {
+            eprintln!("email provider configuration error: {err}");
+            std::process::exit(1);
+        }));
+    let worker = build_worker(&config, db, email);
+    let shutdown = CancellationToken::new();
+    let mut task = tokio::spawn(worker.run(shutdown.child_token()));
+    tokio::select! {
+        _ = wait_for_terminate() => {
+            shutdown.cancel();
+            drain_worker_task(task, config.jobs.shutdown_grace.saturating_mul(2)).await;
+        },
+        result = &mut task => {
+            match result {
+                Ok(()) => tracing::error!("background worker exited unexpectedly"),
+                Err(_) => tracing::error!("background worker task panicked"),
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn drain_worker_task(
+    mut task: tokio::task::JoinHandle<()>,
+    grace: std::time::Duration,
+) -> bool {
+    if tokio::time::timeout(grace, &mut task).await.is_err() {
+        tracing::error!(
+            grace_ms = grace.as_millis(),
+            "worker shutdown grace exceeded; aborting task"
+        );
+        task.abort();
+        let _ = task.await;
+        false
+    } else {
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupervisorExit {
+    Graceful,
+    ServerFailed,
+    ServerExited,
+    WorkerExited,
+    WorkerPanicked,
+    DrainTimedOut,
+}
+
+async fn supervise<S, G>(
+    server: S,
+    mut worker: Option<tokio::task::JoinHandle<()>>,
+    signal: G,
+    shutdown: CancellationToken,
+    grace: std::time::Duration,
+) -> SupervisorExit
+where
+    S: std::future::Future<Output = Result<(), ()>>,
+    G: std::future::Future<Output = ()>,
+{
+    let mut server = Box::pin(server);
+    let mut signal = Box::pin(signal);
+    let mut server_done = false;
+    let mut outcome = if let Some(task) = worker.as_mut() {
+        tokio::select! {
+            _=&mut signal => SupervisorExit::Graceful,
+            result=&mut server => { server_done=true; if result.is_err(){SupervisorExit::ServerFailed}else{SupervisorExit::ServerExited} },
+            result=task => { worker=None; if result.is_err(){SupervisorExit::WorkerPanicked}else{SupervisorExit::WorkerExited} },
+        }
+    } else {
+        tokio::select! { _=&mut signal=>SupervisorExit::Graceful, result=&mut server=>{server_done=true;if result.is_err(){SupervisorExit::ServerFailed}else{SupervisorExit::ServerExited}} }
+    };
+    shutdown.cancel();
+    if !server_done {
+        match tokio::time::timeout(grace, &mut server).await {
+            Err(_) => outcome = SupervisorExit::DrainTimedOut,
+            Ok(Err(())) => outcome = SupervisorExit::ServerFailed,
+            Ok(Ok(())) => {}
+        }
+    }
+    if let Some(task) = worker
+        && !drain_worker_task(task, grace.saturating_mul(2)).await
+    {
+        outcome = SupervisorExit::DrainTimedOut;
+    }
+    outcome
+}
+
 async fn serve(config: Config, db: Db) {
     // Production validation already ran in `main` (before the database
     // connection). Development runs on fakes by design; say which ones, once.
@@ -292,6 +426,7 @@ async fn serve(config: Config, db: Db) {
     }
 
     let config = Arc::new(config);
+    validate_job_config(&config);
 
     // Run migrations explicitly on startup.
     if let Err(err) = db.migrate().await {
@@ -310,23 +445,11 @@ async fn serve(config: Config, db: Db) {
     // loop after finishing whatever job it holds.
     let shutdown = CancellationToken::new();
 
-    // Background worker (plans/m9-background-jobs.md): a tokio task that claims
-    // and runs durable one-shot + recurring jobs. Disable with `JOBS_ENABLED=false`
-    // for web-only instances (or to run jobs elsewhere).
+    // The in-process worker claims and runs durable one-shot + recurring jobs.
+    // Web-only processes disable execution while retaining durable admission;
+    // a separate `worker` process shares the database.
     let worker_task = if config.jobs.enabled {
-        let storage: Arc<dyn bikesnest_application::ObjectStorage> =
-            Arc::new(S3ObjectStorage::from_config(&config.storage));
-        // The worker gets the same provider instance the router holds, so the
-        // `email.send` handler mails through the configured relay/ESP rather
-        // than a second copy of it.
-        let services = bikesnest_infrastructure::job_services(
-            db.clone(),
-            &config,
-            storage,
-            deps.email.clone(),
-        );
-        let worker =
-            bikesnest_infrastructure::Worker::new(services.repo, services.registry, config.jobs);
+        let worker = build_worker(&config, db.clone(), deps.email.clone());
         tracing::info!(jobs = "enabled", "background worker started");
         Some(tokio::spawn(worker.run(shutdown.child_token())))
     } else {
@@ -335,7 +458,7 @@ async fn serve(config: Config, db: Db) {
     };
 
     let bind_addr = config.bind_addr.clone();
-    let app = app_router_with(config, db, deps);
+    let app = app_router_with(config.clone(), db, deps);
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .unwrap_or_else(|err| {
@@ -348,35 +471,32 @@ async fn serve(config: Config, db: Db) {
     // the request extensions; without it `ClientIp` has no address to trust and
     // every caller would share one rate-limit bucket.
     let service = app.into_make_service_with_connect_info::<SocketAddr>();
-    let signal = shutdown.clone();
-    let server = axum::serve(listener, service).with_graceful_shutdown(async move {
-        wait_for_terminate().await;
-        tracing::info!("shutdown signal received; draining");
-        signal.cancel();
+    let server_shutdown = shutdown.clone();
+    let server = Box::pin(async move {
+        axum::serve(listener, service)
+            .with_graceful_shutdown(async move { server_shutdown.cancelled().await })
+            .await
     });
-    if let Err(err) = server.await {
-        tracing::error!(error = %err, "server error");
-    }
 
-    // In-flight requests are done. Give the worker a bounded grace period to
-    // finish the job it may still be running rather than killing it mid-write.
-    if let Some(task) = worker_task {
-        match tokio::time::timeout(WORKER_SHUTDOWN_GRACE, task).await {
-            Ok(Ok(())) => tracing::info!("background worker drained"),
-            Ok(Err(e)) => tracing::warn!(error = %e, "background worker task failed"),
-            Err(_) => tracing::warn!(
-                grace_secs = WORKER_SHUTDOWN_GRACE.as_secs(),
-                "background worker did not finish in time; exiting anyway"
-            ),
-        }
+    let server = async move {
+        server
+            .await
+            .map_err(|err| tracing::error!(error=%err,"server error"))
+    };
+    let outcome = supervise(
+        server,
+        worker_task,
+        wait_for_terminate(),
+        shutdown,
+        config.jobs.shutdown_grace,
+    )
+    .await;
+    if outcome != SupervisorExit::Graceful {
+        tracing::error!(?outcome, "process supervision failed");
+        std::process::exit(1);
     }
     tracing::info!("bikesnest stopped cleanly");
 }
-
-/// How long an in-flight background job may take to finish once shutdown has
-/// been signalled. Container runtimes typically SIGKILL ~10 s after SIGTERM, so
-/// this is an upper bound, not a promise.
-const WORKER_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Resolves on SIGTERM (what a container runtime sends) or SIGINT (Ctrl-C).
 async fn wait_for_terminate() {
@@ -404,5 +524,92 @@ async fn wait_for_terminate() {
     tokio::select! {
         _ = ctrl_c => {}
         _ = terminate => {}
+    }
+}
+
+#[cfg(test)]
+mod worker_supervision_tests {
+    use super::*;
+
+    async fn token_server(token: CancellationToken) -> Result<(), ()> {
+        token.cancelled().await;
+        Ok(())
+    }
+    fn token_worker(token: CancellationToken) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move { token.cancelled().await })
+    }
+
+    #[tokio::test]
+    async fn production_supervisor_classifies_signal_and_component_results() {
+        let token = CancellationToken::new();
+        assert_eq!(
+            supervise(
+                token_server(token.clone()),
+                Some(token_worker(token.clone())),
+                std::future::ready(()),
+                token,
+                std::time::Duration::from_millis(50)
+            )
+            .await,
+            SupervisorExit::Graceful
+        );
+
+        let token = CancellationToken::new();
+        assert_eq!(
+            supervise(
+                token_server(token.clone()),
+                Some(tokio::spawn(async {})),
+                std::future::pending(),
+                token,
+                std::time::Duration::from_millis(50)
+            )
+            .await,
+            SupervisorExit::WorkerExited
+        );
+
+        let token = CancellationToken::new();
+        assert_eq!(
+            supervise(
+                token_server(token.clone()),
+                Some(tokio::spawn(async { panic!("supervisor test") })),
+                std::future::pending(),
+                token,
+                std::time::Duration::from_millis(50)
+            )
+            .await,
+            SupervisorExit::WorkerPanicked
+        );
+
+        let token = CancellationToken::new();
+        assert_eq!(
+            supervise(
+                async { Err(()) },
+                Some(token_worker(token.clone())),
+                std::future::pending(),
+                token,
+                std::time::Duration::from_millis(50)
+            )
+            .await,
+            SupervisorExit::ServerFailed
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_abort_path_joins_a_task_that_exceeds_grace() {
+        struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = dropped.clone();
+        let task = tokio::spawn(async move {
+            let _guard = Dropped(observed);
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!drain_worker_task(task, std::time::Duration::from_millis(10)).await);
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

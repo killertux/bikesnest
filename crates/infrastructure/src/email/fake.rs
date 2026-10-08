@@ -148,6 +148,7 @@ mod tests {
             LocaleCode::PtBr,
             EmailKind::VerifyEmail {
                 link: "http://localhost:8080/verify-email?token=abc-123_XYZ".into(),
+                expires_at: None,
             },
         ))
         .await

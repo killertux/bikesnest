@@ -1,8 +1,8 @@
-This Cookie Policy describes the cookies BikesNest stores in your browser. It complements the [Privacy Policy](/privacy).
+This Cookie Policy describes browser cookies, local preferences and provider telemetry used with BikesNest. It complements the [Privacy Policy](/privacy).
 
 ## What we use
 
-We use **only first-party, strictly necessary or functional cookies**. None of them is used for advertising, audience measurement or cross-site tracking, so they **do not require consent** and we do not show a cookie banner.
+The application uses first-party cookies for sign-in, form protection and language preference. Local preferences and external provider processing are described separately below.
 
 | Cookie | Purpose | Duration | Type | Attributes |
 |---|---|---|---|---|
@@ -10,7 +10,9 @@ We use **only first-party, strictly necessary or functional cookies**. None of t
 | `csrf` | Protects forms against cross-site request forgery (CSRF) while you are not signed in | 1 hour | Necessary — security | HttpOnly, SameSite=Lax |
 | `lang` | Remembers the language you chose (Portuguese or English); only set when you switch language | 1 year | Functional | SameSite=Lax |
 
-We do not use local storage (*localStorage*) or other tracking technologies.
+The map-open preference is stored in *localStorage* under `bn.search.mapOpen`. It remembers whether you opened or closed the search map, has no application-set expiry, and changes when you toggle that preference. You can remove it by clearing this site's storage in your browser; your browser may also remove it. The application does not send this preference as a cookie. Blocking local storage does not prevent the map toggle from working, but the preference may not be remembered.
+
+Cloudflare Web Analytics is used for page-view and performance measurements through a browser beacon. These measurements are separate from the local map preference and our sign-in cookies. Cloudflare describes this service as privacy-first; see [Cloudflare Web Analytics](https://developers.cloudflare.com/web-analytics/about/). The presence of analytics does not by itself establish that an analytics cookie is stored.
 
 ## Third-party cookies
 
@@ -22,6 +24,6 @@ You can delete or block cookies in your browser settings. Without the `session_i
 
 ## Changes
 
-If we ever introduce optional cookies (for example analytics), we will update this Policy and ask for your consent before setting them. Previous versions are at [/cookies/versions](/cookies/versions).
+We will update this Policy when our browser storage or telemetry practices change. Where applicable law requires consent for optional technologies, we will request it before activating them. Previous versions are at [/cookies/versions](/cookies/versions).
 
 Contact: **{{CONTACT_EMAIL}}**.

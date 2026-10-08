@@ -5,7 +5,7 @@
 
 use axum::body::Body;
 use axum::http::Request;
-use bikesnest_test_support::{db_test, pool};
+use bikesnest_test_support::db_test;
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 use tracing::Subscriber;
@@ -16,8 +16,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use bikesnest_infrastructure::Db;
 use bikesnest_web::{RouterDeps, app_router_with};
 
-async fn test_app() -> axum::Router {
-    let db = Db::from_pool(pool().await);
+async fn test_app(db: Db) -> axum::Router {
     let config = std::sync::Arc::new(bikesnest_test_support::test_config());
     let deps = RouterDeps {
         email: std::sync::Arc::new(bikesnest_infrastructure::FakeEmailProvider::with_root(None)),
@@ -25,6 +24,7 @@ async fn test_app() -> axum::Router {
         hasher: bikesnest_test_support::TestPasswordHasher,
         rate_limiter: Box::new(bikesnest_infrastructure::InMemoryRateLimiter::new()),
         storage: std::sync::Arc::new(bikesnest_test_support::TestObjectStorage::new()),
+        detail_reads: None,
     };
     app_router_with(config, db, deps)
 }
@@ -87,12 +87,12 @@ impl Visit for FieldGrabber<'_> {
 }
 
 #[db_test]
-async fn request_logs_never_record_sensitive_headers(_tx: &mut bikesnest_test_support::TestTx) {
+async fn request_logs_never_record_sensitive_headers(tx: &mut bikesnest_test_support::TestTx) {
     let lines = Arc::new(Mutex::new(Vec::<String>::new()));
     let subscriber = tracing_subscriber::registry().with(CaptureLayer {
         lines: lines.clone(),
     });
-    let app = test_app().await;
+    let app = test_app(tx.db().await).await;
 
     let secret = "csrf-secret-value-12345";
     let guard = tracing::subscriber::set_default(subscriber);

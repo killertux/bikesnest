@@ -12,7 +12,8 @@ use async_trait::async_trait;
 use bikesnest_application::{
     Export, ExportAccount, ExportDownload, ExportFavorite, ExportPayload, ExportPhoto,
     ExportProposal, ExportProposalVote, ExportProvider, ExportReport, ExportRepository,
-    ExportReview, ExportReviewRevision, ExportSession, ExportVerification, NewExport, PrivacyError,
+    ExportReview, ExportReviewRevision, ExportSession, ExportTermsAcknowledgement,
+    ExportTermsPresentation, ExportVerification, NewExport, PrivacyError,
 };
 use bikesnest_domain::{ExportState, UserId};
 use chrono::{DateTime, Utc};
@@ -449,6 +450,15 @@ impl ExportRepository for SqlxExportRepository {
             });
         }
 
+        let terms_notice_presentations = sqlx::query_as::<_, (i64, String, String, DateTime<Utc>)>(
+            "SELECT policy_version_id,terms_version,shown_locale,presented_at FROM terms_notice_presentation WHERE user_id=$1 ORDER BY presented_at,id",
+        ).bind(user_id.0).fetch_all(&mut *tx).await.map_err(|e| db_err("export.assemble_payload", e))?
+            .into_iter().map(|r| ExportTermsPresentation { policy_version_id: r.0, terms_version: r.1, shown_locale: r.2, presented_at: r.3 }).collect();
+        let terms_acknowledgements = sqlx::query_as::<_, (i64, String, String, DateTime<Utc>, String)>(
+            "SELECT policy_version_id,terms_version,shown_locale,acknowledged_at,source FROM terms_acknowledgement WHERE user_id=$1 ORDER BY acknowledged_at,id",
+        ).bind(user_id.0).fetch_all(&mut *tx).await.map_err(|e| db_err("export.assemble_payload", e))?
+            .into_iter().map(|r| ExportTermsAcknowledgement { policy_version_id: r.0, terms_version: r.1, shown_locale: r.2, acknowledged_at: r.3, source: r.4 }).collect();
+
         // Read-only: the commit just releases the snapshot.
         tx.commit()
             .await
@@ -465,6 +475,8 @@ impl ExportRepository for SqlxExportRepository {
             proposal_votes,
             reports,
             photos,
+            terms_notice_presentations,
+            terms_acknowledgements,
             now,
         ))
     }

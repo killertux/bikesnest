@@ -1,25 +1,21 @@
-//! WP5 seeder integration test (`devdata`/`parking::seed_mock`): every seeded
+//! Seeder integration test (`devdata`/`parking::seed_mock`): every seeded
 //! photo derivative is really retrievable, `rating_avg`/`rating_count` never
 //! drift from the `review` rows that back them, and enough locations sit
 //! within 1 km of the fake-geocoder centroid to reach a second results page.
 
 use bikesnest_application::ObjectStorage;
 use bikesnest_domain::PhotoLimits;
-use bikesnest_infrastructure::{Db, LocalImageProcessor, parking::seed_mock};
-use bikesnest_test_support::{TestObjectStorage, db_test, pool};
+use bikesnest_infrastructure::{LocalImageProcessor, parking::seed_mock};
+use bikesnest_test_support::{TestObjectStorage, db_test};
 
-// One test function: `seed_mock` reseeds a *global* singleton dataset (a
-// fixed `seed_key`, not a per-test tag), so two `#[db_test]`s calling it would
-// race each other's DELETE+INSERT across OS threads (the Rust test harness
-// runs `#[test]` fns concurrently). Keeping every assertion — including the
-// idempotency check — in one function serializes the calls.
+// One rollback-only scope exercises both the initial seed and idempotent replay.
 #[db_test]
 async fn seed_mock_backs_photos_ratings_geo_spread_and_is_idempotent(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
-    let db = Db::from_pool(pool().await);
+    let db = tx.db().await;
     let storage = TestObjectStorage::new();
-    let processor = LocalImageProcessor::new(PhotoLimits::default());
+    let processor = LocalImageProcessor::new(PhotoLimits::default(), 1);
 
     let seeded = seed_mock(&db, &storage, &processor)
         .await
@@ -33,7 +29,7 @@ async fn seed_mock_backs_photos_ratings_geo_spread_and_is_idempotent(
     let photos: Vec<(String, Option<String>)> = sqlx::query_as(
         "SELECT storage_key, thumbnail_key FROM parking_photo WHERE seed_key IS NOT NULL",
     )
-    .fetch_all(tx.executor())
+    .fetch_all(&mut *db.acquire().await.unwrap())
     .await
     .expect("query seeded photos");
     assert!(!photos.is_empty(), "expected at least one seeded photo");
@@ -55,7 +51,7 @@ async fn seed_mock_backs_photos_ratings_geo_spread_and_is_idempotent(
     let locations: Vec<(i64, Option<f64>, i32)> = sqlx::query_as(
         "SELECT id, rating_avg::float8, rating_count FROM parking_location WHERE seed_key IS NOT NULL",
     )
-    .fetch_all(tx.executor())
+    .fetch_all(&mut *db.acquire().await.unwrap())
     .await
     .expect("query seeded locations");
     assert!(
@@ -68,7 +64,7 @@ async fn seed_mock_backs_photos_ratings_geo_spread_and_is_idempotent(
             "SELECT rating FROM review WHERE location_id = $1 AND moderation_state = 'ACTIVE'",
         )
         .bind(id)
-        .fetch_all(tx.executor())
+        .fetch_all(&mut *db.acquire().await.unwrap())
         .await
         .expect("query reviews for location");
 
@@ -110,7 +106,7 @@ async fn seed_mock_backs_photos_ratings_geo_spread_and_is_idempotent(
           AND NOT EXISTS (SELECT 1 FROM review_revision v WHERE v.review_id = r.id)
         "#,
     )
-    .fetch_one(tx.executor())
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .expect("count seeded reviews without a revision");
     assert_eq!(
@@ -133,7 +129,7 @@ async fn seed_mock_backs_photos_ratings_geo_spread_and_is_idempotent(
               )
         "#,
     )
-    .fetch_one(tx.executor())
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .expect("count locations within 1km");
     assert!(
@@ -152,7 +148,7 @@ async fn seed_mock_backs_photos_ratings_geo_spread_and_is_idempotent(
 
     let (location_count,): (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM parking_location WHERE seed_key IS NOT NULL")
-            .fetch_one(tx.executor())
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .expect("count seeded locations");
     assert_eq!(
@@ -164,7 +160,7 @@ async fn seed_mock_backs_photos_ratings_geo_spread_and_is_idempotent(
     // on `users`), so re-seeding must not duplicate those accounts either.
     let (authors,): (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM users WHERE lower(email) LIKE '%@seed.bikesnest.dev'")
-            .fetch_one(tx.executor())
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .expect("count seeded review authors");
     assert_eq!(

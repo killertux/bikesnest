@@ -1,4 +1,4 @@
-//! SQL-backed report repository. Compile-time `query_as!`.
+//! SQL-backed report repository.
 
 use crate::Db;
 use async_trait::async_trait;
@@ -57,6 +57,12 @@ impl ReportRow {
 #[async_trait]
 impl ReportRepository for SqlxReportRepository {
     async fn create(&self, r: &NewReport) -> Result<i64, ModerationError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("report.create", e))?;
+        let mut tx = conn.begin().await.map_err(|e| db_err("report.create", e))?;
         #[derive(sqlx::FromRow)]
         struct IdRow {
             id: i64,
@@ -74,9 +80,18 @@ impl ReportRepository for SqlxReportRepository {
         .bind(r.target_id)
         .bind(&r.reason)
         .bind(r.description.as_str())
-        .fetch_one(self.db.pool())
-        .await
-        .map_err(|e| db_err("report.create", e))?;
+        .fetch_one(&mut *tx)
+        .await;
+        let row = match row {
+            Ok(row) => row,
+            Err(error) => {
+                tx.rollback()
+                    .await
+                    .map_err(|rollback| db_err("report.create.rollback", rollback))?;
+                return Err(db_err("report.create", error));
+            }
+        };
+        tx.commit().await.map_err(|e| db_err("report.create", e))?;
         Ok(row.id)
     }
 
@@ -89,6 +104,11 @@ impl ReportRepository for SqlxReportRepository {
         after_id: Option<i64>,
         limit: i64,
     ) -> Result<Vec<Report>, ModerationError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("report.list", e))?;
         let limit = limit.clamp(1, 200);
         let rows: Vec<ReportRow> = match (state, after_id) {
             (Some(s), Some(after)) => sqlx::query_as::<_, ReportRow>(
@@ -104,7 +124,7 @@ impl ReportRepository for SqlxReportRepository {
             .bind(s.as_code())
             .bind(after)
             .bind(limit)
-            .fetch_all(self.db.pool())
+            .fetch_all(&mut *conn)
             .await
             .map_err(|e| db_err("report.list", e))?,
             (Some(s), None) => sqlx::query_as::<_, ReportRow>(
@@ -119,7 +139,7 @@ impl ReportRepository for SqlxReportRepository {
             )
             .bind(s.as_code())
             .bind(limit)
-            .fetch_all(self.db.pool())
+            .fetch_all(&mut *conn)
             .await
             .map_err(|e| db_err("report.list", e))?,
             (None, Some(after)) => sqlx::query_as::<_, ReportRow>(
@@ -134,7 +154,7 @@ impl ReportRepository for SqlxReportRepository {
             )
             .bind(after)
             .bind(limit)
-            .fetch_all(self.db.pool())
+            .fetch_all(&mut *conn)
             .await
             .map_err(|e| db_err("report.list", e))?,
             (None, None) => sqlx::query_as::<_, ReportRow>(
@@ -147,7 +167,7 @@ impl ReportRepository for SqlxReportRepository {
                     "#,
             )
             .bind(limit)
-            .fetch_all(self.db.pool())
+            .fetch_all(&mut *conn)
             .await
             .map_err(|e| db_err("report.list", e))?,
         };
@@ -155,6 +175,11 @@ impl ReportRepository for SqlxReportRepository {
     }
 
     async fn get(&self, id: i64) -> Result<Option<Report>, ModerationError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("report.get", e))?;
         let row = sqlx::query_as::<_, ReportRow>(
             r#"
             SELECT id, reporter_id, target_type, target_id, reason, description, state,
@@ -164,7 +189,7 @@ impl ReportRepository for SqlxReportRepository {
             "#,
         )
         .bind(id)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *conn)
         .await
         .map_err(|e| db_err("report.get", e))?;
         match row {
@@ -174,6 +199,11 @@ impl ReportRepository for SqlxReportRepository {
     }
 
     async fn claim(&self, id: i64, moderator: UserId) -> Result<(), ModerationError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("report.claim", e))?;
         let res = sqlx::query(
             r#"
             UPDATE report
@@ -183,7 +213,7 @@ impl ReportRepository for SqlxReportRepository {
         )
         .bind(id)
         .bind(moderator.0)
-        .execute(self.db.pool())
+        .execute(&mut *conn)
         .await
         .map_err(|e| db_err("report.claim", e))?;
         if res.rows_affected() != 1 {
@@ -199,6 +229,11 @@ impl ReportRepository for SqlxReportRepository {
         note: &str,
         outcome: ReportOutcome,
     ) -> Result<(), ModerationError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("report.resolve", e))?;
         let res = sqlx::query(
             r#"
             UPDATE report
@@ -210,7 +245,7 @@ impl ReportRepository for SqlxReportRepository {
         .bind(moderator.0)
         .bind(outcome.as_code())
         .bind(note)
-        .execute(self.db.pool())
+        .execute(&mut *conn)
         .await
         .map_err(|e| db_err("report.resolve", e))?;
         if res.rows_affected() != 1 {

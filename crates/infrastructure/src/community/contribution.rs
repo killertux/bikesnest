@@ -8,8 +8,8 @@ use crate::parking::SqlxParkingDetailsReader;
 use async_trait::async_trait;
 use bikesnest_application::{
     ContributionError, DuplicateCandidate, ListingProposal, NewParkingLocation, NewProposal,
-    ParkingContributionRepository, ParkingDetailsReader, ParkingEdit, ProposalVote,
-    ProposalVoteTotals,
+    ParkingContributionRepository, ParkingDetailsReader, ParkingEdit, PendingFieldCue,
+    PendingProposalSummary, ProposalVote, ProposalVoteTotals,
 };
 use bikesnest_domain::{
     ChangeKind, Cost, GeoPoint, OpeningHours, ParkingLocation, RevisionSummary, SecurityFeature,
@@ -517,7 +517,7 @@ impl ParkingContributionRepository for SqlxParkingContributionRepository {
             .map_err(|e| db_err("contribution.listing_proposals", e))?;
         rows.into_iter()
             .map(|row| {
-                Ok(ListingProposal {
+                Ok::<_, ContributionError>(ListingProposal {
                     id: row.id,
                     base_version: row.base_version,
                     proposer_id: row.proposer_id.map(UserId),
@@ -541,6 +541,174 @@ impl ParkingContributionRepository for SqlxParkingContributionRepository {
                 })
             })
             .collect()
+    }
+
+    async fn pending_proposal_summary(
+        &self,
+        location_id: i64,
+    ) -> Result<PendingProposalSummary, ContributionError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            field: String,
+            proposal_id: i64,
+        }
+        let total: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM parking_proposal WHERE location_id=$1 AND status='PENDING'",
+        )
+        .bind(location_id)
+        .fetch_one(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("contribution.pending_summary_count.acquire", e))?,
+        )
+        .await
+        .map_err(|e| db_err("contribution.pending_summary_count", e))?;
+        let rows = sqlx::query_as::<_, Row>(
+            r#"
+            WITH current_snapshot AS (
+              SELECT COALESCE(
+                (SELECT snapshot FROM parking_revision WHERE location_id=$1 ORDER BY version DESC LIMIT 1),
+                jsonb_build_object(
+                  'name', l.name,
+                  'address', l.address,
+                  'description', l.description,
+                  'type', l.parking_type,
+                  'cost', jsonb_strip_nulls(jsonb_build_object(
+                    'kind', l.cost_kind, 'cents', l.price_cents,
+                    'currency', l.price_currency, 'unit', l.price_unit
+                  )),
+                  'point', jsonb_build_object('lat', l.lat, 'lon', l.lon),
+                  'timezone', l.timezone,
+                  'hours', jsonb_build_object(
+                    'unknown', l.hours_unknown,
+                    'rows', COALESCE((
+                      SELECT jsonb_agg(jsonb_build_array(
+                        h.day_of_week, h.opens_at::text, h.closes_at::text, h.all_day
+                      ) ORDER BY h.day_of_week, h.opens_at)
+                      FROM opening_hours h WHERE h.location_id=l.id
+                    ), '[]'::jsonb)
+                  ),
+                  'security', COALESCE((
+                    SELECT jsonb_agg(jsonb_build_array(s.feature_code, s.state)
+                                     ORDER BY s.feature_code)
+                    FROM parking_security s WHERE s.location_id=l.id
+                  ), '[]'::jsonb),
+                  'moderation_state', l.moderation_state
+                )
+              ) AS snapshot
+              FROM parking_location l WHERE l.id=$1
+            ), pending AS (
+              SELECT id,kind,proposed FROM parking_proposal WHERE location_id=$1 AND status='PENDING'
+            ), cues AS (
+              SELECT p.id, k.field FROM pending p CROSS JOIN current_snapshot c
+              CROSS JOIN LATERAL (VALUES ('name'),('address'),('description'),('type'),('cost'),('hours')) k(field)
+              WHERE p.kind='edit_details' AND p.proposed->k.field IS DISTINCT FROM c.snapshot->k.field
+              UNION ALL SELECT p.id,'point' FROM pending p WHERE p.kind='move_location'
+              UNION ALL SELECT p.id,'timezone' FROM pending p WHERE p.kind='move_location' AND p.proposed ? 'timezone'
+              UNION ALL SELECT p.id,'existence' FROM pending p WHERE p.kind='change_existence'
+              UNION ALL
+              SELECT p.id, proposed_item->>0 FROM pending p CROSS JOIN current_snapshot c
+              CROSS JOIN LATERAL jsonb_array_elements(p.proposed->'security') proposed_item
+              WHERE p.kind='edit_details' AND proposed_item IS DISTINCT FROM (
+                SELECT current_item FROM jsonb_array_elements(c.snapshot->'security') current_item
+                WHERE current_item->>0=proposed_item->>0 LIMIT 1)
+            )
+            SELECT field, max(id) AS proposal_id FROM cues GROUP BY field ORDER BY field
+        "#,
+        )
+        .bind(location_id)
+        .fetch_all(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("contribution.pending_summary.acquire", e))?,
+        )
+        .await
+        .map_err(|e| db_err("contribution.pending_summary", e))?;
+        Ok(PendingProposalSummary {
+            total,
+            fields: rows
+                .into_iter()
+                .map(|r| PendingFieldCue {
+                    field: r.field,
+                    proposal_id: r.proposal_id,
+                })
+                .collect(),
+        })
+    }
+
+    async fn listing_proposals_page(
+        &self,
+        location_id: i64,
+        after_id: Option<i64>,
+        limit: i64,
+    ) -> Result<(Vec<ListingProposal>, i64, bool), ContributionError> {
+        let limit = limit.clamp(1, 50);
+        let total: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM parking_proposal WHERE location_id=$1 AND status='PENDING'",
+        )
+        .bind(location_id)
+        .fetch_one(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("contribution.proposal_count.acquire", e))?,
+        )
+        .await
+        .map_err(|e| db_err("contribution.proposal_count", e))?;
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            id: i64,
+            base_version: i64,
+            proposer_id: Option<i64>,
+            kind: String,
+            proposed: serde_json::Value,
+            status: String,
+            approvals: i64,
+            rejections: i64,
+            created_at: chrono::DateTime<chrono::Utc>,
+        }
+        let rows = sqlx::query_as::<_, Row>(r#"
+            SELECT p.id,p.base_version,p.proposer_id,p.kind,p.proposed,p.status,p.created_at,
+              COUNT(*) FILTER (WHERE v.vote='APPROVE' AND u.id IS NOT NULL)::bigint approvals,
+              COUNT(*) FILTER (WHERE v.vote='REJECT' AND u.id IS NOT NULL)::bigint rejections
+            FROM parking_proposal p LEFT JOIN parking_proposal_vote v ON v.proposal_id=p.id
+            LEFT JOIN users u ON u.id=v.voter_id AND u.account_state='ACTIVE' AND u.email_verified_at IS NOT NULL
+            WHERE p.location_id=$1 AND p.status='PENDING' AND ($2::bigint IS NULL OR p.id<$2)
+            GROUP BY p.id ORDER BY p.id DESC LIMIT $3
+        "#).bind(location_id).bind(after_id).bind(limit + 1).fetch_all(&mut *self.db.acquire().await.map_err(|e| db_err("contribution.proposal_page.acquire", e))?).await
+            .map_err(|e| db_err("contribution.proposal_page", e))?;
+        let mut page = rows
+            .into_iter()
+            .map(|row| {
+                let kind = bikesnest_domain::ProposalKind::from_code(&row.kind)
+                    .map_err(|e| ContributionError::InvalidField(e.to_string()))?;
+                Ok::<_, ContributionError>(ListingProposal {
+                    id: row.id,
+                    base_version: row.base_version,
+                    proposer_id: row.proposer_id.map(UserId),
+                    kind,
+                    change: bikesnest_domain::ProposedChange::from_json(kind, &row.proposed),
+                    reason: row
+                        .proposed
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    status: bikesnest_domain::ProposalStatus::from_code(&row.status)
+                        .map_err(|e| ContributionError::InvalidField(e.to_string()))?,
+                    approvals: row.approvals,
+                    rejections: row.rejections,
+                    created_at: row.created_at,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = page.len() as i64 > limit;
+        page.truncate(limit as usize);
+        Ok((page, total, has_more))
     }
 
     async fn revision_history(
@@ -580,7 +748,7 @@ impl ParkingContributionRepository for SqlxParkingContributionRepository {
 
         rows.into_iter()
             .map(|r| {
-                Ok(RevisionSummary {
+                Ok::<_, ContributionError>(RevisionSummary {
                     version: r.version,
                     change_kind: ChangeKind::from_code(&r.change_kind)
                         .map_err(|e| ContributionError::InvalidField(e.to_string()))?,
@@ -590,6 +758,53 @@ impl ParkingContributionRepository for SqlxParkingContributionRepository {
                 })
             })
             .collect()
+    }
+
+    async fn revision_history_page(
+        &self,
+        id: i64,
+        after_version: Option<i64>,
+        limit: i64,
+    ) -> Result<(Vec<RevisionSummary>, i64, bool), ContributionError> {
+        let total: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM parking_revision WHERE location_id=$1")
+                .bind(id)
+                .fetch_one(
+                    &mut *self
+                        .db
+                        .acquire()
+                        .await
+                        .map_err(|e| db_err("contribution.revision_count.acquire", e))?,
+                )
+                .await
+                .map_err(|e| db_err("contribution.revision_count", e))?;
+        #[derive(sqlx::FromRow)]
+        struct RevRow {
+            version: i64,
+            change_kind: String,
+            snapshot: serde_json::Value,
+            summary: Option<String>,
+            created_at: chrono::DateTime<chrono::Utc>,
+        }
+        let limit = limit.clamp(1, 50);
+        let rows=sqlx::query_as::<_,RevRow>("SELECT version,change_kind,snapshot,summary,created_at FROM parking_revision WHERE location_id=$1 AND ($2::bigint IS NULL OR version<$2) ORDER BY version DESC LIMIT $3")
+          .bind(id).bind(after_version).bind(limit + 1).fetch_all(&mut *self.db.acquire().await.map_err(|e|db_err("contribution.revision_page.acquire",e))?).await.map_err(|e|db_err("contribution.revision_page",e))?;
+        let mut page = rows
+            .into_iter()
+            .map(|r| {
+                Ok::<_, ContributionError>(RevisionSummary {
+                    version: r.version,
+                    change_kind: ChangeKind::from_code(&r.change_kind)
+                        .map_err(|e| ContributionError::InvalidField(e.to_string()))?,
+                    summary: r.summary,
+                    at: r.created_at,
+                    snapshot: r.snapshot,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = page.len() as i64 > limit;
+        page.truncate(limit as usize);
+        Ok((page, total, has_more))
     }
 
     /// Near neighbours to compare a proposed location against.

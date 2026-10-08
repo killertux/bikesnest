@@ -8,6 +8,13 @@
   {% if notice.is_some() %}
     <div role="status" class="mt-4 rounded-xl border border-accent-strong/30 bg-accent-soft px-4 py-3 text-sm text-accent-strong">{{ notice.as_deref().unwrap_or("") }}</div>
   {% endif %}
+  {% for terms in terms_notices %}
+    <aside data-terms-notice data-effective-at="{{ terms.effective_at }}" class="mt-4 rounded-xl border border-accent-strong/30 bg-accent-soft px-4 py-4">
+      <p class="font-medium text-accent-strong">{% if terms.future %}{{ tr.t("terms.notice.future") }}{% else %}{{ tr.t("terms.notice.current") }}{% endif %}</p>
+      <p class="mt-1 text-sm text-muted">{{ tr.t("policy.version") }} {{ terms.version }} · {{ tr.t("policy.effective") }} {{ terms.effective_label }}</p>
+      <a href="{{ terms.url }}" class="mt-2 inline-flex min-h-11 items-center font-semibold text-accent-strong underline">{{ tr.t("terms.notice.review") }}</a>
+    </aside>
+  {% endfor %}
   {% if !is_verified %}
     <div class="mt-4 rounded-lg border border-aging/30 bg-aging/10 px-4 py-4">
       <p class="font-medium text-aging">{{ tr.t("account.banner_title") }}</p>

@@ -28,9 +28,10 @@ use routes::contribution_form::{
 };
 
 /// Base layout data shared by all pages. `current` drives the active nav item;
-/// `csrf` is the per-session synchronizer token (empty when anonymous) — rendered
-/// into the `<meta name="csrf">` tag the CSRF middleware / htmx reads.
+/// `csrf` is the request's session or stable anonymous token, rendered into
+/// forms and document metadata for native and htmx submissions.
 pub struct PageLayout {
+    pub csp_nonce: String,
     pub title: String,
     pub current: String,
     pub csrf: String,
@@ -53,8 +54,8 @@ pub struct PageLayout {
     pub google_map_id: String,
     /// Whether this request carries a resolved session (signed in). Drives the
     /// header: an account menu vs. Entrar/Criar conta. An anonymous page that
-    /// still mints a double-submit CSRF token (login/register/reset/verify)
-    /// keeps this `false` even though `csrf` is non-empty — see [`Self::new`].
+    /// can still carry an anonymous double-submit CSRF token and keeps this
+    /// `false` even though `csrf` is non-empty — see [`Self::new`].
     pub is_authenticated: bool,
     /// Session user has MODERATOR or ADMIN (shows the Moderação link).
     pub is_moderator: bool,
@@ -66,7 +67,9 @@ pub struct PageLayout {
 }
 
 impl PageLayout {
-    /// An anonymous page layout: no session identity, no CSRF token. The map
+    /// A bare anonymous page layout: no session identity or token. Request
+    /// handlers should normally prefer [`Self::for_request`] so middleware's
+    /// anonymous token context is retained. The map
     /// style/token come from the configuration parsed at startup and held in
     /// `AppState`, never from the process environment at render time.
     pub fn new(map: &MapConfig, title: String, current: &str) -> Self {
@@ -104,6 +107,7 @@ impl PageLayout {
                 ),
             };
         Self {
+            csp_nonce: String::new(),
             title,
             current: current.to_string(),
             csrf: String::new(),
@@ -146,6 +150,7 @@ impl PageLayout {
             .is_some_and(|u| u.has_role(bikesnest_domain::Role::Admin));
         let can_contribute = auth.user.as_ref().is_some_and(|u| u.is_verified);
         Self {
+            csp_nonce: auth.csp_nonce.to_string(),
             is_authenticated: auth.authenticated(),
             is_moderator,
             is_admin,
@@ -157,6 +162,11 @@ impl PageLayout {
     /// Set (or overwrite) the canonical URL.
     pub fn canonical(mut self, url: impl Into<String>) -> Self {
         self.canonical = url.into();
+        self
+    }
+
+    pub fn csp_nonce(mut self, nonce: impl ToString) -> Self {
+        self.csp_nonce = nonce.to_string();
         self
     }
 
@@ -180,7 +190,7 @@ impl PageLayout {
     }
 
     /// Resolves `path` (relative to `static_root`, forward-slash separated —
-    /// e.g. `"css/app.css"`, `"vendor/maplibre-gl.js"`) to its content-hashed
+    /// e.g. `"css/app.css"`, `"js/maplibre-loader.mjs"`) to its content-hashed
     /// `/static/h/<hash>/<path>` URL. Falls back to the plain
     /// `/static/<path>` when the asset manifest hasn't been built yet or the
     /// path isn't in it, so a template call here never produces a broken
@@ -229,7 +239,7 @@ impl PageLayout {
     }
 }
 
-/// Error page (E1/E2), styled via Tailwind tokens.
+/// Error page, styled via Tailwind tokens.
 #[derive(Template)]
 #[template(path = "pages/error.html")]
 pub struct ErrorPage {
@@ -237,6 +247,8 @@ pub struct ErrorPage {
     pub tr: Translator,
     pub status: u16,
     pub message: String,
+    pub recovery_url: String,
+    pub login_url: String,
 }
 
 /// One translated failure, rendered the way the caller can use it: a real
@@ -287,6 +299,8 @@ pub fn error_response(
             tr,
             status: status.as_u16(),
             message: message.clone(),
+            recovery_url: auth.next.clone(),
+            login_url: auth.login_url(),
         }
         .render()
     };
@@ -352,8 +366,8 @@ impl SearchPageVm {
     fn open_now_checked(&self) -> bool {
         self.form.open_now == "true"
     }
-    fn q_set(&self) -> bool {
-        !self.form.q.is_empty()
+    fn clear_filters_url(&self) -> String {
+        self.form.clear_filters_url()
     }
     fn radius_is(&self, m: u32) -> bool {
         self.form.radius == Some(m)
@@ -414,6 +428,7 @@ pub struct DetailsPage {
     pub hours: Vec<view::HoursRowVm>,
     pub timezone_label: String,
     pub security: Vec<SecVm>,
+    pub has_unknown_security: bool,
     pub verified_label: String,
     pub osm_url: String,
     pub google_url: String,
@@ -449,6 +464,21 @@ pub struct DetailsPage {
     pub version: i64,
     pub tab: String,
     pub pending_photos: i64,
+    pub pending_proposals_total: i64,
+    pub proposals_total: i64,
+    pub history_total: i64,
+    pub reviews_total: i64,
+    pub gallery_total: i64,
+    pub reviews_next: Option<String>,
+    pub reviews_has_more: bool,
+    pub proposals_next: Option<String>,
+    pub history_next: Option<String>,
+    pub collaboration_summary_available: bool,
+    pub current_content_available: bool,
+    pub gallery_available: bool,
+    pub proposals_available: bool,
+    pub history_available: bool,
+    pub pending_fields: Vec<(String, i64)>,
     pub published_values: Vec<profile::ProfileValueVm>,
     pub viewer_id: Option<bikesnest_domain::UserId>,
 }
@@ -480,6 +510,20 @@ impl DetailsPage {
             OpenStatus::Unknown => "unknown",
         };
         let open_label = view::open_label(tr, v.is_open_now);
+        let security = loc
+            .security()
+            .iter()
+            .map(|f| SecVm {
+                code: f.code().to_string(),
+                label: tr.security(f.code()).to_string(),
+                state: match f.state() {
+                    bikesnest_domain::SecurityState::Yes => "yes",
+                    bikesnest_domain::SecurityState::No => "no",
+                    bikesnest_domain::SecurityState::Unknown => "unknown",
+                },
+            })
+            .collect::<Vec<_>>();
+        let has_unknown_security = security.iter().any(|f| f.state == "unknown");
         Self {
             layout: PageLayout::for_request(format!("{} — BikesNest", loc.name()), "", auth, map),
             tr,
@@ -497,19 +541,8 @@ impl DetailsPage {
             open_code,
             hours: view::hours_rows(tr, loc.hours(), loc.timezone(), now),
             timezone_label: loc.timezone().name().to_string(),
-            security: loc
-                .security()
-                .iter()
-                .map(|f| SecVm {
-                    code: f.code().to_string(),
-                    label: tr.security(f.code()).to_string(),
-                    state: match f.state() {
-                        bikesnest_domain::SecurityState::Yes => "yes",
-                        bikesnest_domain::SecurityState::No => "no",
-                        bikesnest_domain::SecurityState::Unknown => "unknown",
-                    },
-                })
-                .collect(),
+            security,
+            has_unknown_security,
             verified_label: match loc.last_verified_at() {
                 Some(t) => {
                     let days = (now - t).num_days();
@@ -528,7 +561,12 @@ impl DetailsPage {
             osm_url: format!(
                 "https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=18/{lat}/{lon}"
             ),
-            google_url: format!("https://www.google.com/maps/dir/?api=1&destination={lat},{lon}"),
+            // Google Maps URLs documents `travelmode=bicycling` for the
+            // directions action. Coordinates are the only value we send when
+            // the rider explicitly follows this external link.
+            google_url: format!(
+                "https://www.google.com/maps/dir/?api=1&destination={lat},{lon}&travelmode=bicycling"
+            ),
             lat,
             lon,
             gallery,
@@ -540,20 +578,38 @@ impl DetailsPage {
             dispute_items: Vec::new(),
             parked_here_count: 0,
             is_favorited: false,
-            can_contribute: false,
-            is_authenticated: false,
+            can_contribute: auth.user.as_ref().is_some_and(|u| u.is_verified),
+            is_authenticated: auth.authenticated(),
             has_own_review: false,
             own_rating: 0,
             reasons: Vec::new(),
             notice: None,
             moderation_state: loc.moderation_state().as_code(),
-            is_moderator: false,
+            is_moderator: auth.user.as_ref().is_some_and(|u| {
+                u.has_role(bikesnest_domain::Role::Moderator)
+                    || u.has_role(bikesnest_domain::Role::Admin)
+            }),
             reason_options: view::report_reason_options(tr),
             collaboration_proposals: Vec::new(),
             collaboration_history: Vec::new(),
             version: loc.version(),
             tab: "current".into(),
             pending_photos: 0,
+            pending_proposals_total: 0,
+            proposals_total: 0,
+            history_total: 0,
+            reviews_total: loc.rating().count(),
+            gallery_total: 0,
+            reviews_next: None,
+            reviews_has_more: false,
+            proposals_next: None,
+            history_next: None,
+            collaboration_summary_available: true,
+            current_content_available: true,
+            gallery_available: true,
+            proposals_available: true,
+            history_available: true,
+            pending_fields: Vec::new(),
             published_values: {
                 let mut snapshot = bikesnest_domain::ParkingEdit::from_location(loc).to_json();
                 snapshot["point"] = serde_json::json!({"lat":lat,"lon":lon});
@@ -583,9 +639,16 @@ impl DetailsPage {
         let mut reviews = Vec::with_capacity(c.reviews.len());
         for r in &c.reviews {
             let mut photos = Vec::new();
+            let mut media_available = true;
             if let Some(ps) = c.review_photos.get(&r.id) {
                 for p in ps {
                     let Some(url) = view::resolve_photo(storage, Some(&p.key)).await else {
+                        media_available = false;
+                        tracing::warn!(
+                            category = "review_media_signing_unavailable",
+                            location_id = page.id,
+                            review_id = r.id
+                        );
                         continue;
                     };
                     let thumb_url = match p.thumbnail_key.as_deref() {
@@ -597,13 +660,19 @@ impl DetailsPage {
                     photos.push(PhotoVm {
                         url,
                         thumb_url,
-                        alt: p.alt.clone().unwrap_or_else(|| "Review photo".to_string()),
+                        alt: p
+                            .alt
+                            .clone()
+                            .unwrap_or_else(|| tr.t("details.review_photo_alt").to_string()),
                     });
                 }
             }
-            reviews.push(view::review_vm(tr, r, false, photos));
+            let mut review = view::review_vm(tr, r, false, photos);
+            review.media_available = media_available;
+            reviews.push(review);
         }
         page.reviews = reviews;
+        page.reviews_has_more = c.reviews_has_more;
         page.confidence_code = c.confidence.as_code();
         page.confidence_label = view::confidence_label(tr, c.confidence).to_string();
         page.disputed = c.disputed;
@@ -615,15 +684,9 @@ impl DetailsPage {
             .collect();
         page.parked_here_count = c.parked_here_count;
         page.is_favorited = c.is_favorited;
-        page.can_contribute = auth.user.as_ref().is_some_and(|u| u.is_verified);
-        page.is_authenticated = auth.authenticated();
         page.has_own_review = c.own_review.is_some();
         page.own_rating = c.own_review.map(|r| r.rating.value()).unwrap_or(0);
         page.reasons = c.reasons.iter().map(|r| view::reason_vm(tr, r)).collect();
-        page.is_moderator = auth.user.as_ref().is_some_and(|u| {
-            u.has_role(bikesnest_domain::Role::Moderator)
-                || u.has_role(bikesnest_domain::Role::Admin)
-        });
         page
     }
 
@@ -665,6 +728,10 @@ pub struct RegisterPage {
     pub error: Option<String>,
     /// Which input(s) a rejected submission belongs to.
     pub field_errors: view::FieldErrors,
+    pub terms_required: bool,
+    pub terms_policy_id: i64,
+    pub terms_version: String,
+    pub terms_url: String,
 }
 
 /// A2 — login.
@@ -733,6 +800,30 @@ pub struct AccountPage {
     pub is_verified: bool,
     pub roles_label: String,
     pub notice: Option<String>,
+    pub terms_notices: Vec<TermsNoticeVm>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TermsNoticeVm {
+    pub url: String,
+    pub version: String,
+    pub effective_label: String,
+    pub effective_at: String,
+    pub future: bool,
+}
+
+#[derive(Template)]
+#[template(path = "pages/terms_notice.html")]
+pub struct TermsNoticePage {
+    pub layout: PageLayout,
+    pub tr: Translator,
+    pub policy_id: i64,
+    pub version: String,
+    pub effective_label: String,
+    pub effective_at: String,
+    pub content: String,
+    pub future: bool,
+    pub error: Option<String>,
 }
 
 /// C2 — change password.
@@ -865,6 +956,9 @@ pub struct ParkingNewPage {
     pub default_lon: f64,
     pub hours_days: Vec<ContributionHoursDayVm>,
     pub security_states: Vec<ContributionTriStateVm>,
+    pub hours_open: bool,
+    pub security_open: bool,
+    pub advanced_open: bool,
     pub type_options: Vec<view::OptionVm>,
     pub error: Option<String>,
     /// Which input(s) a rejected submission belongs to.
@@ -904,6 +998,8 @@ pub struct ParkingEditPage {
     pub price_unit: String,
     pub hours_days: Vec<ContributionHoursDayVm>,
     pub security_states: Vec<ContributionTriStateVm>,
+    pub hours_open: bool,
+    pub security_open: bool,
     pub type_options: Vec<view::OptionVm>,
     /// The spot's current position. Not editable here — moving a pin is a
     /// reviewed proposal — but it seeds the map on the "move the pin" form.

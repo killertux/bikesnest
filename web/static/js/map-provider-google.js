@@ -2,6 +2,8 @@
 (function () {
   "use strict";
 
+  var documentNonce = document.currentScript && document.currentScript.nonce || "";
+
   var cfg = document.body ? document.body.dataset : {};
   var apiKey = cfg.googleMapsApiKey || "";
   var mapId = cfg.googleMapId || "";
@@ -20,6 +22,7 @@
       };
       var script = document.createElement("script");
       script.async = true;
+      if (documentNonce) script.nonce = documentNonce;
       script.src = "https://maps.googleapis.com/maps/api/js?key=" +
         encodeURIComponent(apiKey) + "&loading=async&v=weekly&libraries=marker&callback=" + callback;
       script.onerror = function () {

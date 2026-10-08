@@ -5,16 +5,34 @@ How BikesNest is tested and how to write a test.
 ## Running tests
 
 ```bash
-cargo test                    # domain + application only (no database needed)
+cargo test -p bikesnest-domain -p bikesnest-application  # no database needed
 docker compose up -d db       # required once, before DB-backed tests
-cargo test --workspace        # everything, including #[db_test] integration/HTTP tests
-cargo test -p bikesnest-web    # a single crate
-cargo test search_            # filter by name substring
+TEST_DATABASE_URL=postgres://bikesnest:bikesnest@localhost:5432/bikesnest_test \
+  cargo test --workspace      # everything, including #[db_test] integration/HTTP tests
+TEST_DATABASE_URL=postgres://bikesnest:bikesnest@localhost:5432/bikesnest_test \
+  cargo test -p bikesnest-web # a single DB-backed crate
+TEST_DATABASE_URL=postgres://bikesnest:bikesnest@localhost:5432/bikesnest_test \
+  cargo test search_          # filter by name substring
 ```
 
 `cargo build` itself needs **no database** (queries are runtime-checked), but
-the DB-backed tests do — they connect to the compose database
-(`TEST_DATABASE_URL`, falling back to `DATABASE_URL`).
+the DB-backed tests do. They require an explicit `TEST_DATABASE_URL`; the
+harness never reads `DATABASE_URL`. Its final parsed database name must be
+`bikesnest_test` or `bikesnest_test_<suffix>`, which rejects common accidental
+targets before the harness connects or runs migrations. This name allowlist
+does not prove that a server is disposable: keep the target on an isolated host
+and use a dedicated test role with no production access in CI or shared
+environments.
+
+The default compose database is the application's development database. Create
+the separate local test database once before using the command above:
+
+```bash
+docker compose exec db createdb -U bikesnest bikesnest_test
+```
+
+Plain `cargo test` selects every crate in this virtual workspace, including
+DB-backed tests, so it is not the database-free quick command.
 
 Every `#[db_test]` installs a `tracing` subscriber (see "Tracing in tests"
 below), so a repository's error-classification logging is visible with:
@@ -29,9 +47,28 @@ RUST_LOG=info cargo test -- --nocapture
 Chromium against a local fixture server using the real layout asset declarations,
 map-page manifests, htmx, Alpine and consumer scripts. External map services are
 stubbed with delayed responses; no database, account or API key is needed.
-The suite covers mobile menus, history navigation, every map consumer and
-provider configuration, and retry after an asset failure. CI installs Chromium
-with its system dependencies and runs these tests in the Frontend assets job.
+The suite covers mobile menus, metadata/focus across boost and history,
+geolocation outcomes and detached callbacks, every map consumer and provider
+configuration, same-page map recovery/state preservation, and retry after an
+asset or renderer failure. It also constructs the vendored MapLibre and Mapbox
+SDKs with local empty styles. CI installs Chromium with its system dependencies
+and runs these tests in the Frontend assets job.
+
+The CSRF lifecycle also has a rendered-router browser regression. It requires
+the disposable PostgreSQL target and Chromium, starts the real Axum router on a
+loopback ephemeral port, and never contacts external providers:
+
+```bash
+TEST_DATABASE_URL=postgres://bikesnest:bikesnest@localhost:5432/bikesnest_test \
+  cargo test -p bikesnest-web --test csrf_browser_test --locked -- --ignored
+
+TEST_DATABASE_URL=postgres://bikesnest:bikesnest@localhost:5432/bikesnest_test \
+  cargo test -p bikesnest-web --test search_browser_test --locked -- --ignored
+```
+
+It is explicitly ignored in ordinary workspace runs because spawning a browser
+is comparatively expensive; CI invokes it separately rather than silently
+omitting the security journey.
 
 ## The four layers
 
@@ -65,14 +102,15 @@ async fn my_test(tx: &mut TestTx) {
 Rules:
 
 - The function must take exactly one parameter: `tx: &mut TestTx`.
-- Use `tx.executor()` for any SQL that must be visible to code running inside
-  the same transaction.
-- **Never** `block_on` inside a `#[db_test]` body — await `pool()` instead.
+- Use `tx.executor()` for SQL-only tests. Once a test calls `tx.db().await`,
+  acquire fixture connections from that `Db` instead.
+- **Never** `block_on` inside a `#[db_test]` body — await asynchronous fixture
+  and adapter operations directly.
 - An open **savepoint** simulates an inner application transaction committing:
   `let mut sp = tx.savepoint().await;` … `sp.commit().await;` (or
   `sp.rollback().await`).
 
-### Repository tests: inject the outer transaction (preferred)
+### Repository and HTTP tests: inject the outer transaction
 
 Use `tx.db().await` **before any fixture queries**. It transfers ownership of the
 test transaction to a cloneable, transaction-backed `Db`. Build fixtures using
@@ -101,12 +139,11 @@ savepoint without aborting the test's outer transaction. Scope tests run at
 REPEATABLE READ so snapshot-export transactions can use a savepoint too;
 PostgreSQL cannot change transaction isolation inside a savepoint.
 
-Adapters must use `Db::acquire()` for reads and acquire a connection before
-calling `conn.begin()` for writes. Do not call `Db::pool()` on an injected scope:
-it deliberately fails rather than accidentally committing outside the test.
-Account, review and export adapters support this now; migrate other adapters
-before injecting them into a transaction-scoped HTTP router. Do not mix
-`tx.executor()` / `tx.commit_fixture()` with `tx.db()` in one test.
+Adapters use `Db::acquire()` for reads and acquire a connection before calling
+`conn.begin()` for writes. Real HTTP routers receive the same scoped `Db` as
+their fixtures. `Db::pool()` is reserved for the migration runner; an injected
+scope deliberately cannot expose a pool or commit outside the test. Do not use
+`tx.executor()` after ownership has moved into `tx.db()`.
 
 One scoped `Db` means **one connection**, with exclusive leases. This tests real
 SQL, constraints, rollback and repository commit behavior, but not independent
@@ -114,50 +151,33 @@ concurrent transactions, snapshot visibility between connections, or lock races.
 Those tests need a dedicated isolated database and real connections; do not
 serialize them on a scoped `Db` and claim concurrency coverage.
 
+### Isolated multi-connection race tests
+
+`run_isolated_database_test` creates a uniquely named `bikesnest_test_race_*`
+database on the same loopback server as the already validated
+`TEST_DATABASE_URL`, migrates it, and supplies a small real pool to an async
+test closure. Use it when independent connections, schema-wide or global state,
+DDL upgrades, or actual lock waits are behavior under test; ordinary sequential
+tests use a scoped `Db`. The configured test role must have `CREATEDB`.
+
+The runner records whether its exact generated database was created, awaits a
+bounded pool close, force-drops only that database after success, setup failure,
+or panic, and then propagates the panic. It never drops the configured shared
+test database or reuses an existing name. A process kill cannot run cleanup;
+the timestamp/PID/counter name makes such leftovers identifiable for manual
+removal. Test tasks must still be joined or canceled and transaction locks
+released before their closure returns.
+
+`run_isolated_unmigrated_database_test` uses the same target validation,
+unique-name ownership and cleanup path but supplies an empty database. It is
+reserved for forward-upgrade tests that first run an exact older subset of the
+committed SQLx migration set and then run the current migrator; ordinary tests
+must use the migrated runner.
+
 Regression examples: `infrastructure/tests/transaction_scope_test.rs` verifies
 repository commit isolation, failed-savepoint recovery, outer rollback after
 success/panic, and invalidation of surviving clones. `public_attribution_test.rs`
 tests the real account/review/export adapters without committing fixtures.
-
-### Legacy pooled tests: the committed-fixture pattern
-
-Existing tests below predate transaction injection. Prefer the scoped pattern
-above for new sequential repository tests and migrate these incrementally.
-
-Read-model tests query through *other* pool connections, which cannot see the
-uncommitted rows of the test transaction. For those, commit a **tagged**
-fixture, assert against the real readers, then delete by tag. See
-`crates/infrastructure/tests/parking_test.rs` for the canonical example:
-
-```rust
-const MARK: &str = "fix-within-radius";
-
-#[db_test]
-async fn within_radius_ordered_by_distance(tx: &mut TestTx) {
-    cleanup_fixture(MARK).await;                       // delete leftover rows by seed_key
-    ParkingBuilder::new()
-        .with_fixture_tag(MARK)
-        .at(lat, lon)
-        .create(tx.executor()).await.unwrap();
-    tx.commit_fixture().await;                         // commit, then start a fresh tx
-
-    let page = real_search(&request).await.unwrap();   // reads via the pool
-    assert!(/* ... */);
-
-    cleanup_fixture(MARK).await;                       // leave no trace
-}
-```
-
-`ParkingBuilder::with_fixture_tag(marker)` writes the marker into the
-`seed_key` column; `cleanup_fixture` deletes by it. Give each test a unique tag
-and a geographically separated origin so crashed runs can't cross-contaminate.
-
-The canonical example of this pattern at scale is
-`crates/infrastructure/tests/parking_test.rs::keyset_pagination_is_stable_across_inserts`:
-it commits **25** fixture rows (tagged `fix-keyset`, spread along a line so
-distance order is unambiguous), pages through the real search reader 5 rows at
-a time via the keyset cursor, and asserts every one of the 25 ids is seen
-exactly once across the pages before deleting the fixture by tag.
 
 ## Tracing in tests
 
@@ -228,7 +248,7 @@ signs every URL under `bikesnest_infrastructure::TEST_MEDIA_ORIGIN`
 resolve to anything real), and `Config::for_tests` puts that exact string in
 `security.media_hosts` — one constant, so the two can never drift apart. This
 means the rendered photo is a genuine *absolute-origin* URL, the same shape a
-real S3/MinIO presigned URL has, not a same-origin `/media/...` placeholder —
+real S3/RustFS presigned URL has, not a same-origin `/media/...` placeholder —
 the test additionally asserts (`assert_page_has_media_origin_img`) that the
 moderation queue (while it still holds the test's own pending upload) and the
 published parking page each render at least one `<img src>` at that origin, so
@@ -254,6 +274,16 @@ reaches the parking/moderation pages:
 by the dedicated `media_hosts`-list assertion at the end of the test (which
 still also fails, redundantly). Reverting `media_hosts` makes the test pass
 again with no other change.
+
+## Policy-release and terms-proof isolation
+
+`crates/infrastructure/tests/policy_terms_test.rs` uses
+`run_isolated_database_test` because release-lock, signup/publish, and
+delete/proof races require independent connections. It reconstructs the
+pre-0028 tables only inside an owned disposable child database when checking
+the forward migration. Ordinary policy reader tests use `tx.db()` and rely on
+the outer rollback; do not commit or delete immutable policy fixtures in the
+shared test database.
 
 ## Hygiene / guard tests
 
@@ -312,12 +342,13 @@ missing translated dataset attribute, not copy shown in the normal path.
 - **`TestPasswordHasher`** — a non-cryptographic hash (prefix `test:`) so the
   web/HTTP suite never pays for argon2.
 - **`TestObjectStorage`** — in-memory object storage double.
-- **`pool()`** — the shared, migrated connection pool, for wiring routers.
+- **`pool()`** — the shared, migrated connection pool, for harness internals
+  and independent read-only observers; ordinary routers use the scoped `Db`.
 
 For HTTP tests, inject doubles through the test constructor:
 
 ```rust
-let db = Db::from_pool(pool().await);
+let db = tx.db().await;
 let app = bikesnest_web::app_router_with(
     db,
     std::time::Duration::from_secs(2),
@@ -376,12 +407,13 @@ async fn user_builder_persists_a_user(tx: &mut TestTx) {
 
 ### 4. HTTP endpoint (DB-backed, through the real router)
 
-Use `#[db_test]` + `pool()` + `app_router(_with)` + `tower::ServiceExt::oneshot`:
+Use `#[db_test]` + `tx.db()` + `app_router(_with)` + `tower::ServiceExt::oneshot`:
 
 ```rust
 #[db_test]
-async fn healthz_is_alive(_tx: &mut TestTx) {
-    let app = bikesnest_web::app_router(Db::from_pool(pool().await), std::time::Duration::from_secs(2));
+async fn healthz_is_alive(tx: &mut TestTx) {
+    let db = tx.db().await;
+    let app = bikesnest_web::app_router(db, std::time::Duration::from_secs(2));
     let res = app.oneshot(
         Request::builder().uri("/healthz").body(axum::body::Body::empty()).unwrap()
     ).await.unwrap();
@@ -413,8 +445,9 @@ without waiting for the integration suite:
 - **Format** runs `cargo fmt --all -- --check`.
 - **Clippy** runs `cargo clippy --workspace --all-targets --locked -- -D warnings`.
 - **Tests** runs `cargo test --workspace --locked` against PostgreSQL/PostGIS,
-  ValKey, and MinIO. The provider smoke tests remain opt-in and skip when their
-  external API keys are absent.
+  ValKey, and RustFS, followed by the rendered CSRF lifecycle in Chromium. The
+  provider smoke tests remain opt-in and skip when their external API keys are
+  absent.
 - **Frontend assets** rebuilds the vendored JavaScript/CSS and Tailwind output,
   then fails if the generated files differ from the committed copies.
 - **Docker image** builds the production image and checks that startup rejects

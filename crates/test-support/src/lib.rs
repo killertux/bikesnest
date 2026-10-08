@@ -8,7 +8,8 @@
 //! - Domain-rich builders.
 
 use sqlx::postgres::{PgPoolOptions, Postgres};
-use sqlx::{PgPool, Transaction};
+use sqlx::{Connection, PgConnection, PgPool, Transaction};
+use std::str::FromStr;
 use tokio::sync::OnceCell;
 
 /// Re-exported so test crates only need `bikesnest_test_support` in scope.
@@ -60,10 +61,176 @@ pub fn init_test_tracing() {
     });
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TestDatabaseTargetError {
+    Missing,
+    Malformed,
+    UnsafeDatabaseName,
+}
+
+impl TestDatabaseTargetError {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Missing => "test-support: TEST_DATABASE_URL is required for DB-backed tests",
+            Self::Malformed => {
+                "test-support: TEST_DATABASE_URL must be a valid PostgreSQL connection URL"
+            }
+            Self::UnsafeDatabaseName => {
+                "test-support: TEST_DATABASE_URL must target `bikesnest_test` or `bikesnest_test_<suffix>`"
+            }
+        }
+    }
+}
+
+fn is_disposable_test_database_name(database: &str) -> bool {
+    database == "bikesnest_test"
+        || database
+            .strip_prefix("bikesnest_test_")
+            .is_some_and(|suffix| {
+                !suffix.is_empty()
+                    && suffix.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                    })
+            })
+}
+
+fn validate_test_database_url(database_url: &str) -> Result<(), TestDatabaseTargetError> {
+    let scheme = database_url
+        .split_once(':')
+        .map(|(scheme, _)| scheme)
+        .filter(|scheme| {
+            scheme.eq_ignore_ascii_case("postgres") || scheme.eq_ignore_ascii_case("postgresql")
+        });
+    if scheme.is_none() {
+        return Err(TestDatabaseTargetError::Malformed);
+    }
+
+    // Validate the final parsed database name rather than just the path. SQLx
+    // accepts `dbname` as a URL option, and that option takes precedence over
+    // the path when it opens the connection.
+    let options = sqlx::postgres::PgConnectOptions::from_str(database_url)
+        .map_err(|_| TestDatabaseTargetError::Malformed)?;
+    let database = options
+        .get_database()
+        .ok_or(TestDatabaseTargetError::UnsafeDatabaseName)?;
+    if !is_disposable_test_database_name(database) {
+        return Err(TestDatabaseTargetError::UnsafeDatabaseName);
+    }
+
+    Ok(())
+}
+
+fn database_url_from_value(value: Option<&str>) -> Result<String, TestDatabaseTargetError> {
+    let database_url = value.ok_or(TestDatabaseTargetError::Missing)?;
+    validate_test_database_url(database_url)?;
+    Ok(database_url.to_owned())
+}
+
 fn database_url() -> String {
-    std::env::var("TEST_DATABASE_URL")
-        .or_else(|_| std::env::var("DATABASE_URL"))
-        .unwrap_or_else(|_| "postgres://bikesnest:bikesnest@localhost:5432/bikesnest".to_string())
+    let value = std::env::var("TEST_DATABASE_URL").ok();
+    database_url_from_value(value.as_deref()).unwrap_or_else(|error| panic!("{}", error.message()))
+}
+
+fn is_loopback_test_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+/// Run a real multi-connection test in its own migrated disposable database.
+///
+/// The configured test role needs `CREATEDB`. Cleanup is awaited after success
+/// and panic, but a process kill can still leave the uniquely named database
+/// behind for an operator to remove.
+pub fn run_isolated_database_test(f: impl AsyncFnOnce(PgPool)) -> String {
+    run_isolated_database_test_with_setup(true, f)
+}
+
+/// Run a real multi-connection test in its own empty disposable database.
+///
+/// This is reserved for migration tests that must first build an older schema
+/// from the committed migration set. The closure owns migration setup; the
+/// same loopback/name validation and awaited cleanup guarantees apply.
+pub fn run_isolated_unmigrated_database_test(f: impl AsyncFnOnce(PgPool)) -> String {
+    run_isolated_database_test_with_setup(false, f)
+}
+
+fn run_isolated_database_test_with_setup(
+    migrate_current: bool,
+    f: impl AsyncFnOnce(PgPool),
+) -> String {
+    let base_url = database_url();
+    let base_options = sqlx::postgres::PgConnectOptions::from_str(&base_url)
+        .unwrap_or_else(|_| panic!("test-support: invalid validated test database URL"));
+    assert!(
+        is_loopback_test_host(base_options.get_host()),
+        "test-support: isolated databases require a loopback TEST_DATABASE_URL"
+    );
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("test-support: system clock before Unix epoch")
+        .as_nanos();
+    let name = format!(
+        "bikesnest_test_race_{}_{}_{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        nonce,
+    );
+    assert!(name.len() <= 63 && is_disposable_test_database_name(&name));
+
+    let mut admin = shared_runtime().block_on(async {
+        PgConnection::connect_with(&base_options)
+            .await
+            .unwrap_or_else(|_| panic!("test-support: cannot connect to isolated-test server"))
+    });
+    shared_runtime().block_on(async {
+        sqlx::query(&format!("CREATE DATABASE \"{name}\""))
+            .execute(&mut admin)
+            .await
+            .unwrap_or_else(|_| {
+                panic!("test-support: cannot create isolated test database (CREATEDB required)")
+            });
+    });
+    let isolated_options = base_options.clone().database(&name);
+    let pool_result = shared_runtime().block_on(async {
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect_with(isolated_options)
+            .await
+            .map_err(|_| "connect")?;
+        if migrate_current && sqlx::migrate!("../../migrations").run(&pool).await.is_err() {
+            pool.close().await;
+            return Err("migrate");
+        }
+        Ok(pool)
+    });
+    let result = match pool_result {
+        Ok(pool) => {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                shared_runtime().block_on(f(pool.clone()));
+            }));
+            let _ = shared_runtime().block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), pool.close()).await
+            });
+            result
+        }
+        Err(stage) => Err(
+            Box::new(format!("test-support: isolated database {stage} failed"))
+                as Box<dyn std::any::Any + Send>,
+        ),
+    };
+    shared_runtime().block_on(async {
+        let drop_result = sqlx::query(&format!("DROP DATABASE \"{name}\" WITH (FORCE)"))
+            .execute(&mut admin)
+            .await;
+        assert!(
+            drop_result.is_ok(),
+            "test-support: isolated database cleanup failed"
+        );
+    });
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+    name
 }
 
 /// The configuration the HTTP tests build their router from: a development
@@ -88,6 +255,88 @@ async fn connect_and_migrate() -> PgPool {
     pool
 }
 
+#[cfg(test)]
+mod test_database_target_tests {
+    use super::{
+        TestDatabaseTargetError, database_url_from_value, is_loopback_test_host,
+        validate_test_database_url,
+    };
+
+    #[test]
+    fn missing_test_database_url_is_rejected() {
+        assert_eq!(
+            database_url_from_value(None),
+            Err(TestDatabaseTargetError::Missing)
+        );
+    }
+
+    #[test]
+    fn malformed_or_non_postgres_urls_are_rejected() {
+        for database_url in [
+            "not a URL",
+            "mysql://test:test@localhost/bikesnest_test",
+            "https://localhost/bikesnest_test",
+        ] {
+            assert_eq!(
+                validate_test_database_url(database_url),
+                Err(TestDatabaseTargetError::Malformed),
+                "{database_url}",
+            );
+        }
+    }
+
+    #[test]
+    fn missing_or_non_test_database_names_are_rejected() {
+        for database_url in [
+            "postgres://test:test@localhost",
+            "postgres://test:test@localhost/bikesnest",
+            "postgres://test:test@localhost/bikesnest-test",
+            "postgres://test:test@localhost/bikesnest_test-Audit",
+        ] {
+            assert_eq!(
+                validate_test_database_url(database_url),
+                Err(TestDatabaseTargetError::UnsafeDatabaseName),
+                "{database_url}",
+            );
+        }
+    }
+
+    #[test]
+    fn dbname_option_cannot_bypass_the_test_database_name_check() {
+        assert_eq!(
+            validate_test_database_url(
+                "postgres://test:test@localhost/bikesnest_test?dbname=bikesnest",
+            ),
+            Err(TestDatabaseTargetError::UnsafeDatabaseName)
+        );
+    }
+
+    #[test]
+    fn explicit_disposable_test_database_names_are_accepted() {
+        for database_url in [
+            "postgres://test:test@localhost/bikesnest_test",
+            "postgresql://test:test@localhost/bikesnest_test_audit_20260908",
+            "postgres://test:test@localhost/bikesnest?dbname=bikesnest_test_ci",
+        ] {
+            assert_eq!(
+                validate_test_database_url(database_url),
+                Ok(()),
+                "{database_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn isolated_database_hosts_are_loopback_only() {
+        for host in ["localhost", "127.0.0.1", "::1"] {
+            assert!(is_loopback_test_host(host));
+        }
+        for host in ["db", "postgres.example.com", "10.0.0.1"] {
+            assert!(!is_loopback_test_host(host));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test transaction
 // ---------------------------------------------------------------------------
@@ -98,7 +347,6 @@ async fn connect_and_migrate() -> PgPool {
 /// so tests are isolated without cleanup logic.
 pub struct TestTx {
     tx: Option<Transaction<'static, Postgres>>,
-    pool: PgPool,
     scoped: Option<bikesnest_infrastructure::Db>,
 }
 
@@ -156,29 +404,6 @@ impl TestTx {
     pub fn executor(&mut self) -> &mut sqlx::PgConnection {
         self.tx.as_mut().expect("transaction still open")
     }
-
-    /// Commits the current transaction and opens a fresh one.
-    ///
-    /// Use case: read-model tests whose queries run on *other* pool
-    /// connections (they cannot see uncommitted rows of this transaction).
-    /// The test commits a tagged fixture, asserts against the readers, then
-    /// deletes the fixture rows (by tag) via the pool. The fresh transaction
-    /// the harness opened is simply rolled back at test end.
-    pub async fn commit_fixture(&mut self) {
-        assert!(
-            self.scoped.is_none(),
-            "scoped repository tests must never commit fixtures"
-        );
-        if let Some(tx) = self.tx.take() {
-            tx.commit().await.expect("commit test fixture");
-        }
-        self.tx = Some(
-            self.pool
-                .begin()
-                .await
-                .expect("begin tx after fixture commit"),
-        );
-    }
 }
 
 /// A named SAVEPOINT opened inside a [`TestTx`].
@@ -215,77 +440,11 @@ impl Savepoint<'_> {
 // Runner used by #[db_test]
 // ---------------------------------------------------------------------------
 
-/// Clone of the shared, migrated pool (for wiring routers in HTTP tests).
-/// Await this inside a `#[db_test]` body — never `block_on` there.
+/// Clone of the shared, migrated pool for explicit external, query-only
+/// observers and the harness itself. Ordinary fixtures and routers use the
+/// transaction-scoped [`TestTx::db`] seam.
 pub async fn pool() -> PgPool {
     shared_pool().get_or_init(connect_and_migrate).await.clone()
-}
-
-/// Lock id for the system-wide ADMIN set. Arbitrary but fixed; it only has to
-/// be unique among this suite's advisory locks.
-const ADMIN_SET_LOCK: i64 = 0x62_69_6b_65_00_01;
-
-/// A transaction holding the shared lock on the system's ADMIN set.
-///
-/// "Never zero administrators" is a property of the whole `user_roles` table,
-/// so a test that needs to be the *only* admin has to exclude every other
-/// writer — including the other test binaries running against the same
-/// database. `pg_advisory_xact_lock` reaches across processes and is released
-/// when the returned transaction is dropped, so a panicking test cannot wedge
-/// the suite. Hold it for as long as the exclusive state must last.
-///
-/// Every test that creates or removes an ADMIN row must take this lock, or the
-/// exclusion is one-sided: see [`hold_admin_set_lock_for_process`] for the
-/// fixture-helper side.
-pub async fn admin_set_lock(pool: &PgPool) -> Transaction<'static, Postgres> {
-    let mut tx = pool.begin().await.expect("begin admin-set lock");
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(ADMIN_SET_LOCK)
-        .execute(&mut *tx)
-        .await
-        .expect("take admin-set lock");
-    tx
-}
-
-/// Claims the ADMIN-set lock for the rest of this test process.
-///
-/// The counterpart to [`admin_set_lock`], for fixture helpers that grant ADMIN
-/// and then need the row to stay put for the remainder of their test. A
-/// transaction-scoped lock cannot express that (the helper returns long before
-/// its caller is done), so this takes a *session*-scoped lock on a dedicated
-/// connection and keeps it for the process. Idempotent: the first caller takes
-/// it, every later one returns immediately.
-pub async fn hold_admin_set_lock_for_process(pool: &PgPool) {
-    static HELD: OnceCell<()> = OnceCell::const_new();
-    HELD.get_or_init(|| async {
-        let mut conn = pool.acquire().await.expect("acquire admin-set lock conn");
-        sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(ADMIN_SET_LOCK)
-            .execute(&mut *conn)
-            .await
-            .expect("take process admin-set lock");
-        // Leak the connection so the session — and with it the lock — outlives
-        // this call. It is one connection out of the pool for the process.
-        std::mem::forget(conn);
-    })
-    .await;
-}
-
-/// A transaction allowed to mutate `audit_events`.
-///
-/// The table is append-only (migration 0019): the trigger refuses every UPDATE
-/// and DELETE unless the transaction sets `app.audit_purge`, which the
-/// production erasure and retention-purge paths do. A test cleaning up the
-/// audit rows its own fixture wrote is the same kind of sanctioned mutation, so
-/// it says so the same way. Run the DELETE on the returned transaction and
-/// commit it.
-pub async fn audit_mutation_tx(pool: &PgPool) -> Transaction<'static, Postgres> {
-    let mut tx = pool.begin().await.expect("begin audit mutation");
-    sqlx::query("SET LOCAL app.audit_purge = 'on'")
-        .execute(&mut *tx)
-        .await
-        .expect("announce audit mutation");
-    tx
 }
 
 /// Entry point behind `#[db_test]`: runs `f` on the shared runtime with a
@@ -296,7 +455,6 @@ pub fn run_db_test(f: impl AsyncFnOnce(&mut TestTx)) {
         let pool = shared_pool().get_or_init(connect_and_migrate).await;
         TestTx {
             tx: Some(pool.begin().await.expect("begin test transaction")),
-            pool: pool.clone(),
             scoped: None,
         }
     });
@@ -350,9 +508,7 @@ impl UserBuilder {
 
     /// Inserts the row using the test transaction; returns the domain `User`.
     ///
-    /// Runtime query (not `query!`) so the workspace builds without
-    /// `DATABASE_URL` at compile time; compile-time checked macros arrive
-    /// with the M1 schema work (with `.env` + offline cache).
+    /// Runtime query so the workspace builds without a database connection.
     pub async fn create<'e, E>(&self, exec: E) -> Result<bikesnest_domain::User, sqlx::Error>
     where
         E: sqlx::Executor<'e, Database = Postgres>,
@@ -375,7 +531,7 @@ impl UserBuilder {
 }
 
 // ---------------------------------------------------------------------------
-// Parking builder (M1)
+// Parking builder
 // ---------------------------------------------------------------------------
 
 use bikesnest_domain::{Cost, ParkingType, TimeRange};
@@ -399,8 +555,7 @@ pub struct ParkingBuilder {
     rating_count: i64,
     verified_days_ago: Option<i64>,
     moderation_state: &'static str,
-    /// Tag stored in `seed_key` so committed fixture rows can be cleaned up
-    /// by tag (`seed_key` column).
+    /// Optional `seed_key` used when a test needs to distinguish fixture rows.
     fixture_tag: Option<String>,
     /// Optimistic-concurrency version. Defaults to 1 for fresh inserts.
     version: i64,
@@ -436,8 +591,7 @@ impl ParkingBuilder {
         Self::default()
     }
 
-    /// Tags the row with `seed_key = marker` for committed-fixture cleanup
-    /// (read-model tests that query through pool connections).
+    /// Tags the row with `seed_key = marker` for fixture selection assertions.
     pub fn with_fixture_tag(mut self, marker: impl Into<String>) -> Self {
         self.fixture_tag = Some(marker.into());
         self
@@ -699,7 +853,7 @@ impl ParkingBuilder {
 }
 
 // ---------------------------------------------------------------------------
-// Fast test password hasher (M2)
+// Fast test password hasher
 // ---------------------------------------------------------------------------
 
 use async_trait::async_trait;

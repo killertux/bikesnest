@@ -14,10 +14,22 @@ pub mod smtp;
 pub mod templates;
 
 pub use fake::{CapturedEmail, FakeEmailProvider};
-pub use queue::{InlineEmailQueue, JobEmailQueue, idempotency_key};
+pub use queue::{
+    DurableAuthMailDispatcher, InlineAuthMailDispatcher, InlineEmailQueue, JobEmailQueue,
+    idempotency_key,
+};
 pub use resend::ResendEmailProvider;
 pub use smtp::SmtpEmailProvider;
 pub use templates::{APP_NAME, RenderedEmail, render};
+
+pub(crate) fn token_hash_from_link(link: &str) -> Option<String> {
+    let parsed = url::Url::parse(link).ok()?;
+    let encoded = parsed
+        .query_pairs()
+        .find_map(|(key, value)| (key == "token").then_some(value))?;
+    let token = bikesnest_domain::VerificationToken::from_base64url(&encoded)?;
+    Some(crate::auth::hash::sha256_hex(token.as_bytes()))
+}
 
 use crate::config::{ConfigError, EmailConfig};
 

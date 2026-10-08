@@ -1,6 +1,6 @@
 //! Mock parking seeder.
 //!
-//! Dev/demo affordance only: production starts with an empty dataset (.1).
+//! Development/demo affordance only: production starts with an empty dataset.
 //! `parking_location`/`parking_photo` rows are tagged with `seed_key` so
 //! re-runs are idempotent (delete + insert in one transaction) and easy to
 //! identify for cleanup. `users` has no `seed_key` column, so the community
@@ -43,7 +43,8 @@ pub async fn seed_mock(
     storage: &dyn ObjectStorage,
     processor: &dyn ImageProcessor,
 ) -> Result<usize, SeedError> {
-    let mut tx = db.pool().begin().await?;
+    let mut conn = db.acquire().await?;
+    let mut tx = conn.begin().await?;
     // Remove every previously seeded row (any dev dataset, including an older
     // key) so re-seeding is fully idempotent and never leaves stale rows.
     // `parking_photo`/`review` rows cascade with their location; storage
@@ -83,7 +84,7 @@ pub async fn seed_mock(
     let tz = "America/Sao_Paulo";
     let mut count = 0usize;
     // Every object key the seeder pushes this run, so we can confirm each one
-    // is really retrievable before declaring success (Problem #1).
+    // is really retrievable before declaring success.
     let mut pushed_keys: HashSet<String> = HashSet::new();
 
     for (loc_idx, mock) in mock_parkings().into_iter().enumerate() {
@@ -104,7 +105,7 @@ pub async fn seed_mock(
 
         // rating_avg/rating_count are intentionally omitted here (both
         // default to NULL/0): they're recomputed below from the actual
-        // `review` rows, never hand-set (Problem #2).
+        // `review` rows, never hand-set.
         let row: (i64,) = sqlx::query_as(
             r#"
             INSERT INTO parking_location
@@ -180,7 +181,7 @@ pub async fn seed_mock(
             }
         }
 
-        // Reviews (Problem #2): synthesize `rating_count` real ACTIVE reviews
+        // Reviews: synthesize `rating_count` real ACTIVE reviews
         // approximating `rating_avg`, authored by distinct seeded reviewers
         // (rotated per location so the same few people don't review
         // everything), then recompute the denormalized aggregate from them.
@@ -220,7 +221,7 @@ pub async fn seed_mock(
         // Recompute the denormalized aggregate from actual ACTIVE reviews —
         // the same query `SqlxReviewRepository::upsert_review` uses — so a
         // location can never end up with a rating_count and no reviews behind
-        // it (Problem #2), including the locations with no reviews at all
+        // it, including the locations with no reviews at all
         // (this just confirms rating_avg/rating_count stay NULL/0 for them).
         sqlx::query(
             r#"
@@ -240,7 +241,7 @@ pub async fn seed_mock(
         .execute(&mut *tx)
         .await?;
 
-        // Photo (Problem #1): process the bundled JPEG into a full derivative
+        // Photo: process the bundled JPEG into a full derivative
         // + thumbnail exactly as a real upload would, then push both through
         // the object-storage port under stable keys (re-seeding overwrites
         // them in place) and record both in `parking_photo`.
@@ -296,7 +297,7 @@ pub async fn seed_mock(
     }
 
     // Verify every object the seeder just pushed is really retrievable before
-    // declaring success (Problem #1) — a `put` that silently no-ops must fail
+    // declaring success — a `put` that silently no-ops must fail
     // the seed loudly instead of leaving a broken photo in the demo.
     for key in &pushed_keys {
         if !storage.exists(key).await? {

@@ -1,21 +1,23 @@
 //! Transactional email ports.
 //!
-//! The application layer describes *what* to send — recipient, locale, kind and
-//! the single-use link — and never *how it reads*: subject and body come from
+//! The application layer describes *what* to send — recipient, locale, kind,
+//! and either a credential link or credential-free notice identity — and never
+//! *how it reads*: subject and body come from
 //! the message catalog at render time, in the recipient's own language. That is
 //! the i18n rule (no user-facing strings outside the catalog) applied to mail.
 //!
 //! Two ports, deliberately separate:
 //!
-//! - [`EmailQueue`] is what use cases call. It hands the message off durably
-//!   (an `email.send` row on the job queue) and returns immediately, so a slow
-//!   or failing provider can never hold an HTTP request open or half-succeed a
-//!   registration.
+//! - [`EmailQueue`] supports generic callers. Authentication uses `AuthOutbox`
+//!   so its transition, audit, and durable `email.send` admission commit in one
+//!   transaction. Inline dispatch may attempt the exact admitted job after
+//!   commit, but never makes provider I/O part of that transaction.
 //! - [`EmailProvider`] is what actually talks to a relay/ESP. Only the job
 //!   handler (and the inline queue used when the worker is disabled) calls it.
 
 use async_trait::async_trait;
-use bikesnest_domain::LocaleCode;
+use bikesnest_domain::{LocaleCode, UserId};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
@@ -24,19 +26,53 @@ pub enum EmailError {
     Unavailable,
     #[error("mail provider error: {0}")]
     Unexpected(String),
+    #[error("mail provider permanently rejected the request")]
+    Permanent,
 }
 
 /// Which transactional message this is. The variant chooses the catalog keys;
-/// its payload carries the one thing that varies, the single-use link.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// its payload carries either a single-use credential link or an immutable,
+/// credential-free security-notice identity.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EmailKind {
     /// Registration (and re-send): confirm the address on a pending account.
-    VerifyEmail { link: String },
+    VerifyEmail {
+        link: String,
+        #[serde(default)]
+        expires_at: Option<DateTime<Utc>>,
+    },
     /// Password reset: choose a new password.
-    ResetPassword { link: String },
+    ResetPassword {
+        link: String,
+        #[serde(default)]
+        expires_at: Option<DateTime<Utc>>,
+    },
     /// Email change: confirm the *new* address before it becomes canonical.
-    ConfirmEmailChange { link: String },
+    ConfirmEmailChange {
+        link: String,
+        #[serde(default)]
+        expires_at: Option<DateTime<Utc>>,
+    },
+    /// A password was successfully replaced. Carries no credential.
+    PasswordChanged {
+        account_link: String,
+        notification_id: String,
+    },
+    /// The canonical email was successfully changed; sent to the old address.
+    EmailAddressChanged {
+        account_link: String,
+        notification_id: String,
+    },
+}
+
+impl std::fmt::Debug for EmailKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmailKind")
+            .field("code", &self.code())
+            .field("link", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl EmailKind {
@@ -47,15 +83,53 @@ impl EmailKind {
             EmailKind::VerifyEmail { .. } => "verify",
             EmailKind::ResetPassword { .. } => "reset",
             EmailKind::ConfirmEmailChange { .. } => "change",
+            EmailKind::PasswordChanged { .. } => "password_changed",
+            EmailKind::EmailAddressChanged { .. } => "email_changed",
         }
     }
 
-    /// The single-use link this message exists to deliver.
-    pub fn link(&self) -> &str {
+    /// The CTA/fallback URL. Security-notice URLs carry no credential.
+    pub fn action_link(&self) -> &str {
         match self {
-            EmailKind::VerifyEmail { link }
-            | EmailKind::ResetPassword { link }
-            | EmailKind::ConfirmEmailChange { link } => link,
+            EmailKind::VerifyEmail { link, .. }
+            | EmailKind::ResetPassword { link, .. }
+            | EmailKind::ConfirmEmailChange { link, .. } => link,
+            EmailKind::PasswordChanged { account_link, .. }
+            | EmailKind::EmailAddressChanged { account_link, .. } => account_link,
+        }
+    }
+    /// Return a single-use credential only for action mails. Security notices
+    /// deliberately have no credential-bearing destination.
+    pub fn credential_link(&self) -> Option<&str> {
+        match self {
+            EmailKind::VerifyEmail { link, .. }
+            | EmailKind::ResetPassword { link, .. }
+            | EmailKind::ConfirmEmailChange { link, .. } => Some(link),
+            EmailKind::PasswordChanged { .. } | EmailKind::EmailAddressChanged { .. } => None,
+        }
+    }
+
+    pub fn expires_at(&self) -> Option<DateTime<Utc>> {
+        match self {
+            EmailKind::VerifyEmail { expires_at, .. }
+            | EmailKind::ResetPassword { expires_at, .. }
+            | EmailKind::ConfirmEmailChange { expires_at, .. } => *expires_at,
+            EmailKind::PasswordChanged { .. } | EmailKind::EmailAddressChanged { .. } => None,
+        }
+    }
+
+    /// Stable material for queue/provider replay; never rendered or logged.
+    pub fn idempotency_material(&self) -> &str {
+        match self {
+            EmailKind::VerifyEmail { link, .. }
+            | EmailKind::ResetPassword { link, .. }
+            | EmailKind::ConfirmEmailChange { link, .. } => link,
+            EmailKind::PasswordChanged {
+                notification_id, ..
+            }
+            | EmailKind::EmailAddressChanged {
+                notification_id, ..
+            } => notification_id,
         }
     }
 }
@@ -66,8 +140,9 @@ impl EmailKind {
 /// This is also the `email.send` job payload, hence the serde derives. The
 /// recipient is a plain `String` because a queued payload is round-tripped
 /// through JSON, and the address was already validated when it was accepted.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmailMessage {
+    pub account_id: i64,
     pub to: String,
     #[serde(with = "locale_code")]
     pub locale: LocaleCode,
@@ -77,20 +152,31 @@ pub struct EmailMessage {
 
 impl EmailMessage {
     pub fn new(to: impl Into<String>, locale: LocaleCode, kind: EmailKind) -> Self {
+        Self::linked(UserId(0), to, locale, kind)
+    }
+
+    pub fn linked(
+        account_id: UserId,
+        to: impl Into<String>,
+        locale: LocaleCode,
+        kind: EmailKind,
+    ) -> Self {
         Self {
+            account_id: account_id.0,
             to: to.into(),
             locale,
             kind,
         }
     }
+}
 
-    /// The recipient's domain — the only part of an address safe to log
-    /// (an email address is personal data; its provider is not).
-    pub fn recipient_domain(&self) -> &str {
-        self.to
-            .rsplit_once('@')
-            .map(|(_, d)| d)
-            .unwrap_or("unknown")
+impl std::fmt::Debug for EmailMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmailMessage")
+            .field("account_id", &self.account_id)
+            .field("locale", &self.locale.as_str())
+            .field("kind", &self.kind.code())
+            .finish()
     }
 }
 
@@ -106,8 +192,7 @@ mod locale_code {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<LocaleCode, D::Error> {
         let raw = String::deserialize(d)?;
-        LocaleCode::parse(&raw)
-            .ok_or_else(|| serde::de::Error::custom(format!("unknown locale code: {raw}")))
+        LocaleCode::parse(&raw).ok_or_else(|| serde::de::Error::custom("unknown locale code"))
     }
 }
 
@@ -128,6 +213,15 @@ pub trait EmailQueue: Send + Sync {
 #[async_trait]
 pub trait EmailProvider: Send + Sync {
     async fn send(&self, msg: &EmailMessage) -> Result<(), EmailError>;
+    /// Provider-supported replay key. SMTP implementations deliberately fall
+    /// back to `send`: SMTP has no portable idempotency contract.
+    async fn send_idempotent(
+        &self,
+        msg: &EmailMessage,
+        _idempotency_key: &str,
+    ) -> Result<(), EmailError> {
+        self.send(msg).await
+    }
 }
 
 #[cfg(test)]
@@ -136,11 +230,13 @@ mod tests {
 
     #[test]
     fn message_round_trips_through_the_job_payload() {
-        let msg = EmailMessage::new(
+        let msg = EmailMessage::linked(
+            UserId(7),
             "ada@example.com",
             LocaleCode::PtBr,
             EmailKind::VerifyEmail {
                 link: "http://localhost:8080/verify-email?token=abc".into(),
+                expires_at: None,
             },
         );
         let json = serde_json::to_value(&msg).unwrap();
@@ -151,13 +247,16 @@ mod tests {
     }
 
     #[test]
-    fn only_the_recipient_domain_is_loggable() {
-        let msg = EmailMessage::new(
+    fn purpose_code_is_a_bounded_diagnostic() {
+        let msg = EmailMessage::linked(
+            UserId(7),
             "ada@example.com",
             LocaleCode::En,
-            EmailKind::ResetPassword { link: "x".into() },
+            EmailKind::ResetPassword {
+                link: "x".into(),
+                expires_at: None,
+            },
         );
-        assert_eq!(msg.recipient_domain(), "example.com");
         assert_eq!(msg.kind.code(), "reset");
     }
 
@@ -169,6 +268,26 @@ mod tests {
             "kind": "verify_email",
             "link": "x",
         });
-        assert!(serde_json::from_value::<EmailMessage>(json).is_err());
+        let error = serde_json::from_value::<EmailMessage>(json)
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("fr"));
+    }
+
+    #[test]
+    fn debug_output_redacts_recipient_and_link() {
+        let marker = "SECRET-MARKER.invalid";
+        let msg = EmailMessage::linked(
+            UserId(9),
+            format!("ada@{marker}"),
+            LocaleCode::En,
+            EmailKind::ResetPassword {
+                link: format!("https://x/?token={marker}"),
+                expires_at: None,
+            },
+        );
+        let debug = format!("{msg:?}");
+        assert!(!debug.contains(marker));
+        assert!(debug.contains("reset"));
     }
 }

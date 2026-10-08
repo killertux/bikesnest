@@ -9,7 +9,7 @@ use crate::config::{ConfigError, EmailConfig};
 use crate::email::templates::render;
 use async_trait::async_trait;
 use bikesnest_application::{EmailError, EmailMessage, EmailProvider};
-use lettre::message::Mailbox;
+use lettre::message::{Mailbox, MultiPart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
@@ -76,8 +76,11 @@ impl SmtpEmailProvider {
             .from(from)
             .to(to)
             .subject(rendered.subject)
-            .body(rendered.text)
-            .map_err(|e| EmailError::Unexpected(e.to_string()))
+            .multipart(MultiPart::alternative_plain_html(
+                rendered.text,
+                rendered.html,
+            ))
+            .map_err(|_| EmailError::Unexpected("could not build SMTP message".into()))
     }
 }
 
@@ -90,7 +93,7 @@ fn build_mailer(
 ) -> Result<Mailer, EmailError> {
     let builder = if tls {
         AsyncSmtpTransport::<Tokio1Executor>::relay(&host)
-            .map_err(|e| EmailError::Unexpected(e.to_string()))?
+            .map_err(|_| EmailError::Unexpected("invalid SMTP relay configuration".into()))?
     } else {
         AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&host)
     };
@@ -110,7 +113,7 @@ impl EmailProvider for SmtpEmailProvider {
         self.mailer
             .send(message)
             .await
-            .map_err(|e| EmailError::Unexpected(e.to_string()))?;
+            .map_err(|_| EmailError::Unavailable)?;
         Ok(())
     }
 }
@@ -136,18 +139,22 @@ mod tests {
     /// The provider renders: what goes on the wire is the catalog text for the
     /// recipient's locale, not anything a caller passed in.
     #[test]
-    fn builds_a_plain_text_message_rendered_in_the_recipients_locale() {
+    fn builds_a_multipart_message_rendered_in_the_recipients_locale() {
         let message = EmailMessage::new(
             "x@example.com",
             LocaleCode::PtBr,
             EmailKind::ResetPassword {
                 link: "https://bikesnest.test/password-reset/new?token=t".into(),
+                expires_at: None,
             },
         );
         let built = provider().message(&message).unwrap();
         let bytes = built.formatted();
         let formatted = String::from_utf8_lossy(&bytes);
         assert!(formatted.contains("To: x@example.com"));
+        assert!(formatted.contains("Content-Type: multipart/alternative"));
+        assert!(formatted.contains("Content-Type: text/plain"));
+        assert!(formatted.contains("Content-Type: text/html"));
         assert!(
             formatted.contains("=?utf-8?") || formatted.contains("Redefina sua senha"),
             "the pt-BR subject must be on the wire (encoded or literal): {formatted}"

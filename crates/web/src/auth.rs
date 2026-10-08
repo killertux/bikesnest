@@ -10,6 +10,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use bikesnest_application::{AuthenticatedUser, TokenGenerator};
 use bikesnest_domain::{CsrfToken, SessionId};
 use bikesnest_infrastructure::MapConfig;
+use std::sync::Arc;
 
 use crate::htmx;
 use crate::i18n::{Locale, Translator};
@@ -25,7 +26,7 @@ pub const CSRF_HEADER: &str = "x-csrf-token";
 pub const CSRF_QUERY: &str = "csrf";
 /// Name of the anonymous double-submit CSRF cookie ( — protects pre-session
 /// requests like login/register/reset, which have no session row yet).
-pub const ANON_CSRF_COOKIE: &str = "csrf";
+pub const ANON_CSRF_COOKIE: &str = "__Host-csrf";
 
 /// How much of a urlencoded body the CSRF middleware buffers to find the `csrf`
 /// field. Kept well under the route body limits (`DefaultBodyLimit`), which is
@@ -41,8 +42,11 @@ pub const CSRF_BODY_LIMIT: usize = 64 * 1024;
 /// whether this request wants a swap-safe fragment or a whole document.
 #[derive(Debug, Clone)]
 pub struct Auth {
+    pub csp_nonce: Arc<String>,
     pub user: Option<AuthenticatedUser>,
     pub csrf: Option<CsrfToken>,
+    /// A session cookie was presented but no live session resolved.
+    pub stale_session: bool,
     /// The raw session id (for revoking the current session).
     pub session: Option<SessionId>,
     /// Where a successful login should return the user to (see
@@ -59,8 +63,10 @@ pub struct Auth {
 impl Default for Auth {
     fn default() -> Self {
         Self {
+            csp_nonce: Arc::new(String::new()),
             user: None,
             csrf: None,
+            stale_session: false,
             session: None,
             next: "/".to_string(),
             fragment: false,
@@ -226,9 +232,10 @@ pub fn clear_session_cookie() -> String {
     format!("{SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0")
 }
 
-/// `Set-Cookie` for the anonymous double-submit CSRF cookie. `SameSite=Lax`
-/// means a cross-site POST won't carry it, so it can't be validated — the CSRF
-/// defense for pre-session requests (login/register/reset).
+/// `Set-Cookie` for the anonymous double-submit CSRF cookie. The browser-enforced
+/// `__Host-` prefix requires HTTPS, Secure, Path=/ and no Domain attribute,
+/// preventing a sibling subdomain from planting this host's token. This is not
+/// a signature: token equality, SameSite and Fetch Metadata are all enforced.
 pub fn set_anon_csrf_cookie(token: &str) -> String {
     format!("{ANON_CSRF_COOKIE}={token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=3600")
 }
@@ -262,10 +269,8 @@ pub fn set_export_cookie(id: i64, token: &str) -> String {
 /// Lifetime of the export cookie, matching `PrivacyService`'s 24-hour export TTL.
 const EXPORT_TOKEN_MAX_AGE_SECONDS: u32 = 24 * 60 * 60;
 
-/// A fresh random token for an anonymous page, set both as the `csrf` cookie
-/// and in the form's hidden field / `<meta name="csrf">`.
-pub fn anon_csrf_token() -> String {
-    CsrfToken::new(bikesnest_infrastructure::RealTokenGenerator.generate()).to_base64url()
+fn fresh_anon_csrf_token() -> CsrfToken {
+    CsrfToken::new(bikesnest_infrastructure::RealTokenGenerator.generate())
 }
 
 /// A fresh random hex nonce, for the OAuth `state` parameter. Minted here,
@@ -282,20 +287,18 @@ pub fn random_state_hex() -> String {
 // CSRF
 // ---------------------------------------------------------------------------
 
-/// Constant-time string comparison (defends against a timing side channel).
-fn constant_time_eq(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.bytes().zip(b.bytes()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 fn csrf_cookie_value(headers: &HeaderMap) -> Option<String> {
-    cookie_value(headers, ANON_CSRF_COOKIE)
+    let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
+    let mut values = cookie
+        .split(';')
+        .filter_map(|pair| pair.split_once('='))
+        .filter(|(name, _)| name.trim() == ANON_CSRF_COOKIE)
+        .map(|(_, value)| value.trim());
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    Some(value.to_string())
 }
 
 fn csrf_from_headers(headers: &HeaderMap) -> Option<String> {
@@ -376,7 +379,32 @@ pub async fn auth_middleware(
     // Snapshot what `Auth` needs *before* the await: `&Request<Body>` is not
     // `Send` (axum's `Body` is not `Sync`), and holding one across an await
     // would make the middleware future non-`Send`.
-    let auth = resolve_auth(&state, req.method(), req.uri(), req.headers().clone()).await;
+    let (auth, set_anon_cookie) = match resolve_auth(
+        &state,
+        req.method(),
+        req.uri(),
+        req.headers().clone(),
+        req.extensions()
+            .get::<crate::security::CspNonce>()
+            .map(|nonce| nonce.0.clone())
+            .unwrap_or_default(),
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(auth) => {
+            tracing::error!(
+                auth_failure = "session_store_unavailable",
+                "session resolution failed"
+            );
+            let mut response = auth.deny(StatusCode::SERVICE_UNAVAILABLE, "error.unavailable");
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("private, no-store"),
+            );
+            return response;
+        }
+    };
 
     // Safe methods never carry a token. `HEAD` and `OPTIONS` are as read-only
     // as `GET` (axum answers `HEAD` with the `GET` route), so requiring one
@@ -414,25 +442,73 @@ pub async fn auth_middleware(
             }
         }
 
-        let ok = match (&auth.csrf, submitted.as_deref()) {
-            // Authenticated: the per-session synchronizer token.
-            (Some(session_csrf), Some(sub)) => session_csrf.verify(sub),
-            (Some(_), None) => false,
-            // Anonymous: double-submit cookie. A cross-site POST won't
-            // carry the `csrf` cookie (SameSite=Lax), so it cannot be validated → 403.
-            (None, Some(got)) => match csrf_cookie_value(req.headers()) {
-                Some(expected) => constant_time_eq(&expected, got),
-                None => false,
-            },
-            (None, None) => false,
-        };
+        // Modern browsers identify cross-site requests explicitly. Keep token
+        // validation for all clients, and use Fetch Metadata as defense in
+        // depth without rejecting older/native clients that omit the header.
+        let cross_site = req
+            .headers()
+            .get("sec-fetch-site")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value == "cross-site");
+        let ok = !cross_site
+            && match (&auth.csrf, submitted.as_deref()) {
+                (Some(expected), Some(sub)) => expected.verify(sub),
+                _ => false,
+            };
         if !ok {
-            return auth.deny(StatusCode::FORBIDDEN, "error.csrf");
+            let category = if cross_site {
+                "cross_site"
+            } else if auth.stale_session {
+                "stale_session"
+            } else if submitted.is_none() {
+                "missing"
+            } else {
+                "mismatch"
+            };
+            tracing::warn!(
+                csrf_failure = category,
+                request_shape = if auth.fragment {
+                    "fragment"
+                } else {
+                    "document"
+                },
+                "csrf request rejected"
+            );
+            let mut response = auth.deny(StatusCode::FORBIDDEN, "error.csrf");
+            response.headers_mut().insert(
+                "x-bikesnest-csrf-recovery",
+                HeaderValue::from_static("reload-required"),
+            );
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("private, no-store"),
+            );
+            return response;
         }
     }
 
+    let is_anonymous = auth.user.is_none();
     req.extensions_mut().insert(auth);
-    next.run(req).await
+    let mut response = next.run(req).await;
+    let is_html = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/html"));
+    let token_cookie_allowed = response.status().is_success();
+    if is_html && is_anonymous {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
+        if token_cookie_allowed
+            && let Some(token) = set_anon_cookie
+            && let Ok(value) = set_anon_csrf_cookie(&token.to_base64url()).parse()
+        {
+            response.headers_mut().append(header::SET_COOKIE, value);
+        }
+    }
+    response
 }
 
 async fn resolve_auth(
@@ -440,27 +516,50 @@ async fn resolve_auth(
     method: &Method,
     uri: &axum::http::Uri,
     headers: HeaderMap,
-) -> Auth {
+    csp_nonce: String,
+) -> Result<(Auth, Option<CsrfToken>), Box<Auth>> {
     let base = Auth {
+        csp_nonce: Arc::new(csp_nonce),
         next: htmx::login_next(method, uri, &headers),
         fragment: htmx::is_fragment_request(&headers),
         tr: Translator::new(Locale::from_headers(&headers)),
         map: state.map.clone(),
         ..Auth::default()
     };
-    let Some(raw) = session_id_from_headers(&headers) else {
-        return base;
+    if let Some(raw) = session_id_from_headers(&headers)
+        && let Some(session_id) = SessionId::from_hex(&raw)
+    {
+        match state.auth.resolve_session(&session_id).await {
+            Ok(Some(resolved)) => {
+                return Ok((
+                    Auth {
+                        user: Some(resolved.user),
+                        csrf: Some(resolved.csrf_token),
+                        session: Some(session_id),
+                        ..base
+                    },
+                    None,
+                ));
+            }
+            Ok(None) => {}
+            Err(_) => return Err(Box::new(base)),
+        }
+    }
+    let stale_session = session_id_from_headers(&headers).is_some();
+    let existing = csrf_cookie_value(&headers).and_then(|raw| CsrfToken::from_base64url(&raw));
+    let (token, minted) = match existing {
+        Some(token) => (token, None),
+        None => {
+            let token = fresh_anon_csrf_token();
+            (token.clone(), Some(token))
+        }
     };
-    let Some(session_id) = SessionId::from_hex(&raw) else {
-        return base;
-    };
-    match state.auth.resolve_session(&session_id).await {
-        Ok(Some(resolved)) => Auth {
-            user: Some(resolved.user),
-            csrf: Some(resolved.csrf_token),
-            session: Some(session_id),
+    Ok((
+        Auth {
+            csrf: Some(token),
+            stale_session,
             ..base
         },
-        _ => base,
-    }
+        minted,
+    ))
 }

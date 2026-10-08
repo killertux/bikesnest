@@ -1,10 +1,12 @@
-//! Background job abstraction (plans/m9-background-jobs.md).
+//! Background job abstraction.
 //!
 //! Pure ports/vals only — no SQL. Infrastructure implements [`JobHandler`]
 //! (concrete handlers that capture the ports they need) and the SQL job
 //! repository/worker. A job is a durable unit of work with a retry budget,
 //! claimed by an in-process worker, and either executed to `succeeded` or
-//! dead-lettered to `failed`.
+//! dead-lettered to `failed`. Recurring jobs never go terminal on a handler
+//! failure: a spent occurrence records its error and moves to the next
+//! scheduled run.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -21,7 +23,8 @@ pub const JOB_JOBS_GC: &str = "jobs.gc";
 pub const JOB_EMAIL_SEND: &str = "email.send";
 
 /// A job-run failure. `Failed` is transient (the worker retries it if the
-/// attempt budget remains); `Permanent` skips retries and dead-letters now.
+/// attempt budget remains); `Permanent` skips retries and dead-letters now
+/// (a recurring job skips to its next scheduled run instead).
 #[derive(Debug, thiserror::Error)]
 pub enum JobError {
     #[error("job failed: {0}")]

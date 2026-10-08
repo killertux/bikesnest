@@ -1,13 +1,17 @@
 {% extends "layouts/base.html" %}
 {% import "components/search_state_inputs.html" as state %}
 {% block content %}
-<div class="search-page" x-data="searchFilters">
+<div class="search-page" x-data="searchFilters"
+     data-location-loading="{{ tr.t("search.location.loading") }}"
+     data-location-unavailable="{{ tr.t("search.location.unavailable") }}"
+     data-location-timeout="{{ tr.t("search.location.timeout") }}"
+     data-location-denied="{{ tr.t("search.location.denied") }}">
 
 <!-- Search strip: pre-filled and editable. -->
 <section class="search-intro border-b border-border">
-  <div class="search-shell mx-auto max-w-[88rem] px-6 pb-6 pt-10 md:px-8">
-    <p class="mb-3 text-xs font-semibold uppercase tracking-wide text-accent-strong">{{ tr.t("search.eyebrow") }}</p>
-    <h1 id="search-heading" class="font-display text-[clamp(1.875rem,3vw,2.75rem)] leading-[1.15] font-bold tracking-[-0.04em] wrap-anywhere">
+  <div class="search-shell mx-auto max-w-[88rem] px-6 pb-5 pt-7 md:px-8">
+    <p class="mb-2 text-xs font-semibold uppercase tracking-wide text-accent-strong">{{ tr.t("search.eyebrow") }}</p>
+    <h1 id="search-heading" class="font-display text-[clamp(1.625rem,2.5vw,2.25rem)] leading-[1.15] font-bold tracking-[-0.04em] wrap-anywhere">
       {% if results.browse %}
         {{ tr.t("search.browse.heading") }}
       {% else if let Some(label) = results.destination_label %}
@@ -16,15 +20,16 @@
         {{ tr.t("search.heading.generic") }}
       {% endif %}
     </h1>
-    <p class="mt-3 text-muted">{{ tr.t("search.subtitle") }}</p>
+    <p class="mt-2 text-sm text-muted">{{ tr.t("search.subtitle") }}</p>
 
     <form
       id="search-form"
       action="/search" method="get"
       hx-get="/search" hx-target="#results" hx-swap="innerHTML"
+      hx-sync="#results:replace"
       hx-push-url="true" hx-indicator="#results-indicator"
       role="search"
-      class="search-query mt-6 flex flex-col items-stretch gap-2 rounded-2xl border border-border bg-surface p-2 shadow-[0_8px_24px_oklch(20%_0.02_240/0.04)] md:flex-row md:items-center"
+      class="search-query mt-4 flex flex-col items-stretch gap-2 rounded-2xl border border-border bg-surface p-2 shadow-[0_8px_24px_oklch(20%_0.02_240/0.04)] md:flex-row md:items-center"
     >
       <span id="search-query-state" hidden>{% call state::hidden(form, true, false, false, true, true) %}</span>
       <div class="relative min-w-0 flex-1" x-data="addressAutocomplete"
@@ -74,13 +79,19 @@
         </button>
         <button
           type="button" @click="locate"
+          :disabled="locating"
           class="inline-flex h-12 flex-1 items-center justify-center gap-2 rounded-xl px-4 text-sm font-medium text-accent-strong transition-colors hover:bg-bg sm:flex-none"
         >
           <svg aria-hidden="true" class="h-5 w-5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 10c0 6-8 12-8 12S4 16 4 10a8 8 0 0 1 16 0" /><circle cx="12" cy="10" r="3" /></svg>
-          <span>{{ tr.t("home.search.locate") }}<span x-show="locating">…</span></span>
+          <span>{{ tr.t("home.search.locate") }}</span>
         </button>
       </div>
     </form>
+    <div class="mt-3 flex flex-wrap items-center gap-3" aria-live="polite" aria-atomic="true">
+      <p x-show="locationMessage" x-cloak class="text-sm text-muted" x-text="locationMessage"></p>
+      <button type="button" x-show="locationMessage" x-cloak @click="focusDestination"
+              class="text-sm font-medium text-accent-strong hover:underline">{{ tr.t("search.location.destination") }}</button>
+    </div>
     <p class="mt-3 text-xs text-muted">{{ tr.t("home.search.locate_hint") }}</p>
   </div>
 </section>
@@ -94,25 +105,25 @@
       </p>
       <div class="search-tools flex flex-wrap items-center gap-2.5 max-md:w-full max-md:[&>a]:order-3 max-md:[&>a]:w-full max-md:[&>a]:justify-center max-md:[&>button]:flex-1 max-md:[&>button]:justify-center max-md:[&>form]:order-2 max-md:[&>form]:w-full max-md:[&>form>label]:w-full max-md:[&>form>label]:justify-between">
         {% if can_contribute %}
-          <a href="/parking/new" class="inline-flex items-center gap-1.5 rounded-lg bg-accent-strong px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-accent-dark">
+          <a href="/parking/new" class="inline-flex items-center gap-1.5 rounded-lg border border-border bg-surface px-3 py-2 text-xs font-medium text-fg transition-colors hover:border-accent">
             <svg aria-hidden="true" class="h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14" /><path d="M12 5v14" /></svg>
             {{ tr.t("nav.add_spot") }}
           </a>
         {% else if is_authenticated %}
           <a href="/account" class="text-xs text-muted hover:text-fg">{{ tr.t("nav.verify_to_contribute") }}</a>
         {% else %}
-          <a href="/register" class="inline-flex items-center gap-1.5 rounded-lg border border-border bg-surface px-3 py-2 text-xs font-medium text-fg hover:border-fg">{{ tr.t("nav.signup_to_add") }}</a>
+          <a href="/register" class="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium text-muted hover:text-fg">{{ tr.t("nav.signup_to_add") }}</a>
         {% endif %}
         <button @click="toggleMap" :aria-expanded="mapOpen" aria-controls="search-map-panel" class="search-toggle inline-flex items-center gap-1.5 rounded-lg border border-border bg-surface px-3 py-2 text-sm font-medium text-fg aria-expanded:border-accent-strong aria-expanded:bg-accent-soft aria-expanded:text-accent-strong">
           <svg aria-hidden="true" class="h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.1 5.5 9.9 3.8 4 6v15l5.9-2.2 4.2 1.7 5.9-2.3V3.7Z" /><path d="M9.9 3.8v15" /><path d="M14.1 5.5v15" /></svg>
           <span x-text="mapOpen ? '{{ tr.t("search.map.hide") }}' : '{{ tr.t("search.map.show") }}'">{{ tr.t("search.map.show") }}</span>
         </button>
-        <form action="/search" method="get" hx-get="/search" hx-target="#results" hx-swap="innerHTML" hx-push-url="true" hx-indicator="#results-indicator" class="flex items-center gap-2.5">
+        <form id="search-sort-form" action="/search" method="get" hx-get="/search" hx-target="#results" hx-swap="innerHTML" hx-sync="#results:replace" hx-push-url="true" hx-indicator="#results-indicator" @submit="syncSearchState" class="flex items-center gap-2.5">
           <span id="search-sort-state" hidden>{% call state::hidden(form, false, true, false, false, false) %}</span>
           <label class="flex items-center gap-2 text-sm text-muted">
             {{ tr.t("search.sort.label") }}
             <select
-              name="sort" @change="submitSort"
+              name="sort" @change="sortChanged"
               class="h-9 max-w-[75%] flex-1 rounded-lg border border-border bg-surface px-2.5 text-sm font-medium text-fg focus:border-accent md:max-w-52 md:flex-none"
             >
               <option value="recommended" {% if sort_is("recommended") || sort_none() %}selected{% endif %}>{{ tr.t("search.sort.recommended") }}</option>
@@ -135,13 +146,15 @@
     <div id="search-filter-panel" x-show="filtersOpen" class="search-filter-panel mt-4 rounded-2xl border border-border bg-surface p-6 [&_label]:min-h-7 [&_fieldset]:min-w-0">
       <div class="flex items-center justify-between">
         <h2 class="font-display text-sm font-semibold uppercase tracking-wide text-muted">{{ tr.t("search.filters.results") }}</h2>
-        <a href="/search{% if q_set() %}?q={{ form.q|urlencode }}{% endif %}" class="text-sm font-medium text-accent-strong hover:text-accent-dark">{{ tr.t("search.filters.clear") }}</a>
+        <a data-search-clear href="{{ clear_filters_url() }}" hx-get="{{ clear_filters_url() }}" hx-target="#results" hx-swap="innerHTML" hx-sync="#results:replace" hx-push-url="true" hx-indicator="#results-indicator" @click="clearSearchState" class="text-sm font-medium text-accent-strong hover:text-accent-dark">{{ tr.t("search.filters.clear") }}</a>
       </div>
       <form
         action="/search" method="get"
-        hx-get="/search" hx-target="#results" hx-swap="innerHTML"
-        hx-trigger="change from:input[type='checkbox'], change from:input[type='radio'], change from:select"
+        id="search-filter-form"
+        hx-get="/search" hx-target="#results" hx-swap="innerHTML" hx-sync="#results:replace"
+        hx-trigger="change"
         hx-push-url="true" hx-indicator="#results-indicator"
+        @change="syncSearchState" @submit="syncSearchState"
         class="mt-5 grid gap-6 sm:grid-cols-2 xl:grid-cols-4"
       >
         <span id="search-filter-state" hidden>{% call state::hidden(form, false, false, true, false, false) %}</span>
@@ -223,6 +236,8 @@
                 data-label-details="{{ tr.t("card.view") }}"
                 data-label-cluster="{{ tr.t("map.cluster") }}"
               ></div>
+              <div data-map-status class="absolute inset-0 flex items-center justify-center bg-surface/90 p-4 text-center text-sm text-muted" role="status"
+                   data-loading="{{ tr.t("map.loading") }}" data-failed="{{ tr.t("map.failed") }}" data-retry="{{ tr.t("map.retry") }}">{{ tr.t("map.loading") }}</div>
               <!-- Appears once the viewer has panned or zoomed: the map's own
                    box, submitted as a browse search. Inside the map frame so it
                    reads as "this area", and hidden until there is an area to
@@ -230,8 +245,10 @@
               <form
                 x-show="moved" x-cloak
                 action="/search" method="get"
-                hx-get="/search" hx-target="#results" hx-swap="innerHTML"
+                id="search-browse-form"
+                hx-get="/search" hx-target="#results" hx-swap="innerHTML" hx-sync="#results:replace"
                 hx-push-url="true" hx-indicator="#results-indicator"
+                @submit="syncSearchState"
                 class="absolute inset-x-0 bottom-3 flex justify-center"
               >
                 <span id="search-browse-state" hidden>{% call state::browse(form) %}</span>
@@ -265,7 +282,7 @@
              every re-search. #}
           <script type="application/json" id="search-data">{{ results.map_json|safe }}</script>
           <!-- HTMX loading overlay -->
-          <div id="results-indicator" class="htmx-indicator absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-[oklch(98%_0.004_240_/_0.7)]" aria-hidden="true">
+          <div id="results-indicator" class="htmx-indicator pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-[oklch(98%_0.004_240_/_0.7)]" aria-hidden="true">
             <span class="inline-flex items-center gap-2.5 rounded-xl border border-border bg-surface px-4 py-2.5 text-sm font-medium text-fg shadow-pop">{{ tr.t("search.updating") }}</span>
           </div>
           <div id="results" role="list" aria-label="{{ tr.t("search.results_aria") }}" class="space-y-4">
@@ -305,14 +322,14 @@
 {% endif %}
 <link rel="stylesheet" href="{{ layout.asset("css/map.css") }}">
 {% if layout.uses_maplibre() %}
-<script src="{{ layout.asset("vendor/maplibre-gl.js") }}"></script>
-<script src="{{ layout.asset("js/map-provider-maplibre.js") }}"></script>
+<script type="module" nonce="{{ layout.csp_nonce }}" src="{{ layout.asset("js/maplibre-loader.mjs") }}"></script>
+<script nonce="{{ layout.csp_nonce }}" src="{{ layout.asset("js/map-provider-maplibre.js") }}"></script>
 {% else if layout.uses_mapbox() %}
-<script src="{{ layout.asset("vendor/mapbox-gl.js") }}"></script>
-<script src="{{ layout.asset("js/map-provider-mapbox.js") }}"></script>
+<script nonce="{{ layout.csp_nonce }}" src="{{ layout.asset("vendor/mapbox-gl.js") }}"></script>
+<script nonce="{{ layout.csp_nonce }}" src="{{ layout.asset("js/map-provider-mapbox.js") }}"></script>
 {% else if layout.uses_google_maps() %}
-<script src="{{ layout.asset("js/map-provider-google.js") }}"></script>
+<script nonce="{{ layout.csp_nonce }}" src="{{ layout.asset("js/map-provider-google.js") }}"></script>
 {% endif %}
-<script src="{{ layout.asset("js/search.js") }}"></script>
+<script nonce="{{ layout.csp_nonce }}" src="{{ layout.asset("js/search.js") }}"></script>
 </template>
 {% endblock %}

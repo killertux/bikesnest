@@ -101,6 +101,8 @@ fn invalid_field_names(raw: &str) -> &'static [&'static str] {
         &["lon"]
     } else if raw.contains("coordinates out of range") {
         &["lat", "lon"]
+    } else if raw.contains("invalid timezone") {
+        &["timezone"]
     } else if raw.contains("currency") || raw.contains("pricing unit") {
         &["price"]
     } else {
@@ -261,6 +263,14 @@ pub(crate) fn parking_edit_page_vm(
     error: Option<String>,
 ) -> ParkingEditPage {
     let (price, price_currency, price_unit) = cost_price_strings(loc.cost());
+    let hours_fields = hours_fields_from(loc.hours());
+    let security_fields = security_fields_from(loc.security());
+    let hours_open = hours_fields
+        .iter()
+        .any(|day| !day.state.is_empty() && day.state != "unknown");
+    let security_open = security_fields
+        .iter()
+        .any(|state| matches!(state.as_str(), "yes" | "no"));
     ParkingEditPage {
         layout,
         tr,
@@ -274,8 +284,10 @@ pub(crate) fn parking_edit_page_vm(
         price,
         price_currency,
         price_unit,
-        hours_days: hours_editor_vm(tr, &hours_fields_from(loc.hours()), None),
-        security_states: security_editor_vm(tr, &security_fields_from(loc.security())),
+        hours_days: hours_editor_vm(tr, &hours_fields, None),
+        security_states: security_editor_vm(tr, &security_fields),
+        hours_open,
+        security_open,
         type_options: view::type_options(tr, Some(loc.parking_type().as_code())),
         lat: loc.point().lat(),
         lon: loc.point().lon(),
@@ -435,6 +447,16 @@ pub(crate) fn new_page_vm(
         None => (None, None),
     };
     let hours_fields: [DayFields; 7] = form.hours_fields();
+    let hours_open = hours_error.is_some()
+        || hours_fields
+            .iter()
+            .any(|day| !day.state.is_empty() && day.state != "unknown");
+    let security_open = form
+        .security_fields()
+        .iter()
+        .any(|state| matches!(state.as_str(), "yes" | "no"));
+    let advanced_open =
+        field_errors.has("lat") || field_errors.has("lon") || field_errors.has("timezone");
     ParkingNewPage {
         layout,
         tr,
@@ -461,6 +483,9 @@ pub(crate) fn new_page_vm(
         default_lon: FEATURED_ORIGIN.1,
         hours_days: hours_editor_vm(tr, &hours_fields, hours_error),
         security_states: security_editor_vm(tr, &form.security_fields()),
+        hours_open,
+        security_open,
+        advanced_open,
         type_options: view::type_options(tr, Some(&form.parking_type)),
         error: message,
         field_errors,
@@ -696,6 +721,15 @@ pub(crate) fn edit_page_vm(
     field_errors: view::FieldErrors,
     notice: Option<String>,
 ) -> ParkingEditPage {
+    let hours_fields = form.hours_fields();
+    let hours_open = hours_error.is_some()
+        || hours_fields
+            .iter()
+            .any(|day| !day.state.is_empty() && day.state != "unknown");
+    let security_open = form
+        .security_fields()
+        .iter()
+        .any(|state| matches!(state.as_str(), "yes" | "no"));
     ParkingEditPage {
         layout: edit_parking_layout(map, tr, auth),
         tr,
@@ -709,8 +743,10 @@ pub(crate) fn edit_page_vm(
         price: form.price.clone(),
         price_currency: form.price_currency.clone(),
         price_unit: form.price_unit.clone(),
-        hours_days: hours_editor_vm(tr, &form.hours_fields(), hours_error),
+        hours_days: hours_editor_vm(tr, &hours_fields, hours_error),
         security_states: security_editor_vm(tr, &form.security_fields()),
+        hours_open,
+        security_open,
         type_options: view::type_options(tr, Some(&form.parking_type)),
         lat: point.lat(),
         lon: point.lon(),

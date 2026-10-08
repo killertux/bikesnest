@@ -1,4 +1,4 @@
-This Privacy Policy explains how BikesNest handles personal data, in line with Brazil's General Data Protection Law (Law No. 13,709/2018, "LGPD") and, where it applies to people located in the European Economic Area or the United Kingdom, the General Data Protection Regulation (Regulation (EU) 2016/679, "GDPR").
+This Privacy Policy explains how BikesNest handles personal data under Brazil's General Data Protection Law (Law No. 13,709/2018, "LGPD"). The European Union or United Kingdom GDPR provisions described below apply only when the relevant law applies to the processing; a person's location alone does not decide that question.
 
 BikesNest is a community map of bicycle parking. Anyone can search without an account. An account is only needed to contribute (adding locations, photos, reviews and verifications).
 
@@ -22,9 +22,11 @@ Privacy contact channel and data protection officer (LGPD art. 41): **{{CONTACT_
 | Technical data | session identifier (*hash*), e-mail verification and password reset tokens, IP address and browser information used for rate limiting, security and access logs | your browser | automatic |
 | Audit records | administrative, moderation and privacy actions, with actor and timestamp | system | automatic |
 | Privacy requests | requests to exercise your rights and their status | you | no |
-| Browser location | approximate coordinates, **only** if you allow it in your browser; used to run the search and **never stored** | your browser | no |
+| Search and browser location | address/search text; precise or approximate coordinates supplied by your browser or a map pin; search URL parameters; the `bn.search.mapOpen` map-display preference stored locally in your browser | you / your browser | no |
 
-We do not collect sensitive personal data, we do not profile you, and we do not use your data for advertising.
+We do not ask you to provide sensitive personal data. Free-text, photos and location contributions can nevertheless reveal sensitive or identifying information about you or someone else. Please do not include it unless it is necessary and lawful. We do not profile you or use your data for advertising.
+
+Browser coordinates are used to run your search. They can appear in the search URL and browser history and travel in requests through our hosting or proxy; those systems' logs and the selected map or geocoding provider may therefore receive them. We do not intentionally add browser-location coordinates to your account record or the community dataset unless you separately submit a map location as a contribution.
 
 ## 3. Why we use the data and on what legal basis
 
@@ -34,55 +36,58 @@ We do not collect sensitive personal data, we do not profile you, and we do not 
 | Publish and maintain your contributions on the community map; favourites and "I parked here" | contributions, photos, private activity | V – performance of a contract | 6(1)(b) – performance of a contract |
 | Keep the service secure: sessions, abuse and fraud prevention, rate limits, audit records | technical data, audit records | IX – legitimate interest | 6(1)(f) – legitimate interest |
 | Keep application access logs for the statutory period | access timestamp and IP address | II – legal obligation (art. 15 of the Brazilian Internet Act, Law No. 12,965/2014) | 6(1)(f) – legitimate interest |
-| Content moderation and handling of reports, including automated screening (section 5) | contributions, photos, reports | IX – legitimate interest | 6(1)(f) – legitimate interest |
+| Content moderation and handling of reports | contributions, photos, reports | IX – legitimate interest | 6(1)(f) – legitimate interest |
 | Handle rights requests and keep a record of them | privacy requests, account | II – legal obligation | 6(1)(c) – legal obligation |
-| Run a nearby search | browser location (not stored) | V – performance of a contract | 6(1)(b) – performance of a contract |
+| Run a nearby search and remember whether the search map is open | search and browser location data | V – performance of a contract | 6(1)(b) – performance of a contract |
 
-Where we rely on legitimate interest, we have assessed that the processing is necessary to keep the service secure and trustworthy and does not disproportionately affect your rights. You may object to it (section 9).
+Legitimate interest is the proposed basis for the security, moderation and audit purposes described above. You may object to processing based on legitimate interest (section 9).
 
 ## 4. Who we share data with
 
-We do not sell personal data and we do not share it with advertising networks or tracking tools. We use the following **processors** (providers that process data on our behalf, under contract):
+We do not sell personal data or share it with advertising networks. Depending on the deployed configuration and the provider's terms, the following services may act as a processor or in another legally defined role:
 
 - **Hosting and database** – run the application and store all the data described above.
-- **File storage** – holds the resized photo versions under opaque identifiers, with no account data.
-- **E-mail delivery** – receives only your e-mail address and the transactional message (verification, password reset).
+- **File storage** – holds resized photo versions under opaque identifiers; the object key does not contain your e-mail address or account identifier.
+- **E-mail delivery** – receives your e-mail address and the transactional account or security message.
 - **Geocoding** – receives the address text you type and may receive a random autocomplete-session identifier. Requests come from the BikesNest server, so they include no account identity, cookie or direct browser IP address.
 - **Maps** – when the map is displayed, your browser requests map code and data directly from the selected map provider, which receives your IP address and the map area shown. We send it no account data. When Google Maps Platform is selected, its use is also governed by the [Google Maps Platform Terms](https://cloud.google.com/maps-platform/terms) and [Google Privacy Policy](https://policies.google.com/privacy).
+- **Edge and browser telemetry** – Cloudflare provides page-view and performance telemetry at the service edge and may receive request metadata such as IP address, URL and browser information. See the [Cookie Policy](/cookies) for the data and controls that apply to the deployed feature.
 
 We may also disclose data where required by law, court order or a competent authority, or to protect our rights and the safety of the service and its users.
 
-The current list of processors is available on request through the contact channel.
+The current list of configured providers and their roles is available on request through the contact channel.
 
-## 5. Content moderation and automated decisions
+## 5. Content moderation
 
-Photos and texts you submit are **held for review** before they appear publicly. Review is done by human moderators and may be supported by **automated tools**, including artificial-intelligence models that classify content to detect material that breaches the Terms of Service (for example nudity, violence, hate speech, or content unrelated to bicycle parking). Content flagged automatically is passed to a human moderator; no decision with significant effects on you is taken solely by automated means.
+New parking listings and reviews can appear immediately. A proposed change to an existing parking fact becomes the published fact only after six eligible community approvals or a moderator decision; the pending proposal or a summary of it may be visible before then. Photos appear only after moderator approval. Human moderators can refuse, hide or remove content under the Terms of Service.
 
-You can ask for a moderation decision to be reviewed through the contact channel (LGPD art. 20; GDPR art. 22).
+You can ask for a moderation decision to be reviewed through the contact channel.
 
 ## 6. International transfers
 
-Our servers and processors are located **outside Brazil**, in the European Union and/or the United States, so the data described in this Policy is transferred internationally. We do so under LGPD art. 33, using the **standard contractual clauses approved by the Brazilian data protection authority (ANPD)** incorporated into our processor contracts, or another mechanism provided by law. For people in the European Economic Area, transfers out of the EEA rely on the mechanisms of Chapter V of the GDPR (adequacy decisions or the European Commission's standard contractual clauses).
+Provider locations and legal roles depend on the services selected for deployment. When personal data is transferred internationally, the applicable destination, recipient and transfer mechanism must be assessed for that provider under LGPD art. 33 and, where applicable, Chapter V of the GDPR. Contact us for the current deployed-provider information.
 
 ## 7. How long we keep data
 
 | Data | Period |
 |---|---|
-| Account (e-mail, password *hash*, display name) | until you delete your account; identity data is then removed immediately and the residual record, which no longer holds personal data, is erased within 30 days |
+| Account (e-mail, password *hash*, display name) | until you delete your account; the active account is then de-identified and its residual database shell is scheduled for deletion after 30 days |
 | Sessions | 30 days idle, at most 90 days |
 | E-mail verification / password reset token | 24 hours / 1 hour |
-| Contributions, reviews, verifications, approved photos | remain on the map as part of the community dataset; when you delete your account they are no longer linked to you (anonymised) |
+| Contributions, reviews, verifications, approved photos | remain on the map as part of the community dataset; account and public-name attribution are removed on account deletion, but retained free text or images are not thereby guaranteed to be anonymous |
 | Photos rejected in moderation and incomplete uploads | removed within 24 hours |
 | Favourites | until you remove them or delete your account |
 | "I parked here" | 90 days, or until account deletion |
-| Reports and moderation records | kept for the safety of the service; the reporter's identity is anonymised on account deletion |
+| Reports and moderation records | kept for the safety of the service; the reporter's account link is removed on account deletion, but report content may still identify someone |
 | Access logs (timestamp and IP) | 6 months (art. 15 of the Brazilian Internet Act) |
 | Audit records | 5 years |
 | Privacy requests and their handling | 5 years, unlinked from the account after deletion |
 | Data export file | 24 hours |
-| Browser location | not stored |
+| Browser location | not intentionally stored as an account record; it may remain in browser history, request/access logs and provider records under their respective retention periods |
 
 We do not delete accounts for inactivity without notice. If we start doing so, we will warn you by e-mail in advance and update this Policy.
+
+Deletion also scrubs queued transactional-mail recipient and credential-link data in the application database. A message already accepted by an external delivery provider cannot be recalled. Scheduled expiry and deletion can be delayed during an outage or while retention jobs are disabled. Backup copies are not rewritten immediately; they expire under the applicable backup lifecycle, and restored backups must have deletions reconciled before normal use.
 
 ## 8. Security
 
@@ -96,22 +101,23 @@ At any time you may (LGPD art. 18; GDPR arts. 15–22):
 - **rectify** incomplete, inaccurate or outdated data;
 - request the **anonymisation, blocking or erasure** of unnecessary or excessive data;
 - obtain **portability** of your data in a machine-readable format;
-- **delete your account** – your identity data is removed and your contributions remain, anonymised;
+- **delete your account** – the account link and display-name attribution are removed from retained contributions; their text or images may still identify someone;
+- request removal or restriction of identifying content itself through a separate rights request; deleting the account alone does not rewrite retained community content;
 - be informed about who we share your data with;
 - **object** to processing based on legitimate interest and request **restriction** of processing;
-- request **review of decisions** taken with the support of automated tools;
-- withdraw consent where processing is based on it (there is currently no consent-based processing);
+- request review of a moderation decision;
+- withdraw consent where processing is based on it;
 - lodge a complaint with the **ANPD** (gov.br/anpd) or, if you are in the European Union, with your national data protection authority.
 
 **How to exercise them:** while signed in, go to *Account → Privacy & data* to export your data, delete your account or file other requests. You can also write to {{CONTACT_EMAIL}} from your registered e-mail address. To protect your data we may ask you to confirm your identity first. We respond within **15 days** (LGPD) or **one month** (GDPR); these periods may be extended where the law allows.
 
 ## 10. Minimum age
 
-BikesNest is intended for people aged **18 or older**. We do not knowingly create accounts for anyone under 18; if we become aware of such an account, we will delete it.
+BikesNest is intended for people aged **18 or older**. We do not knowingly create accounts for anyone under 18; if we become aware of such an account, we will act under the applicable law. The age rule does not by itself exclude protections that apply to a service likely to be accessed by children or adolescents. BikesNest does not use identity-document age verification by default; please do not send identity documents unless we request them through a documented privacy process.
 
 ## 11. Cookies
 
-We use only strictly necessary and functional cookies (session, form protection and language). There are no advertising, analytics or third-party cookies. See the [Cookie Policy](/cookies).
+We use first-party cookies for session, form protection and language. The browser also stores the `bn.search.mapOpen` search-map preference in local storage. Cloudflare page-view and performance telemetry at the edge is described in the [Cookie Policy](/cookies).
 
 ## 12. Changes
 

@@ -4,16 +4,12 @@ use axum::{
     http::{Request, StatusCode},
 };
 use bikesnest_infrastructure::Db;
-use bikesnest_test_support::{db_test, pool, test_config};
+use bikesnest_test_support::{db_test, test_config};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-async fn fragment(query: &str) -> String {
-    let app = bikesnest_web::app_router(
-        std::sync::Arc::new(test_config()),
-        Db::from_pool(pool().await),
-    )
-    .unwrap();
+async fn fragment(db: Db, query: &str) -> String {
+    let app = bikesnest_web::app_router(std::sync::Arc::new(test_config()), db).unwrap();
     let response = app
         .oneshot(
             Request::builder()
@@ -49,8 +45,9 @@ fn mirror<'a>(body: &'a str, id: &str) -> &'a str {
 }
 
 #[db_test]
-async fn partial_results_refresh_filters_and_destination_in_other_forms(_tx: &mut TestTx) {
+async fn partial_results_refresh_filters_and_destination_in_other_forms(tx: &mut TestTx) {
     let body = fragment(
+        tx.db().await,
         "lat=-25.43&lon=-49.27&cost=free&type=rack&security=cctv&radius=2000&sort=distance",
     )
     .await;
@@ -73,8 +70,8 @@ async fn partial_results_refresh_filters_and_destination_in_other_forms(_tx: &mu
 }
 
 #[db_test]
-async fn partial_results_remove_cleared_filters_and_preserve_browse_bounds(_tx: &mut TestTx) {
-    let body = fragment("bbox=-49.29,-25.45,-49.25,-25.40").await;
+async fn partial_results_remove_cleared_filters_and_preserve_browse_bounds(tx: &mut TestTx) {
+    let body = fragment(tx.db().await, "bbox=-49.29,-25.45,-49.25,-25.40").await;
     for id in [
         "search-sort-state",
         "search-query-state",

@@ -3,12 +3,12 @@
 //! utilities the paginated lists share.
 
 use askama::Template;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use bikesnest_domain::LocaleCode;
 use bikesnest_infrastructure::MapConfig;
 
-use crate::auth::{Auth, set_anon_csrf_cookie};
+use crate::auth::Auth;
 use crate::htmx::{fragment_or_redirect, is_fragment_request};
 use crate::i18n::{Locale, Translator};
 
@@ -30,7 +30,7 @@ use crate::i18n::{Locale, Translator};
 /// through `Auth::deny`, which does carry the real header). Threading the
 /// caller's `Auth` through every one of these small toasts (verify,
 /// parked-here, favorite, report, photo upload/moderate) for that edge case
-/// was judged not worth the extra parameter on every call site (WP12).
+/// was judged not worth the extra parameter on every call site.
 pub(crate) fn fragment_answer(
     headers: &HeaderMap,
     map: &MapConfig,
@@ -112,13 +112,8 @@ pub(crate) fn render<T: Template>(template: T, status: StatusCode) -> Response {
     }
 }
 
-/// Render an anonymous form page that carries a double-submit CSRF token: the
-/// token goes into the layout (hidden `csrf` field / `<meta name="csrf">`) and
-/// the matching `csrf` cookie is set on the response (see `crate::auth`).
-pub(crate) fn render_anon<T: Template>(page: T, token: &str) -> Response {
-    let mut resp = render(page, StatusCode::OK);
-    if let Ok(value) = set_anon_csrf_cookie(token).parse() {
-        resp.headers_mut().insert(header::SET_COOKIE, value);
-    }
-    resp
+/// Render an anonymous form page. The auth middleware owns the anonymous
+/// token cookie lifecycle; handlers only render its request-scoped value.
+pub(crate) fn render_anon<T: Template>(page: T, _token: &str) -> Response {
+    render(page, StatusCode::OK)
 }

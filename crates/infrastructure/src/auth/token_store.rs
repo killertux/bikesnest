@@ -6,7 +6,7 @@ use crate::Db;
 use crate::auth::hash::sha256_hex;
 use async_trait::async_trait;
 use bikesnest_application::{AuthError, TokenStore};
-use bikesnest_domain::{UserId, VerificationToken};
+use bikesnest_domain::{AccountState, UserId, VerificationToken};
 use chrono::{DateTime, Duration, Utc};
 
 const VERIFICATION_TTL: Duration = Duration::hours(24);
@@ -30,9 +30,40 @@ impl TokenStore for SqlxTokenStore {
         email: &str,
         raw: &VerificationToken,
         now: DateTime<Utc>,
-    ) -> Result<(), AuthError> {
+        expected_state: AccountState,
+    ) -> Result<bool, AuthError> {
+        if !matches!(
+            expected_state,
+            AccountState::PendingEmailVerification | AccountState::Active
+        ) {
+            return Ok(false);
+        }
         let token_hash = sha256_hex(raw.as_bytes());
         let expires_at = now + VERIFICATION_TTL;
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("token.issue_verification", e))?;
+        let mut tx = conn
+            .begin()
+            .await
+            .map_err(|e| db_err("token.issue_verification", e))?;
+        let eligible = sqlx::query_scalar::<_, bool>(
+            "SELECT account_state = $2 FROM users WHERE id = $1 FOR UPDATE",
+        )
+        .bind(user_id.0)
+        .bind(expected_state.as_code())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| db_err("token.issue_verification", e))?
+        .unwrap_or(false);
+        if !eligible {
+            tx.rollback()
+                .await
+                .map_err(|e| db_err("token.issue_verification", e))?;
+            return Ok(false);
+        }
         sqlx::query(
             r#"
             INSERT INTO email_verification_tokens (token_hash, user_id, email, expires_at)
@@ -43,10 +74,13 @@ impl TokenStore for SqlxTokenStore {
         .bind(user_id.0)
         .bind(email)
         .bind(expires_at)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await
         .map_err(|e| db_err("token.issue_verification", e))?;
-        Ok(())
+        tx.commit()
+            .await
+            .map_err(|e| db_err("token.issue_verification", e))?;
+        Ok(true)
     }
 
     async fn consume_verification(
@@ -70,10 +104,40 @@ impl TokenStore for SqlxTokenStore {
         )
         .bind(token_hash)
         .bind(now)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("token.consume_verification", e))?,
+        )
         .await
         .map_err(|e| db_err("token.consume_verification", e))?;
         Ok(row.map(|r| (UserId(r.user_id), r.email)))
+    }
+
+    async fn find_verification(
+        &self,
+        raw: &VerificationToken,
+        now: DateTime<Utc>,
+    ) -> Result<Option<UserId>, AuthError> {
+        let token_hash = sha256_hex(raw.as_bytes());
+        sqlx::query_scalar(
+            "SELECT user_id FROM email_verification_tokens
+             WHERE token_hash = $1 AND used_at IS NULL AND expires_at > $2",
+        )
+        .bind(token_hash)
+        .bind(now)
+        .fetch_optional(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("token.find_verification", e))?,
+        )
+        .await
+        .map(|id| id.map(UserId))
+        .map_err(|e| db_err("token.find_verification", e))
     }
 
     async fn issue_reset(
@@ -81,9 +145,33 @@ impl TokenStore for SqlxTokenStore {
         user_id: UserId,
         raw: &VerificationToken,
         now: DateTime<Utc>,
-    ) -> Result<(), AuthError> {
+    ) -> Result<bool, AuthError> {
         let token_hash = sha256_hex(raw.as_bytes());
         let expires_at = now + RESET_TTL;
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("token.issue_reset", e))?;
+        let mut tx = conn
+            .begin()
+            .await
+            .map_err(|e| db_err("token.issue_reset", e))?;
+        let eligible = sqlx::query_scalar::<_, bool>(
+            "SELECT account_state IN ('PENDING_EMAIL_VERIFICATION', 'ACTIVE')
+             FROM users WHERE id = $1 FOR UPDATE",
+        )
+        .bind(user_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| db_err("token.issue_reset", e))?
+        .unwrap_or(false);
+        if !eligible {
+            tx.rollback()
+                .await
+                .map_err(|e| db_err("token.issue_reset", e))?;
+            return Ok(false);
+        }
         sqlx::query(
             r#"
             INSERT INTO password_reset_tokens (token_hash, user_id, expires_at)
@@ -93,10 +181,13 @@ impl TokenStore for SqlxTokenStore {
         .bind(token_hash)
         .bind(user_id.0)
         .bind(expires_at)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await
         .map_err(|e| db_err("token.issue_reset", e))?;
-        Ok(())
+        tx.commit()
+            .await
+            .map_err(|e| db_err("token.issue_reset", e))?;
+        Ok(true)
     }
 
     async fn consume_reset(
@@ -119,10 +210,40 @@ impl TokenStore for SqlxTokenStore {
         )
         .bind(token_hash)
         .bind(now)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("token.consume_reset", e))?,
+        )
         .await
         .map_err(|e| db_err("token.consume_reset", e))?;
         Ok(row.map(|r| UserId(r.user_id)))
+    }
+
+    async fn find_reset(
+        &self,
+        raw: &VerificationToken,
+        now: DateTime<Utc>,
+    ) -> Result<Option<UserId>, AuthError> {
+        let token_hash = sha256_hex(raw.as_bytes());
+        sqlx::query_scalar(
+            "SELECT user_id FROM password_reset_tokens
+             WHERE token_hash=$1 AND used_at IS NULL AND expires_at>$2",
+        )
+        .bind(token_hash)
+        .bind(now)
+        .fetch_optional(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("token.find_reset", e))?,
+        )
+        .await
+        .map(|id| id.map(UserId))
+        .map_err(|e| db_err("token.find_reset", e))
     }
 }
 

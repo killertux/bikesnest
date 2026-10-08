@@ -1,4 +1,4 @@
-//! CSP/asset consistency (WP22): the CSP media-host bug shipped because
+//! CSP/asset consistency: the CSP media-host bug shipped because
 //! nothing checked that a rendered page's own asset origins are actually
 //! allowed by the `Content-Security-Policy` header riding the same response.
 //! This file renders a representative page set, extracts every
@@ -15,7 +15,7 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use bikesnest_infrastructure::{Db, FakeEmailProvider, FakeOAuthProvider, TEST_MEDIA_ORIGIN};
-use bikesnest_test_support::{ParkingBuilder, TestPasswordHasher, db_test, pool, test_config};
+use bikesnest_test_support::{ParkingBuilder, TestPasswordHasher, db_test, test_config};
 use bikesnest_web::{RouterDeps, app_router_with};
 use http_body_util::BodyExt;
 use regex::Regex;
@@ -27,9 +27,8 @@ use tower::ServiceExt;
 // http_test.rs — see that file for the full, exercised versions).
 // ---------------------------------------------------------------------------
 
-async fn csp_app() -> (axum::Router, FakeEmailProvider) {
+fn csp_app(db: Db) -> (axum::Router, FakeEmailProvider) {
     let email = FakeEmailProvider::with_root(None);
-    let db = Db::from_pool(pool().await);
     let config = test_config();
     let deps = RouterDeps {
         email: std::sync::Arc::new(email.clone()),
@@ -40,6 +39,7 @@ async fn csp_app() -> (axum::Router, FakeEmailProvider) {
         hasher: TestPasswordHasher,
         rate_limiter: Box::new(bikesnest_infrastructure::InMemoryRateLimiter::new()),
         storage: std::sync::Arc::new(bikesnest_test_support::TestObjectStorage::new()),
+        detail_reads: None,
     };
     let app = app_router_with(std::sync::Arc::new(config), db, deps);
     (app, email)
@@ -111,7 +111,7 @@ async fn anon_csrf(app: &axum::Router, page_uri: &str) -> Option<(String, String
         .get("set-cookie")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string)?;
-    if !sc.starts_with("csrf=") {
+    if !sc.starts_with("__Host-csrf=") {
         return None;
     }
     let cookie_line = sc.split(';').next().unwrap().to_string();
@@ -199,23 +199,7 @@ fn extract_csrf(html: &str) -> String {
     html[start..].split('"').next().unwrap_or("").to_string()
 }
 
-async fn cleanup_user_contributions(email: &str) {
-    sqlx::query(
-        "DELETE FROM parking_location WHERE creator_id = (SELECT id FROM users WHERE email = $1)",
-    )
-    .bind(email)
-    .execute(&pool().await)
-    .await
-    .unwrap();
-    sqlx::query("DELETE FROM users WHERE email = $1")
-        .bind(email)
-        .execute(&pool().await)
-        .await
-        .unwrap();
-}
-
 async fn verified_cookie(app: &axum::Router, email: &FakeEmailProvider, addr: &str) -> String {
-    cleanup_user_contributions(addr).await;
     post_form(
         app,
         "/register",
@@ -237,8 +221,12 @@ async fn verified_cookie(app: &axum::Router, email: &FakeEmailProvider, addr: &s
     cookie.unwrap().split(';').next().unwrap().to_string()
 }
 
-async fn admin_cookie(app: &axum::Router, email: &FakeEmailProvider, addr: &str) -> String {
-    cleanup_user_contributions(addr).await;
+async fn admin_cookie(
+    db: &Db,
+    app: &axum::Router,
+    email: &FakeEmailProvider,
+    addr: &str,
+) -> String {
     post_form(
         app,
         "/register",
@@ -250,21 +238,20 @@ async fn admin_cookie(app: &axum::Router, email: &FakeEmailProvider, addr: &str)
         .token_for("/verify-email")
         .expect("admin verification email");
     get_full(app, &format!("/verify-email?token={token}"), None).await;
+    let mut conn = db.acquire().await.unwrap();
     let (uid,): (i64,) = sqlx::query_as("SELECT id FROM users WHERE email = $1")
         .bind(addr)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *conn)
         .await
         .unwrap();
-    // See the note on `hold_admin_set_lock_for_process`: the ADMIN set is
-    // shared with the tests that assert on "never zero admins".
-    bikesnest_test_support::hold_admin_set_lock_for_process(&pool().await).await;
     sqlx::query(
         "INSERT INTO user_roles (user_id, role, granted_by) VALUES ($1, 'ADMIN', NULL) ON CONFLICT DO NOTHING",
     )
     .bind(uid)
-    .execute(&pool().await)
+    .execute(&mut *conn)
     .await
     .unwrap();
+    drop(conn);
     let (_, _, cookie) = post_form(
         app,
         "/login",
@@ -275,19 +262,13 @@ async fn admin_cookie(app: &axum::Router, email: &FakeEmailProvider, addr: &str)
     cookie.unwrap().split(';').next().unwrap().to_string()
 }
 
-async fn fixture_location(tx: &mut bikesnest_test_support::TestTx, mark: &str, name: &str) -> i64 {
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(mark)
-        .execute(&pool().await)
-        .await
-        .unwrap();
+async fn fixture_location(db: &Db, name: &str) -> i64 {
+    let mut conn = db.acquire().await.unwrap();
     let loc = ParkingBuilder::new()
         .with_name(name)
-        .with_fixture_tag(mark)
-        .create(tx.executor())
+        .create(&mut conn)
         .await
         .unwrap();
-    tx.commit_fixture().await;
     loc.id()
 }
 
@@ -488,11 +469,14 @@ async fn csp_allows_every_asset_origin_it_renders(tx: &mut bikesnest_test_suppor
     const PHOTO_USER: &str = "csp-photo-uploader@example.com";
     const ADMIN: &str = "csp-admin@example.com";
 
-    let (app, email) = csp_app().await;
+    // Every fixture and real router adapter shares this rollback scope.
+    // No committed fixture or process-wide ADMIN lock is needed.
+    let db = tx.db().await;
+    let (app, email) = csp_app(db.clone());
 
     // A parking page with a published (APPROVED, publicly visible) photo, so
     // the gallery's `<img src>` is exercised too.
-    let loc = fixture_location(tx, "csp-photo-loc", "CSP Photo Spot").await;
+    let loc = fixture_location(&db, "CSP Photo Spot").await;
     let uploader = verified_cookie(&app, &email, PHOTO_USER).await;
     let (_, page, _) = get_full(&app, &format!("/parking/{loc}"), Some(&uploader)).await;
     let csrf = extract_csrf(&page);
@@ -509,11 +493,11 @@ async fn csp_allows_every_asset_origin_it_renders(tx: &mut bikesnest_test_suppor
     assert_eq!(up_status, StatusCode::OK, "photo upload succeeds");
     let (photo_id,): (i64,) = sqlx::query_as("SELECT id FROM parking_photo WHERE location_id = $1")
         .bind(loc)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
 
-    let admin = admin_cookie(&app, &email, ADMIN).await;
+    let admin = admin_cookie(&db, &app, &email, ADMIN).await;
     let (_, queue, _) = get_full(&app, "/moderation/photos", Some(&admin)).await;
     // The queue holds only PENDING_REVIEW photos, so this is the one window
     // in which our own upload (not yet approved below) is guaranteed to be
@@ -579,12 +563,4 @@ async fn csp_allows_every_asset_origin_it_renders(tx: &mut bikesnest_test_suppor
             "img-src must list the configured media host {host}: {img_src}"
         );
     }
-
-    let _ = tx;
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = 'csp-photo-loc'")
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    cleanup_user_contributions(PHOTO_USER).await;
-    cleanup_user_contributions(ADMIN).await;
 }

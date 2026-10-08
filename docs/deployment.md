@@ -16,9 +16,25 @@ docker build -t bikesnest:$(git rev-parse --short HEAD) .
 The multi-stage `Dockerfile` (`rust:1.95` builder → `debian:bookworm-slim`) bakes
 the release binary and `web/static/`. Templates and migrations are **embedded**
 (Askama / `sqlx::migrate!`), so nothing else is copied. Uploaded media lives in an
-**S3-compatible bucket** (MinIO in dev), not the image; the bucket is the
+**S3-compatible bucket** (RustFS in dev), not the image; the bucket is the
 configured store (`S3_*` env). Media is served via **direct S3 presigned GET
 URLs** (the browser hits the bucket; the app is not a media proxy).
+
+The shipped htmx 4.0.0 network-restores browser history and does not implement
+a localStorage history snapshot cache. That is a pinned-library property guarded
+by the browser suite, not an HTML configuration attribute; rerun that suite when
+upgrading the vendored htmx asset.
+
+HTML responses enforce the existing provider-compatible CSP and simultaneously
+emit a fresh-nonce, `strict-dynamic` candidate as
+`Content-Security-Policy-Report-Only`. This is deliberately observation-only:
+promoting it to enforcement requires live restricted-key Google Maps evidence
+and a decision to nonce or disable the Cloudflare-injected analytics beacon,
+which a host fallback cannot authorize under `strict-dynamic`. Google Maps is
+the only candidate profile retaining `unsafe-eval`, per the official
+[Google Maps CSP guide](https://developers.google.com/maps/documentation/javascript/content-security-policy).
+Mapbox blob-worker and stricter worker-bundle tradeoffs are documented in its
+[security guide](https://docs.mapbox.com/mapbox-gl-js/guides/security-and-testing/).
 
 Build is reproducible because `Cargo.lock` is committed and the toolchain is
 pinned by the base image tag. No `DATABASE_URL`, no offline cache, no build-time
@@ -39,17 +55,20 @@ All knobs are documented in `.env.example`; production sets them as real secrets
 | `TRUSTED_PROXY_HOPS` | how many reverse proxies in front of the app may be trusted to have appended to `X-Forwarded-For`; `0` (default) uses the TCP peer address only. See the reverse-proxy guidance below |
 | `BASE_URL` | the public origin, e.g. `https://bikesnest.com` — builds links + canonical URLs. **Must be reachable** |
 | `MEDIA_ROOT` | directory the **development e-mail outbox** writes to (`EMAIL_PROVIDER=fake` only; default `media`). No longer a media directory: media lives in the S3 bucket, and the retention orphan sweep lists the bucket |
-| `S3_ENDPOINT` | **Object storage:** the S3-compatible endpoint. Unset defaults to `http://localhost:9000` (MinIO) in development only; set it empty for the standard AWS endpoint. **Required in production** |
+| `S3_ENDPOINT` | **Object storage:** the S3-compatible endpoint. Unset defaults to `http://localhost:9000` (RustFS) in development only; set it empty for the standard AWS endpoint. **Required in production** |
 | `S3_REGION` / `S3_BUCKET` | region (default `us-east-1`) + bucket name (development default `bikesnest`; **required in production**) |
-| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | S3 credentials (development default MinIO `minioadmin`, which production rejects outright) |
+| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | S3 credentials (development default RustFS `rustfsadmin`; production rejects it and `minioadmin` outright) |
 | `TLS_ON` | set `true` to emit HSTS behind a real TLS terminator |
 | `VALKEY_URL` | **Rate limiter:** single node, e.g. `valkey://valkey:6379`. Shared across auth/photo/contribution/moderation, survives restarts, aggregates across instances |
 | `VALKEY_CLUSTER_URLS` | comma-separated node URLs → **cluster** mode (wins over `VALKEY_URL`) |
-| `RATE_LIMIT_FAIL_OPEN` | `true` (default) → a ValKey outage **allows** requests (goes fail-open); `false` → **denies** (429s the rate-limited endpoints) |
-| `JOBS_ENABLED` | **Background job queue:** `true` (default) spawns an in-process worker that claims, runs, and retries `background_job` rows; `false` for web-only instances — transactional email then sends inline on the request path instead of being queued |
-| `JOBS_POLL_INTERVAL_MS` / `JOBS_BATCH_SIZE` / `JOBS_LEASE_TTL_MS` | queue poll cadence, batch size, and lease length (defaults 5000 / 4 / 600000) |
+| `RATE_LIMIT_FAIL_OPEN` | `true` (default) lets general traffic fail open; credential-sensitive auth always fails closed. `false` fails closed everywhere |
+| `JOBS_RUN_WORKER` / `JOBS_DURABLE_ENQUEUE` | independently run a worker and leave auth mail for durable delivery (both default true). Legacy `JOBS_ENABLED` sets both only when the new names are absent |
+| `JOBS_POLL_INTERVAL_MS` / `JOBS_BATCH_SIZE` / `JOBS_LEASE_TTL_MS` | queue poll cadence, maximum concurrent attempts, and lease length (defaults 5000 / 4 / 600000) |
+| `JOBS_HANDLER_TIMEOUT_MS` / `JOBS_SHUTDOWN_GRACE_MS` | attempt deadline and bounded shutdown drain (defaults 300000 / 30000) |
 | `JOBS_MAX_ATTEMPTS` / `JOBS_BACKOFF_BASE_MS` | retry budget (default 5) and exponential-backoff base (default 2000) before dead-letter |
 | `JOBS_HISTORY_RETENTION_DAYS` | `jobs.gc` deletes `succeeded`/`failed` rows older than this (default 7) |
+| `PASSWORD_HASH_CONCURRENCY` / `PASSWORD_HASH_QUEUE_CAPACITY` / `PASSWORD_HASH_ADMISSION_TIMEOUT_MS` | shared Argon2 hash+verify running budget, finite waiter count, and waiter deadline (defaults 2 / 8 / 2000; queue 0 disables waiting) |
+| `PHOTO_PROCESSING_CONCURRENCY` | process-wide simultaneous image decode/encode limit (default `1`). Keep at `1` until a release capacity test proves memory headroom for a higher value |
 | `CSP_TILE_HOSTS` / `CSP_GEOCODE_HOSTS` | extra origins allowed by the strict CSP for MapLibre tiles / browser geocoding. Required Mapbox and Google Maps origins are added automatically for their profiles |
 | `CSP_MEDIA_HOSTS` | object-storage origin(s) allowed in the CSP `img-src` that parking photos are served from as direct pre-signed URLs (dev: `http://localhost:9000`; AWS: `https://<bucket>.s3.<region>.amazonaws.com`) |
 | `APP_ENV` | `production` → JSON structured logs (machine-parseable, forward to a log aggregator) **and the startup validation described below** |
@@ -68,6 +87,25 @@ All knobs are documented in `.env.example`; production sets them as real secrets
 | `DELETED_ACCOUNT_PURGE_AFTER_DAYS` | `30` in production (decision, `docs/retention-policy.md`); `INACTIVE_ACCOUNT_ANONYMIZE_AFTER_DAYS` stays `0` |
 | `REC_*`, `FRESHNESS_*`, `PHOTO_*`, `MOD_*`, `RETENTION_*` | tuning constants (see `.env.example`) |
 
+The password default permits two simultaneous Argon2id operations. At the
+unchanged 19 MiB memory parameter this is a nominal 38 MiB working-allocation
+lower bound before allocator, thread, request, and process overhead. Eight
+waiters are deliberately cheap compared with starting eight more hashes and
+are bounded by a two-second deadline. These are conservative process defaults,
+not a production latency SLO: measure the deployed CPU and memory limit, then
+tune all three values together. Queue capacity zero is supported when immediate
+overload rejection is preferred.
+
+Image processing uses a separate semaphore with a conservative default of one
+decode/encode at a time per process. A 20 MP input decodes to about 60 MB of RGB
+pixels and the B18 audit harness observed an approximately 151 MiB absolute
+single-process high-water mark on its test runtime. That high-water mark is not
+an additive per-request prediction. Before increasing
+`PHOTO_PROCESSING_CONCURRENCY`, the release owner must record the deployed
+container memory limit, replica/process layout, baseline RSS, and concurrent
+20 MP load evidence with adequate headroom. Started blocking work retains its
+permit after HTTP cancellation.
+
 **Never** put secrets in the image; the `.dockerignore` excludes `.env*`.
 
 ## 2a. Startup validation
@@ -80,8 +118,8 @@ problem on stderr) unless all of the following hold:
 - `BASE_URL` is set and does not point at `localhost` / `127.0.0.1` — otherwise
   every verification and password-reset e-mail links to the wrong host.
 - `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` are
-  all set, and the credentials are not the MinIO development default
-  (`minioadmin`).
+  all set, and the credentials are not a development default
+  (`rustfsadmin`/`minioadmin`).
 - `EMAIL_PROVIDER` is `smtp` or `resend`, with its credentials present. The
   `fake` provider discards every message, so production never runs on it.
 - `LOCATION_PROVIDER=mapbox` or `google`, with that profile's credentials. The
@@ -141,7 +179,7 @@ connection — no configuration needed.
 
 `SIGTERM` (what `docker stop` / Kubernetes send) starts a graceful shutdown: the
 HTTP server stops accepting, in-flight requests drain, then the background job
-worker is given up to 30 s to finish whatever job it is running before the
+worker is given the configured shutdown grace to finish active jobs before the
 process exits. Killing the process mid-job would leave a `background_job` row in
 `state='running'` until its lease expired.
 
@@ -149,9 +187,9 @@ The container image runs the server under [tini] as PID 1
 (`ENTRYPOINT ["/usr/bin/tini", "--", "bikesnest-web"]`) so signals are forwarded
 and zombies reaped. If you run the binary some other way, make sure it receives
 `SIGTERM` directly (`docker run --init`, or `init: true` in compose, gives the
-same guarantee) and allow at least 35 s of termination grace
-(`--stop-timeout` / `terminationGracePeriodSeconds`) so the worker's 30 s budget
-is usable.
+same guarantee). Set the container termination grace above the HTTP drain plus
+twice `JOBS_SHUTDOWN_GRACE_MS`: the first worker interval permits natural
+completion and the second drains explicitly cancelled handler/heartbeat tasks.
 
 [tini]: https://github.com/krallin/tini
 
@@ -162,13 +200,20 @@ Migrations are **forward-only** (`sqlx` records applied versions). This means:
 
 - **Deploy = run the new image.** The migration runs before the server accepts
   traffic (`readyz` gates until migrations are applied).
-- **Rollback = redeploy the previous image.** Because migrations are
-  forward-only, a *rollback* is a restore of the previous release, **not** an
-  automated down-migration. New columns introduced by the rolled-back release
-  become harmless (ignored) but remain in the schema.
+- **An older image cannot start against a newer schema.** On startup the
+  migrator refuses to run when the database has applied migrations the binary
+  does not contain (`sqlx` `VersionMissing`), and the process exits. So once a
+  release that adds a migration has started even once, redeploying the
+  previous image fails at boot.
+- **Rollback = roll forward, or restore.** For a release that added
+  migrations, either deploy a fix built on top of it (it carries every applied
+  migration), or restore the pre-release database backup and then run the
+  previous image — see `docs/backups.md`. Restoring discards every write made
+  since the backup. Only a release that added **no** migration can be undone
+  by simply redeploying the previous image tag.
 
-> If a release must be undone and the schema is incompatible, restore the
-> pre-release data backup and re-run the old image — see `docs/backups.md`.
+Before deploying a release that adds migrations, take a fresh backup and record
+the last migration version the previous image knows about.
 
 Migrations run on a dedicated connection with `statement_timeout` disabled and
 closed afterwards, so `DB_STATEMENT_TIMEOUT_MS` never aborts an index build
@@ -215,6 +260,12 @@ documented below and must be replaced before enabling sign-in in production.
   random session token. Google requires a browser key, a server key, and a map
   ID; absence of any one is a startup error.
 
+Legacy deployments without `LOCATION_PROVIDER` may still set `MAP_STYLE_URL`.
+A `mapbox://` or `api.mapbox.com` style selects Mapbox GL JS and requires
+`MAPBOX_MAP_ACCESS_TOKEN` (with `MAPBOX_ACCESS_TOKEN` accepted only as the
+legacy fallback). Other style URLs select MapLibre and never expose either
+token to that SDK.
+
 The hosted geocoder sees the typed address and, for Google autocomplete, the
 random session token. It receives no BikesNest account identity, cookie, or
 direct connection from the browser. The Google map renderer receives normal
@@ -228,10 +279,10 @@ Coordinates already submitted by the browser skip direct geocoding. Provider
 errors render the localized location-service unavailable state.
 
 **Object storage.** Media is stored in an S3-compatible bucket
-(MinIO in dev, AWS/S3/R2/B2 in prod; `S3_*` env) and served via **direct S3
+(RustFS in dev, AWS/S3/R2/B2 in prod; `S3_*` env) and served via **direct S3
 presigned GET URLs** — the browser hits the bucket and S3's SigV4 signature
 authorizes the read (no app-side proxy, no app signing secret). Selectable by
-`S3_ENDPOINT`/`S3_BUCKET`; the compose MinIO is the DEVELOPMENT default only —
+`S3_ENDPOINT`/`S3_BUCKET`; the compose RustFS is the DEVELOPMENT default only —
 production must set every `S3_*` value (see “Required environment” above).
 
 **Email — done in code.** Provider is selected by `EMAIL_PROVIDER`
@@ -265,12 +316,12 @@ restarts. The app picks the backend from env (no code change):
 correct under concurrency, including in cluster mode (the script touches a
 single key, so it stays within one hash slot).
 
-**Failure mode — fail open by default.** `Check` on a ValKey outage returns
-*allow* and logs a `warn!` (`RATE_LIMIT_FAIL_OPEN=true`), so a ValKey outage
-degrades brute-force protection without taking the site down (the application
-maps any `RateLimitError` to 429 — fail closed — which would 429 every
-rate-limited endpoint during an outage). Set `RATE_LIMIT_FAIL_OPEN=false` to
-fail closed instead (stricter, but an outage 429s auth/photo/moderation).
+**Failure mode.** Every ValKey check has a 500 ms total deadline and emits only
+an allowlisted reason/policy warning on degradation. Credential-sensitive auth
+checks fail closed (the application maps the error to its existing limited
+response). With `RATE_LIMIT_FAIL_OPEN=true`, other limited traffic is allowed
+so a store outage does not take down unrelated contributions/photos. Set it to
+false to fail closed for every limited endpoint.
 
 **Docker compose:** the dev stack runs a single-node ValKey
 (`docker-compose.yml`, `valkey` service, wired as `VALKEY_URL`). For cluster
@@ -283,57 +334,170 @@ multi-node variant).
 
 The app ships a **pure-PostgreSQL job queue** — no broker. A `background_job`
 table stores durable one-shot + recurring work; an **in-process worker task**
-(started when `JOBS_ENABLED=true`, the default) claims due jobs with
+(started when `JOBS_RUN_WORKER=true`, the default) claims due jobs with
 `FOR UPDATE SKIP LOCKED`, runs their handler, and records the outcome. All job
 times are UTC.
 
 - **Recurring** jobs never go terminal: on success the worker recomputes
   `run_at` from `schedule` (`{"every_seconds":N}` or a UTC `{"cron":"…"}`) and
   resets the row to `pending`.
-- **Retries** use exponential backoff + jitter; after `JOBS_MAX_ATTEMPTS` a job
-  is dead-lettered to `failed` (kept with `last_error` for inspection).
-- **`jobs.gc`** (itself a recurring job) deletes `succeeded`/`failed` rows older
-  than `JOBS_HISTORY_RETENTION_DAYS` (default 7).
+- **Retries** use exponential backoff + jitter; after `JOBS_MAX_ATTEMPTS` a
+  *one-shot* job is dead-lettered to `failed` (kept with `last_error` for
+  inspection). A *recurring* job never goes terminal on a handler failure: when
+  an occurrence uses up its attempts (or fails permanently), `last_error` is
+  recorded, an error is logged, attempts reset, and the row returns to
+  `pending` at its next scheduled run.
+- **`jobs.gc`** (itself a recurring job) deletes one-shot `succeeded`/`failed`
+  rows older than `JOBS_HISTORY_RETENTION_DAYS` (default 7). Scheduled rows are
+  never GC'd. The
+  built-ins currently have `{}` payloads; any future sensitive recurring payload
+  needs a separate minimization and retention review before registration.
 - **At-least-once**: a worker crash leaves the job leasable; it is re-claimed
-  after the lease. Handlers must be idempotent.
-- On a multi-instance deploy each instance runs its own worker; claims are safe
-  because `SKIP LOCKED` assigns disjoint rows. `JOBS_ENABLED=false` keeps an
-  instance web-only (no worker).
+  after the lease, but only while `attempts < max_attempts`. A job that crashed
+  or hung on its final attempt is finalized at the next claim instead (one-shot
+  to `failed`, recurring to its next run, both with a `last_error` saying the
+  lease expired after the final attempt), so a crash loop cannot re-run a job
+  such as an email forever. Handlers must be idempotent.
+- On a multi-instance deploy claims are safe because `SKIP LOCKED` assigns
+  disjoint rows. A web-only instance sets `JOBS_RUN_WORKER=false` while keeping
+  `JOBS_DURABLE_ENQUEUE=true`, and a separate `bikesnest-web worker` process
+  must share its database.
 
-The always-on recurring jobs (`retention`, `jobs.gc`) are bootstrapped by the
-worker at startup (idempotent via a stable `idempotency_key`), so no manual
-seeding is required. The legacy `cargo run -- retention` subcommand still works
-as a manual escape hatch.
+The worker authoritatively registers exactly two built-ins at startup:
+
+| Kind | Stable key | Schedule |
+|---|---|---|
+| `retention` | `recurring:retention` | every 86,400 seconds |
+| `jobs.gc` | `recurring:jobs.gc` | every 86,400 seconds |
+
+Registration validates and persists the schedule. On restart it preserves a
+healthy pending row's future `run_at` and any active running lease. It repairs
+an exact kind/key/payload legacy row whose schedule is NULL. A live legacy row
+is revisited after its current lease/attempt finishes, so its active owner is
+never overwritten. Any key collision with a different kind, payload or non-NULL
+schedule is logged and left untouched. Startup continues processing independent
+queue work while retrying reconciliation on later polls.
+
+On boot, a scheduled row left `failed` by an older release is revived: it
+returns to `pending` with a fresh attempt budget at its next scheduled run,
+keeping `last_error` and `finished_at` as evidence. A legacy failed row with a
+NULL schedule is reactivated to run now. A failing retention step no longer
+skips the later steps; the run records `result=failure` in its audit event and
+is retried. The legacy `cargo run -- retention` subcommand remains a manual
+escape hatch.
+
+Before a rollout, use a read-only preflight scoped to the two exact stable keys;
+inspect `kind`, `payload`, `state`, `schedule`, `run_at`, `attempts`,
+`claimed_by`, `lease_expires_at`, `finished_at` and `last_error`. Stop if either
+key belongs to unexpected data. After the separately approved deployment,
+verify that each key has exactly one row, the schedule is present, running
+ownership was not changed, and a successful execution returns the same row to
+`pending` with a future `run_at`. Do not delete job history as a repair.
+
+The previous binary cannot start once this release's migrations are applied
+(see section 4), so recovery here means rolling forward. A binary built from this
+release can finish and reschedule a row whose schedule is already persisted, but
+cannot recreate or safely repair a missing/legacy row. Keep the
+persisted schedules intact, use the documented manual retention command only
+with explicit operational approval, and roll forward promptly. Alert separately
+on each built-in's completion timestamp and state, lateness beyond its expected
+next run, a non-null `last_error` on a recurring row together with a
+`finished_at` (its last success) older than one schedule interval, and
+recurring-bootstrap errors. A scheduled `failed` state now only occurs for an
+invalid schedule. Richer history/metrics need a separate change. HTTP readiness alone does not establish that background
+retention is healthy.
 
 ## 5d. Transactional email goes through the queue
 
-Verification, password-reset and e-mail-change messages are **queued, not sent
-inline**. A request writes one `email.send` job (a single INSERT, in the same
-database as the account and token rows) and returns; the worker delivers it with
-the queue's retry budget (`JOBS_MAX_ATTEMPTS`), exponential backoff and
-dead-lettering. A slow or failing relay/ESP therefore cannot hold an HTTP
-request open, and cannot fail a registration *after* the account already exists.
+Registration, verification resend, password-reset request and e-mail-change
+request each commit the account/token transition, audit where applicable, and
+account-linked `email.send` row in one database transaction. Admission failure
+rolls the complete transition back. A registration retry for a pending account
+reuses valid queued work (including an active lease), or creates a fresh token
+and job when the former credential/outbox is absent or expired; it never
+overwrites the existing password, display name or locale. Once admitted, the
+worker uses the configured retry budget
+(`JOBS_MAX_ATTEMPTS`), exponential backoff and dead-lettering, keeping provider
+latency off the request path.
 
 - **Language.** The message carries the recipient's locale (`users.locale`, set
   at registration from the page's language and updated by the header language
   toggle for signed-in users). Subject and body are rendered from the message
   catalog *at send time* — pt-BR and en, never a hard-coded English string.
-- **No double sends.** Each job is enqueued under `email:{kind}:{sha256(link)}`,
-  so a retried or double-submitted request collapses onto the existing row. A
-  genuine re-send issues a new token, hence a new link and a new job.
-- **Dead letters.** An exhausted job logs at `error!` with the message kind and
-  the recipient's *domain* only (never the address, never the link) and stays in
-  `background_job` as `failed` with `last_error` until `jobs.gc` removes it.
-  Alert on that log line: it means someone is stuck without a verification or
-  reset link and needs a re-send.
-- **`JOBS_ENABLED=false`.** No worker runs, so nothing would ever claim an
-  `email.send` row. The app detects this at wiring time and sends **inline** on
-  the request path instead (same provider, same localized rendering) — mail is
-  never silently queued into a void. The trade-off returns with it: a slow ESP
-  is back on the user's request. Prefer leaving the worker on; if you run
-  web-only instances, make sure at least one instance (or a dedicated worker
-  deployment) has `JOBS_ENABLED=true`. Startup validation needs no new rule
-  here: both wirings deliver, so neither is a misconfiguration.
+- **Alternatives and security notices.** SMTP sends `multipart/alternative`;
+  Resend receives explicit `text` and `html` bodies. Newly admitted credential
+  messages carry their exact stored expiry; legacy payloads without it make no
+  invented duration claim. Successful password replacement durably admits a
+  credential-free warning to the current canonical address, while confirmed
+  address change warns the old address. Their transition audit reference and
+  recipient digest are send-boundary evidence, not durable history.
+- **Admission deduplication, at-least-once delivery.** Each job is enqueued under
+  `email:{kind}:{sha256(identity)}`, where identity is the credential link or
+  immutable security-notice id, so repeated admission for the same transition
+  collapses onto the existing row. A genuine re-send issues a new token and a
+  new job. This does not guarantee one provider delivery: lease expiry or an
+  ambiguous provider response can result in a duplicate send.
+- **Provider replay semantics.** Resend receives the same bounded outbox key in
+  `Idempotency-Key`. Resend documents a
+  [24-hour retention window](https://resend.com/docs/dashboard/emails/idempotency-keys),
+  so this lowers duplicate risk only within that provider window. Its
+  [error reference](https://www.resend.com/docs/api-reference/errors) defines
+  `invalid_idempotent_request` as permanent while
+  `concurrent_idempotent_requests` is retried later. The
+  message is rendered at send time, so catalog/from changes during retries can
+  conflict with the original provider payload. SMTP has no portable
+  idempotency key and remains explicitly at-least-once.
+- **Dead letters.** An exhausted job logs only the allowlisted message kind and
+  stores a bounded error classification. Its recipient/link payload is cleared
+  immediately; recipient digests and audit references are cleared with it.
+  Non-personal lifecycle metadata remains until `jobs.gc` removes the row.
+  Alert on that log line: delivery exhausted its retry budget. A provider may
+  already have accepted an attempt whose outcome was ambiguous.
+- **Deletion boundary.** Delivery and anonymization serialize on the account
+  row. Deletion-first cancels even preclaimed mail; provider-acceptance-first is
+  already outside the application's recall boundary. Provider timeout or a
+  lost database connection remains an ambiguous at-least-once outcome.
+- **Explicit inline mode.** `JOBS_DURABLE_ENQUEUE=false` makes the auth request
+  exact-claim its committed outbox row. Legacy `JOBS_ENABLED=false` selects
+  this mode as well as disabling the local worker when neither new knob is set.
+  Success is terminal/redacted; transient failure persists backoff and returns an
+  unavailable response, and a request retry cannot bypass that backoff.
+  Permanent rejection dead-letters immediately. The trade-off is that provider
+  latency is on the request. Prefer leaving the worker on; if you run
+  web-only instances, make sure a dedicated `bikesnest-web worker` deployment
+  shares the queue. Startup validation needs no new rule
+  here: inline delivery uses the same account/token validation, lease ownership
+  and lock-through-provider boundary as the worker.
+  A credential-free security transition is already complete once its notice
+  row commits: a failed post-commit inline attempt leaves its durable queue
+  outcome (retryable or terminal) recorded and does not falsely report the
+  password/address mutation as failed or invite a replay with the spent token
+  or old credential.
+
+Migration 0026 adds nullable mail lifecycle columns. During upgrade it redacts
+all legacy `email.send` payloads because those rows cannot be safely linked to
+an account/token. Pending/running legacy rows are cancelled as failed; existing
+succeeded/failed history keeps its terminal state. Unrelated jobs are untouched.
+The migration is forward-only. Rolling back application code after it runs is
+not supported for mail delivery: old code cannot interpret redacted legacy rows
+or maintain the new lifecycle contract. This migration overrides the generic
+rolling sequence below: first stop and drain every old worker and old inline
+mail-producing web instance, then start only the new version and let it migrate.
+Otherwise an old worker could retain a raw preclaimed snapshot after the
+database row is scrubbed. On failure, pause mail and forward-fix. Restoring a
+backup can resurrect erased data and lose intervening writes; it is only a
+separately approved disaster-recovery action and requires erasure
+reconciliation. Backup expiry, not this migration, removes historical copies.
+
+Migration 0027 extends that lifecycle with security-notice purposes, a
+recipient digest, and a nullable audit-event foreign key (`ON DELETE SET
+NULL`). Existing token jobs remain unchanged and readable; deleting retained
+audit history does not block retention, but makes an unsent notice fail closed.
+Stop and drain old workers before enabling writers that emit the new payload
+variants: an old worker cannot decode them and may dead-letter them. Apply 0027,
+upgrade every worker, then enable the new writers. Terminal outcomes and account
+deletion clear both new metadata fields. Rollback to an old worker while new
+notice rows exist is unsupported; pause mail and forward-fix instead.
 
 ## 6. Rolling deploy + rollback
 
@@ -341,23 +505,34 @@ request open, and cannot fail a registration *after* the account already exists.
 2. Push to the registry; deploy the new image to one instance.
 3. Wait for `readyz` to go green on that instance (migrations applied).
 4. Drain the old instance; promote the new one.
-5. On failure: stop the rollout, redeploy the **previous** image tag, and if the
-   schema is incompatible restore the pre-release backup (see /`docs/backups.md`).
+5. On failure: stop the rollout. If the release added **no** migration,
+   redeploy the **previous** image tag. If it added migrations, the previous
+   image will refuse to start (section 4): roll forward with a fix, or restore
+   the pre-release backup and then run the previous image (see
+   `docs/backups.md`).
 
 ## 6a. Legal pages (privacy / terms / cookies)
 
-The versioned legal pages are stored in `policy_version` and seeded from
+The versioned legal pages are stored in `policy_version` and seeded as one
+coherent six-document release from
 `policies/{privacy,terms,cookies}.{pt-BR,en}.md`:
+
+Every release, material or otherwise, requires the owner/counsel publication
+approval recorded by the runbook before these commands are run.
 
 1. Set `POLICY_OPERATOR_NAME`, `POLICY_OPERATOR_CNPJ`, `POLICY_OPERATOR_ADDRESS`
    and `POLICY_CONTACT_EMAIL` (the privacy inbox must be monitored — rights
    requests and takedown notices arrive there).
 2. Set `POLICY_VERSION` (e.g. `2026-09-05.1`) and `POLICY_EFFECTIVE_AT`.
-3. Run `bikesnest-web seed-policies` once per release that changes the text. It is
-   idempotent per `(kind, locale, version)`; a new version supersedes the current
-   one and the old text stays reachable at `/{privacy,terms,cookies}/versions`.
-4. Material changes must be announced to users (e-mail or in-app notice) before
-   `POLICY_EFFECTIVE_AT` — the policies promise that.
+3. Follow the preflight, fleet-coherence, activation, and rollback procedure in
+   [`policy-publication.md`](policy-publication.md). The seeder rejects partial
+   or ambiguous releases and exact replay is idempotent; published rows remain
+   immutable and reachable from version history.
+4. The acknowledgement feature is off by default. Its in-product presentation
+   evidence is not proof of delivery or reading, and it does not send the
+   advance e-mail described by the policy draft. Do not enable or publish a
+   material release until the additional activation gates in the runbook are
+   complete.
 
 Review status of the text itself: `docs/legal-review.md`.
 

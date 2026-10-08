@@ -1,27 +1,31 @@
 //! HTTP-layer tests: health/readiness endpoints + pages.
 //!
-//! Run via `#[db_test]` so they share the suite's runtime and migrated pool.
-//! Page tests that assert against seeded search results use the committed-
-//! fixture pattern (see crates/infrastructure/tests/parking_test.rs).
+//! Run via `#[db_test]` so each router and its fixtures share one rollback-only
+//! transaction scope.
 
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
 use bikesnest_infrastructure::Db;
-use bikesnest_test_support::{ParkingBuilder, db_test, pool, test_config};
+use bikesnest_test_support::{ParkingBuilder, db_test, run_isolated_database_test, test_config};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 /// The public-page router: the real providers the test `Config` selects (fake
-/// email/geocoder, in-memory limiter, the compose MinIO for media).
-async fn test_app() -> axum::Router {
-    let db = Db::from_pool(pool().await);
+/// email/geocoder, in-memory limiter, the compose RustFS for media).
+async fn test_app(tx: &mut bikesnest_test_support::TestTx) -> axum::Router {
+    let db = tx.db().await;
+    bikesnest_web::app_router(std::sync::Arc::new(test_config()), db)
+        .expect("test config builds every provider")
+}
+
+fn scoped_test_app(db: Db) -> axum::Router {
     bikesnest_web::app_router(std::sync::Arc::new(test_config()), db)
         .expect("test config builds every provider")
 }
 
 /// GET and return only the response headers (for security-header asserts).
-async fn get_headers(uri: &str) -> HeaderMap {
-    let app = test_app().await;
+async fn get_headers(tx: &mut bikesnest_test_support::TestTx, uri: &str) -> HeaderMap {
+    let app = test_app(tx).await;
     let res = app
         .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
         .await
@@ -29,8 +33,12 @@ async fn get_headers(uri: &str) -> HeaderMap {
     res.headers().clone()
 }
 
-async fn get(uri: &str) -> (StatusCode, String) {
-    let app = test_app().await;
+async fn get(tx: &mut bikesnest_test_support::TestTx, uri: &str) -> (StatusCode, String) {
+    get_with_db(tx.db().await, uri).await
+}
+
+async fn get_with_db(db: Db, uri: &str) -> (StatusCode, String) {
+    let app = scoped_test_app(db);
     // Pin the locale to English so assertions on English copy are deterministic
     // (default resolution falls back to pt-BR — ).
     let res = app
@@ -43,9 +51,23 @@ async fn get(uri: &str) -> (StatusCode, String) {
         )
         .await
         .unwrap();
+    let report_only = res.headers()["content-security-policy-report-only"]
+        .to_str()
+        .unwrap()
+        .to_string();
     let status = res.status();
     let body = res.into_body().collect().await.unwrap().to_bytes();
-    (status, String::from_utf8_lossy(&body).to_string())
+    let body = String::from_utf8_lossy(&body).to_string();
+    if status.is_success() && body.contains("<html") {
+        let nonce = regex::Regex::new(r#"<script nonce="([^"]+)""#)
+            .unwrap()
+            .captures(&body)
+            .and_then(|captures| captures.get(1))
+            .map(|value| value.as_str())
+            .expect("rendered HTML has trusted nonced scripts");
+        assert!(report_only.contains(&format!("'nonce-{nonce}'")));
+    }
+    (status, body)
 }
 
 // ---------------------------------------------------------------------------
@@ -53,14 +75,14 @@ async fn get(uri: &str) -> (StatusCode, String) {
 // ---------------------------------------------------------------------------
 
 #[db_test]
-async fn healthz_is_alive_without_dependencies(_tx: &mut TestTx) {
-    let (status, _) = get("/healthz").await;
+async fn healthz_is_alive_without_dependencies(tx: &mut TestTx) {
+    let (status, _) = get(tx, "/healthz").await;
     assert_eq!(status, StatusCode::OK);
 }
 
 #[db_test]
-async fn readyz_returns_ready_with_real_database(_tx: &mut TestTx) {
-    let (status, body) = get("/readyz").await;
+async fn readyz_returns_ready_with_real_database(tx: &mut TestTx) {
+    let (status, body) = get(tx, "/readyz").await;
     assert_eq!(status, StatusCode::OK);
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["status"], "ready");
@@ -72,8 +94,9 @@ async fn readyz_returns_ready_with_real_database(_tx: &mut TestTx) {
 // ---------------------------------------------------------------------------
 
 #[db_test]
-async fn security_headers_present_on_public_page(_tx: &mut TestTx) {
-    let headers = get_headers("/").await;
+async fn security_headers_present_on_public_page(tx: &mut TestTx) {
+    let headers = get_headers(tx, "/").await;
+    assert_eq!(headers["cache-control"], "private, no-store");
     assert_eq!(headers["x-content-type-options"], "nosniff");
     assert_eq!(
         headers["referrer-policy"],
@@ -85,19 +108,49 @@ async fn security_headers_present_on_public_page(_tx: &mut TestTx) {
 }
 
 #[db_test]
-async fn security_headers_present_on_private_page(_tx: &mut TestTx) {
-    // Account page redirects anonymous users, but the header set rides every response.
-    let headers = get_headers("/login").await;
-    assert_eq!(headers["x-content-type-options"], "nosniff");
-    assert!(headers.contains_key("content-security-policy"));
+async fn report_only_csp_nonce_matches_markup_and_is_fresh(tx: &mut TestTx) {
+    let (_, first_headers, first_body) = get_raw(tx, "/", ("accept-encoding", "identity")).await;
+    let (_, second_headers, _) = get_raw(tx, "/", ("accept-encoding", "identity")).await;
+    let (_, hostile_headers, hostile_body) = get_raw(tx, "/", ("x-csp-nonce", "attacker")).await;
+    let first = first_headers["content-security-policy-report-only"]
+        .to_str()
+        .unwrap();
+    let second = second_headers["content-security-policy-report-only"]
+        .to_str()
+        .unwrap();
+    let nonce = first
+        .split("'nonce-")
+        .nth(1)
+        .and_then(|tail| tail.split('\'').next())
+        .unwrap();
+    assert_eq!(nonce.len(), 32);
+    assert!(first.contains("'strict-dynamic'"));
+    assert!(String::from_utf8_lossy(&first_body).contains(&format!("<script nonce=\"{nonce}\"")));
+    assert!(!second.contains(&format!("'nonce-{nonce}'")));
+    assert!(
+        !hostile_headers["content-security-policy-report-only"]
+            .to_str()
+            .unwrap()
+            .contains("attacker")
+    );
+    assert!(!String::from_utf8_lossy(&hostile_body).contains("nonce=\"attacker\""));
 }
 
 #[db_test]
-async fn security_headers_present_when_auth_short_circuits(_tx: &mut TestTx) {
+async fn security_headers_present_on_private_page(tx: &mut TestTx) {
+    // Account page redirects anonymous users, but the header set rides every response.
+    let headers = get_headers(tx, "/login").await;
+    assert_eq!(headers["x-content-type-options"], "nosniff");
+    assert!(headers.contains_key("content-security-policy"));
+    assert_eq!(headers["cache-control"], "private, no-store");
+}
+
+#[db_test]
+async fn security_headers_present_when_auth_short_circuits(tx: &mut TestTx) {
     // A state-changing request without a CSRF cookie → the auth middleware returns
     // 403 *without* running the inner handler. The security-header middleware is
     // outermost and must still apply CSP/nosniff to that response.
-    let app = test_app().await;
+    let app = test_app(tx).await;
     let res = app
         .oneshot(
             Request::builder()
@@ -117,8 +170,8 @@ async fn security_headers_present_when_auth_short_circuits(_tx: &mut TestTx) {
 }
 
 #[db_test]
-async fn csp_is_strict_no_unsafe_eval(_tx: &mut TestTx) {
-    let headers = get_headers("/").await;
+async fn csp_is_strict_no_unsafe_eval(tx: &mut TestTx) {
+    let headers = get_headers(tx, "/").await;
     let csp = headers["content-security-policy"]
         .to_str()
         .unwrap()
@@ -138,9 +191,9 @@ async fn csp_is_strict_no_unsafe_eval(_tx: &mut TestTx) {
 // unguarded `std::env::set_var`/`remove_var` pair no longer compiles here).
 
 #[db_test]
-async fn hsts_absent_in_dev_without_tls(_tx: &mut TestTx) {
+async fn hsts_absent_in_dev_without_tls(tx: &mut TestTx) {
     // `TLS_ON` is unset in the test environment → no HSTS header.
-    let headers = get_headers("/").await;
+    let headers = get_headers(tx, "/").await;
     assert!(!headers.contains_key("strict-transport-security"));
 }
 
@@ -149,8 +202,8 @@ async fn hsts_absent_in_dev_without_tls(_tx: &mut TestTx) {
 // ---------------------------------------------------------------------------
 
 #[db_test]
-async fn robots_txt_matches_crawl_policy(_tx: &mut TestTx) {
-    let (status, body) = get("/robots.txt").await;
+async fn robots_txt_matches_crawl_policy(tx: &mut TestTx) {
+    let (status, body) = get(tx, "/robots.txt").await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("User-agent: *"));
     assert!(body.contains("Allow: /"));
@@ -161,23 +214,20 @@ async fn robots_txt_matches_crawl_policy(_tx: &mut TestTx) {
 
 #[db_test]
 async fn sitemap_includes_static_pages_and_active_parking(tx: &mut TestTx) {
+    let db = tx.db().await;
     const MARK: &str = "fix-http-sitemap";
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    let conn = tx.executor();
+
+    let mut conn = db.acquire().await.unwrap();
     let loc = ParkingBuilder::new()
         .with_fixture_tag(MARK)
         .with_name("Sitemap Fixture")
         .at(-33.920_000, -70.620_000)
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
-    tx.commit_fixture().await;
+    drop(conn);
 
-    let (status, body) = get("/sitemap.xml").await;
+    let (status, body) = get(tx, "/sitemap.xml").await;
     assert_eq!(status, StatusCode::OK);
     let base = "http://localhost:8080";
     assert!(
@@ -192,17 +242,11 @@ async fn sitemap_includes_static_pages_and_active_parking(tx: &mut TestTx) {
         body.contains(&format!("<loc>{base}/parking/{}</loc>", loc.id())),
         "active parking in sitemap"
     );
-
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
-        .await
-        .unwrap();
 }
 
 #[db_test]
-async fn public_page_has_canonical_description_and_hreflang(_tx: &mut TestTx) {
-    let (status, body) = get("/").await;
+async fn public_page_has_canonical_description_and_hreflang(tx: &mut TestTx) {
+    let (status, body) = get(tx, "/").await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         body.contains("rel=\"canonical\""),
@@ -221,9 +265,9 @@ async fn public_page_has_canonical_description_and_hreflang(_tx: &mut TestTx) {
 }
 
 #[db_test]
-async fn private_pages_are_noindex(_tx: &mut TestTx) {
+async fn private_pages_are_noindex(tx: &mut TestTx) {
     for path in ["/account", "/admin/users", "/moderation"] {
-        let headers = get_headers(path).await;
+        let headers = get_headers(tx, path).await;
         let v = headers["x-robots-tag"].to_str().unwrap();
         assert!(v.contains("noindex"), "{path} must be noindex, got: {v}");
     }
@@ -234,8 +278,8 @@ async fn private_pages_are_noindex(_tx: &mut TestTx) {
 // ---------------------------------------------------------------------------
 
 #[db_test]
-async fn home_renders_hero_and_search_form(_tx: &mut TestTx) {
-    let (status, body) = get("/").await;
+async fn home_renders_hero_and_search_form(tx: &mut TestTx) {
+    let (status, body) = get(tx, "/").await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         body.contains("From destination to parked bike"),
@@ -245,30 +289,30 @@ async fn home_renders_hero_and_search_form(_tx: &mut TestTx) {
 }
 
 #[db_test]
-async fn skip_link_targets_main_content(_tx: &mut TestTx) {
-    let (status, body) = get("/").await;
+async fn skip_link_targets_main_content(tx: &mut TestTx) {
+    let (status, body) = get(tx, "/").await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains(r##"href="#content""##), "skip link");
     assert!(body.contains(r#"id="content""#), "main landmark");
 }
 
 #[db_test]
-async fn about_renders_how_it_works(_tx: &mut TestTx) {
-    let (status, body) = get("/about").await;
+async fn about_renders_how_it_works(tx: &mut TestTx) {
+    let (status, body) = get(tx, "/about").await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("How verification"));
 }
 
 #[db_test]
-async fn search_without_destination_shows_guidance_not_error(_tx: &mut TestTx) {
-    let (status, body) = get("/search").await;
+async fn search_without_destination_shows_guidance_not_error(tx: &mut TestTx) {
+    let (status, body) = get(tx, "/search").await;
     assert_eq!(status, StatusCode::OK, "user input is not a server error");
     assert!(body.contains("Type a destination"));
 }
 
 #[db_test]
-async fn search_resolves_query_through_fake_geocoder(_tx: &mut TestTx) {
-    let (status, body) = get("/search?q=Rua%20XV%20de%20Novembro").await;
+async fn search_resolves_query_through_fake_geocoder(tx: &mut TestTx) {
+    let (status, body) = get(tx, "/search?q=Rua%20XV%20de%20Novembro").await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         body.contains("Parking near"),
@@ -278,12 +322,12 @@ async fn search_resolves_query_through_fake_geocoder(_tx: &mut TestTx) {
 }
 
 #[db_test]
-async fn htmx_request_gets_fragment_without_full_page(_tx: &mut TestTx) {
-    let (status, body) = get("/search?lat=-25.4284&lon=-49.2733&sort=distance").await;
+async fn htmx_request_gets_fragment_without_full_page(tx: &mut TestTx) {
+    let (status, body) = get(tx, "/search?lat=-25.4284&lon=-49.2733&sort=distance").await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("search-data"));
     // Full-page request vs fragment: send the header this time.
-    let app = test_app().await;
+    let app = test_app(tx).await;
     let res = app
         .oneshot(
             Request::builder()
@@ -296,6 +340,7 @@ async fn htmx_request_gets_fragment_without_full_page(_tx: &mut TestTx) {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["cache-control"], "private, no-store");
     let body = res.into_body().collect().await.unwrap().to_bytes();
     let html = String::from_utf8_lossy(&body);
     assert!(
@@ -309,11 +354,31 @@ async fn htmx_request_gets_fragment_without_full_page(_tx: &mut TestTx) {
 }
 
 #[db_test]
-async fn htmx_search_fragment_updates_result_count_out_of_band(_tx: &mut TestTx) {
+async fn dynamic_cache_policy_covers_auth_tokens_privacy_errors_and_redirects(tx: &mut TestTx) {
+    for path in [
+        "/",
+        "/login",
+        "/register",
+        "/verify-email?token=invalid",
+        "/password-reset/new?token=invalid",
+        "/account",
+        "/account/privacy",
+        "/admin/users",
+        "/moderation",
+        "/definitely-missing",
+        "/static/definitely-missing.css",
+    ] {
+        let headers = get_headers(tx, path).await;
+        assert_eq!(headers["cache-control"], "private, no-store", "{path}");
+    }
+}
+
+#[db_test]
+async fn htmx_search_fragment_updates_result_count_out_of_band(tx: &mut TestTx) {
     // The result count / destination heading live outside `#results` in
     // search.html, so the fragment response must carry `hx-swap-oob` copies
     // for htmx to patch them in place.
-    let app = test_app().await;
+    let app = test_app(tx).await;
     let res = app
         .oneshot(
             Request::builder()
@@ -333,27 +398,24 @@ async fn htmx_search_fragment_updates_result_count_out_of_band(_tx: &mut TestTx)
 }
 
 #[db_test]
-async fn search_renders_committed_fixture_rows_with_filters(tx: &mut TestTx) {
+async fn search_renders_scoped_fixture_rows_with_filters(tx: &mut TestTx) {
+    let db = tx.db().await;
     const MARK: &str = "fix-http-search";
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    let conn = tx.executor();
+
+    let mut conn = db.acquire().await.unwrap();
     // Two free racks and one paid locker, ~5.5 km from any other test patch.
     ParkingBuilder::new()
         .with_fixture_tag(MARK)
         .with_name("HTTP Fixture Free A")
         .at(-33.900_000, -70.600_000)
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
     ParkingBuilder::new()
         .with_fixture_tag(MARK)
         .with_name("HTTP Fixture Free B")
         .at(-33.900_300, -70.600_000)
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
     ParkingBuilder::new()
@@ -361,12 +423,16 @@ async fn search_renders_committed_fixture_rows_with_filters(tx: &mut TestTx) {
         .with_name("HTTP Fixture Paid")
         .with_cost(bikesnest_domain::Cost::Paid { price: None })
         .at(-33.900_600, -70.600_000)
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
-    tx.commit_fixture().await;
+    drop(conn);
 
-    let (_, body) = get("/search?lat=-33.900000&lon=-70.600000&radius=1000&sort=distance").await;
+    let (_, body) = get(
+        tx,
+        "/search?lat=-33.900000&lon=-70.600000&radius=1000&sort=distance",
+    )
+    .await;
     assert!(
         body.contains("3 parking spots"),
         "all fixtures visible: {}",
@@ -375,17 +441,114 @@ async fn search_renders_committed_fixture_rows_with_filters(tx: &mut TestTx) {
     assert!(body.contains("HTTP Fixture Free A"));
 
     // Cost filter narrows to the free ones.
-    let (_, body) =
-        get("/search?lat=-33.900000&lon=-70.600000&radius=1000&sort=distance&cost=free").await;
+    let (_, body) = get(
+        tx,
+        "/search?lat=-33.900000&lon=-70.600000&radius=1000&sort=distance&cost=free",
+    )
+    .await;
     assert!(body.contains("2 parking spots"));
     assert!(body.contains("HTTP Fixture Free B"));
     assert!(!body.contains("HTTP Fixture Paid"));
+}
 
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
+#[db_test]
+async fn search_accepts_repeated_checkbox_filters_and_rejects_duplicate_scalars(tx: &mut TestTx) {
+    use bikesnest_domain::ParkingType;
+
+    let db = tx.db().await;
+    let mut conn = db.acquire().await.unwrap();
+    ParkingBuilder::new()
+        .with_name("Repeated filters match")
+        .with_type(ParkingType::Rack)
+        .with_security("cctv", 1)
+        .with_security("well_lit", 1)
+        .at(-33.920_000, -70.620_000)
+        .create(&mut conn)
         .await
         .unwrap();
+    ParkingBuilder::new()
+        .with_name("Missing lighting")
+        .with_type(ParkingType::Indoor)
+        .with_security("cctv", 1)
+        .at(-33.920_200, -70.620_000)
+        .create(&mut conn)
+        .await
+        .unwrap();
+    ParkingBuilder::new()
+        .with_name("Wrong type")
+        .with_type(ParkingType::Locker)
+        .with_security("cctv", 1)
+        .with_security("well_lit", 1)
+        .at(-33.920_400, -70.620_000)
+        .create(&mut conn)
+        .await
+        .unwrap();
+    drop(conn);
+
+    let app = scoped_test_app(db);
+    for query in [
+        "type=rack&type=indoor&security=cctv&security=well_lit",
+        "type=rack,indoor&security=cctv,well_lit",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/search?lat=-33.920000&lon=-70.620000&radius=1000&{query}"
+                    ))
+                    .header("Accept-Language", "en")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "query: {query}");
+        let body =
+            String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+                .to_string();
+        assert!(
+            body.contains("Repeated filters match"),
+            "query: {query}\n{body}"
+        );
+        assert!(!body.contains("Missing lighting"), "query: {query}\n{body}");
+        assert!(!body.contains("Wrong type"), "query: {query}\n{body}");
+    }
+
+    for (language, message, fragment) in [
+        (
+            "en",
+            "That search link is invalid. Check it and try again.",
+            false,
+        ),
+        (
+            "pt-BR",
+            "Esse link de busca é inválido. Confira e tente novamente.",
+            true,
+        ),
+    ] {
+        let mut request = Request::builder()
+            .uri("/search?lat=-33.920000&lat=-33.920001&lon=-70.620000")
+            .header("Accept-Language", language);
+        if fragment {
+            request = request
+                .header("HX-Request", "true")
+                .header("HX-Target", "results")
+                .header("HX-Request-Type", "partial");
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body =
+            String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+                .to_string();
+        assert!(body.contains(message), "localized malformed-query message");
+        assert_eq!(body.contains("<html"), !fragment, "response shape");
+        assert!(!body.contains("bad search query"), "no parser detail leaks");
+    }
 }
 
 /// Stored-XSS regression: a user-controlled `name`/`address` containing
@@ -395,24 +558,25 @@ async fn search_renders_committed_fixture_rows_with_filters(tx: &mut TestTx) {
 /// survives.
 #[db_test]
 async fn search_map_payload_is_html_safe_for_ugc_names(tx: &mut TestTx) {
+    let db = tx.db().await;
     const MARK: &str = "fix-http-xss";
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    let conn = tx.executor();
+
+    let mut conn = db.acquire().await.unwrap();
     let payload_attack = "</script><img src=x onerror=alert(1)>";
     ParkingBuilder::new()
         .with_fixture_tag(MARK)
         .with_name(payload_attack)
         .at(-33.910_000, -70.610_000)
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
-    tx.commit_fixture().await;
+    drop(conn);
 
-    let (_, body) = get("/search?lat=-33.910000&lon=-70.610000&radius=1000&sort=distance").await;
+    let (_, body) = get(
+        tx,
+        "/search?lat=-33.910000&lon=-70.610000&radius=1000&sort=distance",
+    )
+    .await;
 
     // The escaped JSON must be present, so the browser's JSON.parse gets `<` back.
     assert!(
@@ -437,12 +601,6 @@ async fn search_map_payload_is_html_safe_for_ugc_names(tx: &mut TestTx) {
         round_trip.contains(payload_attack),
         "JSON.parse must round-trip to the original value"
     );
-
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
-        .await
-        .unwrap();
 }
 
 // --- Browse mode: ?bbox= ---------------------------------------------
@@ -461,25 +619,22 @@ fn search_data_block(body: &str) -> String {
 
 #[db_test]
 async fn browsing_a_box_lists_numbered_cards_and_no_next_page(tx: &mut TestTx) {
+    let db = tx.db().await;
     const MARK: &str = "fix-http-browse";
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    let conn = tx.executor();
+
+    let mut conn = db.acquire().await.unwrap();
     // Inside the box, so the assertions below hold on an otherwise empty
     // database as well as on a seeded one.
     ParkingBuilder::new()
         .with_fixture_tag(MARK)
         .with_name("Browse Box Fixture")
         .at(-25.430_000, -49.275_000)
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
-    tx.commit_fixture().await;
+    drop(conn);
 
-    let (status, body) = get(&format!("/search?bbox={BROWSE_BBOX}")).await;
+    let (status, body) = get(tx, &format!("/search?bbox={BROWSE_BBOX}")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(is_document(&body), "a bbox URL is a page, not a fragment");
     assert!(body.contains("Parking in this area"), "browse heading");
@@ -512,7 +667,7 @@ async fn browsing_a_box_lists_numbered_cards_and_no_next_page(tx: &mut TestTx) {
     assert!(!body.contains("Next page"), "browse has no next page");
 
     // The same URL as an htmx fragment: the results list, not a document.
-    let app = test_app().await;
+    let app = test_app(tx).await;
     let res = app
         .oneshot(
             Request::builder()
@@ -537,16 +692,10 @@ async fn browsing_a_box_lists_numbered_cards_and_no_next_page(tx: &mut TestTx) {
         fragment.contains("Parking in this area"),
         "the out-of-band heading names the area too"
     );
-
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
-        .await
-        .unwrap();
 }
 
 #[db_test]
-async fn an_unusable_box_is_a_400_with_a_notice_not_a_500(_tx: &mut TestTx) {
+async fn an_unusable_box_is_a_400_with_a_notice_not_a_500(tx: &mut TestTx) {
     // Inside out, off the globe, wider than the span limit, not a box at all.
     for bbox in [
         "-49.25,-25.45,-49.30,-25.41",
@@ -554,7 +703,7 @@ async fn an_unusable_box_is_a_400_with_a_notice_not_a_500(_tx: &mut TestTx) {
         "-52.00,-25.45,-49.25,-25.41",
         "not-a-box",
     ] {
-        let (status, body) = get(&format!("/search?bbox={bbox}")).await;
+        let (status, body) = get(tx, &format!("/search?bbox={bbox}")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "bbox={bbox}");
         assert!(
             body.contains("That map area can&#39;t be searched"),
@@ -565,8 +714,8 @@ async fn an_unusable_box_is_a_400_with_a_notice_not_a_500(_tx: &mut TestTx) {
 }
 
 #[db_test]
-async fn a_cursor_on_a_browse_url_is_refused(_tx: &mut TestTx) {
-    let (status, body) = get(&format!("/search?bbox={BROWSE_BBOX}&cursor=abc")).await;
+async fn a_cursor_on_a_browse_url_is_refused(tx: &mut TestTx) {
+    let (status, body) = get(tx, &format!("/search?bbox={BROWSE_BBOX}&cursor=abc")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(
         body.contains("Browsing the map has no pages"),
@@ -575,12 +724,13 @@ async fn a_cursor_on_a_browse_url_is_refused(_tx: &mut TestTx) {
 }
 
 #[db_test]
-async fn a_destination_wins_over_a_box(_tx: &mut TestTx) {
+async fn a_destination_wins_over_a_box(tx: &mut TestTx) {
     // A hand-edited URL carrying both: the destination is what the viewer
     // asked for, so it is a radius search — not a browse.
-    let (status, body) = get(&format!(
-        "/search?q=Rua%20XV%20de%20Novembro&bbox={BROWSE_BBOX}"
-    ))
+    let (status, body) = get(
+        tx,
+        &format!("/search?q=Rua%20XV%20de%20Novembro&bbox={BROWSE_BBOX}"),
+    )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("Parking near"), "radius search headline");
@@ -588,9 +738,9 @@ async fn a_destination_wins_over_a_box(_tx: &mut TestTx) {
 }
 
 #[db_test]
-async fn every_entry_point_offers_the_map(_tx: &mut TestTx) {
+async fn every_entry_point_offers_the_map(tx: &mut TestTx) {
     // The empty prompt: a way in that needs no destination typed.
-    let (status, body) = get("/search").await;
+    let (status, body) = get(tx, "/search").await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         body.contains("Explore the map"),
@@ -601,7 +751,7 @@ async fn every_entry_point_offers_the_map(_tx: &mut TestTx) {
         "…pointed at the centre box: {body}"
     );
     // The home page's explore link is that same box, not one hard-coded street.
-    let (status, body) = get("/").await;
+    let (status, body) = get(tx, "/").await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         body.contains("/search?bbox=-49.2905,-25.4497,-49.2505,-25.4097"),
@@ -615,69 +765,782 @@ async fn every_entry_point_offers_the_map(_tx: &mut TestTx) {
 
 #[db_test]
 async fn parking_details_renders_full_page_and_404_for_unknown(tx: &mut TestTx) {
+    let db = tx.db().await;
     // Unknown id → styled 404 page.
-    let (status, body) = get("/parking/999999999").await;
+    let (status, body) = get_with_db(db.clone(), "/parking/999999999").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(body.contains("does not exist"));
 
-    // Self-contained committed fixture (no dependency on `seed-mock`).
-    const MARK: &str = "fix-http-details";
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    let conn = tx.executor();
+    let mut conn = db.acquire().await.unwrap();
     let created = ParkingBuilder::new()
-        .with_fixture_tag(MARK)
         .with_name("Details Fixture")
         .at(-25.4300, -49.2700)
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
-    tx.commit_fixture().await;
+    drop(conn);
 
-    let (status, body) = get(&format!("/parking/{}", created.id())).await;
+    let (status, body) = get_with_db(db, &format!("/parking/{}", created.id())).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("Key facts"));
     assert!(body.contains("Opening hours"));
     assert!(
-        body.contains("Open in Google Maps"),
+        body.contains("Cycling directions in Google Maps"),
         "external navigation link"
     );
     assert!(body.contains("Security attributes"));
+}
 
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
+#[test]
+fn detail_tabs_skip_current_reads_and_render_current_read_failures_honestly() {
+    run_isolated_database_test(|pool| async move {
+        let db = Db::from_pool(pool);
+        let mut conn = db.acquire().await.unwrap();
+        let location = ParkingBuilder::new()
+            .with_name("B11 published facts")
+            .create(&mut conn)
+            .await
+            .unwrap();
+        let reviewer = bikesnest_test_support::UserBuilder::new()
+            .with_email("b11-invalid-review@example.com")
+            .create(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO parking_revision (location_id,version,change_kind,summary,snapshot) \
+         VALUES ($1,1,'create','created','{}'::jsonb)",
+        )
+        .bind(location.id())
+        .execute(&mut *conn)
         .await
         .unwrap();
+        drop(conn);
+        let app = scoped_test_app(db.clone());
+        let request = |uri: String| {
+            Request::builder()
+                .uri(uri)
+                .header("Accept-Language", "en")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let mut conn = db.acquire().await.unwrap();
+        sqlx::query(
+            "ALTER TABLE parking_proposal_vote RENAME TO parking_proposal_vote_unavailable",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        drop(conn);
+        let current_without_votes = app
+            .clone()
+            .oneshot(request(format!("/parking/{}", location.id())))
+            .await
+            .unwrap();
+        let current_without_votes = String::from_utf8_lossy(
+            &current_without_votes
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
+        )
+        .to_string();
+        assert!(
+            !current_without_votes.contains("temporarily unavailable"),
+            "current tab must not fetch detailed proposals"
+        );
+        let approvals = app
+            .clone()
+            .oneshot(request(format!("/parking/{}?tab=approvals", location.id())))
+            .await
+            .unwrap();
+        let approvals =
+            String::from_utf8_lossy(&approvals.into_body().collect().await.unwrap().to_bytes())
+                .to_string();
+        assert!(approvals.contains("temporarily unavailable"));
+        let mut conn = db.acquire().await.unwrap();
+        sqlx::query(
+            "ALTER TABLE parking_proposal_vote_unavailable RENAME TO parking_proposal_vote",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::query("ALTER TABLE review DROP CONSTRAINT review_rating_check")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO review (location_id,author_id,rating,body) VALUES ($1,$2,9,'broken')",
+        )
+        .bind(location.id())
+        .bind(reviewer.id.0)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        drop(conn);
+
+        let history = app
+            .clone()
+            .oneshot(request(format!(
+                "/parking/{}?tab=history&limit=1",
+                location.id()
+            )))
+            .await
+            .unwrap();
+        assert_eq!(history.status(), StatusCode::OK);
+        let history_body =
+            String::from_utf8_lossy(&history.into_body().collect().await.unwrap().to_bytes())
+                .to_string();
+        assert!(history_body.contains("B11 published facts"));
+        assert!(
+            !history_body.contains("temporarily unavailable"),
+            "history must not touch reviews"
+        );
+        assert!(history_body.contains("Showing 1 of 1"));
+        assert!(!history_body.contains("parking-gallery"));
+
+        let current = app
+            .oneshot(request(format!("/parking/{}", location.id())))
+            .await
+            .unwrap();
+        assert_eq!(current.status(), StatusCode::OK);
+        let current_body =
+            String::from_utf8_lossy(&current.into_body().collect().await.unwrap().to_bytes())
+                .to_string();
+        assert!(current_body.contains("B11 published facts"));
+        assert!(current_body.contains("temporarily unavailable"));
+        assert!(
+            !current_body.contains("No reviews yet — reviews arrive with community accounts."),
+            "a failed review read is not an empty review set"
+        );
+        eprintln!(
+            "B11 actual isolated HTTP bytes: history={}, current-degraded={}",
+            history_body.len(),
+            current_body.len()
+        );
+    });
+}
+
+struct CountingDetailReads {
+    calls: std::sync::Arc<std::sync::Mutex<[usize; 6]>>,
+}
+
+#[async_trait::async_trait]
+impl bikesnest_web::state::DetailReads for CountingDetailReads {
+    async fn photos_page(
+        &self,
+        _id: i64,
+        _limit: i64,
+    ) -> Result<(Vec<bikesnest_application::StoredPhoto>, i64), bikesnest_application::ReaderError>
+    {
+        self.calls.lock().unwrap()[0] += 1;
+        Ok((
+            vec![bikesnest_application::StoredPhoto {
+                key: "b11/photo.jpg".into(),
+                thumbnail_key: None,
+                content_type: "image/jpeg".into(),
+                alt: None,
+            }],
+            1,
+        ))
+    }
+    async fn pending_photos(&self, _id: i64) -> Result<i64, bikesnest_application::ReaderError> {
+        self.calls.lock().unwrap()[1] += 1;
+        Ok(0)
+    }
+    async fn community(
+        &self,
+        _location: bikesnest_domain::ParkingLocation,
+        _viewer: Option<bikesnest_domain::UserId>,
+        _after: Option<i64>,
+        _limit: i64,
+    ) -> Result<
+        bikesnest_application::CommunityParkingDetails,
+        bikesnest_application::ContributionError,
+    > {
+        self.calls.lock().unwrap()[2] += 1;
+        Err(bikesnest_application::ContributionError::Unavailable)
+    }
+    async fn summary(
+        &self,
+        _id: i64,
+    ) -> Result<
+        bikesnest_application::PendingProposalSummary,
+        bikesnest_application::ContributionError,
+    > {
+        self.calls.lock().unwrap()[3] += 1;
+        Ok(bikesnest_application::PendingProposalSummary {
+            total: 0,
+            fields: vec![],
+        })
+    }
+    async fn proposals(
+        &self,
+        _id: i64,
+        _after: Option<i64>,
+        _limit: i64,
+    ) -> Result<
+        (Vec<bikesnest_application::ListingProposal>, i64, bool),
+        bikesnest_application::ContributionError,
+    > {
+        self.calls.lock().unwrap()[4] += 1;
+        Ok((vec![], 0, false))
+    }
+    async fn history(
+        &self,
+        _id: i64,
+        _after: Option<i64>,
+        _limit: i64,
+    ) -> Result<
+        (Vec<bikesnest_domain::RevisionSummary>, i64, bool),
+        bikesnest_application::ContributionError,
+    > {
+        self.calls.lock().unwrap()[5] += 1;
+        Ok((vec![], 0, false))
+    }
+}
+
+struct MediaDetailReads;
+
+#[async_trait::async_trait]
+impl bikesnest_web::state::DetailReads for MediaDetailReads {
+    async fn photos_page(
+        &self,
+        _id: i64,
+        _limit: i64,
+    ) -> Result<(Vec<bikesnest_application::StoredPhoto>, i64), bikesnest_application::ReaderError>
+    {
+        Ok((
+            vec![bikesnest_application::StoredPhoto {
+                key: "b11/gallery-primary.jpg".into(),
+                thumbnail_key: Some("b11/gallery-thumb.jpg".into()),
+                content_type: "image/jpeg".into(),
+                alt: None,
+            }],
+            1,
+        ))
+    }
+    async fn pending_photos(&self, _id: i64) -> Result<i64, bikesnest_application::ReaderError> {
+        Ok(0)
+    }
+    async fn community(
+        &self,
+        location: bikesnest_domain::ParkingLocation,
+        _viewer: Option<bikesnest_domain::UserId>,
+        _after: Option<i64>,
+        _limit: i64,
+    ) -> Result<
+        bikesnest_application::CommunityParkingDetails,
+        bikesnest_application::ContributionError,
+    > {
+        let review = bikesnest_application::Review {
+            id: 71,
+            location_id: location.id(),
+            author: None,
+            public_author_name: None,
+            rating: bikesnest_domain::StarRating::new(5).unwrap(),
+            body: bikesnest_domain::ReviewBody::new("Approved review remains visible").unwrap(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let mut review_photos = std::collections::HashMap::new();
+        review_photos.insert(
+            review.id,
+            vec![bikesnest_application::StoredPhoto {
+                key: "b11/review-primary.jpg".into(),
+                thumbnail_key: Some("b11/review-thumb.jpg".into()),
+                content_type: "image/jpeg".into(),
+                alt: None,
+            }],
+        );
+        Ok(bikesnest_application::CommunityParkingDetails {
+            location,
+            reviews: vec![review],
+            reviews_has_more: false,
+            review_photos,
+            confidence: bikesnest_domain::Confidence::Reported,
+            disputed: false,
+            attribute_summary: vec![],
+            parked_here_count: 0,
+            is_favorited: false,
+            own_review: None,
+            own_verification: None,
+            reasons: vec![],
+        })
+    }
+    async fn summary(
+        &self,
+        _id: i64,
+    ) -> Result<
+        bikesnest_application::PendingProposalSummary,
+        bikesnest_application::ContributionError,
+    > {
+        Ok(bikesnest_application::PendingProposalSummary {
+            total: 0,
+            fields: vec![],
+        })
+    }
+    async fn proposals(
+        &self,
+        _id: i64,
+        _after: Option<i64>,
+        _limit: i64,
+    ) -> Result<
+        (Vec<bikesnest_application::ListingProposal>, i64, bool),
+        bikesnest_application::ContributionError,
+    > {
+        Ok((vec![], 0, false))
+    }
+    async fn history(
+        &self,
+        _id: i64,
+        _after: Option<i64>,
+        _limit: i64,
+    ) -> Result<
+        (Vec<bikesnest_domain::RevisionSummary>, i64, bool),
+        bikesnest_application::ContributionError,
+    > {
+        Ok((vec![], 0, false))
+    }
+}
+
+struct EligibilityDetailReads {
+    calls: std::sync::Arc<std::sync::Mutex<[usize; 6]>>,
+    viewer: bikesnest_domain::UserId,
+}
+
+#[async_trait::async_trait]
+impl bikesnest_web::state::DetailReads for EligibilityDetailReads {
+    async fn photos_page(
+        &self,
+        _id: i64,
+        _limit: i64,
+    ) -> Result<(Vec<bikesnest_application::StoredPhoto>, i64), bikesnest_application::ReaderError>
+    {
+        self.calls.lock().unwrap()[0] += 1;
+        Ok((vec![], 0))
+    }
+    async fn pending_photos(&self, _id: i64) -> Result<i64, bikesnest_application::ReaderError> {
+        self.calls.lock().unwrap()[1] += 1;
+        Ok(1)
+    }
+    async fn community(
+        &self,
+        _location: bikesnest_domain::ParkingLocation,
+        _viewer: Option<bikesnest_domain::UserId>,
+        _after: Option<i64>,
+        _limit: i64,
+    ) -> Result<
+        bikesnest_application::CommunityParkingDetails,
+        bikesnest_application::ContributionError,
+    > {
+        self.calls.lock().unwrap()[2] += 1;
+        Err(bikesnest_application::ContributionError::Unavailable)
+    }
+    async fn summary(
+        &self,
+        _id: i64,
+    ) -> Result<
+        bikesnest_application::PendingProposalSummary,
+        bikesnest_application::ContributionError,
+    > {
+        self.calls.lock().unwrap()[3] += 1;
+        Ok(bikesnest_application::PendingProposalSummary {
+            total: 3,
+            fields: vec![],
+        })
+    }
+    async fn proposals(
+        &self,
+        _id: i64,
+        _after: Option<i64>,
+        _limit: i64,
+    ) -> Result<
+        (Vec<bikesnest_application::ListingProposal>, i64, bool),
+        bikesnest_application::ContributionError,
+    > {
+        self.calls.lock().unwrap()[4] += 1;
+        let proposal = |id, proposer_id, base_version| bikesnest_application::ListingProposal {
+            id,
+            kind: bikesnest_domain::ProposalKind::ChangeExistence,
+            change: bikesnest_domain::ProposedChange::ChangeExistence { exists: false },
+            reason: None,
+            status: bikesnest_domain::ProposalStatus::Pending,
+            approvals: 0,
+            rejections: 0,
+            created_at: chrono::Utc::now(),
+            base_version,
+            proposer_id,
+        };
+        Ok((
+            vec![
+                proposal(81, Some(bikesnest_domain::UserId(999_999)), 1),
+                proposal(82, Some(self.viewer), 1),
+                proposal(83, Some(bikesnest_domain::UserId(999_998)), 0),
+            ],
+            3,
+            false,
+        ))
+    }
+    async fn history(
+        &self,
+        _id: i64,
+        _after: Option<i64>,
+        _limit: i64,
+    ) -> Result<
+        (Vec<bikesnest_domain::RevisionSummary>, i64, bool),
+        bikesnest_application::ContributionError,
+    > {
+        self.calls.lock().unwrap()[5] += 1;
+        Ok((vec![], 0, false))
+    }
+}
+
+struct CountingStorage {
+    inner: bikesnest_test_support::TestObjectStorage,
+    signs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    fail_key: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl bikesnest_application::ObjectStorage for CountingStorage {
+    async fn put(
+        &self,
+        req: bikesnest_application::PutObject<'_>,
+    ) -> Result<String, bikesnest_application::StorageError> {
+        self.inner.put(req).await
+    }
+    async fn presigned_get(
+        &self,
+        key: &str,
+        ttl: std::time::Duration,
+    ) -> Result<String, bikesnest_application::StorageError> {
+        self.signs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_key.as_deref() == Some(key) {
+            return Err(bikesnest_application::StorageError::Unexpected(
+                "B11_SECRET_PROVIDER_MARKER".into(),
+            ));
+        }
+        self.inner.presigned_get(key, ttl).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), bikesnest_application::StorageError> {
+        self.inner.delete(key).await
+    }
+    async fn exists(&self, key: &str) -> Result<bool, bikesnest_application::StorageError> {
+        self.inner.exists(key).await
+    }
+    async fn list(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+    ) -> Result<bikesnest_application::ObjectPage, bikesnest_application::StorageError> {
+        self.inner.list(prefix, after).await
+    }
+}
+
+#[test]
+fn detail_tabs_count_actual_reader_calls_through_the_router() {
+    run_isolated_database_test(|pool| async move {
+        let db = Db::from_pool(pool);
+        let mut conn = db.acquire().await.unwrap();
+        let location = ParkingBuilder::new()
+            .with_name("B11 counted fixture")
+            .create(&mut conn)
+            .await
+            .unwrap();
+        drop(conn);
+        let calls = std::sync::Arc::new(std::sync::Mutex::new([0; 6]));
+        let signs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let deps = RouterDeps {
+            email: std::sync::Arc::new(FakeEmailProvider::with_root(None)),
+            oauth: None,
+            hasher: TestPasswordHasher,
+            rate_limiter: Box::new(bikesnest_infrastructure::InMemoryRateLimiter::new()),
+            storage: std::sync::Arc::new(CountingStorage {
+                inner: bikesnest_test_support::TestObjectStorage::new(),
+                signs: signs.clone(),
+                fail_key: None,
+            }),
+            detail_reads: Some(std::sync::Arc::new(CountingDetailReads {
+                calls: calls.clone(),
+            })),
+        };
+        let app = app_router_with(std::sync::Arc::new(test_config()), db, deps);
+        for (query, expected, expected_signs) in [
+            ("", [1, 1, 1, 1, 0, 0], 1),
+            ("?tab=approvals", [0, 1, 0, 1, 1, 0], 0),
+            ("?tab=history", [0, 1, 0, 1, 0, 1], 0),
+        ] {
+            *calls.lock().unwrap() = [0; 6];
+            signs.store(0, std::sync::atomic::Ordering::SeqCst);
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/parking/{}{query}", location.id()))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(*calls.lock().unwrap(), expected);
+            assert_eq!(
+                signs.load(std::sync::atomic::Ordering::SeqCst),
+                expected_signs
+            );
+        }
+    });
+}
+
+#[test]
+fn approvals_derive_eligibility_from_auth_without_loading_current_tab_data() {
+    run_isolated_database_test(|pool| async move {
+        use bikesnest_application::SessionStore;
+        use bikesnest_domain::{CsrfToken, SessionId};
+
+        let db = Db::from_pool(pool);
+        let mut conn = db.acquire().await.unwrap();
+        let location = ParkingBuilder::new()
+            .with_name("B11 approvals eligibility")
+            .create(&mut conn)
+            .await
+            .unwrap();
+        let verified = bikesnest_test_support::UserBuilder::new()
+            .with_email("b11-eligible@example.com")
+            .create(&mut *conn)
+            .await
+            .unwrap();
+        let unverified = bikesnest_test_support::UserBuilder::new()
+            .with_email("b11-unverified@example.com")
+            .create(&mut *conn)
+            .await
+            .unwrap();
+        let moderator = bikesnest_test_support::UserBuilder::new()
+            .with_email("b11-moderator@example.com")
+            .create(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE users SET account_state='ACTIVE',email_verified_at=now() WHERE id IN ($1,$2)",
+        )
+        .bind(verified.id.0)
+        .bind(moderator.id.0)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO user_roles (user_id,role) VALUES ($1,'MODERATOR')")
+            .bind(moderator.id.0)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        let sessions = bikesnest_infrastructure::SqlxSessionStore::new(db.clone());
+        let verified_token = SessionId::new([81; 32]);
+        let unverified_token = SessionId::new([82; 32]);
+        let moderator_token = SessionId::new([83; 32]);
+        for (user, token) in [
+            (verified.id, &verified_token),
+            (unverified.id, &unverified_token),
+            (moderator.id, &moderator_token),
+        ] {
+            sessions
+                .create(user, token, &CsrfToken::new([84; 32]), chrono::Utc::now())
+                .await
+                .unwrap();
+        }
+
+        let calls = std::sync::Arc::new(std::sync::Mutex::new([0; 6]));
+        let deps = RouterDeps {
+            email: std::sync::Arc::new(FakeEmailProvider::with_root(None)),
+            oauth: None,
+            hasher: TestPasswordHasher,
+            rate_limiter: Box::new(bikesnest_infrastructure::InMemoryRateLimiter::new()),
+            storage: std::sync::Arc::new(bikesnest_test_support::TestObjectStorage::new()),
+            detail_reads: Some(std::sync::Arc::new(EligibilityDetailReads {
+                calls: calls.clone(),
+                viewer: verified.id,
+            })),
+        };
+        let app = app_router_with(std::sync::Arc::new(test_config()), db, deps);
+        let fetch = |path: String, cookie: Option<String>| {
+            let app = app.clone();
+            async move {
+                let mut request = Request::builder().uri(path);
+                if let Some(cookie) = cookie {
+                    request = request.header("Cookie", cookie);
+                }
+                let response = app
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+                    .to_string()
+            }
+        };
+        let path = format!("/parking/{}?tab=approvals", location.id());
+
+        *calls.lock().unwrap() = [0; 6];
+        let eligible = fetch(
+            path.clone(),
+            Some(format!("session_id={}", verified_token.to_hex())),
+        )
+        .await;
+        assert_eq!(
+            eligible.matches("name=\"vote\"").count(),
+            2,
+            "only the other, current proposal is votable"
+        );
+        assert!(eligible.contains(&format!("/parking/{}/edit", location.id())));
+        assert!(eligible.contains("report('parking'"));
+        assert_eq!(*calls.lock().unwrap(), [0, 1, 0, 1, 1, 0]);
+
+        let unverified_body = fetch(
+            path.clone(),
+            Some(format!("session_id={}", unverified_token.to_hex())),
+        )
+        .await;
+        assert!(!unverified_body.contains("name=\"vote\""));
+        assert!(!unverified_body.contains(&format!("/parking/{}/edit", location.id())));
+        let anonymous = fetch(path.clone(), None).await;
+        assert!(!anonymous.contains("name=\"vote\""));
+        let moderator_body = fetch(
+            path,
+            Some(format!("session_id={}", moderator_token.to_hex())),
+        )
+        .await;
+        assert!(moderator_body.contains("/moderation/photos"));
+
+        *calls.lock().unwrap() = [0; 6];
+        let history = fetch(
+            format!("/parking/{}?tab=history", location.id()),
+            Some(format!("session_id={}", verified_token.to_hex())),
+        )
+        .await;
+        assert!(history.contains(&format!("/parking/{}/edit", location.id())));
+        assert!(history.contains("report('parking'"));
+        assert_eq!(*calls.lock().unwrap(), [0, 1, 0, 1, 0, 1]);
+
+        *calls.lock().unwrap() = [0; 6];
+        let current_outage = fetch(
+            format!("/parking/{}", location.id()),
+            Some(format!("session_id={}", verified_token.to_hex())),
+        )
+        .await;
+        assert!(current_outage.contains(&format!("/parking/{}/edit", location.id())));
+        assert_eq!(*calls.lock().unwrap(), [1, 1, 1, 1, 0, 0]);
+    });
+}
+
+#[test]
+fn detail_media_signing_failures_are_honest_and_thumbnail_fallbacks_remain_usable() {
+    run_isolated_database_test(|pool| async move {
+        let db = Db::from_pool(pool);
+        let mut conn = db.acquire().await.unwrap();
+        let location = ParkingBuilder::new()
+            .with_name("B11 media facts remain")
+            .create(&mut conn)
+            .await
+            .unwrap();
+        drop(conn);
+
+        for (fail_key, language, unavailable, absent) in [
+            (
+                "b11/gallery-primary.jpg",
+                "en",
+                "temporarily unavailable",
+                "",
+            ),
+            ("b11/gallery-thumb.jpg", "en", "", "temporarily unavailable"),
+            (
+                "b11/review-primary.jpg",
+                "en",
+                "Review photos are temporarily unavailable.",
+                "",
+            ),
+            (
+                "b11/review-thumb.jpg",
+                "en",
+                "",
+                "Review photos are temporarily unavailable.",
+            ),
+            (
+                "b11/review-primary.jpg",
+                "pt-BR",
+                "As fotos da avaliação estão temporariamente indisponíveis.",
+                "",
+            ),
+        ] {
+            let deps = RouterDeps {
+                email: std::sync::Arc::new(FakeEmailProvider::with_root(None)),
+                oauth: None,
+                hasher: TestPasswordHasher,
+                rate_limiter: Box::new(bikesnest_infrastructure::InMemoryRateLimiter::new()),
+                storage: std::sync::Arc::new(CountingStorage {
+                    inner: bikesnest_test_support::TestObjectStorage::new(),
+                    signs: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    fail_key: Some(fail_key.into()),
+                }),
+                detail_reads: Some(std::sync::Arc::new(MediaDetailReads)),
+            };
+            let response = app_router_with(std::sync::Arc::new(test_config()), db.clone(), deps)
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/parking/{}", location.id()))
+                        .header("Accept-Language", language)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body =
+                String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+                    .to_string();
+            assert!(body.contains("B11 media facts remain"));
+            assert!(body.contains("Approved review remains visible"));
+            if !unavailable.is_empty() {
+                assert!(body.contains(unavailable), "failure={fail_key}");
+            }
+            if !absent.is_empty() {
+                assert!(!body.contains(absent), "failure={fail_key}");
+            }
+            assert!(!body.contains("B11_SECRET_PROVIDER_MARKER"));
+            assert!(!body.contains(fail_key));
+            if fail_key.ends_with("thumb.jpg") {
+                let primary = if fail_key.contains("gallery") {
+                    "gallery-primary.jpg"
+                } else {
+                    "review-primary.jpg"
+                };
+                assert!(body.matches(primary).count() >= 2, "failure={fail_key}");
+            }
+        }
+    });
 }
 
 #[db_test]
 async fn never_verified_location_shows_the_freshness_label_once(tx: &mut TestTx) {
+    let db = tx.db().await;
     // Problem #4 regression: a never-verified location's freshness card must
     // not render the "never verified" copy twice — `freshness_label` and
     // `verified_label` both resolve to the same string when there's no
     // `last_verified_at`, so the template must collapse them into one.
     const MARK: &str = "fix-http-never-verified";
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    let conn = tx.executor();
+
+    let mut conn = db.acquire().await.unwrap();
     let created = ParkingBuilder::new()
         .with_fixture_tag(MARK)
         .with_name("Never Verified Fixture")
         .at(-25.4300, -49.2700)
         .never_verified()
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
-    tx.commit_fixture().await;
+    drop(conn);
 
-    let (status, body) = get(&format!("/parking/{}", created.id())).await;
+    let (status, body) = get(tx, &format!("/parking/{}", created.id())).await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         !body.contains("Never verified · Never verified"),
@@ -687,12 +1550,6 @@ async fn never_verified_location_shows_the_freshness_label_once(tx: &mut TestTx)
         body.contains("Never verified"),
         "freshness card should still show the label once"
     );
-
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
-        .await
-        .unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -717,18 +1574,55 @@ fn urlencode(s: &str) -> String {
     out
 }
 
-async fn auth_app() -> (axum::Router, FakeEmailProvider) {
+async fn auth_app(tx: &mut bikesnest_test_support::TestTx) -> (axum::Router, FakeEmailProvider) {
     // The wider suite exercises the fake OAuth flow's plumbing, so
     // it builds with Google sign-in enabled; feature-flag tests below build with
     // `auth_app_opts(false)` to cover the disabled (default) product state.
-    auth_app_opts(true).await
+    auth_app_opts(tx, true).await
+}
+
+async fn scoped_auth_app(tx: &mut bikesnest_test_support::TestTx) -> axum::Router {
+    let deps = RouterDeps {
+        email: std::sync::Arc::new(FakeEmailProvider::with_root(None)),
+        oauth: None,
+        hasher: TestPasswordHasher,
+        rate_limiter: Box::new(bikesnest_infrastructure::InMemoryRateLimiter::new()),
+        storage: std::sync::Arc::new(bikesnest_test_support::TestObjectStorage::new()),
+        detail_reads: None,
+    };
+    app_router_with(std::sync::Arc::new(test_config()), tx.db().await, deps)
+}
+
+async fn scoped_login(app: &axum::Router, email: &str) -> (String, String) {
+    let (status, _, _) = post_form(
+        app,
+        "/register",
+        &[("email", email), ("password", "password123")],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (status, _, cookie) = post_form(
+        app,
+        "/login",
+        &[("email", email), ("password", "password123")],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let cookie = cookie.unwrap().split(';').next().unwrap().to_string();
+    let (_, account) = get_c(app, "/account", Some(&cookie)).await;
+    (cookie, extract_csrf(&account))
 }
 
 /// Like [`auth_app`], but with the Google sign-in feature flag set explicitly
 /// (product decision: disabled by default until a real OAuth provider exists).
-async fn auth_app_opts(google_oauth_enabled: bool) -> (axum::Router, FakeEmailProvider) {
+async fn auth_app_opts(
+    tx: &mut bikesnest_test_support::TestTx,
+    google_oauth_enabled: bool,
+) -> (axum::Router, FakeEmailProvider) {
     let email = FakeEmailProvider::with_root(None);
-    let db = Db::from_pool(pool().await);
+    let db = tx.db().await;
     let config = bikesnest_infrastructure::Config {
         google_oauth_enabled,
         ..test_config()
@@ -742,6 +1636,7 @@ async fn auth_app_opts(google_oauth_enabled: bool) -> (axum::Router, FakeEmailPr
         hasher: TestPasswordHasher,
         rate_limiter: Box::new(bikesnest_infrastructure::InMemoryRateLimiter::new()),
         storage: std::sync::Arc::new(bikesnest_test_support::TestObjectStorage::new()),
+        detail_reads: None,
     };
     let app = app_router_with(std::sync::Arc::new(config), db, deps);
     (app, email)
@@ -751,13 +1646,15 @@ async fn auth_app_opts(google_oauth_enabled: bool) -> (axum::Router, FakeEmailPr
 /// test can read object bytes directly — there is no `/media` route to fetch
 /// them through (media is served via direct S3 presigned URLs; the app is
 /// never a media proxy).
-async fn auth_app_with_storage() -> (
+async fn auth_app_with_storage(
+    tx: &mut bikesnest_test_support::TestTx,
+) -> (
     axum::Router,
     FakeEmailProvider,
     std::sync::Arc<bikesnest_test_support::TestObjectStorage>,
 ) {
     let email = FakeEmailProvider::with_root(None);
-    let db = Db::from_pool(pool().await);
+    let db = tx.db().await;
     let config = test_config();
     let storage = std::sync::Arc::new(bikesnest_test_support::TestObjectStorage::new());
     let deps = RouterDeps {
@@ -769,9 +1666,203 @@ async fn auth_app_with_storage() -> (
         hasher: TestPasswordHasher,
         rate_limiter: Box::new(bikesnest_infrastructure::InMemoryRateLimiter::new()),
         storage: storage.clone(),
+        detail_reads: None,
     };
     let app = app_router_with(std::sync::Arc::new(config), db, deps);
     (app, email, storage)
+}
+
+#[test]
+fn terms_acknowledgement_gate_and_policy_read_failures_are_honest_http_states() {
+    run_isolated_database_test(|pool: sqlx::PgPool| async move {
+        let db = Db::from_pool(pool.clone());
+        let deps = || RouterDeps {
+            email: std::sync::Arc::new(FakeEmailProvider::with_root(None)),
+            oauth: None,
+            hasher: TestPasswordHasher,
+            rate_limiter: Box::new(bikesnest_infrastructure::InMemoryRateLimiter::new()),
+            storage: std::sync::Arc::new(bikesnest_test_support::TestObjectStorage::new()),
+            detail_reads: None,
+        };
+
+        let disabled = app_router_with(std::sync::Arc::new(test_config()), db.clone(), deps());
+        let response = disabled
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/register")
+                    .header("Accept-Language", "en")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body =
+            String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+                .into_owned();
+        assert!(!body.contains("name=\"terms_policy_id\""));
+        let (cookie, csrf) = scoped_login(&disabled, "terms-csrf@example.test").await;
+
+        let wrong_kind: i64 = sqlx::query_scalar(
+            "INSERT INTO policy_version(kind,locale,version,effective_at,content) \
+             VALUES('privacy','en','wrong-kind',clock_timestamp(),'privacy') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let wrong = app_router_with(std::sync::Arc::new(test_config()), db.clone(), deps())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/terms/versions/{wrong_kind}"))
+                    .header("Accept-Language", "en")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::NOT_FOUND);
+
+        let mut enabled_config = test_config();
+        enabled_config.policy.acknowledgement_enabled = true;
+        enabled_config.google_oauth_enabled = false;
+        let enabled = app_router_with(std::sync::Arc::new(enabled_config), db, deps());
+        let terms_id: i64 = sqlx::query_scalar(
+            "INSERT INTO policy_version(kind,locale,version,effective_at,content,requires_acknowledgement) \
+             VALUES('terms','en','csrf-current',clock_timestamp(),'terms',true) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // A registration form prepared before activation has no terms fields.
+        // Submitting it after fleet-wide activation must preserve only the
+        // non-secret inputs and supply the authoritative current proof for a
+        // retry; it must not create or mutate registration state.
+        let (anonymous_cookie, anonymous_csrf) = anon_csrf(&disabled, "/register")
+            .await
+            .expect("anonymous registration csrf");
+        let omitted_email = "before-activation@example.test";
+        let omitted_display_name = "Before & Activation";
+        let omitted_body = format!(
+            "email={}&display_name={}&password={}&csrf={}",
+            urlencode(omitted_email),
+            urlencode(omitted_display_name),
+            urlencode("must-not-be-rendered-123"),
+            urlencode(&anonymous_csrf),
+        );
+        let omitted = enabled
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("Accept-Language", "en")
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .header("Cookie", &anonymous_cookie)
+                    .body(Body::from(omitted_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(omitted.status(), StatusCode::CONFLICT);
+        let omitted_html =
+            String::from_utf8_lossy(&omitted.into_body().collect().await.unwrap().to_bytes())
+                .into_owned();
+        assert!(omitted_html.contains("value=\"before-activation@example.test\""));
+        let retained_name =
+            regex::Regex::new(r#"<input[^>]+name="display_name"[^>]+value="([^"]+)""#)
+                .unwrap()
+                .captures(&omitted_html)
+                .and_then(|captures| captures.get(1))
+                .expect("display name remains in the retry form")
+                .as_str();
+        assert!(retained_name.contains("Before"));
+        assert!(retained_name.contains("Activation"));
+        assert!(!omitted_html.contains("must-not-be-rendered-123"));
+        assert!(omitted_html.contains(&format!("name=\"terms_policy_id\" value=\"{terms_id}\"")));
+        assert!(omitted_html.contains("name=\"terms_version\" value=\"csrf-current\""));
+        assert!(omitted_html.contains(&format!("/terms/versions/{terms_id}")));
+        assert!(omitted_html.contains("The applicable terms changed"));
+        let omitted_artifacts: (i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+               (SELECT count(*) FROM users WHERE email=$1), \
+               (SELECT count(*) FROM terms_acknowledgement ta JOIN users u ON u.id=ta.user_id WHERE u.email=$1), \
+               (SELECT count(*) FROM background_job WHERE payload::text LIKE '%' || $1 || '%')",
+        )
+        .bind(omitted_email)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(omitted_artifacts, (0, 0, 0));
+
+        for fields in [
+            vec![
+                ("policy_id", terms_id.to_string()),
+                ("terms_version", "csrf-current".into()),
+            ],
+            vec![
+                ("policy_id", terms_id.to_string()),
+                ("terms_version", "csrf-current".into()),
+                ("csrf", "wrong-session-proof".into()),
+            ],
+        ] {
+            let borrowed = fields
+                .iter()
+                .map(|(key, value)| (*key, value.as_str()))
+                .collect::<Vec<_>>();
+            let (status, _, _) = post_form(
+                &enabled,
+                &format!("/account/terms-notice/{terms_id}/acknowledge"),
+                &borrowed,
+                Some(&cookie),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+        let acknowledgements: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM terms_acknowledgement WHERE terms_version='csrf-current'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(acknowledgements, 0);
+
+        let terms_id_field = terms_id.to_string();
+        let (status, _, _) = post_form(
+            &enabled,
+            &format!("/account/terms-notice/{terms_id}/acknowledge"),
+            &[
+                ("policy_id", &terms_id_field),
+                ("terms_version", "future-or-wrong"),
+                ("csrf", &csrf),
+            ],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        sqlx::query("ALTER TABLE policy_version RENAME TO unavailable_policy_version")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let unavailable = enabled
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/register")
+                    .header("Accept-Language", "en")
+                    .header("Accept", "text/html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body =
+            String::from_utf8_lossy(&unavailable.into_body().collect().await.unwrap().to_bytes())
+                .into_owned();
+        assert!(body.contains("temporarily unavailable"));
+    });
 }
 
 async fn get_c(app: &axum::Router, uri: &str, cookie: Option<&str>) -> (StatusCode, String) {
@@ -784,9 +1875,40 @@ async fn get_c(app: &axum::Router, uri: &str, cookie: Option<&str>) -> (StatusCo
         .oneshot(b.body(Body::empty()).unwrap())
         .await
         .unwrap();
+    let report_only = res.headers()["content-security-policy-report-only"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        res.headers()["cache-control"],
+        "private, no-store",
+        "dynamic GET {uri} must not be cached"
+    );
     let status = res.status();
     let body = res.into_body().collect().await.unwrap().to_bytes();
-    (status, String::from_utf8_lossy(&body).to_string())
+    let body = String::from_utf8_lossy(&body).to_string();
+    if status.is_success() && body.contains("<html") {
+        let nonce = regex::Regex::new(r#"<script nonce="([^"]+)""#)
+            .unwrap()
+            .captures(&body)
+            .and_then(|captures| captures.get(1))
+            .unwrap()
+            .as_str();
+        assert!(report_only.contains(&format!("'nonce-{nonce}'")), "{uri}");
+        for script in regex::Regex::new(r"<script\b[^>]*>")
+            .unwrap()
+            .find_iter(&body)
+            .map(|found| found.as_str())
+        {
+            if !script.contains("type=\"application/json\"") {
+                assert!(
+                    script.contains(&format!("nonce=\"{nonce}\"")),
+                    "{uri}: {script}"
+                );
+            }
+        }
+    }
+    (status, body)
 }
 
 /// Which page to GET to obtain the anonymous double-submit CSRF cookie for a
@@ -826,7 +1948,7 @@ async fn anon_csrf(app: &axum::Router, page_uri: &str) -> Option<(String, String
         .get("set-cookie")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string)?;
-    if !sc.starts_with("csrf=") {
+    if !sc.starts_with("__Host-csrf=") {
         return None;
     }
     let cookie_line = sc.split(';').next().unwrap().to_string();
@@ -903,6 +2025,11 @@ async fn post_form_h(
         .oneshot(b.body(Body::from(body)).unwrap())
         .await
         .unwrap();
+    assert_eq!(
+        res.headers()["cache-control"],
+        "private, no-store",
+        "dynamic POST {uri} must not be cached"
+    );
     let set_cookie = res
         .headers()
         .get("set-cookie")
@@ -919,9 +2046,8 @@ async fn post_form_h(
 
 #[db_test]
 async fn register_verify_login_account_logout(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
+    let (app, email) = auth_app(tx).await;
     const EMAIL: &str = "flow@example.com";
-    cleanup_user(EMAIL).await;
 
     // Register → redirect to login?registered=1, verification email captured.
     let (s, _, _) = post_form(
@@ -992,14 +2118,11 @@ async fn register_verify_login_account_logout(tx: &mut bikesnest_test_support::T
         matches!(s, StatusCode::SEE_OTHER | StatusCode::FOUND),
         "logged-out user is redirected"
     );
-
-    let _ = tx;
-    cleanup_user(EMAIL).await;
 }
 
 #[db_test]
 async fn resend_verification_from_account_page_succeeds(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, _email) = auth_app().await;
+    let (app, _email) = auth_app(tx).await;
     const EMAIL: &str = "resend-account@example.com";
     let cookie = unverified_cookie(&app, EMAIL).await;
 
@@ -1026,16 +2149,12 @@ async fn resend_verification_from_account_page_succeeds(tx: &mut bikesnest_test_
         StatusCode::SEE_OTHER,
         "resend-verification POST from /account must succeed, not 403"
     );
-
-    let _ = tx;
-    cleanup_user_contributions(EMAIL).await;
 }
 
 #[db_test]
 async fn privacy_public_pages_gating_and_export_flow(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
+    let (app, email) = auth_app(tx).await;
     const EMAIL: &str = "privacy-web@example.com";
-    cleanup_user(EMAIL).await;
 
     // Public legal pages render (200), even with placeholder content.
     let (s, body) = get_c(&app, "/privacy", None).await;
@@ -1213,25 +2332,14 @@ async fn privacy_public_pages_gating_and_export_flow(tx: &mut bikesnest_test_sup
         StatusCode::FORBIDDEN,
         "non-admin blocked from the privacy-request queue"
     );
-
-    let _ = tx;
-    cleanup_user(EMAIL).await;
-}
-
-async fn cleanup_user(email: &str) {
-    sqlx::query("DELETE FROM users WHERE email = $1")
-        .bind(email)
-        .execute(&pool().await)
-        .await
-        .unwrap();
 }
 
 #[db_test]
 async fn login_failure_body_is_identical_for_unknown_and_existing(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
-    let (app, _) = auth_app().await;
-    cleanup_user("known@example.com").await;
+    let (app, _) = auth_app(tx).await;
+
     post_form(
         &app,
         "/register",
@@ -1265,14 +2373,11 @@ async fn login_failure_body_is_identical_for_unknown_and_existing(
     // by the per-request CSRF token, which is unrelated to account existence.)
     assert!(!b_known.contains("known@example.com"));
     assert!(!b_unknown.contains("ghost@example.com"));
-    let _ = tx;
-    cleanup_user("known@example.com").await;
 }
 
 #[db_test]
 async fn admin_users_denied_for_anonymous_and_non_admin(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, _) = auth_app().await;
-    cleanup_user("admin-user@example.com").await;
+    let (app, _) = auth_app(tx).await;
 
     // Anonymous → redirected to login.
     let (s, _) = get_c(&app, "/admin/users", None).await;
@@ -1304,15 +2409,12 @@ async fn admin_users_denied_for_anonymous_and_non_admin(tx: &mut bikesnest_test_
     .await;
     let (s, _) = get_c(&app, "/admin/users", cookie.as_deref()).await;
     assert_eq!(s, StatusCode::FORBIDDEN, "non-admin forbidden");
-    let _ = tx;
-    cleanup_user("admin-user@example.com").await;
 }
 
 #[db_test]
 async fn admin_can_grant_role_and_audit_is_written(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, _) = auth_app().await;
-    cleanup_user("root@example.com").await;
-    cleanup_user("target@example.com").await;
+    let db = tx.db().await;
+    let (app, _) = auth_app(tx).await;
 
     // Seed a logged-in admin + a target user.
     post_form(
@@ -1340,20 +2442,18 @@ async fn admin_can_grant_role_and_audit_is_written(tx: &mut bikesnest_test_suppo
 
     let (root_id,): (i64,) =
         sqlx::query_as("SELECT id FROM users WHERE email = 'root@example.com'")
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
     let (target_id,): (i64,) =
         sqlx::query_as("SELECT id FROM users WHERE email = 'target@example.com'")
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
-    // Granting ADMIN changes a system-wide set that the last-admin guard reads,
-    // and other test binaries assert on it. Claim the shared lock first.
-    bikesnest_test_support::hold_admin_set_lock_for_process(&pool().await).await;
+
     sqlx::query("INSERT INTO user_roles (user_id, role, granted_by) VALUES ($1, 'ADMIN', NULL)")
         .bind(root_id)
-        .execute(&pool().await)
+        .execute(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
 
@@ -1377,7 +2477,7 @@ async fn admin_can_grant_role_and_audit_is_written(tx: &mut bikesnest_test_suppo
         "SELECT count(*) FROM audit_events WHERE action = 'role.granted' AND target_id = $1",
     )
     .bind(target_id.to_string())
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     assert_eq!(audit_count, 1, "granted role is audited");
@@ -1385,14 +2485,10 @@ async fn admin_can_grant_role_and_audit_is_written(tx: &mut bikesnest_test_suppo
     let (role_count,): (i64,) =
         sqlx::query_as("SELECT count(*) FROM user_roles WHERE user_id = $1 AND role = 'MODERATOR'")
             .bind(target_id)
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
     assert_eq!(role_count, 1);
-
-    let _ = tx;
-    cleanup_user("root@example.com").await;
-    cleanup_user("target@example.com").await;
 }
 
 fn extract_csrf(html: &str) -> String {
@@ -1402,9 +2498,256 @@ fn extract_csrf(html: &str) -> String {
 }
 
 #[db_test]
+async fn anonymous_csrf_is_stable_across_pages_tabs_and_validation_errors(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let app = scoped_auth_app(tx).await;
+    let (cookie, token) = anon_csrf(&app, "/login").await.expect("first token");
+    assert!(cookie.starts_with("__Host-csrf="));
+
+    for uri in ["/register", "/password-reset", "/login"] {
+        let request = Request::builder()
+            .uri(uri)
+            .header("cookie", &cookie)
+            .header("accept-language", "en")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert!(!response.headers().contains_key("set-cookie"));
+        let html =
+            String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+                .to_string();
+        assert_eq!(extract_csrf(&html), token, "token changed on {uri}");
+    }
+
+    let (status, html, set_cookie) = post_form(
+        &app,
+        "/login",
+        &[
+            ("csrf", &token),
+            ("email", "not-an-account@example.com"),
+            ("password", "incorrect-password"),
+        ],
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(set_cookie.is_none());
+    assert_eq!(extract_csrf(&html), token);
+    assert!(
+        !html.contains("incorrect-password"),
+        "credentials must not be repopulated"
+    );
+}
+
+#[db_test]
+async fn stale_header_is_rejected_even_when_body_token_is_valid(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let app = scoped_auth_app(tx).await;
+    let (cookie, token) = anon_csrf(&app, "/login").await.expect("anonymous token");
+    let body = format!("csrf={token}&email=x%40example.com&password=password123");
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("cookie", cookie)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("x-csrf-token", "attacker-or-stale-token")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        response.headers()["x-bikesnest-csrf-recovery"],
+        "reload-required"
+    );
+}
+
+#[db_test]
+async fn duplicate_cookie_and_cross_site_requests_are_rejected(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let app = scoped_auth_app(tx).await;
+    let (cookie, token) = anon_csrf(&app, "/login").await.expect("anonymous token");
+    let body = format!("csrf={token}&email=x%40example.com&password=password123");
+
+    for (cookie_header, fetch_site) in [
+        (format!("{cookie}; {cookie}"), None),
+        (cookie.clone(), Some("cross-site")),
+    ] {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/login")
+            .header("cookie", cookie_header)
+            .header("content-type", "application/x-www-form-urlencoded");
+        if let Some(value) = fetch_site {
+            request = request.header("sec-fetch-site", value);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::from(body.clone())).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+}
+
+#[db_test]
+async fn multipart_content_type_cannot_bypass_non_upload_csrf(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let app = scoped_auth_app(tx).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/logout")
+                .header("content-type", "multipart/form-data; boundary=attack")
+                .body(Body::from("--attack--\r\n"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let html = String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+        .to_string();
+    assert!(
+        html.contains(r#"href="/""#),
+        "recovery returns to a GET page"
+    );
+    assert!(
+        !html.contains(r#"href="""#),
+        "recovery must not GET the POST action"
+    );
+}
+
+#[db_test]
+async fn expired_and_revoked_session_cookies_get_stale_form_recovery(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    for (email, state_change) in [
+        ("csrf-expired@example.com", "expire"),
+        ("csrf-revoked@example.com", "revoke"),
+    ] {
+        let app = scoped_auth_app(tx).await;
+        let (cookie, csrf) = scoped_login(&app, email).await;
+        let db = tx.db().await;
+        let mut conn = db.acquire().await.unwrap();
+        if state_change == "expire" {
+            sqlx::query(
+                "UPDATE sessions SET expires_at = now() - interval '1 second' WHERE user_id = (SELECT id FROM users WHERE email = $1)",
+            )
+            .bind(email)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        } else {
+            sqlx::query(
+                "UPDATE sessions SET revoked_at = now() WHERE user_id = (SELECT id FROM users WHERE email = $1)",
+            )
+            .bind(email)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        }
+        drop(conn);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/logout")
+                    .header("cookie", &cookie)
+                    .header("accept-language", "en")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("csrf={csrf}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response.headers()["x-bikesnest-csrf-recovery"],
+            "reload-required"
+        );
+        let html =
+            String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+                .to_string();
+        assert!(html.contains("Your session expired or this form is stale"));
+        assert!(html.contains(r#"href="/""#));
+    }
+}
+
+#[db_test]
+async fn csrf_token_from_another_live_session_cannot_mutate(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let app = scoped_auth_app(tx).await;
+    let (first_cookie, _) = scoped_login(&app, "csrf-first-session@example.com").await;
+    let (_, second_csrf) = scoped_login(&app, "csrf-second-session@example.com").await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/logout")
+                .header("cookie", &first_cookie)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(format!("csrf={second_csrf}")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let (status, _) = get_c(&app, "/account", Some(&first_cookie)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "rejected request did not log out session"
+    );
+}
+
+#[db_test]
+async fn session_store_failure_is_unavailable_not_stale_recovery(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let app = scoped_auth_app(tx).await;
+    let db = tx.db().await;
+    sqlx::query("SET LOCAL search_path = pg_catalog")
+        .execute(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/account")
+                .header("cookie", format!("session_id={}", "01".repeat(32)))
+                .header("accept-language", "en")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!response.headers().contains_key("x-bikesnest-csrf-recovery"));
+    assert!(!response.headers().contains_key("set-cookie"));
+    let html = String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+        .to_string();
+    assert!(
+        html.contains(
+            ">The service is temporarily unavailable. Please try again in a moment.</h1>"
+        )
+    );
+}
+
+#[db_test]
 async fn csrf_required_on_authenticated_post(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, _) = auth_app().await;
-    cleanup_user("csrf@example.com").await;
+    let (app, _) = auth_app(tx).await;
+
     post_form(
         &app,
         "/register",
@@ -1437,16 +2780,15 @@ async fn csrf_required_on_authenticated_post(tx: &mut bikesnest_test_support::Te
         matches!(s, StatusCode::SEE_OTHER | StatusCode::FOUND),
         "logout with CSRF succeeds"
     );
-    let _ = tx;
-    cleanup_user("csrf@example.com").await;
 }
 
 #[db_test]
 async fn suspended_account_is_blocked_at_login_with_generic_error(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
-    let (app, _) = auth_app().await;
-    cleanup_user("suspend@example.com").await;
+    let db = tx.db().await;
+    let (app, _) = auth_app(tx).await;
+
     post_form(
         &app,
         "/register",
@@ -1459,7 +2801,7 @@ async fn suspended_account_is_blocked_at_login_with_generic_error(
     .await;
 
     sqlx::query("UPDATE users SET account_state = 'SUSPENDED' WHERE email = 'suspend@example.com'")
-        .execute(&pool().await)
+        .execute(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
 
@@ -1477,13 +2819,11 @@ async fn suspended_account_is_blocked_at_login_with_generic_error(
         body.contains("Email or password is incorrect"),
         "suspended logged out with generic message"
     );
-    let _ = tx;
-    cleanup_user("suspend@example.com").await;
 }
 
 #[db_test]
 async fn anonymous_post_without_csrf_cookie_is_forbidden(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, _) = auth_app().await;
+    let (app, _) = auth_app(tx).await;
     // A POST with no `csrf` cookie (here the session cookie alone) is rejected on
     // the anonymous path — SameSite=Lax alone is not treated as CSRF-safe.
     let (s, _, _) = post_form(
@@ -1498,13 +2838,12 @@ async fn anonymous_post_without_csrf_cookie_is_forbidden(tx: &mut bikesnest_test
         StatusCode::FORBIDDEN,
         "anonymous POST without csrf cookie is forbidden"
     );
-    let _ = tx;
 }
 
 #[db_test]
 async fn csrf_header_path_is_accepted(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, _) = auth_app().await;
-    cleanup_user("hdr@example.com").await;
+    let (app, _) = auth_app(tx).await;
+
     post_form(
         &app,
         "/register",
@@ -1542,8 +2881,6 @@ async fn csrf_header_path_is_accepted(tx: &mut bikesnest_test_support::TestTx) {
         matches!(res.status(), StatusCode::SEE_OTHER | StatusCode::FOUND),
         "header-path CSRF accepted"
     );
-    let _ = tx;
-    cleanup_user("hdr@example.com").await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1553,8 +2890,8 @@ async fn csrf_header_path_is_accepted(tx: &mut bikesnest_test_support::TestTx) {
 // ---------------------------------------------------------------------------
 
 #[db_test]
-async fn google_oauth_disabled_by_default_returns_404(_tx: &mut TestTx) {
-    let app = test_app().await;
+async fn google_oauth_disabled_by_default_returns_404(tx: &mut TestTx) {
+    let app = test_app(tx).await;
     let res = app
         .oneshot(
             Request::builder()
@@ -1573,14 +2910,14 @@ async fn google_oauth_disabled_by_default_returns_404(_tx: &mut TestTx) {
 }
 
 #[db_test]
-async fn google_oauth_disabled_callback_returns_404(_tx: &mut TestTx) {
-    let (status, _) = get("/auth/google/callback?code=x&state=y").await;
+async fn google_oauth_disabled_callback_returns_404(tx: &mut TestTx) {
+    let (status, _) = get(tx, "/auth/google/callback?code=x&state=y").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[db_test]
-async fn login_page_hides_google_link_when_disabled(_tx: &mut TestTx) {
-    let (status, body) = get("/login").await;
+async fn login_page_hides_google_link_when_disabled(tx: &mut TestTx) {
+    let (status, body) = get(tx, "/login").await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         !body.contains("href=\"/auth/google\""),
@@ -1593,11 +2930,11 @@ async fn login_page_hides_google_link_when_disabled(_tx: &mut TestTx) {
 }
 
 #[db_test]
-async fn google_oauth_enabled_flag_still_redirects(_tx: &mut TestTx) {
+async fn google_oauth_enabled_flag_still_redirects(tx: &mut TestTx) {
     // Protects the future real-integration plumbing: with the flag explicitly
     // on, `/auth/google` is registered and behaves as before (redirect to the
     // provider's authorize URL — the fake's consent stub in this test build).
-    let (app, _) = auth_app_opts(true).await;
+    let (app, _) = auth_app_opts(tx, true).await;
     let (status, _) = get_c(&app, "/auth/google", None).await;
     assert!(
         matches!(
@@ -1612,23 +2949,7 @@ async fn google_oauth_enabled_flag_still_redirects(_tx: &mut TestTx) {
 // community routes
 // ---------------------------------------------------------------------------
 
-async fn cleanup_user_contributions(email: &str) {
-    sqlx::query(
-        "DELETE FROM parking_location WHERE creator_id = (SELECT id FROM users WHERE email = $1)",
-    )
-    .bind(email)
-    .execute(&pool().await)
-    .await
-    .unwrap();
-    sqlx::query("DELETE FROM users WHERE email = $1")
-        .bind(email)
-        .execute(&pool().await)
-        .await
-        .unwrap();
-}
-
 async fn unverified_cookie(app: &axum::Router, addr: &str) -> String {
-    cleanup_user_contributions(addr).await;
     post_form(
         app,
         "/register",
@@ -1651,7 +2972,6 @@ async fn verified_cookie(
     email: &bikesnest_infrastructure::FakeEmailProvider,
     addr: &str,
 ) -> String {
-    cleanup_user_contributions(addr).await;
     post_form(
         app,
         "/register",
@@ -1675,7 +2995,7 @@ async fn verified_cookie(
 
 #[db_test]
 async fn community_routes_redirect_anonymous(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, _) = auth_app().await;
+    let (app, _) = auth_app(tx).await;
     for uri in [
         "/parking/new",
         "/parking/1/edit",
@@ -1689,12 +3009,11 @@ async fn community_routes_redirect_anonymous(tx: &mut bikesnest_test_support::Te
             "{uri} redirects anonymous: {s}"
         );
     }
-    let _ = tx;
 }
 
 #[db_test]
 async fn add_location_requires_verified(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, _) = auth_app().await;
+    let (app, _) = auth_app(tx).await;
     let cookie = unverified_cookie(&app, "unverified-contrib@example.com").await;
     let (s, _) = get_c(&app, "/parking/new", Some(&cookie)).await;
     assert_eq!(s, StatusCode::FORBIDDEN, "unverified cannot open add form");
@@ -1716,13 +3035,12 @@ async fn add_location_requires_verified(tx: &mut bikesnest_test_support::TestTx)
     )
     .await;
     assert_eq!(s, StatusCode::FORBIDDEN, "unverified POST denied");
-    let _ = tx;
-    cleanup_user_contributions("unverified-contrib@example.com").await;
 }
 
 #[db_test]
 async fn verified_user_adds_a_location_and_sees_details(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
     const EMAIL: &str = "contrib-add@example.com";
     let cookie = verified_cookie(&app, &email, EMAIL).await;
 
@@ -1758,45 +3076,38 @@ async fn verified_user_adds_a_location_and_sees_details(tx: &mut bikesnest_test_
     // The location is persisted with creator attribution + version 1.
     let (id,): (i64,) = sqlx::query_as(
         "SELECT id FROM parking_location WHERE name = 'Estação Centro Added' ORDER BY id DESC LIMIT 1",
-    ).fetch_one(&pool().await).await.unwrap();
+    ).fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
     assert!(id > 0);
     let (version,): (i64,) = sqlx::query_as("SELECT version FROM parking_location WHERE id = $1")
         .bind(id)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     assert_eq!(version, 1);
 
-    // The P3 details page renders.
+    // The details page renders.
     let (s, body) = get_c(&app, &format!("/parking/{id}"), Some(&cookie)).await;
     assert_eq!(s, StatusCode::OK);
     assert!(body.contains("Estação Centro Added"));
-
-    let _ = tx;
-    cleanup_user_contributions(EMAIL).await;
 }
 
 #[db_test]
 async fn favorite_toggle_and_list_work_for_authenticated_user(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
+    let db = tx.db().await;
     const MARK: &str = "fix-http-fav";
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    // Fixture location (committed) so the favorite repo can reference it.
+
+    // The fixture and favorite repository share this test's rollback scope.
     let loc = ParkingBuilder::new()
         .with_name("Favorite Target")
         .with_fixture_tag(MARK)
-        .create(tx.executor())
+        .create(&mut db.acquire().await.unwrap())
         .await
         .unwrap();
-    tx.commit_fixture().await;
     let loc_id = loc.id();
 
-    let (app, _) = auth_app().await;
+    let (app, _) = auth_app(tx).await;
     let cookie = unverified_cookie(&app, "fav-user@example.com").await;
 
     // GET the details page to grab CSRF, then toggle favorite (auth-only).
@@ -1823,14 +3134,6 @@ async fn favorite_toggle_and_list_work_for_authenticated_user(
         body.contains("Favorite Target"),
         "favorites page lists the spot"
     );
-
-    let _ = tx;
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    cleanup_user_contributions("fav-user@example.com").await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1840,6 +3143,7 @@ async fn favorite_toggle_and_list_work_for_authenticated_user(
 
 /// POST /parking/new for a verified session; returns the created location id.
 async fn add_location(
+    db: &Db,
     app: &axum::Router,
     cookie: &str,
     csrf: &str,
@@ -1872,14 +3176,22 @@ async fn add_location(
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
-    let (s, _, _) = post_form(app, "/parking/new", &refs, Some(cookie)).await;
-    assert_eq!(s, StatusCode::SEE_OTHER, "add should redirect: {s}");
-    let (id,): (i64,) =
-        sqlx::query_as("SELECT id FROM parking_location WHERE name = $1 ORDER BY id DESC LIMIT 1")
-            .bind(name)
-            .fetch_one(&pool().await)
-            .await
-            .unwrap();
+    let (s, headers, body) = post_form_raw(app, "/parking/new", &refs, cookie).await;
+    assert_eq!(s, StatusCode::SEE_OTHER, "add should redirect: {s}: {body}");
+    let id: i64 = location_of(&headers)
+        .strip_prefix("/parking/")
+        .expect("creation redirects to the exact created location")
+        .split('?')
+        .next()
+        .unwrap()
+        .parse()
+        .expect("location redirect contains an integer id");
+    let stored_name: String = sqlx::query_scalar("SELECT name FROM parking_location WHERE id=$1")
+        .bind(id)
+        .fetch_one(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(stored_name, name);
     id
 }
 
@@ -1913,6 +3225,7 @@ async fn scoped_edit_app(
         hasher: TestPasswordHasher,
         rate_limiter: Box::new(bikesnest_infrastructure::InMemoryRateLimiter::new()),
         storage: std::sync::Arc::new(bikesnest_test_support::TestObjectStorage::new()),
+        detail_reads: None,
     };
     let app = app_router_with(std::sync::Arc::new(test_config()), db.clone(), deps);
     (db, app, format!("session_id={}", raw.to_hex()))
@@ -1952,14 +3265,22 @@ async fn scoped_add_location(
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
-    let (s, _, _) = post_form(app, "/parking/new", &refs, Some(cookie)).await;
-    assert_eq!(s, StatusCode::SEE_OTHER, "add should redirect: {s}");
-    let (id,): (i64,) =
-        sqlx::query_as("SELECT id FROM parking_location WHERE name = $1 ORDER BY id DESC LIMIT 1")
-            .bind(name)
-            .fetch_one(&mut *db.acquire().await.unwrap())
-            .await
-            .unwrap();
+    let (s, headers, body) = post_form_raw(app, "/parking/new", &refs, cookie).await;
+    assert_eq!(s, StatusCode::SEE_OTHER, "add should redirect: {s}: {body}");
+    let id: i64 = location_of(&headers)
+        .strip_prefix("/parking/")
+        .expect("creation redirects to the exact created location")
+        .split('?')
+        .next()
+        .unwrap()
+        .parse()
+        .expect("location redirect contains an integer id");
+    let stored_name: String = sqlx::query_scalar("SELECT name FROM parking_location WHERE id=$1")
+        .bind(id)
+        .fetch_one(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(stored_name, name);
     id
 }
 
@@ -2116,12 +3437,13 @@ async fn edit_proposal_is_visible_in_contributions_without_publishing(
 
 #[db_test]
 async fn proposing_a_move_creates_pending_proposal(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
     const EMAIL: &str = "proposal@example.com";
     let cookie = verified_cookie(&app, &email, EMAIL).await;
     let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
     let csrf = extract_csrf(&form);
-    let id = add_location(&app, &cookie, &csrf, "Move Spot", &[]).await;
+    let id = add_location(&db, &app, &cookie, &csrf, "Move Spot", &[]).await;
 
     let (_, edit_html) = get_c(&app, &format!("/parking/{id}/edit"), Some(&cookie)).await;
     let ecsrf = extract_csrf(&edit_html);
@@ -2146,13 +3468,13 @@ async fn proposing_a_move_creates_pending_proposal(tx: &mut bikesnest_test_suppo
         "SELECT status FROM parking_proposal WHERE location_id = $1 AND kind = 'move_location'",
     )
     .bind(id)
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     assert_eq!(status, "PENDING");
     let (version,): (i64,) = sqlx::query_as("SELECT version FROM parking_location WHERE id = $1")
         .bind(id)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     assert_eq!(version, 1, "proposal causes no live change");
@@ -2164,19 +3486,17 @@ async fn proposing_a_move_creates_pending_proposal(tx: &mut bikesnest_test_suppo
         body.contains("Your change is pending approval"),
         "proposal confirmation shown"
     );
-
-    let _ = tx;
-    cleanup_user_contributions(EMAIL).await;
 }
 
 #[db_test]
 async fn review_create_updates_aggregate(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
     const EMAIL: &str = "review-agg@example.com";
     let cookie = verified_cookie(&app, &email, EMAIL).await;
     let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
     let csrf = extract_csrf(&form);
-    let id = add_location(&app, &cookie, &csrf, "Review Spot", &[]).await;
+    let id = add_location(&db, &app, &cookie, &csrf, "Review Spot", &[]).await;
 
     let (_, review_form) = get_c(&app, &format!("/parking/{id}/review"), Some(&cookie)).await;
     let rcsrf = extract_csrf(&review_form);
@@ -2195,7 +3515,7 @@ async fn review_create_updates_aggregate(tx: &mut bikesnest_test_support::TestTx
         "SELECT rating_count, rating_avg::float8 FROM parking_location WHERE id = $1",
     )
     .bind(id)
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     assert_eq!(count, 1);
@@ -2204,16 +3524,13 @@ async fn review_create_updates_aggregate(tx: &mut bikesnest_test_support::TestTx
         "rating aggregate updated"
     );
     let (rev,): (i64,) = sqlx::query_as("SELECT count(*) FROM review_revision WHERE review_id IN (SELECT id FROM review WHERE location_id = $1)")
-        .bind(id).fetch_one(&pool().await).await.unwrap();
+        .bind(id).fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
     assert_eq!(rev, 1, "review revision recorded");
-
-    let _ = tx;
-    cleanup_user_contributions(EMAIL).await;
 }
 
 #[db_test]
 async fn parking_create_is_rate_limited(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
+    let (app, email) = auth_app(tx).await;
     const EMAIL: &str = "ratelimit@example.com";
     let cookie = verified_cookie(&app, &email, EMAIL).await;
     let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
@@ -2262,23 +3579,21 @@ async fn parking_create_is_rate_limited(tx: &mut bikesnest_test_support::TestTx)
     )
     .await;
     assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "6th add is rate-limited");
-
-    let _ = tx;
-    cleanup_user_contributions(EMAIL).await;
 }
 
 #[db_test]
 async fn no_identity_leak_in_rendered_html(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
     const EMAIL: &str = "identity@example.com";
     let cookie = verified_cookie(&app, &email, EMAIL).await;
     let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
     let csrf = extract_csrf(&form);
-    let id = add_location(&app, &cookie, &csrf, "Identity Spot", &[]).await;
+    let id = add_location(&db, &app, &cookie, &csrf, "Identity Spot", &[]).await;
 
     let (user_id,): (i64,) = sqlx::query_as("SELECT id FROM users WHERE email = $1")
         .bind(EMAIL)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
 
@@ -2298,21 +3613,14 @@ async fn no_identity_leak_in_rendered_html(tx: &mut bikesnest_test_support::Test
             "user id leaked on {uri}"
         );
     }
-
-    let _ = tx;
-    cleanup_user_contributions(EMAIL).await;
 }
 
 #[db_test]
 async fn multiple_security_values_and_major_unit_price(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
     const EMAIL: &str = "multi-sec@example.com";
-    const MARK: &str = "fix-http-multisec";
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
-        .await
-        .unwrap();
+
     let cookie = verified_cookie(&app, &email, EMAIL).await;
     let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
     let csrf = extract_csrf(&form);
@@ -2320,6 +3628,7 @@ async fn multiple_security_values_and_major_unit_price(tx: &mut bikesnest_test_s
     // TWO security attributes (the source of the "duplicate field" crash) plus a
     // major-unit price ("1.50" must store as 150 cents, not raw text/cents).
     let id = add_location(
+        &db,
         &app,
         &cookie,
         &csrf,
@@ -2339,7 +3648,7 @@ async fn multiple_security_values_and_major_unit_price(tx: &mut bikesnest_test_s
         "SELECT cost_kind, price_cents, version FROM parking_location WHERE id = $1",
     )
     .bind(id)
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     assert_eq!(cost_kind, "paid");
@@ -2349,7 +3658,7 @@ async fn multiple_security_values_and_major_unit_price(tx: &mut bikesnest_test_s
     // Both security attributes recorded as YES.
     let (yes,): (i64,) = sqlx::query_as(
         "SELECT count(*) FROM parking_security WHERE location_id = $1 AND state = 1 AND feature_code IN ('well_lit','cctv')")
-        .bind(id).fetch_one(&pool().await).await.unwrap();
+        .bind(id).fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
     assert_eq!(yes, 2, "both security attributes stored");
 
     // Editing preserves both (no reset) and the price round-trips as majors.
@@ -2377,16 +3686,8 @@ async fn multiple_security_values_and_major_unit_price(tx: &mut bikesnest_test_s
     assert_eq!(s, StatusCode::SEE_OTHER);
     let (yes,): (i64,) = sqlx::query_as(
         "SELECT count(*) FROM parking_security WHERE location_id = $1 AND state = 1 AND feature_code IN ('well_lit','cctv')")
-        .bind(id).fetch_one(&pool().await).await.unwrap();
+        .bind(id).fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
     assert_eq!(yes, 2, "security preserved through edit");
-
-    let _ = tx;
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    cleanup_user_contributions(EMAIL).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -2528,29 +3829,25 @@ fn has_exif_marker(bytes: &[u8]) -> bool {
     false
 }
 
-/// A committed fixture location (no photos) for photo tests.
+/// A rollback-scoped fixture location (no photos) for photo tests.
 async fn fixture_location(tx: &mut bikesnest_test_support::TestTx, mark: &str, name: &str) -> i64 {
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(mark)
-        .execute(&pool().await)
-        .await
-        .unwrap();
+    let db = tx.db().await;
+
     let loc = ParkingBuilder::new()
         .with_name(name)
         .with_fixture_tag(mark)
-        .create(tx.executor())
+        .create(&mut db.acquire().await.unwrap())
         .await
         .unwrap();
-    tx.commit_fixture().await;
     loc.id()
 }
 
 async fn moderator_cookie(
+    db: &Db,
     app: &axum::Router,
     email: &bikesnest_infrastructure::FakeEmailProvider,
     addr: &str,
 ) -> String {
-    cleanup_user_contributions(addr).await;
     post_form(
         app,
         "/register",
@@ -2564,13 +3861,13 @@ async fn moderator_cookie(
     get_c(app, &format!("/verify-email?token={token}"), None).await;
     let (uid,): (i64,) = sqlx::query_as("SELECT id FROM users WHERE email = $1")
         .bind(addr)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     sqlx::query(
         "INSERT INTO user_roles (user_id, role, granted_by) VALUES ($1, 'MODERATOR', NULL) ON CONFLICT DO NOTHING",
     )
-    .bind(uid).execute(&pool().await).await.unwrap();
+    .bind(uid).execute(&mut *db.acquire().await.unwrap()).await.unwrap();
     let (_, _, cookie) = post_form(
         app,
         "/login",
@@ -2583,7 +3880,7 @@ async fn moderator_cookie(
 
 #[db_test]
 async fn photo_upload_requires_verified(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, _) = auth_app().await;
+    let (app, _) = auth_app(tx).await;
     let loc = fixture_location(tx, "photo-verify-gate", "Photo Verify Gate").await;
     let cookie = unverified_cookie(&app, "photo-unverified@example.com").await;
     let (s, page) = get_c(&app, &format!("/parking/{loc}"), Some(&cookie)).await;
@@ -2601,17 +3898,11 @@ async fn photo_upload_requires_verified(tx: &mut bikesnest_test_support::TestTx)
     )
     .await;
     assert_eq!(s, StatusCode::FORBIDDEN, "unverified upload blocked");
-    let _ = tx;
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = 'photo-verify-gate'")
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    cleanup_user_contributions("photo-unverified@example.com").await;
 }
 
 #[db_test]
 async fn photo_upload_missing_csrf_header_is_forbidden(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
+    let (app, email) = auth_app(tx).await;
     let loc = fixture_location(tx, "photo-csrf-gate", "Photo Csrf Gate").await;
     let cookie = verified_cookie(&app, &email, "photo-csrf@example.com").await;
     // No X-CSRF-Token header on a multipart POST → the middleware cannot read a
@@ -2623,17 +3914,12 @@ async fn photo_upload_missing_csrf_header_is_forbidden(tx: &mut bikesnest_test_s
         StatusCode::FORBIDDEN,
         "multipart without CSRF header denied"
     );
-    let _ = tx;
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = 'photo-csrf-gate'")
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    cleanup_user_contributions("photo-csrf@example.com").await;
 }
 
 #[db_test]
 async fn verified_upload_enters_queue_not_gallery(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
     let loc = fixture_location(tx, "photo-queue-gate", "Photo Queue Gate").await;
     let cookie = verified_cookie(&app, &email, "photo-uploader@example.com").await;
     let (s, page) = get_c(&app, &format!("/parking/{loc}"), Some(&cookie)).await;
@@ -2656,7 +3942,7 @@ async fn verified_upload_enters_queue_not_gallery(tx: &mut bikesnest_test_suppor
         "SELECT moderation_state, thumbnail_key FROM parking_photo WHERE location_id = $1",
     )
     .bind(loc)
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     assert_eq!(state, "PENDING_REVIEW");
@@ -2669,17 +3955,11 @@ async fn verified_upload_enters_queue_not_gallery(tx: &mut bikesnest_test_suppor
         !gallery.contains(&format!("{MEDIA_ORIGIN}/uploads/")),
         "pending photo not in gallery"
     );
-    let _ = tx;
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = 'photo-queue-gate'")
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    cleanup_user_contributions("photo-uploader@example.com").await;
 }
 
 #[db_test]
 async fn moderation_routes_require_moderator_role(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
+    let (app, email) = auth_app(tx).await;
     // Anonymous is redirected to login (require_role → require_user → redirect).
     let (s, _) = get_c(&app, "/moderation/photos", None).await;
     assert!(
@@ -2699,13 +3979,12 @@ async fn moderation_routes_require_moderator_role(tx: &mut bikesnest_test_suppor
     )
     .await;
     assert_eq!(s, StatusCode::FORBIDDEN, "non-moderator cannot approve");
-    let _ = tx;
-    cleanup_user_contributions("photo-nonmod@example.com").await;
 }
 
 #[db_test]
 async fn moderator_approve_publishes_to_gallery(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
     let loc = fixture_location(tx, "photo-approve", "Photo Approve").await;
     let uploader = verified_cookie(&app, &email, "photo-approve-up@example.com").await;
     let (_, page) = get_c(&app, &format!("/parking/{loc}"), Some(&uploader)).await;
@@ -2721,12 +4000,12 @@ async fn moderator_approve_publishes_to_gallery(tx: &mut bikesnest_test_support:
     .await;
     let (id,): (i64,) = sqlx::query_as("SELECT id FROM parking_photo WHERE location_id = $1")
         .bind(loc)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
 
     // The moderator opens the queue, grabs CSRF, and approves.
-    let mod_cookie = moderator_cookie(&app, &email, "photo-moderator@example.com").await;
+    let mod_cookie = moderator_cookie(&db, &app, &email, "photo-moderator@example.com").await;
     let (s, queue) = get_c(&app, "/moderation/photos", Some(&mod_cookie)).await;
     assert_eq!(s, StatusCode::OK);
     let mcs = extract_csrf(&queue);
@@ -2742,7 +4021,7 @@ async fn moderator_approve_publishes_to_gallery(tx: &mut bikesnest_test_support:
     let (state,): (String,) =
         sqlx::query_as("SELECT moderation_state FROM parking_photo WHERE id = $1")
             .bind(id)
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
     assert_eq!(state, "APPROVED");
@@ -2753,18 +4032,12 @@ async fn moderator_approve_publishes_to_gallery(tx: &mut bikesnest_test_support:
         gallery.contains(&format!("{MEDIA_ORIGIN}/uploads/")),
         "approved photo appears in gallery"
     );
-    let _ = tx;
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = 'photo-approve'")
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    cleanup_user_contributions("photo-approve-up@example.com").await;
-    cleanup_user_contributions("photo-moderator@example.com").await;
 }
 
 #[db_test]
 async fn moderator_reject_deletes_object_and_hides(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email, storage) = auth_app_with_storage().await;
+    let db = tx.db().await;
+    let (app, email, storage) = auth_app_with_storage(tx).await;
     let loc = fixture_location(tx, "photo-reject", "Photo Reject").await;
     let uploader = verified_cookie(&app, &email, "photo-reject-up@example.com").await;
     let (_, page) = get_c(&app, &format!("/parking/{loc}"), Some(&uploader)).await;
@@ -2782,13 +4055,13 @@ async fn moderator_reject_deletes_object_and_hides(tx: &mut bikesnest_test_suppo
         "SELECT id, storage_key, thumbnail_key FROM parking_photo WHERE location_id = $1",
     )
     .bind(loc)
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     let thumb = thumb.expect("upload writes a thumbnail");
     assert!(storage.contains(&full) && storage.contains(&thumb));
 
-    let mod_cookie = moderator_cookie(&app, &email, "photo-reject-mod@example.com").await;
+    let mod_cookie = moderator_cookie(&db, &app, &email, "photo-reject-mod@example.com").await;
     let (_, queue) = get_c(&app, "/moderation/photos", Some(&mod_cookie)).await;
     let mcs = extract_csrf(&queue);
     let (s, _, _) = post_form_hx(
@@ -2804,7 +4077,7 @@ async fn moderator_reject_deletes_object_and_hides(tx: &mut bikesnest_test_suppo
         "SELECT moderation_state, rejection_reason FROM parking_photo WHERE id = $1",
     )
     .bind(id)
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     assert_eq!(state, "REJECTED");
@@ -2816,18 +4089,12 @@ async fn moderator_reject_deletes_object_and_hides(tx: &mut bikesnest_test_suppo
     // vacuously. It now asks the store the row's own keys.)
     assert!(!storage.contains(&full), "full derivative must be deleted");
     assert!(!storage.contains(&thumb), "thumbnail must be deleted");
-    let _ = tx;
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = 'photo-reject'")
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    cleanup_user_contributions("photo-reject-up@example.com").await;
-    cleanup_user_contributions("photo-reject-mod@example.com").await;
 }
 
 #[db_test]
 async fn moderation_queue_hides_uploader_identity(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
     let loc = fixture_location(tx, "photo-ident", "Photo Identity").await;
     const EMAIL: &str = "photo-ident-up@example.com";
     let uploader = verified_cookie(&app, &email, EMAIL).await;
@@ -2843,7 +4110,7 @@ async fn moderation_queue_hides_uploader_identity(tx: &mut bikesnest_test_suppor
     )
     .await;
 
-    let mod_cookie = moderator_cookie(&app, &email, "photo-ident-mod@example.com").await;
+    let mod_cookie = moderator_cookie(&db, &app, &email, "photo-ident-mod@example.com").await;
     let (s, queue) = get_c(&app, "/moderation/photos", Some(&mod_cookie)).await;
     assert_eq!(s, StatusCode::OK);
     // "Contributor #id" is shown; the uploader's email / OAuth subject is not.
@@ -2853,18 +4120,12 @@ async fn moderation_queue_hides_uploader_identity(tx: &mut bikesnest_test_suppor
     );
     assert!(!queue.contains(EMAIL), "uploader email never rendered");
     assert!(!queue.contains("sub-oauth"), "OAuth subject never rendered");
-    let _ = tx;
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = 'photo-ident'")
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    cleanup_user_contributions(EMAIL).await;
-    cleanup_user_contributions("photo-ident-mod@example.com").await;
 }
 
 #[db_test]
 async fn served_derivative_has_no_exif(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email, storage) = auth_app_with_storage().await;
+    let db = tx.db().await;
+    let (app, email, storage) = auth_app_with_storage(tx).await;
     let loc = fixture_location(tx, "photo-exif", "Photo Exif").await;
     let uploader = verified_cookie(&app, &email, "photo-exif-up@example.com").await;
     let (_, page) = get_c(&app, &format!("/parking/{loc}"), Some(&uploader)).await;
@@ -2880,12 +4141,12 @@ async fn served_derivative_has_no_exif(tx: &mut bikesnest_test_support::TestTx) 
     .await;
     let (id,): (i64,) = sqlx::query_as("SELECT id FROM parking_photo WHERE location_id = $1")
         .bind(loc)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
 
     // Approve so it is served.
-    let mod_cookie = moderator_cookie(&app, &email, "photo-exif-mod@example.com").await;
+    let mod_cookie = moderator_cookie(&db, &app, &email, "photo-exif-mod@example.com").await;
     let (_, queue) = get_c(&app, "/moderation/photos", Some(&mod_cookie)).await;
     let mcs = extract_csrf(&queue);
     post_form(
@@ -2917,18 +4178,11 @@ async fn served_derivative_has_no_exif(tx: &mut bikesnest_test_support::TestTx) 
         !has_exif_marker(&bytes),
         "served derivative has no EXIF/APP1"
     );
-    let _ = tx;
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = 'photo-exif'")
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    cleanup_user_contributions("photo-exif-up@example.com").await;
-    cleanup_user_contributions("photo-exif-mod@example.com").await;
 }
 
 #[db_test]
 async fn photo_upload_is_rate_limited(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
+    let (app, email) = auth_app(tx).await;
     let loc = fixture_location(tx, "photo-rl", "Photo Rate Limit").await;
     let cookie = verified_cookie(&app, &email, "photo-rl-up@example.com").await;
     let (_, page) = get_c(&app, &format!("/parking/{loc}"), Some(&cookie)).await;
@@ -2960,20 +4214,14 @@ async fn photo_upload_is_rate_limited(tx: &mut bikesnest_test_support::TestTx) {
         StatusCode::TOO_MANY_REQUESTS,
         "11th same-day upload rate-limited"
     );
-    let _ = tx;
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = 'photo-rl'")
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    cleanup_user_contributions("photo-rl-up@example.com").await;
 }
 
 async fn admin_cookie(
+    db: &Db,
     app: &axum::Router,
     email: &bikesnest_infrastructure::FakeEmailProvider,
     addr: &str,
 ) -> String {
-    cleanup_user_contributions(addr).await;
     post_form(
         app,
         "/register",
@@ -2987,16 +4235,14 @@ async fn admin_cookie(
     get_c(app, &format!("/verify-email?token={token}"), None).await;
     let (uid,): (i64,) = sqlx::query_as("SELECT id FROM users WHERE email = $1")
         .bind(addr)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
-    // See the note in `hold_admin_set_lock_for_process`: the ADMIN set is
-    // shared with the tests that assert on "never zero admins".
-    bikesnest_test_support::hold_admin_set_lock_for_process(&pool().await).await;
+
     sqlx::query(
         "INSERT INTO user_roles (user_id, role, granted_by) VALUES ($1, 'ADMIN', NULL) ON CONFLICT DO NOTHING",
     )
-    .bind(uid).execute(&pool().await).await.unwrap();
+    .bind(uid).execute(&mut *db.acquire().await.unwrap()).await.unwrap();
     let (_, _, cookie) = post_form(
         app,
         "/login",
@@ -3009,8 +4255,9 @@ async fn admin_cookie(
 
 #[db_test]
 async fn admin_can_access_moderation_queue(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
-    let admin = admin_cookie(&app, &email, "photo-admin@example.com").await;
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
+    let admin = admin_cookie(&db, &app, &email, "photo-admin@example.com").await;
     let (s, body) = get_c(&app, "/moderation/photos", Some(&admin)).await;
     assert_eq!(
         s,
@@ -3018,8 +4265,6 @@ async fn admin_can_access_moderation_queue(tx: &mut bikesnest_test_support::Test
         "admin (without Moderator role) can open the queue"
     );
     assert!(body.contains("Photo moderation"), "queue page renders");
-    let _ = tx;
-    cleanup_user_contributions("photo-admin@example.com").await;
 }
 
 /// the dashboard renders four numeric count tiles wired to
@@ -3033,8 +4278,9 @@ async fn admin_can_access_moderation_queue(tx: &mut bikesnest_test_support::Test
 /// reads on one isolated connection instead.
 #[db_test]
 async fn moderation_dashboard_renders_four_numeric_tiles(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
-    let moderator = moderator_cookie(&app, &email, "dash-tiles-mod@example.com").await;
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
+    let moderator = moderator_cookie(&db, &app, &email, "dash-tiles-mod@example.com").await;
 
     let (status, body) = get_c(&app, "/moderation", Some(&moderator)).await;
     assert_eq!(status, StatusCode::OK);
@@ -3060,9 +4306,6 @@ async fn moderation_dashboard_renders_four_numeric_tiles(tx: &mut bikesnest_test
         tiles.iter().all(|&n| n >= 0),
         "every count tile is non-negative: {tiles:?}"
     );
-
-    let _ = tx;
-    cleanup_user_contributions("dash-tiles-mod@example.com").await;
 }
 
 /// a full page (== the limit) renders the "load more" keyset-pagination
@@ -3071,13 +4314,14 @@ async fn moderation_dashboard_renders_four_numeric_tiles(tx: &mut bikesnest_test
 async fn moderation_reports_queue_shows_load_more_when_full(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
-    let (app, email) = auth_app().await;
-    let moderator = moderator_cookie(&app, &email, "reports-more-mod@example.com").await;
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
+    let moderator = moderator_cookie(&db, &app, &email, "reports-more-mod@example.com").await;
     const REPORTER: &str = "reports-more-reporter@example.com";
     let _ = verified_cookie(&app, &email, REPORTER).await;
     let (uid,): (i64,) = sqlx::query_as("SELECT id FROM users WHERE email = $1")
         .bind(REPORTER)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
 
@@ -3091,7 +4335,7 @@ async fn moderation_reports_queue_shows_load_more_when_full(
         )
         .bind(uid)
         .bind(target_id)
-        .execute(&pool().await)
+        .execute(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     }
@@ -3106,20 +4350,11 @@ async fn moderation_reports_queue_shows_load_more_when_full(
         body.contains("after_id="),
         "the load-more link carries a keyset cursor"
     );
-
-    let _ = tx;
-    sqlx::query("DELETE FROM report WHERE reporter_id = $1")
-        .bind(uid)
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    cleanup_user_contributions("reports-more-mod@example.com").await;
-    cleanup_user_contributions(REPORTER).await;
 }
 
 #[db_test]
 async fn photo_upload_alt_too_long_is_bad_request(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
+    let (app, email) = auth_app(tx).await;
     let loc = fixture_location(tx, "photo-alt-long", "Photo Alt Long").await;
     let cookie = verified_cookie(&app, &email, "photo-alt-long-up@example.com").await;
     let (_, page) = get_c(&app, &format!("/parking/{loc}"), Some(&cookie)).await;
@@ -3139,21 +4374,15 @@ async fn photo_upload_alt_too_long_is_bad_request(tx: &mut bikesnest_test_suppor
         StatusCode::BAD_REQUEST,
         "over-long caption rejected as 400"
     );
-    let _ = tx;
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = 'photo-alt-long'")
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    cleanup_user_contributions("photo-alt-long-up@example.com").await;
 }
 
 // ---------------------------------------------------------------------------
 // moderation & reporting — end-to-end (report → claim → resolve → hide;
 // invalidate/restore parking; suspend/restore; audit viewer gating; the
-// self-resolve guard; D3 multipart review-photo attach).
+// self-resolve guard; multipart review-photo attach).
 // ---------------------------------------------------------------------------
 
-async fn last_report_id(reporter_email: &str, target_type: &str, target_id: i64) -> i64 {
+async fn last_report_id(db: &Db, reporter_email: &str, target_type: &str, target_id: i64) -> i64 {
     let (id,): (i64,) = sqlx::query_as(
         "SELECT id FROM report WHERE reporter_id = (SELECT id FROM users WHERE email = $1) \
          AND target_type = $2 AND target_id = $3 ORDER BY id DESC LIMIT 1",
@@ -3161,7 +4390,7 @@ async fn last_report_id(reporter_email: &str, target_type: &str, target_id: i64)
     .bind(reporter_email)
     .bind(target_type)
     .bind(target_id)
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     id
@@ -3171,13 +4400,14 @@ async fn last_report_id(reporter_email: &str, target_type: &str, target_id: i64)
 async fn report_review_flow_claim_resolve_hides_and_audits(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
-    let (app, email) = auth_app().await;
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
     const UPLOADER: &str = "m5-up@example.com";
     const REPORTER: &str = "m5-reporter@example.com";
     const MOD: &str = "m5-mod@example.com";
-    let loc = fixture_location(tx, "m5-report-loc", "M5 Report Loc").await;
+    let loc = fixture_location(tx, "m5-report-loc", "Reported Review Location").await;
 
-    // Uploader (verified) writes a review (D3 multipart).
+    // Uploader (verified) writes a multipart review.
     let uploader = verified_cookie(&app, &email, UPLOADER).await;
     let (_, rev_form) = get_c(&app, &format!("/parking/{loc}/review"), Some(&uploader)).await;
     let rcsrf = extract_csrf(&rev_form);
@@ -3194,7 +4424,7 @@ async fn report_review_flow_claim_resolve_hides_and_audits(
     let (review_id,): (i64,) =
         sqlx::query_as("SELECT id FROM review WHERE location_id = $1 ORDER BY id DESC LIMIT 1")
             .bind(loc)
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
 
@@ -3216,11 +4446,11 @@ async fn report_review_flow_claim_resolve_hides_and_audits(
     )
     .await;
     assert_eq!(s, StatusCode::OK, "report submitted: {s}");
-    let report_id = last_report_id(REPORTER, "review", review_id).await;
+    let report_id = last_report_id(&db, REPORTER, "review", review_id).await;
 
     let (state,): (String,) = sqlx::query_as("SELECT state FROM report WHERE id = $1")
         .bind(report_id)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     assert_eq!(state, "OPEN");
@@ -3228,13 +4458,13 @@ async fn report_review_flow_claim_resolve_hides_and_audits(
         "SELECT count(*) FROM audit_events WHERE action = 'report.created' AND target_id = $1",
     )
     .bind(report_id.to_string())
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     assert_eq!(created_audits, 1);
 
     // Moderator claims then resolves (hides the review).
-    let mod_cookie = moderator_cookie(&app, &email, MOD).await;
+    let mod_cookie = moderator_cookie(&db, &app, &email, MOD).await;
     let (_, mod_page) = get_c(&app, "/moderation/reports?state=OPEN", Some(&mod_cookie)).await;
     let mcsrf = extract_csrf(&mod_page);
     let (s, _, _) = post_form_hx(
@@ -3256,18 +4486,18 @@ async fn report_review_flow_claim_resolve_hides_and_audits(
 
     let (state,): (String,) = sqlx::query_as("SELECT state FROM report WHERE id = $1")
         .bind(report_id)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     assert_eq!(state, "RESOLVED");
     let (rstate,): (String,) = sqlx::query_as("SELECT moderation_state FROM review WHERE id = $1")
         .bind(review_id)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     assert_eq!(rstate, "HIDDEN", "resolved report hides the review");
 
-    // The hidden review disappears from public P3.
+    // The hidden review disappears from the public details page.
     let (_, pub_page) = get_c(&app, &format!("/parking/{loc}"), None).await;
     assert!(
         !pub_page.contains("Great secured rack"),
@@ -3279,7 +4509,7 @@ async fn report_review_flow_claim_resolve_hides_and_audits(
         "SELECT count(*) FROM audit_events WHERE action = 'report.claimed' AND target_id = $1",
     )
     .bind(report_id.to_string())
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     assert_eq!(claimed, 1);
@@ -3287,27 +4517,19 @@ async fn report_review_flow_claim_resolve_hides_and_audits(
         "SELECT count(*) FROM audit_events WHERE action = 'report.resolved' AND target_id = $1",
     )
     .bind(report_id.to_string())
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     assert_eq!(resolved, 1);
-
-    let _ = tx;
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = 'm5-report-loc'")
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    cleanup_user_contributions(UPLOADER).await;
-    cleanup_user_contributions(REPORTER).await;
-    cleanup_user_contributions(MOD).await;
 }
 
 #[db_test]
 async fn moderator_cannot_resolve_own_report(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
     const MOD: &str = "m5-selfmod@example.com";
-    let loc = fixture_location(tx, "m5-self-loc", "M5 Self Loc").await;
-    let mod_cookie = moderator_cookie(&app, &email, MOD).await;
+    let loc = fixture_location(tx, "m5-self-loc", "Self Report Location").await;
+    let mod_cookie = moderator_cookie(&db, &app, &email, MOD).await;
     let (_, mod_page) = get_c(&app, &format!("/parking/{loc}"), Some(&mod_cookie)).await;
     let csrf = extract_csrf(&mod_page);
 
@@ -3325,7 +4547,7 @@ async fn moderator_cannot_resolve_own_report(tx: &mut bikesnest_test_support::Te
     )
     .await;
     assert_eq!(s, StatusCode::OK);
-    let report_id = last_report_id(MOD, "parking", loc).await;
+    let report_id = last_report_id(&db, MOD, "parking", loc).await;
 
     // Claim → allowed, but self-resolve → CONFLICT/self-resolve error.
     let (_, mod_page2) = get_c(&app, "/moderation/reports?state=OPEN", Some(&mod_cookie)).await;
@@ -3352,35 +4574,29 @@ async fn moderator_cannot_resolve_own_report(tx: &mut bikesnest_test_support::Te
 
     let (state,): (String,) = sqlx::query_as("SELECT state FROM report WHERE id = $1")
         .bind(report_id)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     assert_eq!(
         state, "UNDER_REVIEW",
         "report stays under review after rejected self-resolve"
     );
-
-    let _ = tx;
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = 'm5-self-loc'")
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    cleanup_user_contributions(MOD).await;
 }
 
 #[db_test]
 async fn invalidate_parking_public_404_moderator_banner_and_restore(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
-    let (app, email) = auth_app().await;
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
     const MOD: &str = "m5-inv-mod@example.com";
-    let loc = fixture_location(tx, "m5-inv-loc", "M5 Invalidate Loc").await;
+    let loc = fixture_location(tx, "m5-inv-loc", "Invalidated Location").await;
 
     // Public sees the active listing.
     let (s, _) = get_c(&app, &format!("/parking/{loc}"), None).await;
     assert_eq!(s, StatusCode::OK);
 
-    let mod_cookie = moderator_cookie(&app, &email, MOD).await;
+    let mod_cookie = moderator_cookie(&db, &app, &email, MOD).await;
     let (_, mod_page) = get_c(&app, "/moderation", Some(&mod_cookie)).await;
     let mcsrf = extract_csrf(&mod_page);
     let (s, _, _) = post_form_hx(
@@ -3392,7 +4608,7 @@ async fn invalidate_parking_public_404_moderator_banner_and_restore(
     .await;
     assert_eq!(s, StatusCode::OK, "invalidate: {s}");
 
-    // Public P3 now 404s; the moderator still sees it with a banner.
+    // Public details now 404; the moderator still sees them with a banner.
     let (s, _) = get_c(&app, &format!("/parking/{loc}"), None).await;
     assert_eq!(
         s,
@@ -3408,7 +4624,7 @@ async fn invalidate_parking_public_404_moderator_banner_and_restore(
 
     // Also absent from search (search filters ACTIVE).
     let (_, search) = get_c(&app, "/search?lat=-25.4284&lon=-49.2733&radius=2000", None).await;
-    assert!(!search.contains("M5 Invalidate Loc"));
+    assert!(!search.contains("Invalidated Location"));
 
     // Restore brings it back (grab a fresh CSRF from the dashboard).
     let (_, mod_page2) = get_c(&app, "/moderation", Some(&mod_cookie)).await;
@@ -3423,30 +4639,24 @@ async fn invalidate_parking_public_404_moderator_banner_and_restore(
     assert_eq!(s, StatusCode::OK, "restore: {s}");
     let (s, _) = get_c(&app, &format!("/parking/{loc}"), None).await;
     assert_eq!(s, StatusCode::OK, "public sees restored listing");
-
-    let _ = tx;
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = 'm5-inv-loc'")
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    cleanup_user_contributions(MOD).await;
 }
 
 #[db_test]
 async fn admin_suspend_revokes_sessions_blocks_and_restore(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
-    let (app, email) = auth_app().await;
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
     const USER: &str = "m5-suspend@example.com";
     const ADMIN: &str = "m5-admin@example.com";
     // A verified user with a live session.
     let user_cookie = verified_cookie(&app, &email, USER).await;
-    let admin_cookie = admin_cookie(&app, &email, ADMIN).await;
+    let admin_cookie = admin_cookie(&db, &app, &email, ADMIN).await;
     let (_, admin_page) = get_c(&app, "/admin/users", Some(&admin_cookie)).await;
     let acsrf = extract_csrf(&admin_page);
     let (uid,): (i64,) = sqlx::query_as("SELECT id FROM users WHERE email = $1")
         .bind(USER)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
 
@@ -3461,7 +4671,7 @@ async fn admin_suspend_revokes_sessions_blocks_and_restore(
     assert_eq!(s, StatusCode::SEE_OTHER, "suspend redirects: {s}");
     let (state,): (String,) = sqlx::query_as("SELECT account_state FROM users WHERE id = $1")
         .bind(uid)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     assert_eq!(state, "SUSPENDED");
@@ -3469,7 +4679,7 @@ async fn admin_suspend_revokes_sessions_blocks_and_restore(
         "SELECT count(*) FROM sessions WHERE user_id = $1 AND revoked_at IS NOT NULL",
     )
     .bind(uid)
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     assert!(revoked >= 1, "suspension revokes sessions");
@@ -3477,7 +4687,7 @@ async fn admin_suspend_revokes_sessions_blocks_and_restore(
         "SELECT count(*) FROM audit_events WHERE action = 'user.suspended' AND target_id = $1",
     )
     .bind(uid.to_string())
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     assert_eq!(audit, 1);
@@ -3524,15 +4734,12 @@ async fn admin_suspend_revokes_sessions_blocks_and_restore(
         new_cookie.as_deref().unwrap_or("").contains("session_id="),
         "restored user can log in"
     );
-
-    let _ = tx;
-    cleanup_user_contributions(USER).await;
-    cleanup_user_contributions(ADMIN).await;
 }
 
 #[db_test]
 async fn moderation_and_audit_routes_are_gated(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
     // Anonymous → redirected to login.
     for uri in [
         "/moderation",
@@ -3556,28 +4763,26 @@ async fn moderation_and_audit_routes_are_gated(tx: &mut bikesnest_test_support::
     let (s, _) = get_c(&app, "/admin/audit", Some(&cookie)).await;
     assert_eq!(s, StatusCode::FORBIDDEN, "audit viewer is admin-only");
     // A moderator (not admin) cannot open the audit viewer.
-    let mod_cookie = moderator_cookie(&app, &email, "m5-mod-gate@example.com").await;
+    let mod_cookie = moderator_cookie(&db, &app, &email, "m5-mod-gate@example.com").await;
     let (s, _) = get_c(&app, "/admin/audit", Some(&mod_cookie)).await;
     assert_eq!(
         s,
         StatusCode::FORBIDDEN,
         "moderator (not admin) cannot open audit viewer"
     );
-    let _ = tx;
-    cleanup_user_contributions("m5-nonmod@example.com").await;
-    cleanup_user_contributions("m5-mod-gate@example.com").await;
 }
 
 #[db_test]
-async fn d3_review_photos_held_pending_until_approved(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
+async fn review_photos_are_held_pending_until_approved(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
     const AUTHOR: &str = "m5-review-photo@example.com";
-    let loc = fixture_location(tx, "m5-rp-loc", "M5 Review Photo Loc").await;
+    let loc = fixture_location(tx, "m5-rp-loc", "Pending Review Photo Location").await;
     let cookie = verified_cookie(&app, &email, AUTHOR).await;
     let (_, form) = get_c(&app, &format!("/parking/{loc}/review"), Some(&cookie)).await;
     let csrf = extract_csrf(&form);
 
-    // D3 multipart review with an attached photo (rating + body + photo in one body).
+    // Multipart review with an attached photo (rating + body + photo in one body).
     let jpeg = tiny_jpeg();
     let mut body = Vec::new();
     body.extend_from_slice(
@@ -3600,12 +4805,12 @@ async fn d3_review_photos_held_pending_until_approved(tx: &mut bikesnest_test_su
     let (review_id,): (i64,) =
         sqlx::query_as("SELECT id FROM review WHERE location_id = $1 ORDER BY id DESC LIMIT 1")
             .bind(loc)
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
     let (rstate,): (String,) = sqlx::query_as("SELECT moderation_state FROM review WHERE id = $1")
         .bind(review_id)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     assert_eq!(rstate, "ACTIVE", "review text publishes immediately");
@@ -3614,30 +4819,24 @@ async fn d3_review_photos_held_pending_until_approved(tx: &mut bikesnest_test_su
     let (pstate,): (String,) =
         sqlx::query_as("SELECT moderation_state FROM review_photo WHERE review_id = $1")
             .bind(review_id)
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
     assert_eq!(pstate, "PENDING_REVIEW", "review photo held pending");
-
-    let _ = tx;
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = 'm5-rp-loc'")
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    cleanup_user_contributions(AUTHOR).await;
 }
 
 #[db_test]
-async fn approved_review_photo_renders_on_p3(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
+async fn approved_review_photo_renders_on_details(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
     const AUTHOR: &str = "m5-rp-render@example.com";
     const MOD: &str = "m5-rp-mod@example.com";
-    let loc = fixture_location(tx, "m5-rp-render-loc", "M5 Review Render Loc").await;
+    let loc = fixture_location(tx, "m5-rp-render-loc", "Approved Review Photo Location").await;
     let cookie = verified_cookie(&app, &email, AUTHOR).await;
     let (_, form) = get_c(&app, &format!("/parking/{loc}/review"), Some(&cookie)).await;
     let csrf = extract_csrf(&form);
 
-    // D3 multipart review with an attached (pending) photo.
+    // Multipart review with an attached (pending) photo.
     let jpeg = tiny_jpeg();
     let mut body = Vec::new();
     body.extend_from_slice(
@@ -3660,16 +4859,16 @@ async fn approved_review_photo_renders_on_p3(tx: &mut bikesnest_test_support::Te
     let (review_id,): (i64,) =
         sqlx::query_as("SELECT id FROM review WHERE location_id = $1 ORDER BY id DESC LIMIT 1")
             .bind(loc)
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
     let (rp_id,): (i64,) = sqlx::query_as("SELECT id FROM review_photo WHERE review_id = $1")
         .bind(review_id)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
 
-    // Pending → not yet rendered on the public P3.
+    // Pending → not yet rendered on the public details page.
     let (_, pub_page) = get_c(&app, &format!("/parking/{loc}"), None).await;
     assert!(
         !pub_page.contains(&format!("{MEDIA_ORIGIN}/uploads/")),
@@ -3677,7 +4876,7 @@ async fn approved_review_photo_renders_on_p3(tx: &mut bikesnest_test_support::Te
     );
 
     // Moderator approves it from the unified queue (kind=review).
-    let mod_cookie = moderator_cookie(&app, &email, MOD).await;
+    let mod_cookie = moderator_cookie(&db, &app, &email, MOD).await;
     let (_, mod_page) = get_c(&app, "/moderation/photos", Some(&mod_cookie)).await;
     let mcsrf = extract_csrf(&mod_page);
     let (s, _, _) = post_form_hx(
@@ -3689,20 +4888,12 @@ async fn approved_review_photo_renders_on_p3(tx: &mut bikesnest_test_support::Te
     .await;
     assert_eq!(s, StatusCode::OK);
 
-    // Now the approved review photo renders on P3.
+    // Now the approved review photo renders on the details page.
     let (_, pub_page) = get_c(&app, &format!("/parking/{loc}"), None).await;
     assert!(
         pub_page.contains(&format!("{MEDIA_ORIGIN}/uploads/")),
-        "approved review photo renders on P3"
+        "approved review photo renders on details"
     );
-
-    let _ = tx;
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = 'm5-rp-render-loc'")
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    cleanup_user_contributions(AUTHOR).await;
-    cleanup_user_contributions(MOD).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -3758,6 +4949,36 @@ fn base_layout_does_not_branch_on_csrf_presence() {
     assert!(
         contents.contains("layout.is_authenticated"),
         "base.html header should branch on layout.is_authenticated"
+    );
+}
+
+#[test]
+fn every_executable_template_script_uses_the_response_nonce() {
+    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates"));
+    let tag = regex::Regex::new(r"<script\b[^>]*>").unwrap();
+    let mut stack = vec![root.to_path_buf()];
+    let mut offenders = Vec::new();
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "html") {
+                let source = std::fs::read_to_string(&path).unwrap();
+                for script in tag.find_iter(&source).map(|found| found.as_str()) {
+                    if !script.contains("type=\"application/json\"")
+                        && !script.contains("nonce=\"{{ layout.csp_nonce }}\"")
+                    {
+                        offenders.push(format!("{}: {script}", path.display()));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "unnonced executable scripts:\n{}",
+        offenders.join("\n")
     );
 }
 
@@ -3951,8 +5172,8 @@ async fn post_form_xff(
 /// thing being exercised (no accounts are created) — the limit check runs
 /// before the address is parsed.
 #[db_test]
-async fn a_spoofed_forwarded_for_cannot_dodge_the_rate_limit(_tx: &mut TestTx) {
-    let (app, _email) = auth_app().await;
+async fn a_spoofed_forwarded_for_cannot_dodge_the_rate_limit(tx: &mut TestTx) {
+    let (app, _email) = auth_app(tx).await;
     const RATE_LIMITED: &str = "Too many attempts. Try again later.";
     const INVALID: &str = "That email is not valid.";
 
@@ -3991,8 +5212,8 @@ async fn a_spoofed_forwarded_for_cannot_dodge_the_rate_limit(_tx: &mut TestTx) {
 /// tests show the extractor actually reads the configured hop count rather than
 /// returning one constant.
 #[db_test]
-async fn a_trusted_proxys_forwarded_for_does_key_the_bucket(_tx: &mut TestTx) {
-    let db = Db::from_pool(pool().await);
+async fn a_trusted_proxys_forwarded_for_does_key_the_bucket(tx: &mut TestTx) {
+    let db = tx.db().await;
     let config = bikesnest_infrastructure::Config {
         trusted_proxy_hops: 1,
         ..test_config()
@@ -4006,6 +5227,7 @@ async fn a_trusted_proxys_forwarded_for_does_key_the_bucket(_tx: &mut TestTx) {
             hasher: TestPasswordHasher,
             rate_limiter: Box::new(bikesnest_infrastructure::InMemoryRateLimiter::new()),
             storage: std::sync::Arc::new(bikesnest_test_support::TestObjectStorage::new()),
+            detail_reads: None,
         },
     );
 
@@ -4035,12 +5257,13 @@ async fn a_trusted_proxys_forwarded_for_does_key_the_bucket(_tx: &mut TestTx) {
 async fn contribution_routes_refuse_a_location_that_is_not_active(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
-    let (app, email) = auth_app().await;
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
     const EMAIL: &str = "wp8-not-active@example.com";
     let cookie = verified_cookie(&app, &email, EMAIL).await;
     let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
     let csrf = extract_csrf(&form);
-    let id = add_location(&app, &cookie, &csrf, "WP8 Taken Down", &[]).await;
+    let id = add_location(&db, &app, &cookie, &csrf, "Taken Down", &[]).await;
 
     // A verification while the spot is still ACTIVE, so `last_verified_at` has
     // a value a later `still_exists` could reset.
@@ -4062,10 +5285,10 @@ async fn contribution_routes_refuse_a_location_that_is_not_active(
         sqlx::query("UPDATE parking_location SET moderation_state = $2 WHERE id = $1")
             .bind(id)
             .bind(state)
-            .execute(&pool().await)
+            .execute(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
-        let before = location_write_state(id).await;
+        let before = location_write_state(&db, id).await;
 
         // The edit form is gone, exactly as the public details page is.
         let (s, _) = get_c(&app, &format!("/parking/{id}/edit"), Some(&cookie)).await;
@@ -4137,7 +5360,7 @@ async fn contribution_routes_refuse_a_location_that_is_not_active(
 
         // Nothing moved: version, freshness, revisions, reviews, verifications.
         assert_eq!(
-            location_write_state(id).await,
+            location_write_state(&db, id).await,
             before,
             "{state}: no write landed"
         );
@@ -4152,14 +5375,12 @@ async fn contribution_routes_refuse_a_location_that_is_not_active(
         .await;
         assert_eq!(s, StatusCode::OK, "{state}: favorites keep working");
     }
-
-    let _ = tx;
-    cleanup_user_contributions(EMAIL).await;
 }
 
 /// (version, last_verified_at, revision count, review count, verification count)
 /// — everything a refused contribution must leave untouched.
 async fn location_write_state(
+    db: &Db,
     id: i64,
 ) -> (i64, Option<chrono::DateTime<chrono::Utc>>, i64, i64, i64) {
     sqlx::query_as(
@@ -4173,7 +5394,7 @@ async fn location_write_state(
         "#,
     )
     .bind(id)
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap()
 }
@@ -4181,12 +5402,13 @@ async fn location_write_state(
 /// A second identical report is not a new signal — it is the same complaint.
 #[db_test]
 async fn duplicate_report_is_refused_with_a_conflict(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
     const EMAIL: &str = "wp8-dupe-reporter@example.com";
     let cookie = verified_cookie(&app, &email, EMAIL).await;
     let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
     let csrf = extract_csrf(&form);
-    let id = add_location(&app, &cookie, &csrf, "WP8 Report Target", &[]).await;
+    let id = add_location(&db, &app, &cookie, &csrf, "Report Target", &[]).await;
 
     let fields = [
         ("csrf", csrf.as_str()),
@@ -4209,18 +5431,10 @@ async fn duplicate_report_is_refused_with_a_conflict(tx: &mut bikesnest_test_sup
         "SELECT count(*) FROM report WHERE target_type = 'parking' AND target_id = $1",
     )
     .bind(id)
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     assert_eq!(open, 1, "only one report row exists");
-
-    let _ = tx;
-    sqlx::query("DELETE FROM report WHERE target_type = 'parking' AND target_id = $1")
-        .bind(id)
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    cleanup_user_contributions(EMAIL).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -4289,8 +5503,8 @@ fn vary_of(headers: &HeaderMap) -> String {
 // --- /search: fragment only for a real fragment request --------------------
 
 #[db_test]
-async fn search_answers_a_fragment_request_with_the_results_list(_tx: &mut TestTx) {
-    let app = test_app().await;
+async fn search_answers_a_fragment_request_with_the_results_list(tx: &mut TestTx) {
+    let app = test_app(tx).await;
     let (s, head, body) = request_h(&app, "GET", "/search?q=x", None, HX_FRAGMENT).await;
     assert_eq!(s, StatusCode::OK);
     assert!(!is_document(&body), "fragment must not be a whole page");
@@ -4301,10 +5515,10 @@ async fn search_answers_a_fragment_request_with_the_results_list(_tx: &mut TestT
 }
 
 #[db_test]
-async fn search_answers_a_history_restore_with_a_whole_document(_tx: &mut TestTx) {
+async fn search_answers_a_history_restore_with_a_whole_document(tx: &mut TestTx) {
     // `#restoreHistory` replays the page targeting `document.body`, so a
     // fragment here would *become* the document.
-    let app = test_app().await;
+    let app = test_app(tx).await;
     let (s, _, body) = request_h(
         &app,
         "GET",
@@ -4324,8 +5538,8 @@ async fn search_answers_a_history_restore_with_a_whole_document(_tx: &mut TestTx
 }
 
 #[db_test]
-async fn search_answers_a_boosted_request_with_a_whole_document(_tx: &mut TestTx) {
-    let app = test_app().await;
+async fn search_answers_a_boosted_request_with_a_whole_document(tx: &mut TestTx) {
+    let app = test_app(tx).await;
     let (s, _, body) = request_h(
         &app,
         "GET",
@@ -4343,8 +5557,8 @@ async fn search_answers_a_boosted_request_with_a_whole_document(_tx: &mut TestTx
 }
 
 #[db_test]
-async fn search_without_htmx_headers_is_the_full_page(_tx: &mut TestTx) {
-    let (s, body) = get("/search?q=x").await;
+async fn search_without_htmx_headers_is_the_full_page(tx: &mut TestTx) {
+    let (s, body) = get(tx, "/search?q=x").await;
     assert_eq!(s, StatusCode::OK);
     assert!(is_document(&body));
 }
@@ -4352,25 +5566,26 @@ async fn search_without_htmx_headers_is_the_full_page(_tx: &mut TestTx) {
 // --- Vary on ordinary HTML pages -------------------------------------------
 
 #[db_test]
-async fn html_pages_vary_by_locale_and_session(_tx: &mut TestTx) {
-    let headers = get_headers("/").await;
+async fn html_pages_vary_by_locale_and_session(tx: &mut TestTx) {
+    let headers = get_headers(tx, "/").await;
     let vary = vary_of(&headers);
     assert!(vary.contains("accept-language"), "vary: {vary}");
     assert!(vary.contains("cookie"), "vary: {vary}");
 }
 
-// --- P3 fragment endpoints: partial for htmx, 303 for everyone else --------
+// --- Details fragment endpoints: partial for htmx, 303 otherwise -----------
 
 #[db_test]
-async fn p3_fragment_endpoints_redirect_a_whole_document_request(
+async fn details_fragment_endpoints_redirect_a_whole_document_request(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
-    let (app, email) = auth_app().await;
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
     const EMAIL: &str = "wp10-p3@example.com";
     let cookie = verified_cookie(&app, &email, EMAIL).await;
     let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
     let csrf = extract_csrf(&form);
-    let id = add_location(&app, &cookie, &csrf, "WP10 P3 Target", &[]).await;
+    let id = add_location(&db, &app, &cookie, &csrf, "Proposal Target", &[]).await;
 
     // favorite — the success response *is* the button.
     let (s, body, _) = post_form_hx(
@@ -4458,26 +5673,19 @@ async fn p3_fragment_endpoints_redirect_a_whole_document_request(
     )
     .await;
     let _ = body;
-
-    let _ = tx;
-    sqlx::query("DELETE FROM report WHERE target_type = 'parking' AND target_id = $1")
-        .bind(id)
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    cleanup_user_contributions(EMAIL).await;
 }
 
 #[db_test]
-async fn p3_fragment_endpoints_send_a_no_js_caller_to_the_page(
+async fn details_fragment_endpoints_send_a_no_js_caller_to_the_page(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
-    let (app, email) = auth_app().await;
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
     const EMAIL: &str = "wp10-p3-loc@example.com";
     let cookie = verified_cookie(&app, &email, EMAIL).await;
     let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
     let csrf = extract_csrf(&form);
-    let id = add_location(&app, &cookie, &csrf, "WP10 Redirect Target", &[]).await;
+    let id = add_location(&db, &app, &cookie, &csrf, "Redirect Target", &[]).await;
 
     // Every redirect target is the page that now shows the new state.
     for (uri, fields, want) in [
@@ -4532,9 +5740,6 @@ async fn p3_fragment_endpoints_send_a_no_js_caller_to_the_page(
         };
         assert_eq!(location_of(&head), want, "{uri} lands on the page");
     }
-
-    let _ = tx;
-    cleanup_user_contributions(EMAIL).await;
 }
 
 // --- Moderation fragment endpoints -----------------------------------------
@@ -4543,10 +5748,11 @@ async fn p3_fragment_endpoints_send_a_no_js_caller_to_the_page(
 async fn moderation_fragment_endpoints_redirect_to_their_queue(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
-    let (app, email) = auth_app().await;
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
     const UPLOADER: &str = "wp10-uploader@example.com";
     const MOD: &str = "wp10-mod@example.com";
-    let loc = fixture_location(tx, "wp10-mod-queue", "WP10 Moderation Queue").await;
+    let loc = fixture_location(tx, "moderation-queue", "Moderation Queue").await;
 
     let uploader = verified_cookie(&app, &email, UPLOADER).await;
     let (_, page) = get_c(&app, &format!("/parking/{loc}"), Some(&uploader)).await;
@@ -4564,11 +5770,11 @@ async fn moderation_fragment_endpoints_redirect_to_their_queue(
         "SELECT id FROM parking_photo WHERE location_id = $1 ORDER BY id DESC LIMIT 1",
     )
     .bind(loc)
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
 
-    let mod_cookie = moderator_cookie(&app, &email, MOD).await;
+    let mod_cookie = moderator_cookie(&db, &app, &email, MOD).await;
     let (_, queue) = get_c(&app, "/moderation/photos", Some(&mod_cookie)).await;
     let mcsrf = extract_csrf(&queue);
 
@@ -4634,7 +5840,7 @@ async fn moderation_fragment_endpoints_redirect_to_their_queue(
     .await;
     assert_eq!(s, StatusCode::SEE_OTHER, "no-JS report redirects");
     assert_eq!(location_of(&head), format!("/parking/{loc}?reported=1"));
-    let report_id = last_report_id("wp10-reporter@example.com", "parking", loc).await;
+    let report_id = last_report_id(&db, "wp10-reporter@example.com", "parking", loc).await;
 
     let (s, head, _) = post_form_raw(
         &app,
@@ -4655,15 +5861,6 @@ async fn moderation_fragment_endpoints_redirect_to_their_queue(
     .await;
     assert_eq!(s, StatusCode::SEE_OTHER, "no-JS dismiss redirects");
     assert_eq!(location_of(&head), "/moderation/reports?done=dismissed");
-
-    sqlx::query("DELETE FROM report WHERE id = $1")
-        .bind(report_id)
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    cleanup_user_contributions(UPLOADER).await;
-    cleanup_user_contributions(MOD).await;
-    cleanup_user_contributions("wp10-reporter@example.com").await;
 }
 
 /// A urlencoded POST that returns the raw response headers (for `Location`).
@@ -4701,10 +5898,10 @@ async fn post_form_raw(
 // --- Session expiry on a fragment POST -------------------------------------
 
 #[db_test]
-async fn anonymous_fragment_post_gets_401_and_hx_redirect(_tx: &mut TestTx) {
+async fn anonymous_fragment_post_gets_401_and_hx_redirect(tx: &mut TestTx) {
     // htmx follows a 302/303 transparently and would swap the whole login page
     // into `#favorite-button`, so the gate answers with `HX-Redirect` instead.
-    let (app, _) = auth_app().await;
+    let (app, _) = auth_app(tx).await;
     let (cookie_line, token) = anon_csrf(&app, "/login").await.expect("anon csrf pair");
     let res = app
         .clone()
@@ -4736,9 +5933,9 @@ async fn anonymous_fragment_post_gets_401_and_hx_redirect(_tx: &mut TestTx) {
 }
 
 #[db_test]
-async fn anonymous_plain_post_redirects_to_login_with_next(_tx: &mut TestTx) {
+async fn anonymous_plain_post_redirects_to_login_with_next(tx: &mut TestTx) {
     // The POST path is an action, not a page: `next` is the page it came from.
-    let (app, _) = auth_app().await;
+    let (app, _) = auth_app(tx).await;
     let (cookie_line, token) = anon_csrf(&app, "/login").await.expect("anon csrf pair");
     let res = app
         .clone()
@@ -4759,8 +5956,8 @@ async fn anonymous_plain_post_redirects_to_login_with_next(_tx: &mut TestTx) {
 }
 
 #[db_test]
-async fn anonymous_page_request_carries_its_own_path_as_next(_tx: &mut TestTx) {
-    let (app, _) = auth_app().await;
+async fn anonymous_page_request_carries_its_own_path_as_next(tx: &mut TestTx) {
+    let (app, _) = auth_app(tx).await;
     let (s, head, _) = request_h(&app, "GET", "/account/favorites", None, &[]).await;
     assert_eq!(s, StatusCode::SEE_OTHER);
     assert_eq!(location_of(&head), "/login?next=/account/favorites");
@@ -4770,7 +5967,7 @@ async fn anonymous_page_request_carries_its_own_path_as_next(_tx: &mut TestTx) {
 
 #[db_test]
 async fn login_honours_a_local_next(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
+    let (app, email) = auth_app(tx).await;
     const EMAIL: &str = "wp10-next@example.com";
     let _ = verified_cookie(&app, &email, EMAIL).await;
 
@@ -4799,14 +5996,11 @@ async fn login_honours_a_local_next(tx: &mut bikesnest_test_support::TestTx) {
         (res.status(), res.headers().clone(), ())
     };
     assert_eq!(location_of(&head), "/parking/7?x=1");
-
-    let _ = tx;
-    cleanup_user_contributions(EMAIL).await;
 }
 
 #[db_test]
 async fn login_refuses_an_off_site_next(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
+    let (app, email) = auth_app(tx).await;
     const EMAIL: &str = "wp10-next-evil@example.com";
     let _ = verified_cookie(&app, &email, EMAIL).await;
 
@@ -4843,14 +6037,11 @@ async fn login_refuses_an_off_site_next(tx: &mut bikesnest_test_support::TestTx)
             "`next={evil}` must not leave the origin"
         );
     }
-
-    let _ = tx;
-    cleanup_user_contributions(EMAIL).await;
 }
 
 #[db_test]
-async fn login_page_renders_a_valid_next_as_a_hidden_field(_tx: &mut TestTx) {
-    let (app, _) = auth_app().await;
+async fn login_page_renders_a_valid_next_as_a_hidden_field(tx: &mut TestTx) {
+    let (app, _) = auth_app(tx).await;
     let (_, page) = get_c(&app, "/login?next=%2Fparking%2F7", None).await;
     assert!(
         page.contains(r#"name="next" value="/parking/7""#),
@@ -4863,10 +6054,10 @@ async fn login_page_renders_a_valid_next_as_a_hidden_field(_tx: &mut TestTx) {
 // --- CSRF: safe methods, token sources, multipart ---------------------------
 
 #[db_test]
-async fn head_requests_are_safe_and_not_csrf_checked(_tx: &mut TestTx) {
+async fn head_requests_are_safe_and_not_csrf_checked(tx: &mut TestTx) {
     // axum answers HEAD with the GET route; the middleware used to treat it as
     // state-changing and 403 every HEAD.
-    let (app, _) = auth_app().await;
+    let (app, _) = auth_app(tx).await;
     let (s, _, _) = request_h(&app, "HEAD", "/login", None, &[]).await;
     assert_eq!(s, StatusCode::OK, "HEAD /login");
     let (s, _, _) = request_h(&app, "HEAD", "/", None, &[]).await;
@@ -4879,9 +6070,9 @@ async fn multipart_review_accepts_the_token_from_the_query(
 ) {
     // The middleware must not drain a multipart body (the handler's `Multipart`
     // extractor needs it), so the form carries the token on its action.
-    let (app, email) = auth_app().await;
+    let (app, email) = auth_app(tx).await;
     const EMAIL: &str = "wp10-review-csrf@example.com";
-    let loc = fixture_location(tx, "wp10-review-csrf", "WP10 Review CSRF").await;
+    let loc = fixture_location(tx, "review-csrf", "Review CSRF").await;
     let cookie = verified_cookie(&app, &email, EMAIL).await;
     let (_, form) = get_c(&app, &format!("/parking/{loc}/review"), Some(&cookie)).await;
     let csrf = extract_csrf(&form);
@@ -4895,17 +6086,15 @@ async fn multipart_review_accepts_the_token_from_the_query(
     )
     .await;
     assert_eq!(s, StatusCode::SEE_OTHER, "review accepted via ?csrf=");
-
-    cleanup_user_contributions(EMAIL).await;
 }
 
 #[db_test]
 async fn multipart_review_without_any_token_is_the_styled_error_page(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
-    let (app, email) = auth_app().await;
+    let (app, email) = auth_app(tx).await;
     const EMAIL: &str = "wp10-review-nocsrf@example.com";
-    let loc = fixture_location(tx, "wp10-review-nocsrf", "WP10 Review NoCSRF").await;
+    let loc = fixture_location(tx, "review-nocsrf", "Review No CSRF").await;
     let cookie = verified_cookie(&app, &email, EMAIL).await;
 
     let (s, body) = post_multipart(
@@ -4920,8 +6109,6 @@ async fn multipart_review_without_any_token_is_the_styled_error_page(
     assert!(is_document(&body), "styled page, not a bare string: {body}");
     assert!(!body.trim().eq("Forbidden"), "not the raw literal");
     assert!(body.contains("403"), "the status is on the page");
-
-    cleanup_user_contributions(EMAIL).await;
 }
 
 #[db_test]
@@ -4930,9 +6117,9 @@ async fn an_axum_rejection_is_rendered_as_the_styled_error_page(
 ) {
     // A urlencoded body to a multipart endpoint: axum's `Multipart` rejects it
     // with plain English text, which used to reach the user verbatim.
-    let (app, email) = auth_app().await;
+    let (app, email) = auth_app(tx).await;
     const EMAIL: &str = "wp10-rejection@example.com";
-    let loc = fixture_location(tx, "wp10-rejection", "WP10 Rejection").await;
+    let loc = fixture_location(tx, "multipart-rejection", "Multipart Rejection").await;
     let cookie = verified_cookie(&app, &email, EMAIL).await;
     let (_, form) = get_c(&app, &format!("/parking/{loc}/review"), Some(&cookie)).await;
     let csrf = extract_csrf(&form);
@@ -4963,14 +6150,12 @@ async fn an_axum_rejection_is_rendered_as_the_styled_error_page(
     assert!(status.is_client_error(), "status: {status}");
     assert!(ctype.starts_with("text/html"), "content-type: {ctype}");
     assert!(is_document(&body), "styled page: {body}");
-
-    cleanup_user_contributions(EMAIL).await;
 }
 
 #[db_test]
-async fn plain_text_endpoints_keep_their_plain_bodies(_tx: &mut TestTx) {
+async fn plain_text_endpoints_keep_their_plain_bodies(tx: &mut TestTx) {
     // The styled-error fallback must not touch the probes.
-    let (s, body) = get("/healthz").await;
+    let (s, body) = get(tx, "/healthz").await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body.trim(), "ok");
 }
@@ -5175,10 +6360,10 @@ fn the_report_modal_targets_a_container_inside_itself() {
 // --- Error pages honour the request shape too -------------------------------
 
 #[db_test]
-async fn a_404_for_a_fragment_request_is_a_fragment(_tx: &mut TestTx) {
+async fn a_404_for_a_fragment_request_is_a_fragment(tx: &mut TestTx) {
     // A stale htmx control polling a route that no longer exists must not get a
     // whole document swapped into its target.
-    let app = test_app().await;
+    let app = test_app(tx).await;
     let (s, head, body) = request_h(&app, "GET", "/nonexistent", None, HX_FRAGMENT).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
     assert!(body.contains(r#"role="alert""#), "fragment_error: {body}");
@@ -5188,18 +6373,18 @@ async fn a_404_for_a_fragment_request_is_a_fragment(_tx: &mut TestTx) {
 }
 
 #[db_test]
-async fn a_404_for_a_whole_document_request_is_the_styled_page(_tx: &mut TestTx) {
-    let (s, body) = get("/nonexistent").await;
+async fn a_404_for_a_whole_document_request_is_the_styled_page(tx: &mut TestTx) {
+    let (s, body) = get(tx, "/nonexistent").await;
     assert_eq!(s, StatusCode::NOT_FOUND);
     assert!(is_document(&body), "styled error page: {body}");
     assert!(body.contains("404"), "the status is on the page");
 }
 
 #[db_test]
-async fn a_404_for_a_boosted_request_is_the_styled_page(_tx: &mut TestTx) {
+async fn a_404_for_a_boosted_request_is_the_styled_page(tx: &mut TestTx) {
     // A boosted link swaps <body>, so it needs the whole document even though
     // it carries `HX-Request: true`.
-    let app = test_app().await;
+    let app = test_app(tx).await;
     let (s, _, body) = request_h(
         &app,
         "GET",
@@ -5221,21 +6406,20 @@ async fn a_missing_parking_page_answers_in_the_requests_shape(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
     // `parking_details` used to emit a whole document for every caller.
-    let app = test_app().await;
+    let app = test_app(tx).await;
     let (s, _, body) = request_h(&app, "GET", "/parking/0", None, HX_FRAGMENT).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
     assert!(body.contains(r#"role="alert""#), "fragment_error: {body}");
     assert!(!body.contains("<html"), "must not be a document: {body}");
 
-    let (s, body) = get("/parking/0").await;
+    let (s, body) = get(tx, "/parking/0").await;
     assert_eq!(s, StatusCode::NOT_FOUND);
     assert!(is_document(&body), "styled error page: {body}");
-    let _ = tx;
 }
 
 #[db_test]
-async fn the_anonymous_htmx_401_carries_exactly_one_vary(_tx: &mut TestTx) {
-    let (app, _) = auth_app().await;
+async fn the_anonymous_htmx_401_carries_exactly_one_vary(tx: &mut TestTx) {
+    let (app, _) = auth_app(tx).await;
     let (cookie_line, token) = anon_csrf(&app, "/login").await.expect("anon csrf pair");
     let res = app
         .clone()
@@ -5287,8 +6471,8 @@ async fn the_anonymous_htmx_401_carries_exactly_one_vary(_tx: &mut TestTx) {
 // ---------------------------------------------------------------------------
 
 #[db_test]
-async fn anonymous_login_page_header_has_no_signed_in_links(_tx: &mut TestTx) {
-    let (status, body) = get("/login").await;
+async fn anonymous_login_page_header_has_no_signed_in_links(tx: &mut TestTx) {
+    let (status, body) = get(tx, "/login").await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         !body.contains("action=\"/logout\""),
@@ -5312,7 +6496,7 @@ async fn anonymous_login_page_header_has_no_signed_in_links(_tx: &mut TestTx) {
 async fn signed_in_user_sees_account_links_on_policy_and_error_pages(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
-    let (app, email) = auth_app().await;
+    let (app, email) = auth_app(tx).await;
     let cookie = verified_cookie(&app, &email, "wp12-header-privacy@example.com").await;
     for uri in ["/privacy", "/terms", "/this-route-does-not-exist-wp12"] {
         let (status, body) = get_c(&app, uri, Some(&cookie)).await;
@@ -5341,15 +6525,14 @@ async fn signed_in_user_sees_account_links_on_policy_and_error_pages(
             "{uri}: plain user has no admin link: {body}"
         );
     }
-    let _ = tx;
-    cleanup_user_contributions("wp12-header-privacy@example.com").await;
 }
 
 #[db_test]
 async fn header_shows_moderation_and_admin_links_by_role(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
 
-    let moderator = moderator_cookie(&app, &email, "wp12-header-mod@example.com").await;
+    let moderator = moderator_cookie(&db, &app, &email, "wp12-header-mod@example.com").await;
     let (_, body) = get_c(&app, "/", Some(&moderator)).await;
     assert!(
         body.contains("href=\"/moderation\""),
@@ -5360,7 +6543,7 @@ async fn header_shows_moderation_and_admin_links_by_role(tx: &mut bikesnest_test
         "a moderator (not admin) has no admin link: {body}"
     );
 
-    let admin = admin_cookie(&app, &email, "wp12-header-admin@example.com").await;
+    let admin = admin_cookie(&db, &app, &email, "wp12-header-admin@example.com").await;
     let (_, body) = get_c(&app, "/", Some(&admin)).await;
     assert!(
         body.contains("href=\"/admin/users\""),
@@ -5381,34 +6564,25 @@ async fn header_shows_moderation_and_admin_links_by_role(tx: &mut bikesnest_test
         !body.contains("href=\"/admin/users\""),
         "plain user has no admin link: {body}"
     );
-
-    let _ = tx;
-    cleanup_user_contributions("wp12-header-mod@example.com").await;
-    cleanup_user_contributions("wp12-header-admin@example.com").await;
-    cleanup_user_contributions("wp12-header-plain@example.com").await;
 }
 
 #[db_test]
 async fn add_spot_entry_points_are_gated_by_verification_status(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
+    let db = tx.db().await;
     const MARK: &str = "wp12-add-spot-cta";
     const Q: &str = "/search?q=Rua%20XV%20de%20Novembro";
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
-        .await
-        .unwrap();
+
     let loc = ParkingBuilder::new()
         .with_name("Add Spot CTA Fixture")
         .with_fixture_tag(MARK)
-        .create(tx.executor())
+        .create(&mut db.acquire().await.unwrap())
         .await
         .unwrap();
-    tx.commit_fixture().await;
     let loc_id = loc.id();
 
-    let (app, email) = auth_app().await;
+    let (app, email) = auth_app(tx).await;
 
     // Verified user: the real entry point on every page named in the plan.
     let verified = verified_cookie(&app, &email, "wp12-add-spot-verified@example.com").await;
@@ -5445,20 +6619,11 @@ async fn add_spot_entry_points_are_gated_by_verification_status(
         body.contains("Verify your email to contribute"),
         "verify-to-contribute copy present: {body}"
     );
-
-    let _ = tx;
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    cleanup_user_contributions("wp12-add-spot-verified@example.com").await;
-    cleanup_user_contributions("wp12-add-spot-unverified@example.com").await;
 }
 
 #[db_test]
-async fn about_page_links_entry_points_and_uses_present_tense_copy(_tx: &mut TestTx) {
-    let (status, body) = get("/about").await;
+async fn about_page_links_entry_points_and_uses_present_tense_copy(tx: &mut TestTx) {
+    let (status, body) = get(tx, "/about").await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         body.contains("href=\"/parking/new\""),
@@ -5478,7 +6643,7 @@ async fn about_page_links_entry_points_and_uses_present_tense_copy(_tx: &mut Tes
     );
 
     // pt-BR (default locale): the old "chegam conforme" copy must be gone too.
-    let app = test_app().await;
+    let app = test_app(tx).await;
     let res = app
         .oneshot(
             Request::builder()
@@ -5502,37 +6667,32 @@ async fn about_page_links_entry_points_and_uses_present_tense_copy(_tx: &mut Tes
 
 #[db_test]
 async fn moderation_dashboard_tiles_have_distinct_titles(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
-    let admin = admin_cookie(&app, &email, "wp12-mod-tiles@example.com").await;
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
+    let admin = admin_cookie(&db, &app, &email, "wp12-mod-tiles@example.com").await;
     let (s, body) = get_c(&app, "/moderation", Some(&admin)).await;
     assert_eq!(s, StatusCode::OK);
     assert!(body.contains("Open reports"), "{body}");
     assert!(body.contains("Reports in review"), "{body}");
     assert!(body.contains("Awaiting review"), "{body}");
-    let _ = tx;
-    cleanup_user_contributions("wp12-mod-tiles@example.com").await;
 }
 
 #[db_test]
 async fn contributions_history_labels_parked_here_distinct_from_verified(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
+    let db = tx.db().await;
     const MARK: &str = "wp12-parked-here";
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
-        .await
-        .unwrap();
+
     let loc = ParkingBuilder::new()
         .with_name("Parked Here Fixture")
         .with_fixture_tag(MARK)
-        .create(tx.executor())
+        .create(&mut db.acquire().await.unwrap())
         .await
         .unwrap();
-    tx.commit_fixture().await;
     let loc_id = loc.id();
 
-    let (app, email) = auth_app().await;
+    let (app, email) = auth_app(tx).await;
     let cookie = verified_cookie(&app, &email, "wp12-parked-here@example.com").await;
 
     let (s, page) = get_c(&app, &format!("/parking/{loc_id}"), Some(&cookie)).await;
@@ -5557,14 +6717,6 @@ async fn contributions_history_labels_parked_here_distinct_from_verified(
         !body.contains("Verified · Parked Here Fixture"),
         "must not read as a real verification: {body}"
     );
-
-    let _ = tx;
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    cleanup_user_contributions("wp12-parked-here@example.com").await;
 }
 
 // ---------------------------------------------------------------------------
@@ -5575,6 +6727,7 @@ async fn contributions_history_labels_parked_here_distinct_from_verified(
 /// whose shape the typed [`bikesnest_domain::ProposedChange`] has to keep
 /// reading unchanged.
 async fn seed_proposal(
+    db: &Db,
     location_id: i64,
     proposer_id: i64,
     base_version: i64,
@@ -5590,38 +6743,39 @@ async fn seed_proposal(
     .bind(base_version)
     .bind(kind)
     .bind(proposed)
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     id
 }
 
-async fn user_id_for(email: &str) -> i64 {
+async fn user_id_for(db: &Db, email: &str) -> i64 {
     let (id,): (i64,) = sqlx::query_as("SELECT id FROM users WHERE email = $1")
         .bind(email)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     id
 }
 
 #[db_test]
-async fn wp13_proposal_queue_prefills_the_move_and_links_the_location(
+async fn proposal_queue_prefills_the_move_and_links_the_location(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
+    let db = tx.db().await;
     const MOD: &str = "wp13-prop-mod@example.com";
     const PROPOSER: &str = "wp13-prop-author@example.com";
-    let (app, email) = auth_app().await;
-    let loc = fixture_location(tx, "wp13-prop", "WP13 Proposal Spot").await;
+    let (app, email) = auth_app(tx).await;
+    let loc = fixture_location(tx, "proposal-spot", "Proposal Spot").await;
     let proposer = verified_cookie(&app, &email, PROPOSER).await;
     let _ = proposer;
-    let proposer_id = user_id_for(PROPOSER).await;
+    let proposer_id = user_id_for(&db, PROPOSER).await;
     let (version,): (i64,) = sqlx::query_as("SELECT version FROM parking_location WHERE id = $1")
         .bind(loc)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
-    let pid = seed_proposal(
+    let pid = seed_proposal(&db,
         loc,
         proposer_id,
         version,
@@ -5633,7 +6787,7 @@ async fn wp13_proposal_queue_prefills_the_move_and_links_the_location(
     // The queue is FIFO (`id ASC`) over a 50-row page and the database already
     // holds a backlog, so page straight to this fixture's own row with the
     // handler's real keyset cursor.
-    let mod_cookie = moderator_cookie(&app, &email, MOD).await;
+    let mod_cookie = moderator_cookie(&db, &app, &email, MOD).await;
     let (s, body) = get_c(
         &app,
         &format!("/moderation/proposals?after_id={}", pid - 1),
@@ -5644,7 +6798,7 @@ async fn wp13_proposal_queue_prefills_the_move_and_links_the_location(
 
     // The row names the location and links to it, instead of showing an id.
     assert!(
-        body.contains("WP13 Proposal Spot"),
+        body.contains("Proposal Spot"),
         "the queue names the location"
     );
     assert!(
@@ -5700,7 +6854,7 @@ async fn wp13_proposal_queue_prefills_the_move_and_links_the_location(
     )
     .bind(loc)
     .bind(pid)
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     assert_eq!(status, "APPROVED");
@@ -5708,14 +6862,10 @@ async fn wp13_proposal_queue_prefills_the_move_and_links_the_location(
         lat.is_some_and(|v| (v - -25.4284).abs() < 1e-5),
         "the proposed latitude was applied: {lat:?}"
     );
-
-    let _ = tx;
-    cleanup_user_contributions(MOD).await;
-    cleanup_user_contributions(PROPOSER).await;
 }
 
 #[db_test]
-async fn wp13_proposal_queue_flags_stale_and_unreadable_proposals(
+async fn proposal_queue_flags_stale_and_unreadable_proposals(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
     const MOD: &str = "wp13-stale-mod@example.com";
@@ -5812,13 +6962,14 @@ async fn wp13_proposal_queue_flags_stale_and_unreadable_proposals(
 }
 
 #[db_test]
-async fn wp13_report_queue_previews_and_links_its_targets(tx: &mut bikesnest_test_support::TestTx) {
+async fn report_queue_previews_and_links_its_targets(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
     const MOD: &str = "wp13-rep-mod@example.com";
     const AUTHOR: &str = "wp13-rep-author@example.com";
-    let (app, email) = auth_app().await;
-    let loc = fixture_location(tx, "wp13-rep", "WP13 Reported Spot").await;
+    let (app, email) = auth_app(tx).await;
+    let loc = fixture_location(tx, "reported-spot", "Reported Spot").await;
     let author_cookie = verified_cookie(&app, &email, AUTHOR).await;
-    let author_id = user_id_for(AUTHOR).await;
+    let author_id = user_id_for(&db, AUTHOR).await;
 
     // A review to report, with a body long enough to be excerpted.
     let long_body = format!("{} tail-that-must-be-cut", "spam ".repeat(60));
@@ -5829,7 +6980,7 @@ async fn wp13_report_queue_previews_and_links_its_targets(tx: &mut bikesnest_tes
     .bind(loc)
     .bind(author_id)
     .bind(&long_body)
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     let _ = author_cookie;
@@ -5843,14 +6994,14 @@ async fn wp13_report_queue_previews_and_links_its_targets(tx: &mut bikesnest_tes
         .bind(author_id)
         .bind(target_type)
         .bind(target_id)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
         first_report = first_report.min(rid);
     }
 
     // FIFO queue, 50-row page, existing backlog: page to this fixture's rows.
-    let mod_cookie = moderator_cookie(&app, &email, MOD).await;
+    let mod_cookie = moderator_cookie(&db, &app, &email, MOD).await;
     let queue_url = format!(
         "/moderation/reports?state=OPEN&after_id={}",
         first_report - 1
@@ -5860,7 +7011,7 @@ async fn wp13_report_queue_previews_and_links_its_targets(tx: &mut bikesnest_tes
 
     // The row names and links the target instead of printing `#4057`.
     assert!(
-        body.contains("WP13 Reported Spot"),
+        body.contains("Reported Spot"),
         "the row names the reported location"
     );
     assert!(
@@ -5906,7 +7057,7 @@ async fn wp13_report_queue_previews_and_links_its_targets(tx: &mut bikesnest_tes
     assert_eq!(s, StatusCode::OK, "hide from the queue: {s}");
     let (state,): (String,) = sqlx::query_as("SELECT moderation_state FROM review WHERE id = $1")
         .bind(review_id)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     assert_eq!(state, "HIDDEN");
@@ -5917,29 +7068,21 @@ async fn wp13_report_queue_previews_and_links_its_targets(tx: &mut bikesnest_tes
         !body.contains(&format!(r#"action="/moderation/reviews/{review_id}/hide""#)),
         "an already-hidden review is not offered for hiding again"
     );
-
-    let _ = tx;
-    sqlx::query("DELETE FROM report WHERE reporter_id = $1")
-        .bind(author_id)
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    cleanup_user_contributions(MOD).await;
-    cleanup_user_contributions(AUTHOR).await;
 }
 
 #[db_test]
-async fn wp13_photo_queue_refuses_to_approve_an_image_it_cannot_show(
+async fn photo_queue_refuses_to_approve_an_image_it_cannot_show(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
+    let db = tx.db().await;
     const MOD: &str = "wp13-photo-mod@example.com";
     const UPLOADER: &str = "wp13-photo-up@example.com";
-    let (app, email, storage) = auth_app_with_storage().await;
-    let loc = fixture_location(tx, "wp13-photo", "WP13 Photo Spot").await;
+    let (app, email, storage) = auth_app_with_storage(tx).await;
+    let loc = fixture_location(tx, "photo-spot", "Photo Spot").await;
     let uploader_id = {
         let cookie = verified_cookie(&app, &email, UPLOADER).await;
         let _ = cookie;
-        user_id_for(UPLOADER).await
+        user_id_for(&db, UPLOADER).await
     };
 
     // A pending photo whose object was never written to storage: exactly the
@@ -5950,7 +7093,7 @@ async fn wp13_photo_queue_refuses_to_approve_an_image_it_cannot_show(
     )
     .bind(loc)
     .bind(uploader_id)
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     assert!(
@@ -5958,7 +7101,7 @@ async fn wp13_photo_queue_refuses_to_approve_an_image_it_cannot_show(
         "the fixture's whole point is that the object is absent"
     );
 
-    let mod_cookie = moderator_cookie(&app, &email, MOD).await;
+    let mod_cookie = moderator_cookie(&db, &app, &email, MOD).await;
     let (s, body) = get_c(&app, "/moderation/photos", Some(&mod_cookie)).await;
     assert_eq!(s, StatusCode::OK);
     assert!(
@@ -5987,27 +7130,22 @@ async fn wp13_photo_queue_refuses_to_approve_an_image_it_cannot_show(
     let (state,): (String,) =
         sqlx::query_as("SELECT moderation_state FROM parking_photo WHERE id = $1")
             .bind(photo_id)
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
     assert_eq!(state, "REJECTED");
-
-    let _ = tx;
-    cleanup_user_contributions(MOD).await;
-    cleanup_user_contributions(UPLOADER).await;
 }
 
 #[db_test]
-async fn wp13_audit_log_shows_exact_times_and_named_actors(
-    tx: &mut bikesnest_test_support::TestTx,
-) {
+async fn audit_log_shows_exact_times_and_named_actors(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
     const ADMIN: &str = "wp13-audit-admin@example.com";
-    let (app, email) = auth_app().await;
-    let admin = admin_cookie(&app, &email, ADMIN).await;
-    let admin_id = user_id_for(ADMIN).await;
+    let (app, email) = auth_app(tx).await;
+    let admin = admin_cookie(&db, &app, &email, ADMIN).await;
+    let admin_id = user_id_for(&db, ADMIN).await;
     sqlx::query("UPDATE users SET display_name = 'Ada Audit' WHERE id = $1")
         .bind(admin_id)
-        .execute(&pool().await)
+        .execute(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     sqlx::query(
@@ -6016,7 +7154,7 @@ async fn wp13_audit_log_shows_exact_times_and_named_actors(
     )
     .bind(admin_id)
     .bind(admin_id.to_string())
-    .execute(&pool().await)
+    .execute(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
 
@@ -6071,15 +7209,6 @@ async fn wp13_audit_log_shows_exact_times_and_named_actors(
         body.contains("wp13.audit.probe"),
         "a legacy RFC3339 filter still parses"
     );
-
-    let _ = tx;
-    let mut audit_tx = bikesnest_test_support::audit_mutation_tx(&pool().await).await;
-    sqlx::query("DELETE FROM audit_events WHERE action = 'wp13.audit.probe'")
-        .execute(&mut *audit_tx)
-        .await
-        .unwrap();
-    audit_tx.commit().await.unwrap();
-    cleanup_user_contributions(ADMIN).await;
 }
 
 /// Is there a `YYYY-MM-DD` anywhere in the page? (No regex crate in the web
@@ -6107,18 +7236,19 @@ fn regex_lite_date(html: &str) -> Option<&str> {
 }
 
 #[db_test]
-async fn wp13_privacy_queue_shows_the_subject_and_what_they_asked(
+async fn privacy_queue_shows_the_subject_and_what_they_asked(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
+    let db = tx.db().await;
     const ADMIN: &str = "wp13-priv-admin@example.com";
     const SUBJECT: &str = "wp13-priv-subject@example.com";
-    let (app, email) = auth_app().await;
+    let (app, email) = auth_app(tx).await;
     let subject_cookie = verified_cookie(&app, &email, SUBJECT).await;
     let _ = subject_cookie;
-    let subject_id = user_id_for(SUBJECT).await;
+    let subject_id = user_id_for(&db, SUBJECT).await;
     sqlx::query("UPDATE users SET display_name = 'Rita Rights' WHERE id = $1")
         .bind(subject_id)
-        .execute(&pool().await)
+        .execute(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     sqlx::query(
@@ -6126,11 +7256,11 @@ async fn wp13_privacy_queue_shows_the_subject_and_what_they_asked(
          VALUES ($1, 'rectification', 'OPEN', '{\"note\":\"my display name is misspelled\"}'::jsonb)",
     )
     .bind(subject_id)
-    .execute(&pool().await)
+    .execute(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
 
-    let admin = admin_cookie(&app, &email, ADMIN).await;
+    let admin = admin_cookie(&db, &app, &email, ADMIN).await;
     let (s, body) = get_c(&app, "/admin/privacy-requests", Some(&admin)).await;
     assert_eq!(s, StatusCode::OK);
     assert!(
@@ -6153,29 +7283,21 @@ async fn wp13_privacy_queue_shows_the_subject_and_what_they_asked(
         regex_lite_date(&body).is_some(),
         "the requested-at timestamp is absolute"
     );
-
-    let _ = tx;
-    sqlx::query("DELETE FROM privacy_request WHERE user_id = $1")
-        .bind(subject_id)
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    cleanup_user_contributions(ADMIN).await;
-    cleanup_user_contributions(SUBJECT).await;
 }
 
 #[db_test]
-async fn wp13_admin_user_list_searches_masks_and_confirms(tx: &mut bikesnest_test_support::TestTx) {
+async fn admin_user_list_searches_masks_and_confirms(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
     const ADMIN: &str = "wp13-users-admin@example.com";
     const NEEDLE: &str = "wp13-findme@example.com";
     const OTHER: &str = "wp13-other@example.com";
-    let (app, email) = auth_app().await;
+    let (app, email) = auth_app(tx).await;
     for addr in [NEEDLE, OTHER] {
         let cookie = verified_cookie(&app, &email, addr).await;
         let _ = cookie;
     }
-    let admin = admin_cookie(&app, &email, ADMIN).await;
-    let needle_id = user_id_for(NEEDLE).await;
+    let admin = admin_cookie(&db, &app, &email, ADMIN).await;
+    let needle_id = user_id_for(&db, NEEDLE).await;
 
     // Unfiltered: both accounts are listed, and neither address is in plain
     // sight — the masked form is what the row shows.
@@ -6202,7 +7324,7 @@ async fn wp13_admin_user_list_searches_masks_and_confirms(tx: &mut bikesnest_tes
     // Search matches display names too.
     sqlx::query("UPDATE users SET display_name = 'Zebedee Unique' WHERE id = $1")
         .bind(needle_id)
-        .execute(&pool().await)
+        .execute(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
     let (_, body) = get_c(&app, "/admin/users?q=Zebedee", Some(&admin)).await;
@@ -6245,11 +7367,6 @@ async fn wp13_admin_user_list_searches_masks_and_confirms(tx: &mut bikesnest_tes
     )
     .await;
     assert_eq!(s, StatusCode::SEE_OTHER, "suspend still works server-side");
-
-    let _ = tx;
-    cleanup_user_contributions(ADMIN).await;
-    cleanup_user_contributions(NEEDLE).await;
-    cleanup_user_contributions(OTHER).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -6260,8 +7377,12 @@ async fn wp13_admin_user_list_searches_masks_and_confirms(tx: &mut bikesnest_tes
 /// decoding the body as UTF-8 — a br/gzip-compressed body isn't valid UTF-8.
 /// `extra_header` lets a caller negotiate compression (`Accept-Encoding`) or
 /// anything else per-request.
-async fn get_raw(uri: &str, extra_header: (&str, &str)) -> (StatusCode, HeaderMap, Vec<u8>) {
-    let app = test_app().await;
+async fn get_raw(
+    tx: &mut bikesnest_test_support::TestTx,
+    uri: &str,
+    extra_header: (&str, &str),
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let app = test_app(tx).await;
     let res = app
         .oneshot(
             Request::builder()
@@ -6279,8 +7400,9 @@ async fn get_raw(uri: &str, extra_header: (&str, &str)) -> (StatusCode, HeaderMa
 }
 
 #[db_test]
-async fn static_css_is_served_brotli_compressed_on_request(_tx: &mut TestTx) {
-    let (status, headers, _body) = get_raw("/static/css/app.css", ("accept-encoding", "br")).await;
+async fn static_css_is_served_brotli_compressed_on_request(tx: &mut TestTx) {
+    let (status, headers, _body) =
+        get_raw(tx, "/static/css/app.css", ("accept-encoding", "br")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         headers
@@ -6291,9 +7413,9 @@ async fn static_css_is_served_brotli_compressed_on_request(_tx: &mut TestTx) {
 }
 
 #[db_test]
-async fn static_css_is_served_gzip_compressed_on_request(_tx: &mut TestTx) {
+async fn static_css_is_served_gzip_compressed_on_request(tx: &mut TestTx) {
     let (status, headers, _body) =
-        get_raw("/static/css/app.css", ("accept-encoding", "gzip")).await;
+        get_raw(tx, "/static/css/app.css", ("accept-encoding", "gzip")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         headers
@@ -6310,8 +7432,8 @@ async fn static_css_is_served_gzip_compressed_on_request(_tx: &mut TestTx) {
 /// byte from the compressed length. `text/html` must never be compressed,
 /// even though the client offers both `br` and `gzip`.
 #[db_test]
-async fn html_pages_are_never_compressed(_tx: &mut TestTx) {
-    let (status, headers, _body) = get_raw("/", ("accept-encoding", "br, gzip")).await;
+async fn html_pages_are_never_compressed(tx: &mut TestTx) {
+    let (status, headers, _body) = get_raw(tx, "/", ("accept-encoding", "br, gzip")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         headers.get("content-encoding").is_none(),
@@ -6320,8 +7442,9 @@ async fn html_pages_are_never_compressed(_tx: &mut TestTx) {
 }
 
 #[db_test]
-async fn search_page_html_is_never_compressed(_tx: &mut TestTx) {
-    let (status, headers, _body) = get_raw("/search?q=x", ("accept-encoding", "br, gzip")).await;
+async fn search_page_html_is_never_compressed(tx: &mut TestTx) {
+    let (status, headers, _body) =
+        get_raw(tx, "/search?q=x", ("accept-encoding", "br, gzip")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         headers.get("content-encoding").is_none(),
@@ -6339,11 +7462,11 @@ fn extract_hashed_app_css_url(body: &str) -> String {
 }
 
 #[db_test]
-async fn hashed_static_url_is_cached_as_immutable(_tx: &mut TestTx) {
-    let (_, home_body) = get("/").await;
+async fn hashed_static_url_is_cached_as_immutable(tx: &mut TestTx) {
+    let (_, home_body) = get(tx, "/").await;
     let hashed_url = extract_hashed_app_css_url(&home_body);
 
-    let (status, headers, _) = get_raw(&hashed_url, ("accept-encoding", "identity")).await;
+    let (status, headers, _) = get_raw(tx, &hashed_url, ("accept-encoding", "identity")).await;
     assert_eq!(status, StatusCode::OK);
     let cache_control = headers
         .get("cache-control")
@@ -6360,9 +7483,9 @@ async fn hashed_static_url_is_cached_as_immutable(_tx: &mut TestTx) {
 }
 
 #[db_test]
-async fn unhashed_static_url_keeps_a_short_cache_lifetime(_tx: &mut TestTx) {
+async fn unhashed_static_url_keeps_a_short_cache_lifetime(tx: &mut TestTx) {
     let (status, headers, _) =
-        get_raw("/static/css/app.css", ("accept-encoding", "identity")).await;
+        get_raw(tx, "/static/css/app.css", ("accept-encoding", "identity")).await;
     assert_eq!(status, StatusCode::OK);
     let cache_control = headers
         .get("cache-control")
@@ -6376,8 +7499,9 @@ async fn unhashed_static_url_keeps_a_short_cache_lifetime(_tx: &mut TestTx) {
 }
 
 #[db_test]
-async fn hashed_static_url_with_a_wrong_hash_is_not_found(_tx: &mut TestTx) {
+async fn hashed_static_url_with_a_wrong_hash_is_not_found(tx: &mut TestTx) {
     let (status, _, _) = get_raw(
+        tx,
         "/static/h/deadbeef00/css/app.css",
         ("accept-encoding", "identity"),
     )
@@ -6386,8 +7510,8 @@ async fn hashed_static_url_with_a_wrong_hash_is_not_found(_tx: &mut TestTx) {
 }
 
 #[db_test]
-async fn login_page_never_loads_maplibre(_tx: &mut TestTx) {
-    let (status, body) = get("/login").await;
+async fn login_page_never_loads_maplibre(tx: &mut TestTx) {
+    let (status, body) = get(tx, "/login").await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         !body.contains("maplibre-gl"),
@@ -6396,13 +7520,13 @@ async fn login_page_never_loads_maplibre(_tx: &mut TestTx) {
 }
 
 #[db_test]
-async fn search_page_loads_maplibre_once_with_a_preconnect(_tx: &mut TestTx) {
-    let (status, body) = get("/search?q=x").await;
+async fn search_page_loads_maplibre_once_with_a_preconnect(tx: &mut TestTx) {
+    let (status, body) = get(tx, "/search?q=x").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        body.matches("maplibre-gl.js").count(),
+        body.matches("maplibre-loader.mjs").count(),
         1,
-        "maplibre-gl.js must load exactly once: {body}"
+        "maplibre-loader.mjs must load exactly once: {body}"
     );
     assert!(
         body.contains(r#"rel="preconnect""#),
@@ -6412,44 +7536,35 @@ async fn search_page_loads_maplibre_once_with_a_preconnect(_tx: &mut TestTx) {
 
 #[db_test]
 async fn parking_details_page_loads_maplibre_once_with_a_preconnect(tx: &mut TestTx) {
+    let db = tx.db().await;
     const MARK: &str = "fix-http-wp14-details-map";
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    let conn = tx.executor();
+
+    let mut conn = db.acquire().await.unwrap();
     let created = ParkingBuilder::new()
         .with_fixture_tag(MARK)
-        .with_name("WP14 Map Assets Fixture")
+        .with_name("Map Assets Fixture")
         .at(-25.4300, -49.2700)
-        .create(&mut *conn)
+        .create(&mut conn)
         .await
         .unwrap();
-    tx.commit_fixture().await;
+    drop(conn);
 
-    let (status, body) = get(&format!("/parking/{}", created.id())).await;
+    let (status, body) = get(tx, &format!("/parking/{}", created.id())).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        body.matches("maplibre-gl.js").count(),
+        body.matches("maplibre-loader.mjs").count(),
         1,
-        "maplibre-gl.js must load exactly once: {body}"
+        "maplibre-loader.mjs must load exactly once: {body}"
     );
     assert!(
         body.contains(r#"rel="preconnect""#),
         "a configured map style must get a tile-host preconnect"
     );
-
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
-        .await
-        .unwrap();
 }
 
 #[db_test]
-async fn home_hero_has_srcset_and_priority_and_featured_images_are_lazy(_tx: &mut TestTx) {
-    let (status, body) = get("/").await;
+async fn home_hero_has_srcset_and_priority_and_featured_images_are_lazy(tx: &mut TestTx) {
+    let (status, body) = get(tx, "/").await;
     assert_eq!(status, StatusCode::OK);
     let hero_start = body.find("hero-bike-parking").expect("hero image present");
     let hero_tag = &body[body[..hero_start].rfind("<img").unwrap()..];
@@ -6558,10 +7673,10 @@ async fn register_with_language(
     (res.status(), set_cookie)
 }
 
-async fn stored_locale(email: &str) -> String {
+async fn stored_locale(db: &Db, email: &str) -> String {
     sqlx::query_scalar("SELECT locale FROM users WHERE email = $1")
         .bind(email)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap()
 }
@@ -6571,12 +7686,13 @@ async fn stored_locale(email: &str) -> String {
 /// rendered in, and that language is stored on the account so later messages
 /// (sent with no request in scope) keep speaking it.
 #[db_test]
-async fn the_verification_email_is_written_in_the_signup_language(_tx: &mut TestTx) {
+async fn the_verification_email_is_written_in_the_signup_language(tx: &mut TestTx) {
+    let db = tx.db().await;
     const PT: &str = "locale-pt@example.com";
     const EN: &str = "locale-en@example.com";
 
-    let (app, mail) = auth_app().await;
-    cleanup_user(PT).await;
+    let (app, mail) = auth_app(tx).await;
+
     let (status, _) = register_with_language(&app, PT, "pt-BR,pt;q=0.9").await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(
@@ -6584,34 +7700,32 @@ async fn the_verification_email_is_written_in_the_signup_language(_tx: &mut Test
         Some("Confirme seu e-mail no BikesNest"),
         "a pt-BR signup must be greeted in Portuguese"
     );
-    assert_eq!(stored_locale(PT).await, "pt-BR");
-    cleanup_user(PT).await;
+    assert_eq!(stored_locale(&db, PT).await, "pt-BR");
 
     // A fresh app (and outbox) for the English signup.
-    let (app_en, mail_en) = auth_app().await;
-    cleanup_user(EN).await;
+    let (app_en, mail_en) = auth_app(tx).await;
+
     let (status, _) = register_with_language(&app_en, EN, "en-GB,en;q=0.8").await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(
         mail_en.subject_for_kind("verify").as_deref(),
         Some("Confirm your BikesNest email")
     );
-    assert_eq!(stored_locale(EN).await, "en");
-    cleanup_user(EN).await;
+    assert_eq!(stored_locale(&db, EN).await, "en");
 }
 
 /// `GET /lang/{code}` sets the cookie for everyone; for a signed-in user it
 /// also writes `users.locale`, which is the only thing a background job can
 /// read. The mail that follows switches language with it.
 #[db_test]
-async fn the_language_toggle_persists_for_a_signed_in_user(_tx: &mut TestTx) {
+async fn the_language_toggle_persists_for_a_signed_in_user(tx: &mut TestTx) {
+    let db = tx.db().await;
     const EMAIL: &str = "locale-toggle@example.com";
-    let (app, mail) = auth_app().await;
-    cleanup_user(EMAIL).await;
+    let (app, mail) = auth_app(tx).await;
 
     let (status, _) = register_with_language(&app, EMAIL, "pt-BR").await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert_eq!(stored_locale(EMAIL).await, "pt-BR");
+    assert_eq!(stored_locale(&db, EMAIL).await, "pt-BR");
 
     let (_, _, cookie) = post_form(
         &app,
@@ -6635,7 +7749,7 @@ async fn the_language_toggle_persists_for_a_signed_in_user(_tx: &mut TestTx) {
         .unwrap();
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
     assert_eq!(
-        stored_locale(EMAIL).await,
+        stored_locale(&db, EMAIL).await,
         "pt-BR",
         "an anonymous toggle must not touch anyone's account"
     );
@@ -6661,7 +7775,7 @@ async fn the_language_toggle_persists_for_a_signed_in_user(_tx: &mut TestTx) {
             .contains("lang=en"),
         "the toggle still sets the cookie"
     );
-    assert_eq!(stored_locale(EMAIL).await, "en");
+    assert_eq!(stored_locale(&db, EMAIL).await, "en");
 
     // The next message — a resend, with no page rendered for it — follows.
     let (s, _, _) = post_form(&app, "/verify-email/resend", &[("email", EMAIL)], None).await;
@@ -6675,8 +7789,6 @@ async fn the_language_toggle_persists_for_a_signed_in_user(_tx: &mut TestTx) {
         ],
         "the signup mail stays Portuguese; the one after the toggle is English"
     );
-
-    cleanup_user(EMAIL).await;
 }
 
 /// With the worker enabled (production's default) nothing is sent on the
@@ -6684,12 +7796,12 @@ async fn the_language_toggle_persists_for_a_signed_in_user(_tx: &mut TestTx) {
 /// the handler over that row — what the worker does — produces the localised
 /// message.
 #[db_test]
-async fn with_the_worker_enabled_registration_queues_the_email(_tx: &mut TestTx) {
+async fn with_the_worker_enabled_registration_queues_the_email(tx: &mut TestTx) {
     use bikesnest_infrastructure::{JobConfig, SendEmailHandler};
 
     const EMAIL: &str = "locale-queued@example.com";
     let mail = FakeEmailProvider::with_root(None);
-    let db = Db::from_pool(pool().await);
+    let db = tx.db().await;
     let config = bikesnest_infrastructure::Config {
         jobs: JobConfig {
             enabled: true,
@@ -6699,17 +7811,16 @@ async fn with_the_worker_enabled_registration_queues_the_email(_tx: &mut TestTx)
     };
     let app = app_router_with(
         std::sync::Arc::new(config),
-        db,
+        db.clone(),
         RouterDeps {
             email: std::sync::Arc::new(mail.clone()),
             oauth: None,
             hasher: TestPasswordHasher,
             rate_limiter: Box::new(bikesnest_infrastructure::InMemoryRateLimiter::new()),
             storage: std::sync::Arc::new(bikesnest_test_support::TestObjectStorage::new()),
+            detail_reads: None,
         },
     );
-    cleanup_user(EMAIL).await;
-
     let (status, _) = register_with_language(&app, EMAIL, "pt-BR").await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(
@@ -6717,20 +7828,22 @@ async fn with_the_worker_enabled_registration_queues_the_email(_tx: &mut TestTx)
         "the provider must not be touched on the request path"
     );
 
+    let mut conn = db.acquire().await.unwrap();
     let (job_id, payload): (i64, serde_json::Value) = sqlx::query_as(
         "SELECT id, payload FROM background_job
          WHERE kind = 'email.send' AND payload->>'to' = $1",
     )
     .bind(EMAIL)
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *conn)
     .await
     .expect("registration queued an email.send job");
     assert_eq!(payload["locale"], "pt-BR");
     assert_eq!(payload["kind"], "verify_email");
+    drop(conn);
 
     // Drain it the way the worker would.
     bikesnest_application::JobHandler::run(
-        &SendEmailHandler::new(std::sync::Arc::new(mail.clone())),
+        &SendEmailHandler::new(db.clone(), std::sync::Arc::new(mail.clone())),
         &payload,
     )
     .await
@@ -6740,12 +7853,7 @@ async fn with_the_worker_enabled_registration_queues_the_email(_tx: &mut TestTx)
         Some("Confirme seu e-mail no BikesNest")
     );
 
-    sqlx::query("DELETE FROM background_job WHERE id = $1")
-        .bind(job_id)
-        .execute(&pool().await)
-        .await
-        .unwrap();
-    cleanup_user(EMAIL).await;
+    assert!(job_id > 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -6756,7 +7864,10 @@ async fn with_the_worker_enabled_registration_queues_the_email(_tx: &mut TestTx)
 /// limiter is in-memory and lives in this router's state, so every request
 /// made through this instance shares one bucket (`ClientIp` resolves to a
 /// single test peer when there is no `ConnectInfo`).
-async fn app_with_geocode_budget(per_ip: u32) -> axum::Router {
+async fn app_with_geocode_budget(
+    tx: &mut bikesnest_test_support::TestTx,
+    per_ip: u32,
+) -> axum::Router {
     let config = bikesnest_infrastructure::Config {
         geocode: bikesnest_infrastructure::GeocodeLimits {
             per_ip,
@@ -6764,13 +7875,16 @@ async fn app_with_geocode_budget(per_ip: u32) -> axum::Router {
         },
         ..test_config()
     };
-    bikesnest_web::app_router(std::sync::Arc::new(config), Db::from_pool(pool().await))
+    bikesnest_web::app_router(std::sync::Arc::new(config), tx.db().await)
         .expect("test config builds every provider")
 }
 
 /// [`app_with_geocode_budget`] plus the captured mail, so a test can register
 /// and verify a session against the same limiter bucket.
-async fn auth_app_with_geocode_budget(per_ip: u32) -> (axum::Router, FakeEmailProvider) {
+async fn auth_app_with_geocode_budget(
+    tx: &mut bikesnest_test_support::TestTx,
+    per_ip: u32,
+) -> (axum::Router, FakeEmailProvider) {
     let email = FakeEmailProvider::with_root(None);
     let config = bikesnest_infrastructure::Config {
         geocode: bikesnest_infrastructure::GeocodeLimits {
@@ -6785,13 +7899,10 @@ async fn auth_app_with_geocode_budget(per_ip: u32) -> (axum::Router, FakeEmailPr
         hasher: TestPasswordHasher,
         rate_limiter: Box::new(bikesnest_infrastructure::InMemoryRateLimiter::new()),
         storage: std::sync::Arc::new(bikesnest_test_support::TestObjectStorage::new()),
+        detail_reads: None,
     };
     (
-        app_router_with(
-            std::sync::Arc::new(config),
-            Db::from_pool(pool().await),
-            deps,
-        ),
+        app_router_with(std::sync::Arc::new(config), tx.db().await, deps),
         email,
     )
 }
@@ -6801,8 +7912,8 @@ async fn auth_app_with_geocode_budget(per_ip: u32) -> (axum::Router, FakeEmailPr
 /// in-process cache can already answer costs the provider nothing and must
 /// therefore cost the caller nothing either.
 #[db_test]
-async fn free_text_searches_are_metered_but_cached_ones_are_free(_tx: &mut TestTx) {
-    let app = app_with_geocode_budget(2).await;
+async fn free_text_searches_are_metered_but_cached_ones_are_free(tx: &mut TestTx) {
+    let app = app_with_geocode_budget(tx, 2).await;
 
     // Two fresh destinations: two provider calls, both within budget.
     let (status, body) = get_c(&app, "/search?q=alpha+avenue", None).await;
@@ -6839,8 +7950,8 @@ async fn free_text_searches_are_metered_but_cached_ones_are_free(_tx: &mut TestT
 /// The budget is spent per geocode, not per request: a search that carries no
 /// destination at all resolves nothing and must not be charged.
 #[db_test]
-async fn a_search_without_a_destination_is_not_metered(_tx: &mut TestTx) {
-    let app = app_with_geocode_budget(1).await;
+async fn a_search_without_a_destination_is_not_metered(tx: &mut TestTx) {
+    let app = app_with_geocode_budget(tx, 1).await;
 
     for _ in 0..3 {
         let (status, _) = get_c(&app, "/search", None).await;
@@ -6862,7 +7973,7 @@ async fn a_search_without_a_destination_is_not_metered(_tx: &mut TestTx) {
 /// editor and three-way security controls.
 #[db_test]
 async fn add_form_asks_for_a_place_not_for_coordinates(tx: &mut TestTx) {
-    let (app, email) = auth_app().await;
+    let (app, email) = auth_app(tx).await;
     const EMAIL: &str = "wp19-form@example.com";
     let cookie = verified_cookie(&app, &email, EMAIL).await;
     let (status, body) = get_c(&app, "/parking/new", Some(&cookie)).await;
@@ -6930,9 +8041,6 @@ async fn add_form_asks_for_a_place_not_for_coordinates(tx: &mut TestTx) {
         !body.contains(r#"name="security""#),
         "the hidden comma-separated mirror is gone"
     );
-
-    let _ = tx;
-    cleanup_user_contributions(EMAIL).await;
 }
 
 /// The whole no-JS submission: the fields a browser with no scripting can
@@ -6940,14 +8048,10 @@ async fn add_form_asks_for_a_place_not_for_coordinates(tx: &mut TestTx) {
 /// the ✗ marker, and a weekly overnight range reaches its hours table.
 #[db_test]
 async fn a_script_free_submission_records_hours_and_a_definitive_no(tx: &mut TestTx) {
-    let (app, email) = auth_app().await;
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
     const EMAIL: &str = "wp19-nojs@example.com";
-    const MARK: &str = "wp19-nojs";
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
-        .await
-        .unwrap();
+
     let cookie = verified_cookie(&app, &email, EMAIL).await;
     let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
     let csrf = extract_csrf(&form);
@@ -6984,7 +8088,7 @@ async fn a_script_free_submission_records_hours_and_a_definitive_no(tx: &mut Tes
     let (id,): (i64,) = sqlx::query_as(
         "SELECT id FROM parking_location WHERE name = 'Overnight Rack' ORDER BY id DESC LIMIT 1",
     )
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
 
@@ -6992,7 +8096,7 @@ async fn a_script_free_submission_records_hours_and_a_definitive_no(tx: &mut Tes
     let (timezone,): (String,) =
         sqlx::query_as("SELECT timezone FROM parking_location WHERE id = $1")
             .bind(id)
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
     assert!(
@@ -7006,7 +8110,7 @@ async fn a_script_free_submission_records_hours_and_a_definitive_no(tx: &mut Tes
          WHERE location_id = $1 ORDER BY day_of_week",
     )
     .bind(id)
-    .fetch_all(&pool().await)
+    .fetch_all(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     assert_eq!(rows.len(), 1, "one range, on one day: {rows:?}");
@@ -7023,7 +8127,7 @@ async fn a_script_free_submission_records_hours_and_a_definitive_no(tx: &mut Tes
         "SELECT state FROM parking_security WHERE location_id = $1 AND feature_code = 'cctv'",
     )
     .bind(id)
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     assert_eq!(cctv, 2, "\"no\" is recordable");
@@ -7039,16 +8143,14 @@ async fn a_script_free_submission_records_hours_and_a_definitive_no(tx: &mut Tes
         body.contains("22:00 – 02:00"),
         "the hours table shows the overnight range"
     );
-
-    let _ = tx;
-    cleanup_user_contributions(EMAIL).await;
 }
 
 /// A day whose two ranges overlap is refused with the message next to that
 /// day, and nothing is created.
 #[db_test]
 async fn overlapping_hours_are_refused_with_a_field_level_message(tx: &mut TestTx) {
-    let (app, email) = auth_app().await;
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
     const EMAIL: &str = "wp19-overlap@example.com";
     let cookie = verified_cookie(&app, &email, EMAIL).await;
     let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
@@ -7086,13 +8188,10 @@ async fn overlapping_hours_are_refused_with_a_field_level_message(tx: &mut TestT
     );
     let (count,): (i64,) =
         sqlx::query_as("SELECT count(*) FROM parking_location WHERE name = 'Overlap Spot'")
-            .fetch_one(&pool().await)
+            .fetch_one(&mut *db.acquire().await.unwrap())
             .await
             .unwrap();
     assert_eq!(count, 0, "a rejected form creates nothing");
-
-    let _ = tx;
-    cleanup_user_contributions(EMAIL).await;
 }
 
 /// Duplicate detection runs BEFORE the insert: a near-identical spot 15 m away
@@ -7100,14 +8199,15 @@ async fn overlapping_hours_are_refused_with_a_field_level_message(tx: &mut TestT
 /// details page with the "what happens next" notice.
 #[db_test]
 async fn a_near_duplicate_is_confirmed_before_anything_is_created(tx: &mut TestTx) {
-    let (app, email) = auth_app().await;
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
     const EMAIL: &str = "wp19-dupe@example.com";
     let cookie = verified_cookie(&app, &email, EMAIL).await;
     let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
     let csrf = extract_csrf(&form);
 
     // The spot that already exists.
-    let existing = add_location(&app, &cookie, &csrf, "Bicicletario Praca Central", &[]).await;
+    let existing = add_location(&db, &app, &cookie, &csrf, "Bicicletario Praca Central", &[]).await;
 
     // ~15 m north of it, same name. `add_location` posts -23.4/-46.6.
     let near_lat = (-23.4_f64 + 0.000_135).to_string();
@@ -7137,7 +8237,7 @@ async fn a_near_duplicate_is_confirmed_before_anything_is_created(tx: &mut TestT
     let (count,): (i64,) = sqlx::query_as(
         "SELECT count(*) FROM parking_location WHERE name = 'Bicicletario Praca Central'",
     )
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     assert_eq!(count, 1, "nothing was created while the question stood");
@@ -7151,7 +8251,7 @@ async fn a_near_duplicate_is_confirmed_before_anything_is_created(tx: &mut TestT
         "SELECT id FROM parking_location WHERE name = 'Bicicletario Praca Central'
          ORDER BY id DESC LIMIT 1",
     )
-    .fetch_one(&pool().await)
+    .fetch_one(&mut *db.acquire().await.unwrap())
     .await
     .unwrap();
     assert_ne!(created, existing, "a second spot now exists");
@@ -7166,15 +8266,12 @@ async fn a_near_duplicate_is_confirmed_before_anything_is_created(tx: &mut TestT
         body.contains("Your spot is live. The community will verify it over time"),
         "the details page says what happens next: {body}"
     );
-
-    let _ = tx;
-    cleanup_user_contributions(EMAIL).await;
 }
 
 /// A submission nowhere near an existing spot skips the interstitial entirely.
 #[db_test]
 async fn a_lone_spot_is_created_without_an_interstitial(tx: &mut TestTx) {
-    let (app, email) = auth_app().await;
+    let (app, email) = auth_app(tx).await;
     const EMAIL: &str = "wp19-lone@example.com";
     let cookie = verified_cookie(&app, &email, EMAIL).await;
     let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
@@ -7201,9 +8298,6 @@ async fn a_lone_spot_is_created_without_an_interstitial(tx: &mut TestTx) {
         StatusCode::SEE_OTHER,
         "no candidates, so no question to ask"
     );
-
-    let _ = tx;
-    cleanup_user_contributions(EMAIL).await;
 }
 
 /// `GET /api/geocode` is the picker's address lookup: verified users only, and
@@ -7211,7 +8305,7 @@ async fn a_lone_spot_is_created_without_an_interstitial(tx: &mut TestTx) {
 /// billable provider.
 #[db_test]
 async fn the_geocode_endpoint_is_gated_and_metered(tx: &mut TestTx) {
-    let (app, email) = auth_app().await;
+    let (app, email) = auth_app(tx).await;
     const EMAIL: &str = "wp19-geocode@example.com";
     let cookie = verified_cookie(&app, &email, EMAIL).await;
 
@@ -7230,17 +8324,13 @@ async fn the_geocode_endpoint_is_gated_and_metered(tx: &mut TestTx) {
     let unverified = unverified_cookie(&app, "wp19-unverified@example.com").await;
     let (status, _) = get_c(&app, "/api/geocode?q=Avenida+Nova", Some(&unverified)).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-
-    let _ = tx;
-    cleanup_user(EMAIL).await;
-    cleanup_user("wp19-unverified@example.com").await;
 }
 
 /// The budget is the same bucket `/search` spends from, and a cached address
 /// costs nothing.
 #[db_test]
 async fn the_geocode_endpoint_refuses_over_budget(tx: &mut TestTx) {
-    let (app, email) = auth_app_with_geocode_budget(1).await;
+    let (app, email) = auth_app_with_geocode_budget(tx, 1).await;
     const EMAIL: &str = "wp19-budget@example.com";
     let cookie = verified_cookie(&app, &email, EMAIL).await;
 
@@ -7254,9 +8344,6 @@ async fn the_geocode_endpoint_refuses_over_budget(tx: &mut TestTx) {
     // The first address is cached now: free, so still answered.
     let (status, _) = get_c(&app, "/api/geocode?q=Rua+Primeira", Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK, "a cache hit is not charged");
-
-    let _ = tx;
-    cleanup_user(EMAIL).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -7293,9 +8380,9 @@ fn opening_tag_containing<'a>(body: &'a str, marker: &str) -> &'a str {
 
 #[db_test]
 async fn login_wrong_password_banner_is_an_alert(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, _) = auth_app().await;
+    let (app, _) = auth_app(tx).await;
     const EMAIL: &str = "wp21-login-alert@example.com";
-    cleanup_user(EMAIL).await;
+
     post_form(
         &app,
         "/register",
@@ -7335,9 +8422,6 @@ async fn login_wrong_password_banner_is_an_alert(tx: &mut bikesnest_test_support
             && body.contains(r#"aria-describedby="password-error""#),
         "{body}"
     );
-
-    let _ = tx;
-    cleanup_user(EMAIL).await;
 }
 
 /// `AuthError::EmailTaken` is defined but `AuthService::register` never
@@ -7353,7 +8437,7 @@ async fn login_wrong_password_banner_is_an_alert(tx: &mut bikesnest_test_support
 async fn register_with_an_invalid_email_flags_the_email_field(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
-    let (app, _email) = auth_app().await;
+    let (app, _email) = auth_app(tx).await;
     let (s, body, _) = post_form(
         &app,
         "/register",
@@ -7373,8 +8457,6 @@ async fn register_with_an_invalid_email_flags_the_email_field(
         "{email_input}"
     );
     assert!(body.contains(r#"<p id="email-error""#), "{body}");
-
-    let _ = tx;
 }
 
 #[db_test]
@@ -7386,7 +8468,7 @@ async fn parking_new_bad_currency_code_flags_the_price_field(
     // one way to make the price group of fields fail server-side validation
     // today is a currency/unit code `CurrencyCode::parse`/`PricingUnit::from_code`
     // refuses, which is exactly what a stray non-ISO currency value is.
-    let (app, email) = auth_app().await;
+    let (app, email) = auth_app(tx).await;
     const EMAIL_ADDR: &str = "wp21-price@example.com";
     let cookie = verified_cookie(&app, &email, EMAIL_ADDR).await;
     let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
@@ -7427,19 +8509,63 @@ async fn parking_new_bad_currency_code_flags_the_price_field(
         "{price_input}"
     );
     assert!(body.contains(r#"<p id="price-error""#), "{body}");
+    assert!(
+        price_input.contains("data-form-error-focus") && price_input.contains("autofocus"),
+        "the boosted full-page error path has a narrow focus target: {price_input}"
+    );
+    assert!(
+        body.contains(r#"x-show="costKind === 'paid'""#),
+        "paid fields are conditional only after Alpine initializes: {body}"
+    );
+}
 
-    let _ = tx;
-    cleanup_user_contributions(EMAIL_ADDR).await;
+#[db_test]
+async fn parking_new_timezone_error_opens_advanced_coordinates(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let (app, email) = auth_app(tx).await;
+    const EMAIL_ADDR: &str = "wp21-timezone@example.com";
+    let cookie = verified_cookie(&app, &email, EMAIL_ADDR).await;
+    let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
+    let csrf = extract_csrf(&form);
+
+    let (status, body, _) = post_form(
+        &app,
+        "/parking/new",
+        &[
+            ("csrf", &csrf),
+            ("name", "Timezone Rack"),
+            ("address", "Rua X, 1"),
+            ("parking_type", "rack"),
+            ("cost_kind", "free"),
+            ("lat", "-23.4"),
+            ("lon", "-46.6"),
+            ("timezone", "not/a-timezone"),
+            ("confirm", "1"),
+        ],
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let timezone = opening_tag_with_id(&body, "timezone");
+    assert!(timezone.contains("data-form-error-focus"), "{timezone}");
+    let advanced = body
+        .find(r#"<details class="mt-6 rounded-lg border border-border bg-surface px-3 py-2" open"#);
+    assert!(
+        advanced.is_some(),
+        "the error must open its native ancestor: {body}"
+    );
 }
 
 #[db_test]
 async fn review_with_an_empty_body_flags_the_body_field(tx: &mut bikesnest_test_support::TestTx) {
-    let (app, email) = auth_app().await;
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
     const EMAIL: &str = "wp21-review-body@example.com";
     let cookie = verified_cookie(&app, &email, EMAIL).await;
     let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
     let csrf = extract_csrf(&form);
-    let id = add_location(&app, &cookie, &csrf, "WP21 Review Spot", &[]).await;
+    let id = add_location(&db, &app, &cookie, &csrf, "Review Spot", &[]).await;
 
     let (_, review_form) = get_c(&app, &format!("/parking/{id}/review"), Some(&cookie)).await;
     let rcsrf = extract_csrf(&review_form);
@@ -7463,17 +8589,15 @@ async fn review_with_an_empty_body_flags_the_body_field(tx: &mut bikesnest_test_
         "{body_field}"
     );
     assert!(body.contains(r#"<p id="body-error""#), "{body}");
-
-    let _ = tx;
-    cleanup_user_contributions(EMAIL).await;
 }
 
 #[db_test]
 async fn parking_details_dialogs_and_swap_targets_are_accessible(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
-    let (app, email) = auth_app().await;
-    let loc = fixture_location(tx, "wp21-dialogs", "WP21 Dialogs Spot").await;
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
+    let loc = fixture_location(tx, "dialogs-spot", "Dialogs Spot").await;
     const UPLOADER: &str = "wp21-dialogs-up@example.com";
     const MODERATOR: &str = "wp21-dialogs-mod@example.com";
     let uploader = verified_cookie(&app, &email, UPLOADER).await;
@@ -7492,10 +8616,10 @@ async fn parking_details_dialogs_and_swap_targets_are_accessible(
     .await;
     let (photo_id,): (i64,) = sqlx::query_as("SELECT id FROM parking_photo WHERE location_id = $1")
         .bind(loc)
-        .fetch_one(&pool().await)
+        .fetch_one(&mut *db.acquire().await.unwrap())
         .await
         .unwrap();
-    let mod_cookie = moderator_cookie(&app, &email, MODERATOR).await;
+    let mod_cookie = moderator_cookie(&db, &app, &email, MODERATOR).await;
     let (_, queue) = get_c(&app, "/moderation/photos", Some(&mod_cookie)).await;
     let mcs = extract_csrf(&queue);
     post_form_hx(
@@ -7508,6 +8632,39 @@ async fn parking_details_dialogs_and_swap_targets_are_accessible(
 
     let (s, body) = get_c(&app, &format!("/parking/{loc}"), Some(&uploader)).await;
     assert_eq!(s, StatusCode::OK);
+    assert!(body.contains(r#"<label for="photo-upload-file"#), "{body}");
+    assert!(body.contains("Image file"), "{body}");
+    assert!(body.contains(r#"<label for="photo-upload-alt"#), "{body}");
+    assert!(body.contains("Image description (optional)"), "{body}");
+    assert!(
+        body.contains("Describe what helps riders recognize"),
+        "{body}"
+    );
+
+    let pt_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/parking/{loc}"))
+                .header("accept-language", "pt-BR")
+                .header("cookie", &uploader)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pt_response.status(), StatusCode::OK);
+    let pt_body = pt_response.into_body().collect().await.unwrap().to_bytes();
+    let pt_body = String::from_utf8_lossy(&pt_body);
+    assert!(pt_body.contains("Arquivo de imagem"), "{pt_body}");
+    assert!(
+        pt_body.contains("Descrição da imagem (opcional)"),
+        "{pt_body}"
+    );
+    assert!(
+        pt_body.contains("Descreva o que ajuda ciclistas"),
+        "{pt_body}"
+    );
 
     // Report modal: role/aria-modal/aria-labelledby, and the target exists.
     let report_modal = opening_tag_with_id(&body, "report-modal");
@@ -7548,42 +8705,30 @@ async fn parking_details_dialogs_and_swap_targets_are_accessible(
         assert!(tag.contains(r#"aria-live="polite""#), "{id}: {tag}");
         assert!(tag.contains(r#"tabindex="-1""#), "{id}: {tag}");
     }
-
-    let _ = tx;
-    cleanup_user_contributions(UPLOADER).await;
-    cleanup_user_contributions(MODERATOR).await;
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = 'wp21-dialogs'")
-        .execute(&pool().await)
-        .await
-        .unwrap();
 }
 
 #[db_test]
 async fn search_results_list_has_no_script_child_and_listitems_are_direct_children(
     tx: &mut bikesnest_test_support::TestTx,
 ) {
+    let db = tx.db().await;
     const MARK: &str = "wp21-search-list";
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
-        .await
-        .unwrap();
+
     // The FakeGeocoder resolves "Rua XV de Novembro" to exactly this point
     // (crates/infrastructure/src/geocoding.rs), so a fixture placed there is
     // guaranteed to be in range of the query the task names.
     ParkingBuilder::new()
         .with_fixture_tag(MARK)
-        .with_name("WP21 List Structure Rack")
+        .with_name("List Structure Rack")
         .at(-25.4284, -49.2733)
-        .create(tx.executor())
+        .create(&mut db.acquire().await.unwrap())
         .await
         .unwrap();
-    tx.commit_fixture().await;
 
-    let (status, body) = get("/search?q=Rua+XV+de+Novembro").await;
+    let (status, body) = get(tx, "/search?q=Rua+XV+de+Novembro").await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        body.contains("WP21 List Structure Rack"),
+        body.contains("List Structure Rack"),
         "the seeded fixture is in the results: {body}"
     );
 
@@ -7620,13 +8765,6 @@ async fn search_results_list_has_no_script_child_and_listitems_are_direct_childr
         head.starts_with("<article") && head.contains(r#"role="listitem""#),
         "the first child of #results must be a listitem: {head}"
     );
-
-    let _ = tx;
-    sqlx::query("DELETE FROM parking_location WHERE seed_key = $1")
-        .bind(MARK)
-        .execute(&pool().await)
-        .await
-        .unwrap();
 }
 
 // --- Template/static-asset hygiene (pure filesystem scan, no DB) ------------

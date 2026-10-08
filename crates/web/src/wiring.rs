@@ -13,22 +13,24 @@ use std::sync::Arc;
 
 use axum::{Router, middleware};
 use bikesnest_application::{
-    AuthService, CheckReadiness, ContributionDeps, ContributionService, EmailProvider, EmailQueue,
-    GetParkingDetails, ModerationDeps, ModerationService, ObjectStorage, PasswordHasher, PhotoDeps,
-    PhotoService, PrivacyDeps, PrivacyService, RateLimiter, SearchParking,
+    AuthMailDispatcher, AuthService, CheckReadiness, ContributionDeps, ContributionService,
+    EmailProvider, GetParkingDetails, ModerationDeps, ModerationService, ObjectStorage,
+    ParkingPhotoReader, PasswordHasher, PhotoDeps, PhotoService, PrivacyDeps, PrivacyService,
+    RateLimiter, SearchParking,
 };
 use bikesnest_infrastructure::probe::SqlxDatabaseProbe;
 use bikesnest_infrastructure::{
-    Argon2PasswordHasher, Config, ConfigError, Db, FakeOAuthProvider, InlineEmailQueue,
-    JobEmailQueue, LocalImageProcessor, OfflineTimezoneResolver, RealTokenGenerator,
+    Argon2PasswordHasher, Config, ConfigError, Db, DurableAuthMailDispatcher, FakeOAuthProvider,
+    InlineAuthMailDispatcher, LocalImageProcessor, OfflineTimezoneResolver, RealTokenGenerator,
     S3ObjectStorage, SharedGeocoder, SharedObjectStorage, SharedRateLimiter, SqlxAccountRepository,
-    SqlxAnonymizationRepository, SqlxAuditLog, SqlxAuditLogReader, SqlxContributionHistoryReader,
-    SqlxExportRepository, SqlxFavoriteRepository, SqlxModerationRepository,
-    SqlxParkingContributionRepository, SqlxParkingDetailsReader, SqlxParkingPhotoReader,
-    SqlxParkingSearchReader, SqlxPhotoRepository, SqlxPolicyReader, SqlxPrivacyRequestRepository,
-    SqlxReportRepository, SqlxReviewPhotosReader, SqlxReviewRepository, SqlxSessionStore,
-    SqlxSitemapReader, SqlxTokenStore, SqlxVerificationRepository, SystemClock,
-    caching_geocoder_from_config, email_from_config, rate_limiter_from_config,
+    SqlxAnonymizationRepository, SqlxAuditLog, SqlxAuditLogReader, SqlxAuthOutbox,
+    SqlxContributionHistoryReader, SqlxExportRepository, SqlxFavoriteRepository,
+    SqlxModerationRepository, SqlxParkingContributionRepository, SqlxParkingDetailsReader,
+    SqlxParkingPhotoReader, SqlxParkingSearchReader, SqlxPhotoRepository, SqlxPolicyReader,
+    SqlxPrivacyRequestRepository, SqlxReportRepository, SqlxReviewPhotosReader,
+    SqlxReviewRepository, SqlxSessionStore, SqlxSitemapReader, SqlxTokenStore,
+    SqlxVerificationRepository, SystemClock, caching_geocoder_from_config, email_from_config,
+    rate_limiter_from_config,
 };
 use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 
@@ -48,6 +50,7 @@ pub struct RouterDeps<H: PasswordHasher + Clone + 'static> {
     pub hasher: H,
     pub rate_limiter: Box<dyn RateLimiter>,
     pub storage: Arc<dyn ObjectStorage>,
+    pub detail_reads: Option<Arc<dyn crate::state::DetailReads>>,
 }
 
 impl RouterDeps<Argon2PasswordHasher> {
@@ -58,9 +61,10 @@ impl RouterDeps<Argon2PasswordHasher> {
         Ok(Self {
             email: Arc::from(email_from_config(&config.email)?),
             oauth: None,
-            hasher: Argon2PasswordHasher,
+            hasher: Argon2PasswordHasher::new(config.password_hash),
             rate_limiter: rate_limiter_from_config(&config.rate_limiter)?,
             storage: Arc::new(S3ObjectStorage::from_config(&config.storage)),
+            detail_reads: None,
         })
     }
 }
@@ -90,6 +94,7 @@ pub fn app_router_with<H: PasswordHasher + Clone + 'static>(
         hasher,
         rate_limiter,
         storage,
+        detail_reads,
     } = deps;
     let oauth = oauth.unwrap_or_else(|| FakeOAuthProvider::from_config(&config.fake_oauth));
     let google_oauth_enabled = config.google_oauth_enabled;
@@ -111,19 +116,13 @@ pub fn app_router_with<H: PasswordHasher + Clone + 'static>(
         Box::new(SqlxParkingDetailsReader::new(db.clone())),
         config.freshness,
     );
-    // Transactional mail leaves the request path when there is a worker to
-    // pick it up: `JOBS_ENABLED=true` (the default) queues an `email.send` job,
-    // so a slow ESP cannot hold a registration open or fail it after the
-    // account row exists. With the worker disabled nothing would ever claim
-    // that row, so the same port sends inline instead — queuing it would be
-    // indistinguishable from dropping the mail.
-    let email_queue: Box<dyn EmailQueue> = if config.jobs.enabled {
-        Box::new(JobEmailQueue::new(
-            bikesnest_infrastructure::SqlxJobRepository::new(db.clone()),
-            config.jobs.max_attempts,
-        ))
+    // Auth changes always commit with their outbox row. Worker-enabled web
+    // returns after that commit; worker-disabled compatibility exact-claims
+    // only the just-admitted row and delivers it post-commit.
+    let mail_dispatcher: Box<dyn AuthMailDispatcher> = if config.jobs.durable_enqueue {
+        Box::new(DurableAuthMailDispatcher)
     } else {
-        Box::new(InlineEmailQueue::new(email))
+        Box::new(InlineAuthMailDispatcher::new(db.clone(), email))
     };
     let auth_service = AuthService::new(
         Box::new(SqlxAccountRepository::new(db.clone())),
@@ -132,7 +131,8 @@ pub fn app_router_with<H: PasswordHasher + Clone + 'static>(
         Box::new(hasher.clone()), // password hasher (Argon2 in prod, fast fake in tests)
         Box::new(RealTokenGenerator),
         Box::new(SystemClock),
-        email_queue,
+        Box::new(SqlxAuthOutbox::new(db.clone(), config.jobs.max_attempts)),
+        mail_dispatcher,
         Box::new(oauth),
         Box::new(SharedRateLimiter::new(rate_limiter.clone())), // shared ValKey store
         Box::new(SqlxAuditLog::new(db.clone())),
@@ -152,7 +152,10 @@ pub fn app_router_with<H: PasswordHasher + Clone + 'static>(
         freshness: config.freshness,
     });
     let photo_service = PhotoService::new(PhotoDeps {
-        processor: Box::new(LocalImageProcessor::new(config.photo)),
+        processor: Box::new(LocalImageProcessor::new(
+            config.photo,
+            config.photo_processing_concurrency,
+        )),
         repository: Box::new(SqlxPhotoRepository::new(db.clone())),
         storage: Box::new(SharedObjectStorage::new(storage.clone())),
         rate_limiter: Box::new(SharedRateLimiter::new(rate_limiter.clone())),
@@ -181,8 +184,17 @@ pub fn app_router_with<H: PasswordHasher + Clone + 'static>(
         tokens_gen: Box::new(RealTokenGenerator),
         clock: Box::new(SystemClock),
     });
-    let policy_reader: Arc<dyn bikesnest_application::PolicyReader> =
-        Arc::new(SqlxPolicyReader::new(db.clone()));
+    let policy_adapter = Arc::new(SqlxPolicyReader::new(db.clone()));
+    let policy_reader: Arc<dyn bikesnest_application::PolicyReader> = policy_adapter.clone();
+    let terms_store: Arc<dyn bikesnest_application::TermsAcknowledgementStore> = policy_adapter;
+    let photos: Arc<dyn ParkingPhotoReader> = Arc::new(SqlxParkingPhotoReader::new(db.clone()));
+    let contributions = Arc::new(contribution_service);
+    let detail_reads = detail_reads.unwrap_or_else(|| {
+        Arc::new(crate::state::AppDetailReads {
+            photos: photos.clone(),
+            contributions: contributions.clone(),
+        })
+    });
     let state = AppState {
         readiness: Arc::new(CheckReadiness::new(probe)),
         search: Arc::new(search_uc),
@@ -191,15 +203,17 @@ pub fn app_router_with<H: PasswordHasher + Clone + 'static>(
         geocode_limits: config.geocode,
         details: Arc::new(details),
         freshness: config.freshness,
-        photos: Arc::new(SqlxParkingPhotoReader::new(db.clone())),
+        photos,
+        detail_reads,
         sitemap: Arc::new(SqlxSitemapReader::new(db.clone())),
         storage: storage.clone(),
         auth: Arc::new(auth_service),
-        contributions: Arc::new(contribution_service),
+        contributions,
         photo: Arc::new(photo_service),
         moderation: Arc::new(moderation_service),
         privacy: Arc::new(privacy_service),
         policy: policy_reader,
+        terms: terms_store,
         security: SecurityHeaders::new(&config.security, &config.map, config.tls_on),
         map: config.map.clone(),
         base_url: config.base_url.clone(),

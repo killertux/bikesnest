@@ -45,14 +45,14 @@ images it pulls; no host Rust/Node install is required).
 
 ```bash
 cp .env.example .env            # sensible defaults; adjust if ports are taken
-docker compose up -d            # postgres+postgis, app, tailwind watcher, mailpit, valkey, minio
+docker compose up -d            # postgres+postgis, app, tailwind watcher, mailpit, valkey, rustfs
 docker compose logs -f app      # watch it compile & start (first start takes a few minutes)
 ```
 
 Compose injects the complete `.env` into the app container, so provider,
 policy, job, retention, map, and tuning settings apply there too. The
 `COMPOSE_*` variables in `.env.example` are reserved for addresses that differ
-inside Docker (`db`, `minio`, `valkey`, and `mailpit`).
+inside Docker (`db`, `rustfs`, `valkey`, and `mailpit`).
 
 Open **http://localhost:8080**. The stack starts:
 
@@ -63,7 +63,7 @@ Open **http://localhost:8080**. The stack starts:
 | `css` | Tailwind CSS watcher | — |
 | `mailpit` | catches every outgoing email | `http://localhost:8025` |
 | `valkey` | rate-limit store (Redis-compatible) | `localhost:6380` |
-| `minio` | S3-compatible object storage for photos | `http://localhost:9001` |
+| `rustfs` | S3-compatible object storage for photos | `http://localhost:9001/rustfs/console/` |
 
 Once the app is up, seed development data (optional, dev only — production
 starts empty):
@@ -168,7 +168,7 @@ source of truth). The ones you'll most often touch:
 | `EMAIL_PROVIDER` | `fake` \| `smtp` \| `resend` | `fake` |
 | `SMTP_HOST/PORT/USERNAME/PASSWORD/TLS` | SMTP backend | — |
 | `RESEND_API_KEY` / `RESEND_FROM` | Resend backend | — |
-| `S3_ENDPOINT/REGION/BUCKET/ACCESS_KEY_ID/SECRET_ACCESS_KEY` | object storage (empty endpoint = AWS) | MinIO defaults |
+| `S3_ENDPOINT/REGION/BUCKET/ACCESS_KEY_ID/SECRET_ACCESS_KEY` | object storage (empty endpoint = AWS) | RustFS defaults |
 | `VALKEY_URL` / `VALKEY_CLUSTER_URLS` | shared rate limiter (unset = in-memory) | unset |
 | `RATE_LIMIT_FAIL_OPEN` | allow (true) or 429 (false) if ValKey is down | `true` |
 | `LOCATION_PROVIDER` | `google` \| `mapbox` \| `fake`; selects geocoding, autocomplete, and maps | `fake` |
@@ -188,9 +188,10 @@ source of truth). The ones you'll most often touch:
 ## Tests
 
 ```bash
-cargo test                     # domain + application tests (no DB needed)
+cargo test -p bikesnest-domain -p bikesnest-application  # no DB needed
 docker compose up -d db        # required for DB-backed tests
-cargo test --workspace         # everything, incl. #[db_test] integration/HTTP tests
+TEST_DATABASE_URL=postgres://bikesnest:bikesnest@localhost:5432/bikesnest_test \
+  cargo test --workspace       # everything, incl. #[db_test] integration/HTTP tests
 ```
 
 How tests are structured and how to write one: [`TESTING.md`](TESTING.md).

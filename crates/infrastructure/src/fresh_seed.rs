@@ -32,6 +32,7 @@ pub async fn reset_all_data(
         }
     }
 
+    let mut conn = db.acquire().await?;
     sqlx::query(
         r#"
         TRUNCATE TABLE
@@ -62,7 +63,7 @@ pub async fn reset_all_data(
         RESTART IDENTITY CASCADE
         "#,
     )
-    .execute(db.pool())
+    .execute(&mut *conn)
     .await?;
 
     Ok(deleted_objects)

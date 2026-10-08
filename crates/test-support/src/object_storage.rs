@@ -1,9 +1,9 @@
 //! In-memory [`ObjectStorage`] test double.
 //!
 //! Used by the web/infrastructure test suite so media flows (upload → gallery)
-//! run without a filesystem or a real S3/MinIO, storing bytes in a `HashMap`.
+//! run without a filesystem or a real S3/RustFS, storing bytes in a `HashMap`.
 //! `presigned_get` returns an absolute `http://media.test.invalid/...`-shaped
-//! URL — the same shape a real presigned S3/MinIO URL has (a full, foreign
+//! URL — the same shape a real presigned S3/RustFS URL has (a full, foreign
 //! origin the app never proxies) — purely as a stable, inspectable string for
 //! gallery-link assertions; nothing actually serves that origin.
 //!

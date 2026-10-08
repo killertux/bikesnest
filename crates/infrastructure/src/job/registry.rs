@@ -1,4 +1,4 @@
-//! Job handler registry + the built-in handlers (plans/m9-background-jobs.md).
+//! Job handler registry and the built-in handlers.
 
 use crate::Db;
 use crate::auth::{SqlxAuditLog, SystemClock};
@@ -13,8 +13,10 @@ use bikesnest_application::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// An always-on recurring job the worker bootstraps at startup (self-healing:
-/// `enqueue` with a stable `idempotency_key` is a no-op if the row already exists).
+pub const RETENTION_RECURRING_KEY: &str = "recurring:retention";
+pub const JOBS_GC_RECURRING_KEY: &str = "recurring:jobs.gc";
+
+/// An always-on recurring job the worker reconciles at startup.
 pub struct RecurringKind {
     pub job_kind: &'static str,
     pub payload: JobPayload,
@@ -25,7 +27,7 @@ pub struct RecurringKind {
 
 /// Maps a job `kind` → its handler, plus the always-on recurring kinds.
 pub struct JobRegistry {
-    handlers: HashMap<String, Box<dyn JobHandler>>,
+    handlers: HashMap<String, Arc<dyn JobHandler>>,
     recurring: Vec<RecurringKind>,
 }
 
@@ -33,7 +35,7 @@ impl JobRegistry {
     pub fn new(handlers: Vec<Box<dyn JobHandler>>, recurring: Vec<RecurringKind>) -> Self {
         let map = handlers
             .into_iter()
-            .map(|h| (h.kind().to_string(), h))
+            .map(|h| (h.kind().to_string(), Arc::from(h)))
             .collect();
         Self {
             handlers: map,
@@ -41,8 +43,8 @@ impl JobRegistry {
         }
     }
 
-    pub fn get(&self, kind: &str) -> Option<&dyn JobHandler> {
-        self.handlers.get(kind).map(|b| b.as_ref())
+    pub fn get(&self, kind: &str) -> Option<Arc<dyn JobHandler>> {
+        self.handlers.get(kind).cloned()
     }
 
     pub fn recurring(&self) -> &[RecurringKind] {
@@ -60,8 +62,7 @@ pub struct JobServices {
 /// retention (backed by `RetentionJob`), `jobs.gc` and `email.send`.
 ///
 /// `email` is the same provider instance the router holds, so a deployment
-/// running with `JOBS_ENABLED=false` (where the inline `EmailQueue` sends on
-/// the request path) and one running with the worker talk to one configured
+/// running with explicit inline delivery and one running with the worker talk to one configured
 /// relay/ESP, not two.
 pub fn job_services(
     db: Db,
@@ -76,21 +77,21 @@ pub fn job_services(
             repo.clone(),
             config.jobs.history_retention_days,
         )),
-        Box::new(SendEmailHandler::new(email)),
+        Box::new(SendEmailHandler::new(db.clone(), email)),
     ];
     let recurring = vec![
         RecurringKind {
             job_kind: JOB_RETENTION,
             payload: serde_json::json!({}),
             schedule: serde_json::json!({ "every_seconds": 86_400 }),
-            idempotency_key: "recurring:retention",
+            idempotency_key: RETENTION_RECURRING_KEY,
             max_attempts: config.jobs.max_attempts,
         },
         RecurringKind {
             job_kind: JOB_JOBS_GC,
             payload: serde_json::json!({}),
             schedule: serde_json::json!({ "every_seconds": 86_400 }),
-            idempotency_key: "recurring:jobs.gc",
+            idempotency_key: JOBS_GC_RECURRING_KEY,
             max_attempts: config.jobs.max_attempts,
         },
     ];

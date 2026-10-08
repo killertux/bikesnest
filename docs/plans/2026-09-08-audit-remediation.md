@@ -1,0 +1,478 @@
+# BikesNest audit remediation plan
+
+Date: 2026-09-08. Baseline: `7aa243c`. Working branch: `fix/audit-remediation`, isolated worktree `/tmp/bikesnest-audit-remediation`.
+
+Source: [full review](../reviews/2026-09-08-app-review.md). This is the progress record, not a replacement for the audit evidence.
+
+## Scope and decisions
+
+- Fix the audit's engineering/product defects and factual documentation drift, preserving the modular monolith and approval invariants.
+- **Excluded by the user:** synthetic reviews/demo provenance (`PROD-02`, `UX-10`). The data is intentionally present for validation. Do not delete, relabel, reseed, change its ratings, or otherwise reconcile it in this program.
+- Preserve all existing user changes. Work outside the live main checkout: production serves its static files directly.
+- No production writes, deployments, restarts, policy seeding, external emails, provider-console changes, real retention runs, notification campaigns, or PR publication without separate authorization.
+- New sequential DB tests use transaction injection and automatic rollback. Real multi-connection/worker/browser tests use an explicitly disposable isolated database; no cleanup of user databases.
+- New migrations are forward-only. Document data/backfill/rollback implications; never edit an applied migration.
+- User-facing text stays in en + pt-BR catalogs. Keep native HTML fallback, unknown states, and separation of published/proposed facts.
+- Legal applicability, contracts, DNS/edge operations and restore drills require evidence/authority outside source code. Prepare implementation/runbooks and list pending decisions honestly; do not mark those obligations satisfied merely because documents were edited.
+
+## Execution and independent review protocol
+
+One batch at a time; no implementation of the next batch before the current gate passes.
+
+1. Lead assigns a bounded batch with acceptance criteria, ownership and allowed resources.
+2. **GPT Terra** implements straightforward/local changes; **GPT Sol** implements security, transaction, concurrency or multi-layer changes. Escalate a Terra batch to Sol if complexity exceeds its scope. No model is asked to approve its own implementation.
+3. Implementation agent records files, tests actually run, outcomes, residual risks, migrations and deployment considerations. Lead checks scope and prepares a stable diff.
+4. Spawn a **separate GPT Sol reviewer** to inspect the diff independently, run targeted validation and check regressions/security/invariants. Reviewer does not implement the next batch.
+5. Any correctness, security, untested acceptance criterion or unrelated-change finding returns to implementation. Reviewer rechecks corrections. A missing test environment is not a pass.
+6. Lead accepts only when required checks pass and material findings are resolved. Save a review record under `docs/reviews/remediation/`, update this progress record, and checkpoint a local commit.
+7. Advance to the next queued batch. Operational/legal gates can be marked `awaiting-authority/evidence` with concrete owner/input; do not pretend they are fixed or block unrelated safe implementation.
+
+Statuses: `queued`, `implementing`, `reviewing`, `changes-requested`, `accepted`, `awaiting-authority/evidence`. Accepted means reviewed code, **not deployed**.
+
+## Ordered batches and acceptance criteria
+
+| Batch | Implementation model | Scope / audit mapping | Required acceptance evidence | Status |
+|---|---|---|---|---|
+| B00 | Terra | Safe DB-test target selection; truthful quick commands (`ENG-02`) | Missing/invalid/non-test targets fail before connecting/migrating without leaking URLs; explicit isolated target works; no `DATABASE_URL` fallback; CI/docs updated; pure guard tests | accepted |
+| B01 | Sol | Suspension-safe verification and token invalidation (`SEC-01`) | Suspended/deleted cannot reactivate; legitimate initial verification and active email change work; repository predicate handles races; old verification tokens cannot bypass suspension | accepted |
+| B02 | Sol | CSRF token lifecycle and usable expiry handling (`HX-01/02/03`) | Real middleware/browser matrix: cold/boosted forms, invalid→valid retry, login/logout, two tabs, history, expiry, multipart; invalid tokens still fail; no automatic mutation replay; token-free diagnostics | accepted |
+| B03 | Terra → Sol | Search query contract and request synchronization (`HX-04/05`) | Multiple type/security filters work natively and through htmx; exactly one sort request; stale delayed response cannot win; filters/sort/pagination/history persist; explicit clear semantics | accepted |
+| B04 | Sol | Recurring-job schedule persistence/reconciliation (`ENG-01`, `PROD-01`) | Actual registry→bootstrap→claim→finish→future recurrence; restart idempotence; repair exact existing built-in rows safely; no duplicate scheduling; operational repair documented, not run in production | accepted |
+| B05 | Sol | Password-reset validation and atomic credential transition (`SEC-03`) | Weak password leaves valid token usable; consume/update/revoke commit atomically; persistence-failure and competing-reset tests; preserve suspended/deleted states | accepted |
+| B05r | Sol | Administrator account-state transition guards (additional B01 finding) | Restore only suspended accounts, never deleted; preserve email-verification requirements on restore; suspension cannot overwrite deletion; authoritative predicates and rollback/race regression evidence | accepted |
+| B06a | Sol | Mail-queue privacy and sensitive logging (`SEC-02/06`, `LEG-05` implementation) | Account-linked jobs; scrub terminal sensitive payloads; cancel/redact deletion copies; delayed/expired mail not sent; race tests; vendor error bodies cannot leak email/token; explicit retention/backups limits | accepted |
+| B06b | Sol | Transactional auth outbox and delivery semantics (`ENG-06`, email retry findings) | Account/token/outbox commit together; enqueue failure/crash retry cannot strand registration; permanent vs retryable provider failures; supported provider idempotency; no exactly-once SMTP promise | accepted |
+| B07 | Sol | Worker leases, supervision, execution modes (`ENG-04/05/08`) | Claim only active capacity; heartbeat all active leases; stale owner cannot silently complete; panic/timeouts/outcome-write failures observable; graceful shutdown; separate enqueue vs run config and worker-only command | accepted |
+| B08 | Sol | CPU admission control and cancellation (`SEC-05`, `ENG-07`) | Owned image permit lives inside blocking closure; bounded hash work/admission; cancellation/burst tests assert actual running maximum; no durable login work | accepted |
+| B09a | Sol | Sensitive-response cache and abuse-limit hardening (security additional checks) | Auth/private/token HTML no-store, fragment/full consistency, public cache policy explicit; credential-sensitive limiter failure has bounded safe behavior and monitoring; test trusted-proxy assumptions without changing edge | accepted |
+| B09b | Sol | Provider CSP hardening (`SEC-04`) | Strict nonce-based strategy verified against installed htmx and all map providers; dynamic loader propagates nonce safely; legitimate SDKs work; required eval exceptions documented; report-only rollout path | accepted |
+| B10 | Terra → Sol | Map/GPS recovery, document metadata and navigation accessibility (`UX-01/02/11`, `HX-07`) | Localized loading/failure/retry, finite GPS timeout and manual destination fallback; blocked SDK/style/tiles handled; lang/title/focus/history sync; no reintroduced menu/map bugs | accepted |
+| B11 | Sol | Tab-specific detail reads and honest degraded states (`HX-06`) | Count/reader tests prove unused history/gallery not fetched; cheap pending-field metadata retained; bounded pagination/totals; failed collaboration read shown unavailable, never zero; compare query/response work before/after | accepted |
+| B12 | Terra | Compact cyclist-first profile/search presentation (`UX-03/04/05/06/07/08`) | 390px + desktop task checks; security/access/cost/map before reviews; short current/history/pending links; eligibility next steps; precise trust/history copy; cycling directions with fallback; compact results retain map/list mapping | accepted |
+| B13 | Terra → Sol | Contribution forms and accessibility (`UX-09`, acceptance journeys) | Paid fields conditionally disclosed; optional groups readable; file/description labels; pin/address validation; errors retain values and focus; keyboard/native fallback; no weakening approval | accepted |
+| B14 | Terra (Sol for security-notification logic) | Branded transactional HTML + plaintext and security notifications | Shared escaped bilingual template, actual expiry, accessible CTA/fallback URL; SMTP multipart + Resend text/html; both locales/kinds; blocked images/narrow/dark checks; password/old-address warnings queued without credentials | accepted |
+| B15a | Terra → Sol | Factual policy/runbook corrections (`LEG-01/03/05`, `UX-12`) | Browser storage/analytics and moderation accurately described in both languages; attribution vs anonymization precise; minors exemption claim removed; incident deadlines sourced; drafts not seeded/published automatically | accepted |
+| B15b | Sol | Terms-version acknowledgement/material-change notices (`LEG-04`) | Version + timestamp recorded for applicable agreement, no conflation with blanket privacy consent; recoverable notification/ack flow; migrations and tests; actual notification/policy publication awaits owner-approved wording | accepted |
+| B16a | Sol | Complete transaction-scope migration (`ENG-03`) | Remaining sequential repositories use acquire; HTTP router shares scoped Db; remove cleanup only after migration; panic leaves no fixture; no leaked process-global locks; explicit inventory reaches zero unexplained legacy writes | accepted |
+| B16b | Sol | Independent races and full-stack behavior tests (test gaps) | Disposable DB lanes for approval/suspension/reset/worker races; real rendered CSRF/search journeys; fail original bug cases; tests cannot claim foreign jobs; measured runtime baseline and parallel-repeat reliability | accepted |
+| B17 | Terra | CI advisories and measured test ergonomics (dependency/test findings) | RustSec + npm advisory checks, reviewed expiring exceptions; fast DB-free lane; builds vs execution measured; preserve asset/image checks; no blind dependency upgrades or test-runner churn | accepted |
+| B18 | Sol | Additional worker use for expensive noninteractive work | Measure export/media latency and sizes; queued exports with pending/ready/auth download lifecycle if material; media queue only with durable quarantine/privacy controls; record explicit measurement-backed decision, not an unjustified rewrite | accepted |
+| B19 | Sol reviewer + lead/owner | Integrated release and external evidence gates | Full isolated suite, browser matrix, image build, migrations fresh+upgrade; remediate or explicitly re-review every unexpired B17 advisory exception; counsel/provider/edge/DNS/restore checklist; staged rollout/rollback plan; production deployment/reconciliation only after explicit authorization | awaiting-authority/evidence |
+
+## Batch dependencies and scope boundaries
+
+- B00 is first because all subsequent DB regression evidence must be safe.
+- B01–B05 are the immediate user-visible/security/retention corrections; separate commits let them be reviewed/released without the redesign.
+- B06a/B06b may share a minimal account-aware outbox schema; define it once and use forward migrations. Do not duplicate transactional ports or store raw tokens indefinitely.
+- B06a handoff constraints: verify both stored payloads and already-claimed in-memory copies against canonical account/token validity before provider handoff; define the deletion/send linearization boundary honestly (already accepted external mail cannot be recalled). Legacy rows need an explicit forward-upgrade policy, not an assumption that every existing payload has new metadata. Sanitize decode/provider/terminal-error paths, not just successful-message logging. B06b must reuse that lifecycle when making account/token/outbox atomic; B14 must reuse its expiry/locale metadata.
+- Logging reference for B06a: [OWASP Logging guidance](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html#data-to-exclude) recommends excluding credentials/tokens and treating personal data deliberately; test malformed and hostile provider responses through both persisted errors and captured events.
+- B07 builds on B04; B08 is independent of worker throughput. B09b depends on B02's document/token contract, and B10 must preserve it.
+- B11 supplies reliable read models for B12. Do not let a pretty empty state conceal a failed query.
+- B14 uses B06/B07 delivery guarantees. Introduce structured expiry/locale metadata before rendering it into copy.
+- B15 factual edits can be prepared without a legal opinion; provider contracts, legal bases, liability/age scope and material-change wording cannot be invented.
+- B16 extends tests continuously added in every batch; it is not permission to defer required regressions until the end.
+- B18 is explicitly conditional on evidence: findings recommended considering queues, not queuing every task. Interactive search/auth and atomic proposal publication stay synchronous.
+
+## Coverage matrix
+
+Every actionable audit ID is assigned; duplicates share batches.
+
+| Audit IDs | Batches |
+|---|---|
+| HX-01, HX-02, HX-03 | B02 |
+| HX-04, HX-05 | B03 |
+| HX-06 | B11 |
+| HX-07, UX-11 | B10 |
+| PROD-01, ENG-01 | B04 |
+| PROD-02, UX-10 | Excluded by user; validation/demo data unchanged |
+| ENG-02 | B00 |
+| ENG-03 | B16a, B16b |
+| ENG-04, ENG-05, ENG-08 | B07 |
+| ENG-06 | B06b |
+| ENG-07, SEC-05 | B08 |
+| SEC-01 | B01 |
+| SEC-02 | B06a |
+| SEC-03 | B05 |
+| SEC-04 | B09b |
+| SEC-06 | B06a |
+| UX-01, UX-02 | B10 |
+| UX-03, UX-04, UX-05, UX-06, UX-07, UX-08 | B12 |
+| UX-09 | B13 |
+| UX-12, LEG-01 | B15a |
+| LEG-02 | B19 external evidence + B15a accurate wording |
+| LEG-03 | B15a + B19 counsel applicability |
+| LEG-04 | B15b + owner approval |
+| LEG-05 | B06a, B15a, B19 |
+| Additional security cache/proxy/limiter/MFA recommendations | B09a, B19; privileged MFA choice recorded as an owner decision |
+| Email visual/security-notice recommendations | B14 |
+| Tests/performance/advisory recommendations | B16a, B16b, B17 |
+| More workers / queued exports / optional media | B07, B18 |
+
+## Validation environment and baseline
+
+- Use a new disposable PostGIS database/container with dedicated test credentials and loopback-only access. Never source the production `.env` into test commands.
+- Pure tests: explicit domain/application packages. Full suite: explicit `TEST_DATABASE_URL` only after target validation and test-service setup.
+- External providers use fakes or local mail/object-store/limiter services; no real emails/uploads in validation.
+- Build/debug artifacts may reuse a known compiler cache, but never rebuild the running release binary or live generated static assets.
+- Baseline audit: fmt and strict Clippy passed; 172 domain/application tests; 13 browser tests (~7.38s); no npm advisories at audit time; DB suite/RustSec not yet validated.
+- Every review record lists commands, result counts, actual environment, diff/commit reviewed, issues and final disposition. Source-string guards do not substitute for behavioral proof.
+
+## External evidence / authority checkpoints
+
+These remain explicit until the owner supplies evidence or approves action:
+
+1. Actual provider legal entities/regions/subprocessors, signed DPAs/transfer mechanism, counsel's legal/age/geographic-scope assessment.
+2. Approved terms/privacy wording, effective versions, notification recipients and permission to publish/seed/send notices.
+3. Edge cache/TLS/proxy allowlist topology, map-key restrictions, bucket privacy, SPF/DKIM/DMARC and provider idempotency support.
+4. Backup retention and approved restore drill target; incident owner/escalation contact; authenticated security staging accounts and penetration-test scope.
+5. Release window, migration/backfill review, exact production recurring-job reconciliation and separately approved deployment.
+
+## Progress log
+
+- B19 local/source checkpoint `e0ac245` passed independent GPT Sol review after
+  one bounded correction round from accepted B18 baseline `11cbf00`. The
+  reviewer found that the first MapLibre 6 bridge exposed a non-extensible ESM
+  namespace while the adapter still assigned a browser token. The final source
+  keeps MapLibre token-free and routes legacy Mapbox styles to the existing
+  Mapbox SDK; real Chromium proved the configured token on locally intercepted
+  Mapbox requests without contacting the provider. Five RustSec paths and the
+  direct critical MapLibre advisory were remediated; SQLx defaults were removed,
+  but its retained macro metadata still
+  locks an inactive unpatched RSA package, so one exact exception remains with
+  an updated 2026-10-23 expiry/removal decision. Fresh cargo-audit reports only
+  that finding. A fresh npm audit is an explicit release blocker because both
+  live-registry escalation requests were rejected pending direct user approval;
+  the 6.11.1 lock/tree and official fix are recorded but are not misreported as
+  a fresh scan. MapLibre's ESM/shared/worker topology passed actual Chromium
+  CSP, hard-load, lazy-navigation and retry coverage. Image processing is now
+  configured independently from the runtime CPU count, defaults to one, rejects
+  zero/over-maximum values, and preserves cancellation permit ownership; actual
+  production memory/capacity remains an external staging gate. The isolated
+  workspace passed 761 tests with 0 failures and 10 expected ignores, then all
+  six ignored renderer/browser targets passed explicitly. Fresh 1–29 and real
+  27–29 upgrade paths, local S3/Valkey, frontend deterministic rebuild,
+  browser 28/28, pinned-Rust-1.95 Docker image, all-target/all-feature check,
+  strict Clippy, formatting and diff checks passed. See the
+  [B19 handoff](../reviews/remediation/B19-handoff.md) and independent
+  [B19 review](../reviews/remediation/B19-review.md) for the staged
+  rollout/rollback plan and unsatisfied npm plus
+  owner/counsel/provider/edge/DNS/restore evidence matrix. The local/source
+  gate is complete; release readiness remains blocked and no production action
+  occurred.
+
+- B18 checkpoint: `498d6ef` handed off to B19, limited to integrated release
+  validation, advisory resolution/re-review, external-evidence accounting and
+  a staged rollout/rollback plan. Production deployment, reconciliation,
+  provider/edge/DNS changes, policy publication and restore execution remain
+  separately authorized actions.
+
+- B18 gate passed after one bounded evidence-record correction round. Independent
+  Sol reran all four optimized measurements in separate processes and confirmed
+  exports remained below the documented triggers: representative assembly
+  2.096 ms p95, heavy assembly 57.641 ms p95, 18,955,133 B compact output,
+  conservative generation/persistence RSS +94,300 KiB, and isolated typed
+  download/pretty RSS +72,552 KiB. Media remained at 71.909 ms representative
+  and 542.113 ms for the exact 20 MP fixture. Focused privacy/export/photo/HTTP
+  tests, workspace check, strict Clippy, formatting and diff checks passed. The
+  review corrected threshold chronology, proposal-rate math, query counts,
+  exported-favorite labels and RSS/JSON-text methodology without moving any
+  threshold or changing production behavior. See the
+  [B18 review](../reviews/remediation/B18-review.md). Synchronous export/media
+  processing is accepted with the documented monitoring and B19 capacity
+  risks; no deployment, provider, policy-publication or production-database
+  action occurred. B19 is next.
+
+- B18 bounded evidence-record corrections are frozen for same-reviewer
+  re-review from checkpoint `3f3056b` after the
+  [changes-requested review](../reviews/remediation/B18-review.md). The complete
+  export thresholds (representative p95 >1 s, heavy p95 >3 s, compact output
+  >25 MiB, or request-phase RSS increase >128 MiB) and media thresholds
+  (representative p95 >1 s or synthetic upper-envelope p95 >5 s) are now
+  documented and were held fixed before the fresh independent reruns, which
+  remained below every threshold. Separate-process optimized implementation
+  measurements keep exports synchronous: the heavy envelope produced 18.94 MB
+  compact JSON, assembled at 59.749 ms p95, persisted in 255.031 ms, and the
+  conservative generation/persistence approximation increased RSS by 92.3 MiB;
+  it includes a measurement-only compact serialization in addition to the
+  production create conversion. Current typed download + pretty serialization
+  increased RSS by 89.6 MiB. An earlier approximately 141 MiB combined HWM
+  mixed phases and allocator retention and is explicitly superseded, not a
+  queue trigger. Media also stays synchronous: representative p95 was 74.097 ms
+  and synthetic 20 MP p95 544.292 ms, while a privacy-safe durable raw
+  quarantine does not exist. Unbounded account history and missing
+  export-specific admission remain monitoring/re-evaluation risks; deployment
+  CPU-count memory-capacity validation remains a B19 gate. See the
+  [B18 handoff](../reviews/remediation/B18-handoff.md). No deployment, provider,
+  policy-publication or production-database action occurred.
+
+- B17 checkpoint: `70b2985`. B18 is next, limited to measuring export/media
+  latency and size before deciding whether either path needs durable queued
+  execution. No queue rewrite is justified without material evidence, and the
+  accepted B17 advisory exceptions remain B19 release blockers.
+
+- B17 gate passed after one independent-review correction round. The npm v2
+  validator now proves that every direct or transitive vulnerability resolves
+  to an exact GHSA and cross-checks inventory and severity summaries; the
+  RustSec validator cross-checks count, list, finding shape and exact IDs. The
+  original three fail-open reproductions and the broader malformed-report
+  matrix now reject, while fresh npm1/RustSec6 reports pass only through seven
+  narrow expiring exceptions. Independent Sol passed the validator 7/7 on
+  Node 20 and 24, DB-free tests 182/182, syntax, formatting and diff/scope
+  guards. Implementer evidence covers all six explicitly wired ignored browser
+  tests. See [review](../reviews/remediation/B17-review.md) and
+  [handoff](../reviews/remediation/B17-handoff.md). CI/source accepted only;
+  every exception remains a B19 release blocker and nothing was deployed. B18
+  is next.
+
+- B17 independent review requested parser-integrity corrections: the original
+  JSON reader did not prove every npm v2 vulnerability resolved to an exact
+  advisory and omitted RustSec `count` validation. The bounded correction now
+  validates npm summaries/inventory/direct+transitive `via` resolution and
+  RustSec count/finding/ID invariants, with seven direct regressions; saved
+  live npm1/RustSec6 reports still pass exact exception validation. Same Sol
+  re-review remains required; B17 stays reviewing and nothing is deployed.
+
+- B17 implementation frozen for independent review: CI now has fail-closed
+  RustSec/npm JSON-report validation with one expiring reviewed-exception
+  register; an explicit DB-free domain/application compile-versus-execution
+  lane; and all six ignored renderer/browser tests explicitly invoked with the
+  browser mutant unset. Asset rebuild/diff/navigation and Docker gates remain.
+  Local scans found one critical npm advisory and six RustSec advisories. The
+  remediation lead reviewed narrow per-ID exceptions with fixed expiry/removal
+  criteria; every one is a B19 release blocker, not a safety claim. No
+  dependency upgrade was made. See [B17 handoff](../reviews/remediation/B17-handoff.md).
+  Acceptance pending; no deployment or provider action.
+
+- B16b checkpoint: `9e6edd4`. B17 is next, scoped to fail-closed RustSec/npm advisory gates with reviewed expiring exceptions, an explicit DB-free lane, measured build-versus-execution documentation, and complete explicit ignored-browser CI coverage. Preserve the existing asset/image gates and avoid dependency upgrades or runner churn.
+
+- B16b gate passed after one independent-review correction round. A whole-workspace run exposed that the draft two-worker test's 120 ms lease could genuinely expire under suite contention; the final test observes PostgreSQL cross the original two-second lease deadline while heartbeats retain ownership before starting worker B, and five simultaneous independent repetitions passed. The suspension-first race now directly verifies the persisted `SUSPENDED` state. Independent Sol passed auth 38, job 30, approval 7, normal CSRF/search browsers, strict workspace Clippy/check, formatting, JavaScript syntax and diff/path guards. Lead corrected workspace passed **758 tests, 0 failed, 6 explicitly ignored**, including job 30 and HTTP 181. See [review](../reviews/remediation/B16b-review.md), [handoff](../reviews/remediation/B16b-handoff.md), and [browser evidence](../reviews/remediation/B16b-browser-baseline.md). Test/source acceptance only; nothing deployed. B17 is next.
+
+- B16b partial evidence: lead repeated parallel HTTP 181/181 three times (5.40s/5.47s/5.33s); all 28 browser fixtures passed (23.12s). Separate Sol accepted the bounded real-browser slice: actual logout redirect/stale-tab recovery and native rendered login, plus normal CSRF/search journeys and opt-in response-only mutations that fail the intended stale-token/stale-response assertions. See [browser baseline](../reviews/remediation/B16b-browser-baseline.md). Independent infrastructure races and combined review remain in progress; no batch acceptance or production action. Lead also corrected remaining pool-based HTTP examples in TESTING.md.
+
+- B16a checkpoint: `a8b6058`. B16b assigned to Sol for gap-driven independent approval/suspension/reset/worker race evidence; lead owns actual rendered CSRF/search browser validation and measured execution/repeat baseline. Existing proven race cases remain in place; no single-connection concurrency claims, foreign job claims, migrations or production actions authorized.
+
+- B16a gate passed: independent Sol accepted the full diff and final renderer-contract correction; lead full isolated workspace passed **753 tests, 0 failed, 6 explicitly ignored**. HTTP passed 181 in the integrated run (5.41s), following three earlier parallel passes; router scope/guard passed 3. Strict workspace Clippy, all-target check, formatting and diff checks passed. See [review](../reviews/remediation/B16a-review.md) and [handoff](../reviews/remediation/B16a-handoff.md). Source accepted only; the ignored browser harnesses and broader independent races remain B16b/B19. No production action. B16b is next.
+
+- B16a frozen for full independent Sol review: all ordinary adapters acquire through `Db`, sequential fixtures and HTTP routers share rollback scopes, legacy fixture commits and process-global administrator locks are removed. Lead passed HTTP 181 in parallel plus two repeats (5.69s/6.30s/6.23s), router isolation/guard 3, and bounded independently reviewed parking/photo/privacy/auth/job/CSP slices. Exact response IDs replace the shared-name creation-helper lookup implicated in the review flake. See [lead evidence](../reviews/remediation/B16a-root-validation.md). Full review and combined workspace gates remain pending; no deployment or production database action.
+
+- B15b checkpoint: `0e38e94`. B16a assigned to Sol for the remaining adapters, sequential repository/HTTP tests and process-global admin fixture locks. Lead owns the CSP rendered-router test migration alongside that work. True race/global-state cases retain owned disposable databases; no single-connection concurrency claim or production action is authorized.
+
+- B15b gate passed: independent Sol resolved both review findings and passed policy/race 12, actual policy browser 1 (5.34s), auth 37, privacy 22, sequential HTTP 181, configuration 2, browser JavaScript 28, workspace all-target check, strict Clippy, formatting and diff checks. Lead additionally passed existing CSRF/search actual browsers (1 each, 3.80s/6.33s). See [review](../reviews/remediation/B15b-review.md). Source accepted only; feature defaults off, migrations 0028 and 0029 must ship together, no policy publication/email/activation occurred. External owner/counsel/fleet/upgrade gates remain explicit. B16a is next.
+
+- B15b corrections frozen for independent final review: forward 0029 prevents `id=DEFAULT` during first supersession; applied 0028 remains unchanged. Forms opened before feature activation now receive localized current-terms recovery instead of a bare conflict, preserving nonsecret fields only. Implementer passed policy 12, focused HTTP 1, formatting and diff checks; lead enhanced actual browser passed both boosted EN/mobile and native PT/desktop missing-proof/stale-proof recovery (1 test, 4.93s). Publication runbook requires both migrations. Final independent gates remain pending.
+
+- B15b independent review requested a forward-only correction to policy identity protection: the 0028 trigger does not compare the primary-key ID during otherwise permitted first supersession. Sol is reproducing the combined update and adding a forward migration/regression; applied 0028 remains unchanged. Other review checks continue. Lead frozen-source actual browser rerun passed (1 test, 5.37s); that happy-path result does not settle the database invariant finding.
+
+- B15b frozen for full independent Sol review against `69e73b7`. Implementer reports policy/race 12, privacy 22, auth 37, sequential HTTP 181, infrastructure library 102, web library 69, browser JavaScript 28, workspace strict Clippy, formatting and diff checks passed. Lead separately passed the DB-free domain/application suite and strengthened actual browser journey (1 test, 5.05s). Late registration correction has post-lock parity and exact persisted-state regressions; acceptance awaits independent verification. See [handoff](../reviews/remediation/B15b-handoff.md). Feature remains off by default; no policy publication or notification occurred.
+
+- B15b late source review: lead and separate Sol confirmed a post-precheck policy-activation race where only new registrations revalidated terms, exposing Conflict versus neutral success for existing addresses. Correction requires common authoritative validation without existing-account acknowledgement backfill. Reviewer raised a draft-snapshot lock-order concern; the current source inspection confirms account then policy ordering in registration and all proof paths. Lock-order/parity regressions and independent final verification remain required. Normal browser success does not prove these races safe.
+
+- B15b test-environment recovery: shared tests encountered SQLx `VersionMismatch(28)` after a draft migration revision. The old disposable database was preserved, with no checksum or migration-history rewrite. Lead verified the audit-only container and unused name, then created `bikesnest_test_audit_b15b_20260914` on the same loopback `127.0.0.1:55439`, owned by `bikesnest_test`, for remaining checks. Migration 0028 is now frozen; subsequent schema corrections must be forward migrations. No production database was accessed. Lead workspace all-target check passed.
+
+- B15b lead browser harness passed against a fresh owned database (1 test, 5.60s execution): EN boosted/mobile and PT native/desktop, stale forms, exact current/future documents, separate current/upcoming notices, cross-locale acknowledgement, persisted proof and zero fabricated privacy consent. Targeted strict Clippy passed. This is draft integration evidence, not batch acceptance; transaction/race/privacy checks and full independent review remain pending. Global activation defaults off and no policy was published or notification sent.
+
+- B15a checkpoint: `69e73b7`. B15b assigned to Sol for design-first acknowledgement and material-notice lifecycle, including authoritative effective/future versions, stale forms, atomic signup evidence and recovery without false historical consent. No legal-text approval, policy publication/seeding or real notification sends authorized.
+
+- B15a gate passed: separate Sol verified all four documentation findings resolved and reran the actual six-policy renderer (1 passed), formatting and diff checks; lead targeted strict Clippy passed. See [B15a review](../reviews/remediation/B15a-review.md). Factual source drafts/runbook accepted only; owner/counsel/provider evidence, effective versions, policy publication and notifications remain gated. B15b is next.
+
+- B15a full independent Sol review requested bounded corrections to unsupported completed legitimate-interest assessment, no-consent-processing and deployed proxy-retention assertions, plus an unevidenced oldest-record date. Actual six-policy renderer passed; root cookie/incident slice has no material findings. Sol is correcting the documents before re-review. No publication, version change or notification; B15b remains queued.
+
+- B15a completion escalated to Sol after repeated Terra patch-context failures left most documents unchanged. Lead owns cookie drafts, incident runbook and a DB-free actual six-policy placeholder/Markdown smoke (1 passed; targeted strict Clippy passed); Sol owns privacy/terms factual alignment and legal/processing/provider/retention inventories. Separate Sol is reviewing the frozen lead slice while remaining same-batch documents finish. No policy version, publication, notification or legal approval claim.
+
+- B14 checkpoint: `cd6e879`. B15a assigned to Terra for bilingual factual policy/runbook corrections and current authoritative incident/minors sources. No policy seeding/publication, legal approval, provider-console access or notification campaign is authorized; factual draft acceptance remains separate from owner/counsel evidence.
+
+- B14 gate passed: separate Sol independently passed application auth31, infrastructure auth37/job29/privacy22, provider11, renderer unit2/offline visual48, sequential HTTP180 and workspace all-target/strict/fmt/diff checks. No material findings remain; see [B14 review](../reviews/remediation/B14-review.md). Lead accepts source only. Migration 0027 requires coordinated worker upgrade; actual inbox/DNS/support-contact/production evidence remains external, and B16 parallel reliability is unresolved. B15a is next.
+
+- B14 full independent Sol review assigned after post-commit response correction: all three completed security transitions now retain success if only inline warning delivery fails; credential-mail issuance keeps its existing error behavior. Application auth31/31 and workspace strict/fmt/diff reported passing; same separate reviewer retains the final renderer evidence and is verifying the combined transaction/delivery/privacy diff. B15 remains queued; no production/provider action.
+
+- B14 combined handoff reports application auth30, infrastructure auth37/job29/privacy22, provider11, workspace/strict/fmt passing; lead HTTP180 sequential and final independent renderer unit2/visual48 passed. Lead held combined review for one last response-semantics correction: a failed post-commit inline credential-free warning must not report the already committed password/address transition as failed. See [B14 handoff](../reviews/remediation/B14-handoff.md); final correction and combined independent acceptance remain pending.
+
+- B14 bounded independent renderer review: Sol passed unit2/2 and offline visual48/48 but identified CTA-focus screenshot scrolling that cropped some headings. Lead fixed explicit scroll-to-top plus settled-layout/position assertions; Sol reran48/48 and inspected corrected English notice and Portuguese expiry captures (`/tmp/b14-email-visual-0cy2Ye`), resolving the slice finding. Lead domain/application181 passed. This is not full B14 acceptance; database/delivery review remains pending.
+
+- B14 partial renderer evidence: lead completed the visual harness after rejecting screenshot-only and incomplete assertion drafts. Actual renderer output passes 48 offline checks (16 kind/locale/expiry documents × mobile/desktop/dark preference), exact escaped href and fallback text, language, expiry/legacy, image-free/no network and overflow assertions; representative images inspected in `/tmp/b14-email-visual-bYGJ5t`. Renderer unit2/2 reported passing; lead targeted strict Clippy/JS syntax passed. This is browser dark-preference emulation, not Gmail/Outlook certification. Database lifecycle/rollback and combined independent review remain pending.
+
+- 2026-09-14 B14 continuation: application all-target compilation reported passing; infrastructure/provider integration and actual renderer/lifecycle validation remain in progress. Lead draft review requires authoritative current-session validation for password changes, recipient-metadata scrubbing across terminal/retention/deletion paths, and credential-bearing debug/escaping regressions. Migration 0027 and notice rollout remain local drafts; independent review has not started and B15 remains queued.
+
+- B13 checkpoint: `eaafdfb`. B14 assigned to Sol for shared message-contract/security-notification design before edits; Terra rendering/visual work to follow the agreed contract. Reuse B06 outbox/privacy guarantees and actual expiry; no real sends or production/provider action. B15 remains queued.
+
+- B13 gate passed: separate Sol independently passed authenticated contribution1 with persisted creation/proposal/public-state proof, sequential HTTP180, browser28, profile/search/CSRF1 each, library69 and workspace/strict checks. No material findings; see [B13 review](../reviews/remediation/B13-review.md). Form disclosures, localized labels and request-owned post-scroll error focus accepted, not deployed. B14 is next.
+
+- B13 frozen for separate Sol review: completed real authenticated contribution1 (invalid currency/Hours/timezone, retained values, final create, proposal/public DB invariant, no-JS), HTTP180, navigation-browser28, library69, profile/search/CSRF real browser1 each and strict checks reported passing. Request-owned finally-swap focus replaces rejected global state. See [B13 handoff](../reviews/remediation/B13-handoff.md). Acceptance pending; B14 queued.
+
+- B13 completion escalated to Sol after repeated authenticated-harness redirect/lifecycle failures. Terra source frozen; Sol retains stable request-owned focus fix (browser28/28) and must finish actual create/proposal/public-state assertions plus combined gates. Intermediate 200/303 assumptions are not validation evidence. No acceptance; B14 remains queued.
+
+- B13 focus lifecycle escalated to bounded Sol assistance: real boosted error test exposed htmx scroll overriding after-swap focus, and lead rejected global settle-focus state. Sol owns navigation lifecycle/test files only; Terra retains forms and authenticated browser harness. Require request/task-scoped settled focus and B10 fragment/history invariants. No acceptance or next-batch work.
+
+- B12 checkpoint: `08af3fd`. B13 assigned to Terra for contribution-form conditional disclosure, accessible labels/error recovery, and actual authenticated/native journeys. Preserve approval, CSRF, CSP and pin state; escalate multilayer validation if needed. No production action.
+
+- B12 gate passed: separate Sol independently passed real profile1/search1, profile integration1, sequential HTTP179, navigation-browser27, library69 and strict checks; inspected both screenshots and preserved unknown/negative/pending security, truthful gallery totals, native behavior, auth fences and B11 read/outage contracts. See [B12 review](../reviews/remediation/B12-review.md). Source accepted, not deployed; provider gates remain B19. B13 is next.
+
+- B12 frozen for independent Sol review: Terra reports library69/profile1/HTTP179/navigation-browser27 and real owned-DB profile1/search1, formatting/strict checks passed. Lead inspected populated desktop/390px captures; gallery labels retain bounded loaded/total truthfulness. Search browser fixture moved to owned DB after unchanged fake-geocoder flow hit foreign Curitiba fixtures. See [B12 handoff](../reviews/remediation/B12-handoff.md). Acceptance pending; B13 queued.
+
+- B11 followup checkpoint: `378b448`. B12 resumed with Terra after independent re-acceptance; prior pause had no B12 source edits. Same bounded presentation scope and separate Sol review retained.
+
+- B11 followup gate passed: independent authenticated-route1/1, sequential HTTP179/179, browser27/27, formatting/strict web Clippy/diff all passed. Verified base auth flags, own/stale/unverified/anonymous fences and exact no-extra-reader counts. Review explicitly records missed branch and reopened PASS. Source re-accepted, not deployed; B12 may resume after checkpoint.
+
+- B11 authentication-state followup frozen for review: base page now derives the three principal/role flags independently of optional community data. Implementer reports actual authenticated route1/1 (eligible/own/stale/unverified/anonymous/moderator, History and Current outage), sequential HTTP179/179, browser27/27 and strict checks passed. See [B11 followup](../reviews/remediation/B11-followup.md). B12 remains paused pending genuine re-acceptance.
+
+- B11 gate reopened after lead found an authenticated-approvals regression in committed `ce0aa52`: base page initializes `can_contribute=false`, and the skipped Current community overlay was its only verified-auth initializer. Eligible users therefore lose approval controls. B12 paused with no source edits (Terra confirmed). Sol assigned bounded auth-derived base-state correction and authenticated-route regressions; separate reviewer independently confirming. Prior PASS did not cover this branch; acceptance withdrawn pending correction.
+
+- B11 checkpoint: `ce0aa52`. B12 assigned to Terra for compact cyclist-first profile/search presentation and precise trust/history/eligibility copy, with actual mobile/desktop/native checks. B11 read/failure boundaries and approval invariants must remain intact; escalate multilayer eligibility work if needed. No production action.
+
+- B11 gate passed after independent re-review: media matrix1/1, sequential HTTP178/178, browser27/27 and strict checks passed; original application11/infrastructure4 and real-route counting evidence remain valid. Per-review unavailability, safe diagnostics, thumbnail fallback, tab-specific reads and pagination accepted. Source only, not deployed. Known parallel fixture issue remains B16. B12 is next.
+
+- B11 corrections frozen for same Sol reviewer: per-review primary-signing failure now exposes localized unavailable state; full-image thumbnail fallbacks preserved. Implementer reports actual-router media matrix1/1, sequential HTTP178/178, browser27/27 and strict checks passed; see [B11 corrections](../reviews/remediation/B11-corrections.md). Historical parallel review-create flake recurred, then focused/sequential passed; B16 reliability remains unresolved. Acceptance pending.
+
+- B11 independent review requests correction: review-photo primary signing failure silently hides approved media instead of exposing unavailability. Require localized per-review degradation and actual-router signing-failure matrix; usable full-image thumbnail fallback must be tested. Independent application11/infrastructure4/HTTP177/browser27 and strict checks passed; actual counters/pagination/totals accepted. See [B11 review](../reviews/remediation/B11-review.md). Returned bounded correction; B12 remains queued.
+
+- B11 frozen handoff sent to separate Sol review: application11/11, infrastructure approval4/4, actual-router counter1/1, owned-DB outage1/1, HTTP177/177, browser27/27 and strict checks reported passing. Lead required compact metadata rather than unbounded proposal transfer, honest totals, and actual-route counting instead of simulated reader/boolean tests. See [B11 handoff](../reviews/remediation/B11-handoff.md); source not yet accepted. Simulated former orchestration and cross-tab response bytes are explicitly not production latency measurements.
+
+- B10 checkpoint: `1ef6a1f`. B11 assigned to Sol for tab-specific detail reads, bounded pagination/totals, truthful partial-outage states and measured read/signing work. Design/inventory precedes structural edits; B12 presentation remains queued. No production action.
+
+- B10 gate passed: independent Sol reports no material findings, browser27/27, HTTP175/175, formatting/workspace all-target check/strict web+i18n Clippy/diff passed. See [B10 review](../reviews/remediation/B10-review.md). Source accepted, not deployed; live Google restricted-key/outage checks remain external. B11 is next.
+
+- B10 frozen handoff sent to the separate Sol reviewer: implementer reports browser27/27, HTTP175/175, repeated retry3/3, formatting/strict web+i18n Clippy/diff checks passed. Scoped retry lifecycle, bounded asset loading, GPS outcomes and request-local document metadata implemented; see [B10 handoff](../reviews/remediation/B10-handoff.md). Live Google outage evidence remains external. Independent validation pending; no next-batch or production work.
+
+- B10 escalated from Terra to Sol implementation after repeated unresolved real-htmx metadata regression. Existing browser17/17 and new SDK/runtime retry checks passed earlier, but boosted locale metadata test remains red; GPS normalization and broader recovery evidence remain incomplete. Terra source frozen and handed over; independent reviewer unchanged. No acceptance or next-batch work.
+
+- B09b checkpoint: `9887acb` (local staging approval timed out once, safe retry succeeded). B10 assigned to a Terra implementation thread for map/GPS failure recovery and document/navigation accessibility, with existing separate Sol reviewer retained. No production action; next batches remain queued.
+
+- B09b gate passed after independent runtime continuation: browser17/17, full HTTP175/175, CSP11/11, formatting/strict web Clippy/diff all passed. Explicit trusted-template nonce inventory, create/edit coverage and loader/swap boundaries accepted. The stricter candidate remains report-only by default; live restricted-key Google validation and Cloudflare edge decision remain B19 enforcement gates, not completed compatibility claims. No deployment. B10 is next.
+
+- B09b source correction review found no remaining static issue, but reviewer did not complete independent runtime reruns. Lead does not accept the source-only PASS as the batch gate; reviewer reactivated for validation-only continuation. Batch stays reviewing until actual independent browser/HTTP/CSP evidence completes.
+
+- B09b correction sent for independent re-review: all 12 form script nonces fixed; complete template inventory and rendered exact-header nonce assertions added, with create/edit pin-picker browser coverage. Implementer reports HTTP175/175, browser17/17, workspace check/strict web Clippy/formatting/diff passed. See [B09b corrections](../reviews/remediation/B09b-corrections.md). Independent tests must run successfully before acceptance; prior approval timeout is not evidence.
+
+- B09b independent review requests changes: 12 executable map/pin-picker scripts in parking new/edit templates lack the response nonce and would be blocked under candidate enforcement. Require corrected templates plus inventory/rendered/enforcing coverage. Independent test launch was blocked before start by approval-review timeout and is not a pass; see [B09b review](../reviews/remediation/B09b-review.md). Returned bounded correction; B10 remains queued.
+
+- B09b frozen handoff sent for independent Sol review: implementer reports HTTP174/174, browser17/17, security11/11, workspace all-target check, strict web Clippy, formatting/diff passed. Trusted-site nonce propagation replaces rejected blanket rewriting; original-document loader nonce and restrictive asset URLs verified locally. Candidate remains report-only; live Google-key/edge-beacon evidence explicitly pending. See [B09b handoff](../reviews/remediation/B09b-handoff.md). Acceptance pending.
+
+- B09b corrected draft validation: blanket noncing removed; request/view nonce is rendered at trusted template sites only. Executable swapped scripts are removed and loader asset URLs restricted. Implementer reports enforcing-CSP browser17/17, including injected script/event/manifest rejection and real vendored MapLibre/Mapbox local maps reaching load; CSP unit11/11 and web compile pass. Google live-key and edge-beacon evidence remain external gates; default candidate is report-only. HTTP/final checks and independent review pending.
+
+- 2026-09-14 resumed B09b after an implementation-agent usage interruption. Draft remains unaccepted: lead rejected blanket response-body script noncing and automatic trust of swapped scripts. Implementation must render nonces only at trusted template sites and prove injected scripts remain blocked before independent review. Earlier B09b handoff is provisional, not validation evidence.
+
+- B09a checkpoint: `3882b3a`. B09b assigned to Sol for nonce/provider CSP and report-only rollout path. Installed-library and provider requirement inventory/design precedes edits; real browser enforcement required, SDK stubs cannot be called live-provider proof. No production/edge/provider-console changes.
+
+- B09a gate passed: independent Sol re-review confirms accurate pinned-library history behavior and no inert control claims; browser14/14, focused cache1/1, formatting/diff pass. Full infrastructure101/application109/HTTP173/workspace-check/strict-Clippy evidence remains applicable. Sensitive no-store and explicit bounded limiter policies accepted; edge topology still requires operational evidence. No migration/deployment. B09b is next.
+
+- B09a correction sent for independent re-review: inert history markup/assertion removed; documentation attributes network restoration correctly to pinned htmx4, with browser test retained as upgrade guard. Implementer reports browser14/14, focused cache1/1, formatting/workspace check/strict Clippy/diff checks passed. See [B09a corrections](../reviews/remediation/B09a-corrections.md). Acceptance pending.
+
+- B09a independent review requests one correction: pinned/shipped htmx4 does not read `hx-history`; its history already restores over network without localStorage snapshots. Remove inert markup and inaccurate causal claims, retain browser upgrade regression. Other checks accepted: infrastructure101/101, application109/109, HTTP173/173, browser14/14 and strict gates. Returned bounded correction; no acceptance yet.
+
+- B09a stable handoff sent for independent Sol review: HTTP173/173, browser14/14, infrastructure101/101, application109/109 and strict gates reported passing. Authenticated cache helpers, actual network-backed history restoration, buffered RESP command errors and captured hostile-log exclusions close lead draft gaps. See [B09a handoff](../reviews/remediation/B09a-handoff.md). Acceptance pending.
+
+- B09a draft validation: explicit sensitive-limiter policy replaces key-prefix inference; finite check deadline covers connection/command, dynamic no-store overrides and htmx history suppression implemented. Implementer reports HTTP173/173, browser14/14, application109/109, infrastructure101/101 and strict checks passed. Lead requires final captured-log redaction, authenticated HTML cache and actual back-content/network assertions before handoff. No acceptance yet.
+
+- B08 checkpoint: `513da0b`. B09a assigned to Sol for sensitive cache headers, bounded credential-sensitive limiter failure and trusted-proxy tests only. Design and inventory required before edits; no CSP/edge changes or production action.
+
+- B08 gate passed: independent Sol confirms closure-owned capacity, finite shared password admission, cancellation/burst evidence, startup/seed configuration, unchanged Argon2 and interactive auth. Independent infrastructure98/98, application109/109, photo11/11, HTTP172/172, formatting/workspace check/strict Clippy/diff checks passed. Initial sandbox loopback denial was rerun with permitted test access and recorded honestly. No material findings or migration; source accepted, not deployed. B09a is next.
+
+- B08 frozen handoff sent to independent Sol reviewer: implementer reports password4/4, config1/1, image-admission2/2, infrastructure98/98, application109/109, photo11/11, HTTP172/172, workspace all-target check, strict locked Clippy, formatting and diff checks passed. Debug-process burst timing/RSS recorded with explicit non-production limitations in [B08 handoff](../reviews/remediation/B08-handoff.md). No migration. Acceptance pending.
+
+- B08 draft validation: shared hash/verify execution and finite waiter budgets, closure-owned image permits and whole-operation test guards implemented. Implementer reports infrastructure98/98, application109/109, image11/11, HTTP172/172; capacity-two real hash/image bursts observed peak2. Debug timing is explicitly non-production evidence. Final checks/handoff and independent acceptance remain pending.
+
+- B07 checkpoint: `ad5fdd6`. B08 assigned to Sol implementation for blocking image permit lifetime and bounded shared password hashing admission/cancellation. Actual running-work tests and honest measurement context required; no durable login, B09 work, production changes or shared release rebuilds.
+
+- B07 gate passed: independent Sol re-review resolved all findings, passing three consecutive full job28/28 runs, CLI3/3, supervisor2/2, formatting, strict Clippy and diff checks. Recurrence4/4 remains applicable; lead DB-free domain/application suite passed. Accepted code has no migration; operational deployment remains unauthorized. B08 is next.
+
+- B07 second corrections sent for independent re-review: ChildGuard kill/reap on all early failures with live-child unwind regression, empty dotenv sentinel, and durable timeout-state polling. Implementer reports three consecutive full job28/28 runs, CLI3/3, supervisor2/2, formatting/strict Clippy/diff checks passed. See updated correction handoff; acceptance pending.
+
+- B07 correction re-review resolved original findings but requests two final test fixes: CLI early failures can leave an unreaped worker and ancestor dotenv traversal must be blocked; timeout test raced finalization (full job suite27/28, exact rerun1/1). Recurrence4/4, supervisor2/2, CLI2/2 and strict checks passed. Returned bounded fixes to implementer; no gate passed.
+
+- B07 corrections sent for independent re-review: implementer reports job28/28, recurrence4/4, production-supervisor checks2/2, automated fresh-child CLI/preconnection2/2, workspace all-target check, strict Clippy, formatting and diff checks passed. Five worker cases now own child databases; missing fencing/finalization branches have regressions. CLI uses isolated cwd, readiness observation and bounded signal/kill/reap. See [B07 corrections](../reviews/remediation/B07-corrections.md). Acceptance pending.
+
+- B07 independent review requests changes despite passing job24/24, recurrence4/4, config1/1, binary2/2, formatting/strict Clippy/diff checks: five new worker tests require owned database isolation, and distinct stale-fail/outcome-write/hook/supervision/CLI branches require direct reproducible evidence. Returned bounded corrections to implementer; see [B07 review](../reviews/remediation/B07-review.md). Lead DB-free domain/application run passed. B08 remains queued.
+
+- B07 stable handoff sent to independent Sol reviewer: implementer reports job 24/24, recurrence 4/4, infrastructure unit 92/92, HTTP 172/172, supervision 2/2, fresh disposable worker-only CLI smoke, invalid-config preconnection smoke, formatting, strict locked Clippy, workspace check and diff checks passed. See [B07 handoff](../reviews/remediation/B07-handoff.md). Earlier disposable-row localhost S3 attempt is recorded there; no real provider or production action. Acceptance pending.
+
+- B07 draft checks identified capacity-poll starvation, detached child-task cancellation, unbounded finalization, and normal-signal/worker-exit supervision races. Corrections and direct isolated regression evidence are in progress. Core code compiles; initial recurrence 4/4 and isolated stale-lease/reclaim checks passed. These are partial results, not acceptance; independent review remains pending.
+
+- B07 design approved: claim only free concurrent capacity, per-execution claim identity and explicit lost-ownership outcomes, bounded handler/heartbeat/task lifecycle, worker supervision alongside HTTP, and separate durable-enqueue/run-worker modes with legacy configuration compatibility. Lead requires persisted panic outcomes, no detached shutdown tasks, in-flight claim handling and actual isolated race/failure evidence. Implementation underway; no gate passed.
+
+- B06b checkpoint: `fa3f92d`. B07 assigned to GPT Sol implementation thread after independent acceptance; worker capacity/leases/supervision/shutdown and execution modes only. No deployment or production actions.
+
+- B06b gate passed: independent Sol re-review resolved both findings, passing response-level Resend 5/5, infrastructure auth 35/35, formatting, strict application/infrastructure/web Clippy and diff checks; unchanged job 17/17 remains valid. Lead accepts source only, no migration. Prior sequential HTTP172/172 does not resolve B16 parallel fixture issue. B07 is next; no deployment/provider action authorized.
+
+- B06b corrections ready: bounded response-level Resend parsing supports absent Content-Length; fresh recovery-state and final-audit rollback regressions added. Implementer reports Resend 5/5, infrastructure auth 35/35, job 17/17, formatting/locked strict Clippy/diff checks passed. Same independent reviewer reactivated; see [correction handoff](../reviews/remediation/B06b-corrections.md). Acceptance pending.
+
+- B06b independent review round 1: Sol passed infrastructure auth 27/27, job 17/17, Resend 5/5, application auth 30/30, formatting/strict Clippy/diff checks. Changes requested for retryable 409 responses without Content-Length and complete direct recovery-state/final-audit rollback evidence. Returned bounded corrections to implementer; see [B06b review](../reviews/remediation/B06b-review.md). Lead DB-free domain/application run also passed. B07 remains queued.
+
+- B06b stable implementation handed to independent Sol reviewer: implementer reports application auth 30/30, infrastructure auth 27/27, job/dispatcher 17/17, HTTP 172/172, Resend 5/5, web check, formatting/diff and strict application/infrastructure/web Clippy passing. No migration. See [B06b handoff](../reviews/remediation/B06b-handoff.md). Draft recovery/provider findings reported resolved; acceptance awaits independent verification.
+
+- B06b draft state: one application `AuthOutbox` port and post-commit dispatcher; SQL adapter shares connection-local mail admission and registration recovery preserves existing credentials. Initial compile checks reported passing. Lead draft checks require active-lease recovery without new mail, unique inline claim ownership, permanent-error terminal handling, bounded retry/backoff/no-claim semantics, and secret-free decode errors. Provider semantics and real rollback/retry tests remain in progress; no review gate passed.
+
+- B06a checkpoint: `5728a46`. B06b assigned to GPT Sol `b06a_corrections` (reused implementation thread, independent reviewer remains separate) after acceptance. Scope is transactional auth outbox and delivery semantics; B07 execution modes/supervision and B14 templates/notices remain later batches.
+
+- 2026-09-10 B06a gate passed: independent Sol re-review resolved all three findings and passed job/mail 14/14, privacy 21/21 (isolated upgrade and observed races), application email 4/4, formatting, strict Clippy and diff checks. Lead accepts source only. Known parallel HTTP fixture failure remains B16; external mail/backup/rollout limits remain documented. Migration 0026 requires quiescing old senders; no production action performed. B06b is next.
+
+- B06a corrected-source lead HTTP run: 171 passed, 1 failed (`review_create_updates_aggregate`, SQLSTATE `23503`, `review_location_id_fkey`, `review.upsert_review`, expected 303/actual 200). This matches the previously tracked B02/B16 legacy fixture failure; no mail-related HTTP failure. Isolated rerun passed 1/1 (~0.33s); do not report a clean full HTTP suite or claim the fixture issue fixed.
+
+- B06a corrections ready for re-review: removed recipient-derived diagnostics and bounded database admission errors; expanded fresh-fixture purpose/credential matrices for handler, inline and durable admission; corrected current delivery guarantees. Implementer reports application email 4/4, job/mail 14/14, formatting/diff and strict application/infrastructure/web Clippy passed. Same independent Sol reviewer reactivated; acceptance pending. See [correction handoff](../reviews/remediation/B06a-corrections.md).
+
+- 2026-09-10 B06a independent review: Sol passed job/mail 12/12, privacy 21/21 (including isolated upgrade and observed lock waits), formatting and strict application/infrastructure/web Clippy. Changes requested for recipient-domain diagnostic leakage, complete unconfounded purpose/inline/admission lifecycle evidence, and misleading delivery guarantees in touched deployment documentation. Separate Sol `b06a_corrections` assigned; same independent reviewer will recheck. Lead also reran DB-free domain/application tests successfully. See [review](../reviews/remediation/B06a-review.md). B06b remains queued.
+
+- 2026-09-10: Resumed at the user's request. Fresh independent GPT Sol reviewer `b06a_independent_review` successfully assigned against `a3e6a2b` using the B06a handoff; the earlier agent-capacity blocker is cleared. B06a remains unaccepted and B06b onward remain queued until its review gate passes. No deployment or production action authorized.
+
+- B06a independent-review gate blocked by agent-service capacity, not a source/test failure: three lead attempts to spawn a fresh GPT Sol reviewer and one attempt to reactivate the earlier Sol reviewer returned `agent thread limit reached`, even after the implementer completed. Interrupting completed agents did not release slots; no close/remove tool is available. Live listing retains root plus three completed agents. Requires a released/reset agent slot before the required separate Sol review can run. Stable implementation remains uncommitted and unaccepted; B06b onward remain queued. See [B06a handoff](../reviews/remediation/B06a-handoff.md). Do not bypass the review gate or claim the full plan complete.
+
+- B06a implementation reports job/mail 12/12, privacy 21/21, application auth 30/30, infrastructure auth 23/23 and HTTP 172/172, strict application/infrastructure/web Clippy, workspace check, formatting and diff checks passed. Draft isolation issues corrected; new sequential fixtures roll back and real upgrade/send/deletion/enqueue races own disposable databases. Migration 0026 requires quiescing all old senders before application. Independent review assignment pending transient agent capacity; no source acceptance or deployment.
+
+- B06a lead draft checks: domain/application 179/179 passed. Flagged legacy successful-mail history preservation, raw-token decoding before hashing, pending-account reset parity, lock-through-send versus idle-transaction timeout, and queue-admission/deletion serialization. A draft new race test used the legacy committed-fixture pattern; required conversion to the owned isolated-database runner before acceptance, with observed lock waits and bounded cleanup. No batch gate passed yet.
+
+- B05r checkpoint: `a3e6a2b`. B06a assigned to GPT Sol `b06a_implement` after independent acceptance, with explicit account/token lifecycle, legacy-row upgrade, in-memory claimed-copy and deletion/send-boundary requirements. No production changes.
+
+- B05r gate passed: two bounded test-only correction rounds added verification-token preservation and exact state/suspension/deletion/update timestamp snapshots. Independent Sol final re-review confirmed all findings resolved and reran infrastructure auth 23/23 (both real deletion lock waits), formatting and diff checks. Prior independent application 30/30, HTTP 172/172, workspace 670 passed/2 ignored and strict Clippy/check results remain valid for unchanged behavior. Accepted source only; B06a next.
+
+- B05r review round 1: source inspection found no material behavior defect and independently passed application auth 30/30, infrastructure auth 23/23, focused admin HTTP 1/1, HTTP 172/172, full workspace 670 passed/2 ignored, strict Clippy, workspace check, formatting and diff checks. Reviewer requested complete persisted verification-token and affected-timestamp no-change/rollback evidence. Returned bounded correction to implementer; see [B05r review](../reviews/remediation/B05r-review.md). The workspace run does not replace the two explicitly ignored real-browser harnesses or settle B16 legacy-isolation risks.
+
+- B05r implementation reports application auth 30/30, infrastructure auth 23/23 and focused admin HTTP 1/1, strict application/infrastructure/web Clippy, workspace check, formatting and diff checks passed. Includes exact audit/state matrices, final-audit rollback and independent lock-wait deletion-state races for both transitions; this does not claim full anonymization integration. Fresh GPT Sol `b05r_review` assigned. Full HTTP count will be independently confirmed because implementer capture was incomplete.
+
+- B05 checkpoint: `a159dc3`. B05r assigned to GPT Sol `b05r_implement` after independent acceptance; no production changes.
+- B05r lead checks: existing browser fixtures passed 13/13 (~7.45s), including menu and all three map-provider navigation lifecycles. Explicit state transitions with atomic audit are under implementation; requested real isolated lock-wait evidence in addition to scoped state and rollback matrices. Original production checkout remains unchanged apart from its pre-existing untracked audit directory.
+
+- B05 gate passed: independent Sol re-review confirmed all corrections and reran application auth 29/29, test-support 6/6, infrastructure auth 20/20 and HTTP 172/172, strict Clippy, workspace check, formatting and diff checks. Real account-lock expiry and owned disposable-database cleanup are covered. Source accepted only; adjacent authenticated password changes and broader races remain explicitly queued for B06b/B14 and B16b. B05r is next.
+
+- 2026-09-10: user resumed the full remaining sequence with the same implementation/independent-review gate. Baseline `2bd8d35` (B00–B04 accepted), worktree clean. Disposable audit container and loopback binding reverified; B05 assigned to GPT Sol `b05_implement`. Production and fake reviews remain untouched.
+- B05 design: reset policy/hash validation precedes one account-locked transaction covering token consumption, credential update, all-session and competing-reset invalidation, and durable audit. Scoped SQL tests cover failure rollback; independent multi-connection reset races remain an explicit B16b obligation. Adjacent authenticated `change_password` still splits credential/session/audit writes; include its atomic expected-credential/session guard when adding transactional security-event outbox behavior in B06b/B14, rather than claiming B05 fixes every credential transition.
+- B05 implementation reports application auth 28/28, PostgreSQL auth 18/18, HTTP 172/172, strict targeted Clippy, workspace check, formatting and diff checks passed. Missing password identities roll back; OAuth-only reset requests remain neutral without mail. A connection-local audit failure proves full rollback and subsequent successful retry. Fresh independent GPT Sol `b05_review` assigned; no migration or production change.
+- B05 review round 1: independent Sol reran all reported suites/checks successfully but requested fake expiry/audit parity, stronger persisted non-change/exact-audit assertions, and authoritative expiry after account-lock waiting. Returned to Sol implementation; B05r remains queued. See [B05 review](../reviews/remediation/B05-review.md).
+- B05 correction support: approved a bounded, uniquely owned loopback-only disposable-database runner for real lock-wait evidence, with awaited success/panic cleanup and explicit CREATEDB requirements. Ordinary sequential tests remain rollback-scoped. Expiry uses a fresh database wall clock rather than transaction-start time; see [PostgreSQL 17 current-time semantics](https://www.postgresql.org/docs/17/functions-datetime.html#FUNCTIONS-DATETIME-CURRENT).
+- 2026-09-08: plan created; isolated branch/worktree created; demo-data exception recorded; B00 assigned first. No production changes.
+- Plan/audit checkpoint: `78b0b1d`.
+- Local validation infrastructure: new container `bikesnest-audit-test-20260908`, loopback `127.0.0.1:55439`, database `bikesnest_test_audit`, role `bikesnest_test`; identity verified with `current_database()`/`current_user`. It contains no production data and must not be confused with either existing database.
+- Isolated-worktree baseline: `npm ci --no-audit --no-fund` succeeded; all 13 browser tests passed in ~7.39s. Package lock and generated assets unchanged.
+- B00 implementation agent: GPT Terra (`b00_implement`); reports 5 pure guard tests, fmt, targeted Clippy and one rollback DB smoke passed. Independent GPT Sol (`b00_review`) assigned; acceptance pending.
+- B00 review round 1: behavioral checks passed, but changes requested for an overstated isolation claim in TESTING.md and required cleanup of legacy annotations in the touched test-support file. Returned to Terra; B01 remains queued.
+- B00 corrections: legacy annotations removed and guard documented as defense in depth; 5 guard tests/fmt/diff check passed again. Sol re-review pending.
+- B00 gate passed: independent Sol re-review confirmed both findings resolved, reran 5 guard tests and fmt, and recorded PASS in [B00 review](../reviews/remediation/B00-review.md). Lead accepted source changes; nothing deployed.
+- B00 checkpoint: `6874af0`. B01 assigned to GPT Sol (`b01_implement`) only after this gate passed.
+- B01 implementation reports 25 application auth tests, 12 disposable-Postgres auth tests, workspace check, targeted strict Clippy, fmt and diff checks passed. No migration. Independent GPT Sol review assigned to `b01_review_retry` after implementation finished and reviewer capacity became available; acceptance pending.
+- Additional lifecycle risk identified during B01: administrator restore currently sets Active without restricting the prior state. Track a bounded follow-up with deleted/pending-account guards and tests; B01 verification protection must not be mistaken for fixing every administrator state transition.
+- B01 review round 1: all executed checks passed, but Sol requested direct PostgreSQL coverage for blocked-account confirmation, guarded verification/reset issuance and successful initial pending-account confirmation. Returned to implementer; B02 remains queued. See [B01 review](../reviews/remediation/B01-review.md).
+- B01 corrections: three direct adapter regressions added using scoped transactions and automatic rollback; 15 infrastructure auth tests, targeted Clippy, fmt and diff checks reported passing. Same independent Sol reviewer assigned to recheck; acceptance pending.
+- B01 review round 2: one remaining test gap returned to implementation—blocked database rows must reject otherwise valid expected issuance states, not only invalid expected-state values rejected before SQL. All other findings resolved; current gate remains pending.
+- B01 gate passed: independent Sol final re-review confirmed the complete blocked-state/expected-state matrix exercises the SQL guard, reran all 15 infrastructure auth tests, strict targeted Clippy, fmt and diff checks, and recorded PASS. Lead accepted. No migration and nothing deployed; B05r remains separately queued.
+- B01 checkpoint: `7c927e3`. B02 assigned to GPT Sol (`b02_implement`) after acceptance, with real middleware/browser lifecycle coverage and explicit no-automatic-mutation-replay requirements. Security reference: [OWASP CSRF guidance](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html); verify behavior against the exact installed htmx source.
+- B02 lead-owned integration harness added alongside Sol's implementation: real Axum + Chromium with scoped DB and fake external providers. Boosted forms, stale-head poisoning, explicit headers, tabs/history and retained-input/no-replay recovery passed twice (~1.6s execution each). These focused journeys do not replace review of every middleware bypass path. Lead source inspection flagged an unsafe broad multipart-deferral draft for correction before independent review.
+- B02 draft multipart deferral removed; fail-closed header/query native fallback retained, with an adversarial non-upload multipart regression. Full HTTP suite reports 168 passing tests. Expanded real-browser run passes (~2.7s), adding registration/login context changes, logout/stale-form rejection and deterministic first-cookie race recovery. The logout browser test deliberately avoids following the unrelated homepage redirect because that legacy search reader is not transaction-scoped yet; it observes the real logout response and cookie removal, then verifies the stale form is rejected. Native non-GET action recovery URL correction requested before independent review.
+- B02 native recovery corrected to the safe source/parent page with login preserving the return destination; targeted regression, Clippy, fmt and expanded browser check passed. Fresh GPT Sol reviewer `b02_review` assigned; acceptance pending.
+- Lead cross-batch check while B02 is reviewed: explicit domain/application test run passed all 174 tests (no database), confirming the B01 auth changes remain compatible with the rest of those packages.
+- B02 review round 1: independent Sol reran HTTP 168/168, real browser 1/1 (~2.67s), browser fixtures 13/13 and diff check. Changes requested for direct expired/revoked/unknown/cross-session middleware evidence and for distinguishing session-store failure from a stale session. Returned to Sol implementer; B03 remains queued. See [B02 review](../reviews/remediation/B02-review.md).
+- B02 corrections: scoped real-SQL middleware coverage for presented expired/revoked sessions and crossed live-session tokens added. Transaction-local search-path fault injection proves session lookup errors produce localized 503, no anonymous downgrade/new cookie or misleading stale-session recovery, and token-free unavailability diagnostics. HTTP 171/171, actual browser 1/1, targeted Clippy/fmt/diff checks reported passing. Same Sol reviewer assigned to recheck.
+- B02 gate passed: independent Sol re-review confirmed both material findings resolved, reran focused session tests 3/3 and real Chromium 1/1 (~2.77s), checked the diff, and recorded PASS. Lead accepted; nothing deployed. Reviewer also observed a legacy `review_create_updates_aggregate` foreign-key failure in one full parallel HTTP run (170 passed, 1 failed); immediate isolated rerun passed. Track the intermittent fixture/isolation failure under B16a/B16b; its precise cause is not established merely by a retry, and it is not claimed fixed by B02.
+- B02 checkpoint: `1d7cbab`. B03 assigned to GPT Terra (`b03_implement`) only after acceptance.
+- B16 follow-up evidence: the observed failure was SQLSTATE `23503`, `review_location_id_fkey`, in `review.upsert_review`. Both `review_create_updates_aggregate` and `review_with_an_empty_body_flags_the_body_field` create `Review Spot`; the legacy `add_location` helper recovers IDs by name with `ORDER BY id DESC LIMIT 1`, while cleanup deletes by creator. Cross-selection/cleanup interference is plausible, not established by a trace. Reviewer clarified this limitation in the B02 record.
+- B03 design: native htmx shared replacement queue plus a small live sort/filter mirror; preserve committed destination state. Lead approved a bounded migration of the search reader's five read sites from `pool()` to `acquire()` so new behavior tests use transaction injection and rollback. No broader adapter migration authorized in B03.
+- Cross-batch CSP compatibility regression passed (1 test, ~0.48s) against the disposable target after B02 acceptance.
+- B03 server checks reported passing: four parser regressions, one scoped real-router/PostGIS query-contract regression, formatting and strict targeted Clippy. Lead held the review gate because required real-browser ordering/clear/history acceptance evidence was incomplete; Terra continues that work. Lead also flagged fragment-clear visible-control reset and stale destination-link risks for correction and regression coverage before independent review.
+- B03 complexity escalation: Terra's added actual browser harness exposed a remaining delayed-clear/control-state failure and did not pass. GPT Sol (`b03_finish`) assigned to finish implementation and deterministic browser acceptance; a separate fresh Sol reviewer will follow only once ready. Lead identified a plausible installed htmx queue-ownership race (an aborted older request's `finally` clears a newer request slot); distinguish that source evidence from the precise cause of the current failing assertion until diagnosed.
+- B03 diagnosis correction: Sol found the last reported failure was the harness checking history controls before htmx restoration completed, not proof that a delayed response repopulated cleared filters. The installed queue-ownership issue was separately confirmed. Deterministic real-response gates replace time guesses; initial actual-browser run passes (~1.51s), with destination/empty/pagination acceptance still being completed before review.
+- B03 implementation complete: Sol reports actual Chromium acceptance 1/1 (~2.63s), parser 4/4, scoped PostGIS HTTP 1/1, existing browser fixtures 13/13 (~7.35s), strict targeted Clippy, formatting, Node syntax and diff checks passed. Fresh GPT Sol `b03_review` assigned to independently validate before acceptance. No production changes.
+- B03 review round 1: independent Sol reran parser 4/4, scoped HTTP 1/1, actual Chromium 1/1 (~2.62s), existing browser fixtures 13/13, formatting/syntax/diff checks. Changes requested for stale-request guards surviving body/history replacement, proof of newest response commit, actual fragment destination-change/native submission journeys, and catalogued malformed-query errors. Returned to Sol implementation; B04 remains queued. See [B03 review](../reviews/remediation/B03-review.md).
+- B03 corrections: document-lifetime request ownership, real post-body/history restoration gate with matching request completion, distinct newest-response commit assertions, actual fragment destination changes and no-JavaScript form submissions, localized malformed-query rendering. Sol reports Chromium 1/1 (~3.38s), parser 4/4, scoped localized HTTP 1/1, browser fixtures 13/13, targeted strict Clippy, formatting/syntax/diff checks. Controlled removal of the post-body guard caused the history-spanning test to fail; restoring it passed. Same independent Sol reviewer assigned to recheck. Lead's cross-batch actual CSRF browser regression also passed 1/1 (~2.71s).
+- B03 gate passed: independent Sol re-review resolved all findings and reran parser 4/4, scoped HTTP 1/1 (~0.23s), actual Chromium 1/1 (~3.43s), browser fixtures 13/13 (~7.36s), strict targeted Clippy, formatting/syntax/diff checks. Lead additionally ran full HTTP 172/172 (~2.49s). The legacy FK flake was not observed in this run and remains tracked, not claimed fixed. Lead accepted B03; nothing deployed.
+- B03 checkpoint: `eede1b2`. B04 assigned to GPT Sol (`b04_implement`) after acceptance, scoped to recurring registration/reconciliation and actual recurrence evidence; production repair/deployment remains separately authorized.
+- B04 implementation reports 3 scoped recurrence tests plus 11 existing job tests passing, strict infrastructure Clippy, workspace check, formatting and diff checks. Lead draft review requested no claim starvation on deferred bootstrap, independent registry-entry reconciliation, explicit NULL-schedule rejection, scheduled-failure preservation through GC, and per-test isolation/lease assertions; corrections are included. No migration. Fresh GPT Sol `b04_review` assigned. True multi-connection bootstrap has not been executed in the scoped lane and is not claimed proven by these tests.
+- B04 review round 1: independent Sol reran 3 new + 11 existing job tests, strict infrastructure Clippy, workspace check, formatting/diff checks; lead full HTTP 172/172 also passed (~2.49s). Changes requested for persisted-state/repeat/second-execution evidence, separately exercised mismatch/invalid-input guards, independent retry backoff under busy claims, and alignment of GC policy with code/tests. Returned to implementer; B05 remains queued. See [B04 review](../reviews/remediation/B04-review.md).
+- B04 corrections: expanded persisted-row/repeat/second-execution matrix; separate conflict and invalid-schedule cases; schedule-based GC preservation; bootstrap retry deadline with positive minimum while independent claims continue; deterministic shared-loop busy-work regression using scoped kind claims and read-only diagnostics. Sol reports 4 new + 11 existing job tests, strict infrastructure Clippy, workspace check, formatting and diff checks passed. Same independent Sol reviewer assigned to recheck. Operational docs qualify `finished_at` because failure overwrites it; no unconditional last-success guarantee is inferred from that column.
+- B04 gate passed: independent Sol re-review resolved all findings and reran 4 recurrence + 11 legacy job tests, strict infrastructure Clippy, workspace check, formatting and diff checks. Lead final corrected-diff HTTP suite passed 172/172 (~2.50s). Accepted source only; no migration or deployment. True multi-connection race evidence remains B16b; broader worker supervision/fencing remains B07. B05 is the next queued implementation batch.

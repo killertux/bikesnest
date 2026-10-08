@@ -14,6 +14,25 @@ use crate::{DetailsPage, PhotoVm};
 use super::common::render;
 use super::errors::{internal_error, not_found_page};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DetailReadPlan {
+    gallery: bool,
+    community: bool,
+    proposals: bool,
+    history: bool,
+}
+
+/// The tab-to-reader contract used by the production handler. Compact pending
+/// proposal/photo metadata is shared and therefore intentionally not optional.
+fn detail_read_plan(tab: &str) -> DetailReadPlan {
+    DetailReadPlan {
+        gallery: tab == "current",
+        community: tab == "current",
+        proposals: tab == "approvals",
+        history: tab == "history",
+    }
+}
+
 /// Post-action confirmation flags on the details page (`?proposed=1`, `?edited=1`, …).
 /// The last four are the no-JS landing spots for the fragment endpoints: with
 /// scripting off those POSTs redirect here instead of answering with a partial.
@@ -21,6 +40,10 @@ use super::errors::{internal_error, not_found_page};
 pub(crate) struct DetailsNotice {
     #[serde(default)]
     tab: String,
+    #[serde(default)]
+    after: Option<i64>,
+    #[serde(default)]
+    limit: Option<i64>,
     #[serde(default)]
     proposal_error: Option<String>,
     #[serde(default)]
@@ -98,43 +121,75 @@ pub(crate) async fn parking_details(
             if view.location.moderation_state() != ModerationState::Active && !is_moderator {
                 return not_found_page(&headers, &state.map, &auth, tr);
             }
-            // Approved photos. A read failure degrades to no
-            // gallery rather than failing the page.
-            let gallery = match state.photos.photos(id).await {
-                Ok(photos) => {
-                    let name = view.location.name().to_string();
-                    let mut gallery = Vec::new();
-                    for p in photos {
-                        let Some(url) = view::resolve_photo(&*state.storage, Some(&p.key)).await
-                        else {
-                            continue;
-                        };
-                        let thumb_url = match p.thumbnail_key.as_deref() {
-                            Some(k) => view::resolve_photo(&*state.storage, Some(k))
-                                .await
-                                .unwrap_or_else(|| url.clone()),
-                            None => url.clone(),
-                        };
-                        gallery.push(PhotoVm {
-                            url,
-                            thumb_url,
-                            alt: p.alt.unwrap_or_else(|| format!("Photo of {name}")),
-                        });
+            let tab = match q.tab.as_str() {
+                "history" => "history",
+                "approvals" => "approvals",
+                _ => "current",
+            };
+            let reads = detail_read_plan(tab);
+            let limit = q.limit.unwrap_or(20).clamp(1, 50);
+            let mut gallery_available = true;
+            let mut gallery_total = 0;
+            let gallery = if reads.gallery {
+                match state.detail_reads.photos_page(id, 24).await {
+                    Ok((photos, total)) => {
+                        gallery_total = total;
+                        let name = view.location.name().to_string();
+                        let mut gallery = Vec::new();
+                        let mut signing_failed = false;
+                        for p in photos {
+                            let Some(url) =
+                                view::resolve_photo(&*state.storage, Some(&p.key)).await
+                            else {
+                                signing_failed = true;
+                                continue;
+                            };
+                            let thumb_url = match p.thumbnail_key.as_deref() {
+                                Some(k) => view::resolve_photo(&*state.storage, Some(k))
+                                    .await
+                                    .unwrap_or_else(|| url.clone()),
+                                None => url.clone(),
+                            };
+                            gallery.push(PhotoVm {
+                                url,
+                                thumb_url,
+                                alt: p.alt.unwrap_or_else(|| {
+                                    tr.t("details.photo_alt").replace("{name}", &name)
+                                }),
+                            });
+                        }
+                        if signing_failed {
+                            gallery_available = false;
+                            tracing::warn!(
+                                category = "gallery_signing_unavailable",
+                                location_id = id
+                            );
+                        }
+                        gallery
                     }
-                    gallery
+                    Err(_) => {
+                        gallery_available = false;
+                        tracing::warn!(category = "gallery_unavailable", location_id = id);
+                        Vec::new()
+                    }
                 }
-                Err(_) => Vec::new(),
+            } else {
+                Vec::new()
             };
             let viewer = auth.user.as_ref().map(|u| u.id);
-            // Community overlay (reviews, confidence, favorite, verification).
-            // Reuses the location already loaded above instead of re-reading
-            // the aggregate. A read failure degrades to the base detail page,
-            // never a 500.
-            let community = state
-                .contributions
-                .community_details(view.location.clone(), viewer)
-                .await
-                .ok();
+            let community = if reads.community {
+                state
+                    .detail_reads
+                    .community(view.location.clone(), viewer, q.after, limit)
+                    .await
+                    .map_err(|_| {
+                        tracing::warn!(category = "community_unavailable", location_id = id)
+                    })
+                    .ok()
+            } else {
+                None
+            };
+            let current_content_available = tab != "current" || community.is_some();
             // Post-action confirmation (e.g. "this change will be reviewed").
             let notice = details_notice(tr, &q);
             let mut page = DetailsPage::build_community(
@@ -147,28 +202,76 @@ pub(crate) async fn parking_details(
                 &*state.storage,
             )
             .await
-            .collaboration_proposals(
-                state
-                    .contributions
-                    .listing_proposals(id)
-                    .await
-                    .unwrap_or_default(),
-            )
-            .collaboration_history(
-                state
-                    .contributions
-                    .revision_history(id)
-                    .await
-                    .unwrap_or_default(),
-            )
             .notice(notice);
-            page.pending_photos = state.photos.pending_count(id).await.unwrap_or_default();
-            page.tab = match q.tab.as_str() {
-                "history" => "history",
-                "approvals" => "approvals",
-                _ => "current",
+            page.tab = tab.into();
+            page.gallery_available = gallery_available;
+            page.gallery_total = gallery_total;
+            page.current_content_available = current_content_available;
+            if tab == "current" && page.reviews_has_more {
+                page.reviews_next = page
+                    .reviews
+                    .last()
+                    .map(|review| format!("/parking/{id}?limit={limit}&after={}", review.id));
             }
-            .into();
+
+            match state.detail_reads.summary(id).await {
+                Ok(summary) => page = page.pending_summary(summary),
+                Err(_) => {
+                    page.collaboration_summary_available = false;
+                    tracing::warn!(category = "proposal_summary_unavailable", location_id = id);
+                }
+            }
+            match state.detail_reads.pending_photos(id).await {
+                Ok(count) => page.pending_photos = count,
+                Err(_) => {
+                    page.collaboration_summary_available = false;
+                    tracing::warn!(
+                        category = "pending_photo_count_unavailable",
+                        location_id = id
+                    );
+                }
+            }
+            if reads.proposals {
+                match state.detail_reads.proposals(id, q.after, limit).await {
+                    Ok((items, total, has_more)) => {
+                        page.proposals_total = total;
+                        page = page.collaboration_proposals(items);
+                        page.proposals_next = has_more.then(|| {
+                            format!(
+                                "/parking/{id}?tab=approvals&limit={limit}&after={}",
+                                page.collaboration_proposals
+                                    .last()
+                                    .map(|p| p.id)
+                                    .unwrap_or_default()
+                            )
+                        });
+                    }
+                    Err(_) => {
+                        page.proposals_available = false;
+                        tracing::warn!(category = "proposals_unavailable", location_id = id);
+                    }
+                }
+            } else if reads.history {
+                match state.detail_reads.history(id, q.after, limit).await {
+                    Ok((items, total, has_more)) => {
+                        page.history_total = total;
+                        page = page.collaboration_history(items);
+                        page.history_next = has_more.then(|| {
+                            format!(
+                                "/parking/{id}?tab=history&limit={limit}&after={}",
+                                page.collaboration_history
+                                    .last()
+                                    .map(|r| r.version)
+                                    .unwrap_or_default()
+                            )
+                        });
+                    }
+                    Err(_) => {
+                        page.history_available = false;
+                        tracing::warn!(category = "history_unavailable", location_id = id);
+                    }
+                }
+            }
             render(page, StatusCode::OK)
         }
         Ok(None) => not_found_page(&headers, &state.map, &auth, tr),

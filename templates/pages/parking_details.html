@@ -69,23 +69,91 @@
   </header>
 
   <nav class="my-6 flex flex-wrap items-center gap-x-6 gap-y-1 border-b border-border text-sm" aria-label="{{ tr.t("collab.tabs") }}" data-od-id="parking-navigation">
-    <a href="/parking/{{ id }}" {% if tab == "current" %}aria-current="page"{% endif %} class="inline-flex min-h-11 items-center border-b-2 py-3 {% if tab == "current" %}border-accent-strong font-semibold text-fg{% else %}border-transparent text-muted{% endif %}">{{ tr.t("profile.current") }}</a>
-    <a href="/parking/{{ id }}?tab=history" {% if tab == "history" %}aria-current="page"{% endif %} class="inline-flex min-h-11 items-center border-b-2 py-3 {% if tab == "history" %}border-accent-strong font-semibold text-fg{% else %}border-transparent text-muted{% endif %}">{{ tr.t("profile.history") }}</a>
-    <a href="/parking/{{ id }}?tab=approvals" {% if tab == "approvals" %}aria-current="page"{% endif %} class="inline-flex min-h-11 items-center gap-2 border-b-2 py-3 {% if tab == "approvals" %}border-accent-strong font-semibold text-fg{% else %}border-transparent text-muted{% endif %}">{{ tr.t("profile.approvals") }} <span class="rounded-full bg-accent-soft px-2 font-mono text-xs text-accent-strong">{{ self.pending_count() }}</span></a>
+    <a href="/parking/{{ id }}" {% if tab == "current" %}aria-current="page"{% endif %} class="inline-flex min-h-11 items-center border-b-2 py-3 {% if tab == "current" %}border-accent-strong font-semibold text-fg{% else %}border-transparent text-muted{% endif %}">{{ tr.t("profile.tab.current") }}</a>
+    <a href="/parking/{{ id }}?tab=history" {% if tab == "history" %}aria-current="page"{% endif %} class="inline-flex min-h-11 items-center border-b-2 py-3 {% if tab == "history" %}border-accent-strong font-semibold text-fg{% else %}border-transparent text-muted{% endif %}">{{ tr.t("profile.tab.history") }}</a>
+    <a href="/parking/{{ id }}?tab=approvals" {% if tab == "approvals" %}aria-current="page"{% endif %} class="inline-flex min-h-11 items-center gap-2 border-b-2 py-3 {% if tab == "approvals" %}border-accent-strong font-semibold text-fg{% else %}border-transparent text-muted{% endif %}">{{ tr.t("profile.tab.approvals") }} {% if collaboration_summary_available %}<span class="rounded-full bg-accent-soft px-2 font-mono text-xs text-accent-strong">{{ self.pending_count() }}</span>{% endif %}</a>
     {% if can_contribute %}<a href="/parking/{{ id }}/edit" class="ml-auto inline-flex min-h-11 items-center font-medium text-accent-strong">{{ tr.t("collab.suggest") }}</a>{% endif %}
   </nav>
+  {% if !collaboration_summary_available %}<p role="status" class="mb-4 rounded-xl border border-border bg-surface p-4 text-sm text-muted">{{ tr.t("profile.data_unavailable") }}</p>{% endif %}
   {% if tab == "approvals" %}
+    {% if !proposals_available || !collaboration_summary_available %}<p role="status" class="rounded-xl border border-border bg-surface p-4 text-sm text-muted">{{ tr.t("profile.data_unavailable") }}</p>{% endif %}
     {% include "partials/listing_collaboration.html" %}
+    {% if proposals_available %}<p class="mt-4 text-sm text-muted">{{ tr.t("profile.loaded_total").replace("{shown}", collaboration_proposals.len().to_string().as_str()).replace("{total}", proposals_total.to_string().as_str()) }}</p>{% endif %}
+    {% if let Some(next) = proposals_next %}<a href="{{ next }}" class="mt-3 inline-flex min-h-11 items-center font-medium text-accent-strong">{{ tr.t("profile.load_more") }}</a>{% endif %}
   {% else if tab == "history" %}
+    {% if !history_available %}<p role="status" class="rounded-xl border border-border bg-surface p-4 text-sm text-muted">{{ tr.t("profile.data_unavailable") }}</p>{% endif %}
     {% include "partials/parking_versions.html" %}
+    {% if history_available %}<p class="mt-4 text-sm text-muted">{{ tr.t("profile.loaded_total").replace("{shown}", collaboration_history.len().to_string().as_str()).replace("{total}", history_total.to_string().as_str()) }}</p>{% endif %}
+    {% if let Some(next) = history_next %}<a href="{{ next }}" class="mt-3 inline-flex min-h-11 items-center font-medium text-accent-strong">{{ tr.t("profile.load_more") }}</a>{% endif %}
   {% else %}
+  {% if !current_content_available || !gallery_available %}<p role="status" class="mb-4 rounded-xl border border-border bg-surface p-4 text-sm text-muted">{{ tr.t("profile.data_unavailable") }}</p>{% endif %}
   <div id="listing-overview" class="parking-overview grid gap-8 lg:grid-cols-[1fr_320px]" data-listing-pane="overview">
     <div>
 
+      <!-- The decisions a rider needs first. These are published facts; the
+           separate confidence panel below describes community signals. -->
+      <section class="border-b border-border pb-4" data-od-id="parking-key-facts">
+        <h2 class="font-display text-lg font-semibold">{{ tr.t("details.facts.title") }}</h2>
+        <div class="mt-3 grid grid-cols-2 gap-x-5 gap-y-4 sm:grid-cols-3">
+          <div><p class="text-xs text-muted">{{ tr.t("details.facts.cost") }}</p><p class="mt-1 font-medium">{{ cost_label }}</p>{% let pending_field = "cost" %}{% include "partials/pending_change.html" %}</div>
+          <div><p class="text-xs text-muted">{{ tr.t("details.facts.open_now") }}</p><p class="mt-1 font-medium">{{ open_label }}</p></div>
+          <div><p class="text-xs text-muted">{{ tr.t("details.facts.last_verified") }}</p><p class="mt-1 font-medium">{{ verified_label }}</p></div>
+          <div><p class="text-xs text-muted">{{ tr.t("details.facts.type") }}</p><p class="mt-1 font-medium">{{ type_label }}</p></div>
+          <div><p class="text-xs text-muted">{{ tr.t("details.facts.rating") }}</p><p class="mt-1 font-medium">{{ rating_label }}</p></div>
+        </div>
+      </section>
+
+      <!-- Security is a fact supplied for this listing, not an aggregate
+           confidence claim, so it stays with the route decision information. -->
+      <section class="mt-6 border-b border-border pb-4" data-od-id="security-features">
+        <h2 class="py-2 font-medium">{{ tr.t("details.security.title") }}</h2>
+        <ul class="mt-3 grid gap-2 sm:grid-cols-2 text-sm">
+          {% for f in security %}
+            {% if f.state != "unknown" %}
+            <li class="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-surface px-3 py-2">
+              {% if f.state == "yes" %}
+                <span class="grid h-5 w-5 place-items-center rounded-full bg-fresh/10 text-fresh" aria-label="{{ tr.t("details.security.yes") }}">✓</span><span>{{ f.label }}</span>
+              {% else if f.state == "no" %}
+                <span class="grid h-5 w-5 place-items-center rounded-full bg-stale/10 text-stale" aria-label="{{ tr.t("details.security.no") }}">✗</span><span class="text-muted">{{ f.label }}</span>
+              {% else %}
+                <span class="grid h-5 w-5 place-items-center rounded-full bg-bg text-muted" aria-label="{{ tr.t("details.security.unknown") }}">?</span><span class="text-muted">{{ f.label }}</span>
+              {% endif %}
+              {% let pending_field = f.code.as_str() %}{% include "partials/pending_change.html" %}
+            </li>
+            {% endif %}
+          {% endfor %}
+        </ul>
+        {% if has_unknown_security %}
+        <details class="mt-2">
+          <summary class="inline-flex min-h-11 cursor-pointer items-center text-sm font-medium text-muted">{{ tr.t("details.security.other") }}</summary>
+          <ul class="mt-1 grid gap-2 sm:grid-cols-2 text-sm">
+          {% for f in security %}{% if f.state == "unknown" %}
+            <li class="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-surface px-3 py-2"><span class="grid h-5 w-5 place-items-center rounded-full bg-bg text-muted" aria-label="{{ tr.t("details.security.unknown") }}">?</span><span class="text-muted">{{ f.label }}</span>{% let pending_field = f.code.as_str() %}{% include "partials/pending_change.html" %}</li>
+          {% endif %}{% endfor %}
+          </ul>
+        </details>
+        {% endif %}
+      </section>
+
+      <section id="parking-map" class="mt-6 border-b border-border pb-6" data-od-id="parking-map">
+        <div class="flex flex-wrap items-baseline justify-between gap-2">
+          <h2 class="font-display text-lg font-semibold">{{ tr.t("details.map.title") }}</h2>
+          <a href="{{ osm_url }}" target="_blank" rel="noopener" class="text-sm font-medium text-accent-strong hover:underline">{{ tr.t("details.navigate.osm") }}</a>
+        </div>
+        <p class="mt-1 text-sm text-muted">{{ tr.t("details.map.fallback") }}</p>
+        {% let pending_field = "point" %}{% include "partials/pending_change.html" %}
+        <div class="relative mt-3">
+          <div id="map-single" data-lat="{{ lat }}" data-lon="{{ lon }}" data-name="{{ name }}" class="h-64 rounded-2xl border border-border"></div>
+          <div data-map-status class="absolute inset-0 flex items-center justify-center rounded-2xl bg-surface/90 p-4 text-center text-sm text-muted" role="status"
+               data-loading="{{ tr.t("map.loading") }}" data-failed="{{ tr.t("map.failed") }}" data-retry="{{ tr.t("map.retry") }}">{{ tr.t("map.loading") }}</div>
+        </div>
+      </section>
+
       <!-- Photo gallery -->
-      <section class="parking-gallery">
+      <section class="parking-gallery mt-6">
         {% if pending_photos > 0 %}<a href="/parking/{{ id }}?tab=approvals#pending-photos" class="mb-2 inline-flex min-h-11 items-center text-sm font-medium text-accent-strong" data-pending-field="photos">{{ tr.t("profile.photos_pending") }} · {{ pending_photos }}</a>{% endif %}
-        {% if gallery.is_empty() %}
+        {% if !gallery_available %}
+        {% else if gallery.is_empty() %}
           <div class="rounded-2xl border border-dashed border-border bg-surface px-6 py-12 text-center">
             {% if can_contribute %}
               <p class="font-display text-base font-semibold">{{ tr.t("gallery.empty_can_upload") }}</p>
@@ -95,20 +163,34 @@
             {% endif %}
           </div>
         {% else %}
-          <div class="parking-gallery-grid grid gap-3 sm:grid-cols-4">
+          <div class="parking-gallery-grid grid grid-cols-2 gap-3">
             {% for photo in gallery %}
+              {% if loop.first %}
               <button
                 type="button"
                 @click="openLightbox"
                 data-src="{{ photo.url }}"
                 data-alt="{{ photo.alt }}"
                 aria-label="{{ tr.t("gallery.view_photo") }}"
-                class="{% if loop.first %}sm:col-span-4 aspect-[2/1]{% else %}aspect-square{% endif %} overflow-hidden rounded-2xl border border-border"
+                class="{% if loop.first %}col-span-2 aspect-[16/9]{% else %}aspect-square{% endif %} overflow-hidden rounded-2xl border border-border"
               >
-                <img src="{% if loop.first %}{{ photo.url }}{% else %}{{ photo.thumb_url }}{% endif %}" alt="{{ photo.alt }}" loading="lazy" class="h-full w-full object-cover" />
+                <img src="{{ photo.url }}" alt="{{ photo.alt }}" loading="lazy" class="h-full w-full object-cover" />
               </button>
+              {% endif %}
             {% endfor %}
           </div>
+          {% if gallery.len() > 1 %}
+          <details class="mt-3">
+            <summary class="inline-flex min-h-11 cursor-pointer items-center text-sm font-medium text-accent-strong">{{ tr.t("gallery.view_loaded").replace("{n}", gallery.len().to_string().as_str()) }}</summary>
+            <div class="mt-2 grid grid-cols-2 gap-3 sm:grid-cols-4">
+              {% for photo in gallery %}{% if !loop.first %}
+              <button type="button" @click="openLightbox" data-src="{{ photo.url }}" data-alt="{{ photo.alt }}" aria-label="{{ tr.t("gallery.view_photo") }}" class="aspect-square overflow-hidden rounded-2xl border border-border">
+                <img src="{{ photo.thumb_url }}" alt="{{ photo.alt }}" loading="lazy" class="h-full w-full object-cover" />
+              </button>
+              {% endif %}{% endfor %}
+            </div>
+          </details>
+          {% endif %}
           <!-- Lightbox -->
           <div
             id="photo-lightbox" x-show="galleryOpen" x-cloak
@@ -122,6 +204,7 @@
           </div>
         {% endif %}
       </section>
+      {% if gallery_available %}<p class="mt-2 text-sm text-muted">{{ tr.t("profile.loaded_total").replace("{shown}", gallery.len().to_string().as_str()).replace("{total}", gallery_total.to_string().as_str()) }}</p>{% endif %}
 
 
       <!-- Add a photo: verified users only; holds for review. -->
@@ -129,10 +212,8 @@
       <details id="photo-upload" class="mt-4 rounded-xl border border-border p-4" data-od-id="photo-upload">
         <summary class="min-h-11 cursor-pointer py-2 text-sm font-medium">{{ tr.t("photo.upload.title") }}</summary>
         <p class="mt-1 text-sm text-muted">{{ tr.t("photo.upload.hint") }}</p>
-        {# `?csrf=` on the action is the no-JS token source: the CSRF middleware
-           must not drain a multipart body (the handler's `Multipart` extractor
-           needs it), so it reads the query instead. With JS the `hx-headers`
-           X-CSRF-Token below is used and the query value is simply redundant. #}
+        {# Native multipart fallback carries CSRF in the action because the
+           middleware intentionally does not consume the upload stream. #}
         <form action="/parking/{{ id }}/photo?csrf={{ layout.csrf }}" method="post"
               enctype="multipart/form-data"
               hx-post="/parking/{{ id }}/photo"
@@ -141,35 +222,20 @@
               hx-encoding="multipart/form-data"
               hx-headers='{"X-CSRF-Token": "{{ layout.csrf }}"}'
               class="mt-4 flex flex-wrap items-center gap-3">
-          <input type="file" name="photo" accept="image/jpeg,image/png,image/webp" required class="text-sm" />
-          <input type="text" name="alt" maxlength="500" placeholder="{{ tr.t("photo.upload.title") }}" class="rounded-lg border border-border bg-bg px-3 py-2 text-sm" />
+          <div>
+            <label for="photo-upload-file" class="mb-1 block text-sm font-medium">{{ tr.t("photo.upload.file_label") }}</label>
+            <input id="photo-upload-file" type="file" name="photo" accept="image/jpeg,image/png,image/webp" required class="text-sm" />
+          </div>
+          <div>
+            <label for="photo-upload-alt" class="mb-1 block text-sm font-medium">{{ tr.t("photo.upload.alt_label") }}</label>
+            <input id="photo-upload-alt" type="text" name="alt" maxlength="500" aria-describedby="photo-upload-alt-hint" class="rounded-lg border border-border bg-bg px-3 py-2 text-sm" />
+            <p id="photo-upload-alt-hint" class="mt-1 max-w-sm text-xs text-muted">{{ tr.t("photo.upload.alt_hint") }}</p>
+          </div>
           <button type="submit" class="rounded-lg bg-accent-strong px-4 py-2 text-sm font-medium text-white hover:bg-accent-dark">{{ tr.t("photo.upload.submit") }}</button>
         </form>
         <div id="photo-upload-result" class="mt-3" aria-live="polite" tabindex="-1"></div>
       </details>
       {% endif %}
-
-      <!-- At-a-glance facts -->
-      <section class="mt-8">
-        <h2 class="font-display text-lg font-semibold">{{ tr.t("details.facts.title") }}</h2>
-        <div class="mt-4 grid grid-cols-2 gap-x-6 gap-y-4 border-y border-border py-4 sm:grid-cols-3">
-          <div>
-            <p class="text-xs text-muted">{{ tr.t("details.facts.cost") }}</p>
-            <p class="mt-1 font-medium">{{ cost_label }}</p>
-            {% let pending_field = "cost" %}{% include "partials/pending_change.html" %}
-          </div>
-          <div>
-            <p class="text-xs text-muted">{{ tr.t("details.facts.freshness") }}</p>
-            <p class="mt-1 font-medium">{% if freshness_code == "never" %}{{ freshness_label }}{% else %}{{ freshness_label }} · {{ verified_label }}{% endif %}</p>
-          </div>
-          <div>
-            <p class="text-xs text-muted">{{ tr.t("details.facts.rating") }}</p>
-            <p class="mt-1 font-medium">{{ rating_label }}</p>
-          </div>
-        </div>
-      </section>
-
-
       {% let pending_field = "hours" %}{% include "partials/pending_change.html" %}
       {% let pending_field = "timezone" %}{% include "partials/pending_change.html" %}
       <!-- Opening hours -->
@@ -188,29 +254,11 @@
         </table>
       </details>
 
-      <!-- Security attributes (yes / no / unknown) -->
-      <section class="mt-6 border-b border-border pb-4" data-od-id="security-features">
-        <h2 class="py-2 font-medium">{{ tr.t("details.security.title") }}</h2>
-        <ul class="mt-3 grid gap-2 sm:grid-cols-2 text-sm">
-          {% for f in security %}
-            <li class="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-surface px-3 py-2">
-              {% if f.state == "yes" %}
-                <span class="grid h-5 w-5 place-items-center rounded-full bg-fresh/10 text-fresh" aria-label="{{ tr.t("details.security.yes") }}">✓</span><span>{{ f.label }}</span>
-              {% else if f.state == "no" %}
-                <span class="grid h-5 w-5 place-items-center rounded-full bg-stale/10 text-stale" aria-label="{{ tr.t("details.security.no") }}">✗</span><span class="text-muted">{{ f.label }}</span>
-              {% else %}
-                <span class="grid h-5 w-5 place-items-center rounded-full bg-bg text-muted" aria-label="{{ tr.t("details.security.unknown") }}">?</span><span class="text-muted">{{ f.label }}</span>
-              {% endif %}
-              {% let pending_field = f.code.as_str() %}{% include "partials/pending_change.html" %}
-            </li>
-          {% endfor %}
-        </ul>
-      </section>
-
       <!-- Community signals: recommended because -->
       {% if !reasons.is_empty() %}
-        <section class="mt-8">
-          <h2 class="font-display text-lg font-semibold">{{ tr.t("details.recommend.title") }}</h2>
+        <details class="mt-8 border-b border-border pb-4">
+          <summary class="min-h-11 cursor-pointer py-2 font-display text-lg font-semibold">{{ tr.t("details.recommend.title") }}</summary>
+          <p class="mt-1 text-sm text-muted">{{ tr.t("details.recommend.hint") }}</p>
           <ul class="mt-3 grid gap-2 sm:grid-cols-2 text-sm">
             {% for r in reasons %}
               <li class="flex items-center gap-2 rounded-lg border border-border bg-surface px-3 py-2">
@@ -222,7 +270,7 @@
               </li>
             {% endfor %}
           </ul>
-        </section>
+        </details>
       {% endif %}
 
       <!-- Reviews -->
@@ -233,7 +281,8 @@
             {% if has_own_review %}{{ tr.t("review.edit") }}{% else %}{{ tr.t("review.write") }}{% endif %}
           </a>
         {% endif %}
-        {% if reviews.is_empty() %}
+        {% if !current_content_available %}
+        {% else if reviews.is_empty() %}
           <p class="mt-2 rounded-2xl border border-dashed border-border bg-surface px-5 py-6 text-sm text-muted">{{ tr.t("details.reviews.empty") }}</p>
         {% else %}
           <ul class="mt-3 space-y-3">
@@ -250,6 +299,7 @@
                   </div>
                 </div>
                 <p class="mt-2 text-sm text-fg">{{ r.body }}</p>
+                {% if !r.media_available %}<p role="status" class="mt-3 rounded-lg border border-border bg-bg px-3 py-2 text-sm text-muted">{{ tr.t("details.review_media_unavailable") }}</p>{% endif %}
                 {% if !r.photos.is_empty() %}
                   <div class="mt-3 flex flex-wrap gap-2">
                     {% for p in r.photos %}
@@ -263,24 +313,12 @@
             {% endfor %}
           </ul>
         {% endif %}
+        {% if current_content_available %}<p class="mt-4 text-sm text-muted">{{ tr.t("profile.loaded_total").replace("{shown}", reviews.len().to_string().as_str()).replace("{total}", reviews_total.to_string().as_str()) }}</p>{% endif %}
+        {% if let Some(next) = reviews_next %}<a href="{{ next }}#parking-reviews" class="mt-3 inline-flex min-h-11 items-center font-medium text-accent-strong">{{ tr.t("profile.load_more") }}</a>{% endif %}
       </section>
     </div>
 
     <aside class="parking-sidebar space-y-4">
-      {% let pending_field = "point" %}{% include "partials/pending_change.html" %}
-      <div id="map-single"
-        data-lat="{{ lat }}"
-        data-lon="{{ lon }}"
-        data-name="{{ name }}"
-        class="h-72 rounded-2xl border border-border"
-      ></div>
-
-      <div class="rounded-2xl border border-border bg-surface p-4">
-        <div class="flex flex-col gap-2 text-sm">
-          <a href="{{ osm_url }}" target="_blank" rel="noopener" class="rounded-lg border border-border px-4 py-2 text-center hover:border-accent">{{ tr.t("details.navigate.osm") }}</a>
-        </div>
-      </div>
-
       <!-- Add a nearby spot: the map above only ever shows this one
            listing, so this is the entry point to add whatever it doesn't cover. -->
       <details class="rounded-xl border border-border bg-surface p-4 text-sm" data-od-id="add-nearby">
@@ -436,14 +474,14 @@
 {% endif %}
 <link rel="stylesheet" href="{{ layout.asset("css/map.css") }}">
 {% if layout.uses_maplibre() %}
-<script src="{{ layout.asset("vendor/maplibre-gl.js") }}"></script>
-<script src="{{ layout.asset("js/map-provider-maplibre.js") }}"></script>
+<script type="module" nonce="{{ layout.csp_nonce }}" src="{{ layout.asset("js/maplibre-loader.mjs") }}"></script>
+<script nonce="{{ layout.csp_nonce }}" src="{{ layout.asset("js/map-provider-maplibre.js") }}"></script>
 {% else if layout.uses_mapbox() %}
-<script src="{{ layout.asset("vendor/mapbox-gl.js") }}"></script>
-<script src="{{ layout.asset("js/map-provider-mapbox.js") }}"></script>
+<script nonce="{{ layout.csp_nonce }}" src="{{ layout.asset("vendor/mapbox-gl.js") }}"></script>
+<script nonce="{{ layout.csp_nonce }}" src="{{ layout.asset("js/map-provider-mapbox.js") }}"></script>
 {% else if layout.uses_google_maps() %}
-<script src="{{ layout.asset("js/map-provider-google.js") }}"></script>
+<script nonce="{{ layout.csp_nonce }}" src="{{ layout.asset("js/map-provider-google.js") }}"></script>
 {% endif %}
-<script src="{{ layout.asset("js/details-map.js") }}"></script>
+<script nonce="{{ layout.csp_nonce }}" src="{{ layout.asset("js/details-map.js") }}"></script>
 </template>
 {% endblock %}

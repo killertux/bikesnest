@@ -4,8 +4,8 @@
 //! Decoding and the two JPEG encodes are pure CPU work on images of up to 20
 //! megapixels, so they run on `tokio::task::spawn_blocking` — inline, a handful
 //! of concurrent uploads would occupy every runtime worker and stall the whole
-//! server, `/healthz` included. A [`Semaphore`] sized to the machine's
-//! parallelism bounds how many run at once, so an upload burst *queues* instead
+//! server, `/healthz` included. A [`Semaphore`] sized from explicit process
+//! configuration bounds how many run at once, so an upload burst *queues* instead
 //! of spawning an unbounded number of blocking tasks (each of which allocates
 //! several times the decoded image).
 
@@ -26,17 +26,38 @@ pub struct LocalImageProcessor {
     limits: PhotoLimits,
     /// Concurrency budget for the blocking decode/encode work.
     permits: Arc<Semaphore>,
+    #[cfg(test)]
+    blocking_hook: Option<Arc<dyn Fn() -> Box<dyn Send> + Send + Sync>>,
 }
 
 impl LocalImageProcessor {
-    pub fn new(limits: PhotoLimits) -> Self {
-        let parallelism = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .max(1);
+    pub fn new(limits: PhotoLimits, concurrency: usize) -> Self {
+        assert!(
+            concurrency > 0,
+            "image processing concurrency must be positive"
+        );
+        assert!(
+            concurrency <= Semaphore::MAX_PERMITS,
+            "image processing concurrency exceeds the semaphore implementation limit"
+        );
+        Self {
+            limits,
+            permits: Arc::new(Semaphore::new(concurrency)),
+            #[cfg(test)]
+            blocking_hook: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_hook(
+        limits: PhotoLimits,
+        parallelism: usize,
+        hook: Arc<dyn Fn() -> Box<dyn Send> + Send + Sync>,
+    ) -> Self {
         Self {
             limits,
             permits: Arc::new(Semaphore::new(parallelism)),
+            blocking_hook: Some(hook),
         }
     }
 
@@ -128,7 +149,7 @@ impl bikesnest_application::ImageProcessor for LocalImageProcessor {
         // so a burst queues here — holding nothing but the caller's own buffer
         // — instead of running N decodes at once. The semaphore is never
         // closed, so `acquire_owned` only fails if it were.
-        let _permit = self
+        let permit = self
             .permits
             .clone()
             .acquire_owned()
@@ -136,10 +157,180 @@ impl bikesnest_application::ImageProcessor for LocalImageProcessor {
             .map_err(|_| PhotoError::Undecodable)?;
         let limits = self.limits;
         let bytes = bytes.to_vec();
-        tokio::task::spawn_blocking(move || Self::process_blocking(limits, &bytes))
-            .await
-            // A JoinError means the blocking pool panicked or is shutting down;
-            // to the caller that is the same as an unusable upload.
-            .map_err(|_| PhotoError::Undecodable)?
+        #[cfg(test)]
+        let hook = self.blocking_hook.clone();
+        tokio::task::spawn_blocking(move || {
+            // A started blocking task cannot be aborted. Keep its capacity
+            // permit with the real decode/encode work, even if the caller is
+            // cancelled while awaiting the JoinHandle.
+            let _permit = permit;
+            #[cfg(test)]
+            let _work_guard = hook.map(|hook| hook());
+            Self::process_blocking(limits, &bytes)
+        })
+        .await
+        // A JoinError means the blocking pool panicked or is shutting down;
+        // to the caller that is the same as an unusable upload.
+        .map_err(|_| PhotoError::Undecodable)?
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use bikesnest_application::ImageProcessor;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex};
+
+    #[test]
+    fn constructor_rejects_out_of_range_concurrency() {
+        assert!(
+            std::panic::catch_unwind(|| LocalImageProcessor::new(PhotoLimits::default(), 0))
+                .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(|| {
+                LocalImageProcessor::new(
+                    PhotoLimits::default(),
+                    Semaphore::MAX_PERMITS.saturating_add(1),
+                )
+            })
+            .is_err()
+        );
+    }
+
+    struct Gate {
+        entered: AtomicUsize,
+        active: AtomicUsize,
+        peak: AtomicUsize,
+        open: Mutex<bool>,
+        wake: Condvar,
+    }
+    struct Active(Arc<Gate>);
+    impl Drop for Active {
+        fn drop(&mut self) {
+            self.0.active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    struct Release(Arc<Gate>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            *self.0.open.lock().unwrap() = true;
+            self.0.wake.notify_all();
+        }
+    }
+    impl Gate {
+        fn enter(self: &Arc<Self>) -> Box<dyn Send> {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.wake.wait(open).unwrap();
+            }
+            drop(open);
+            Box::new(Active(self.clone()))
+        }
+        fn release(&self) {
+            *self.open.lock().unwrap() = true;
+            self.wake.notify_all();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_image_caller_does_not_release_running_decode_capacity() {
+        let gate = Arc::new(Gate {
+            entered: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            open: Mutex::new(false),
+            wake: Condvar::new(),
+        });
+        let _release = Release(gate.clone());
+        let hook: Arc<dyn Fn() -> Box<dyn Send> + Send + Sync> = Arc::new({
+            let gate = gate.clone();
+            move || gate.enter()
+        });
+        let processor = Arc::new(LocalImageProcessor::with_hook(
+            PhotoLimits::default(),
+            1,
+            hook,
+        ));
+        let first_processor = processor.clone();
+        let first = tokio::spawn(async move { first_processor.process(b"bad image").await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while gate.entered.load(Ordering::SeqCst) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        first.abort();
+        let _ = first.await;
+        let second_processor = processor.clone();
+        let second = tokio::spawn(async move { second_processor.process(b"also bad").await });
+        tokio::task::yield_now().await;
+        assert_eq!(gate.entered.load(Ordering::SeqCst), 1);
+        second.abort();
+        let _ = second.await;
+        let third_processor = processor.clone();
+        let third = tokio::spawn(async move { third_processor.process(b"third bad").await });
+        tokio::task::yield_now().await;
+        assert_eq!(gate.entered.load(Ordering::SeqCst), 1);
+        gate.release();
+        third.await.unwrap().unwrap_err();
+        assert_eq!(gate.peak.load(Ordering::SeqCst), 1);
+        assert_eq!(gate.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn image_burst_counts_actual_blocking_closures_not_async_callers() {
+        let gate = Arc::new(Gate {
+            entered: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            open: Mutex::new(false),
+            wake: Condvar::new(),
+        });
+        let _release = Release(gate.clone());
+        let hook: Arc<dyn Fn() -> Box<dyn Send> + Send + Sync> = Arc::new({
+            let gate = gate.clone();
+            move || gate.enter()
+        });
+        let processor = Arc::new(LocalImageProcessor::with_hook(
+            PhotoLimits::default(),
+            2,
+            hook,
+        ));
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        DynamicImage::new_rgb8(1024, 1024)
+            .write_to(&mut encoded, ImageFormat::Png)
+            .unwrap();
+        let bytes = Arc::new(encoded.into_inner());
+        let started = std::time::Instant::now();
+        let tasks: Vec<_> = (0..6)
+            .map(|_| {
+                let processor = processor.clone();
+                let bytes = bytes.clone();
+                tokio::spawn(async move { processor.process(&bytes).await })
+            })
+            .collect();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while gate.entered.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(gate.peak.load(Ordering::SeqCst), 2);
+        gate.release();
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        assert_eq!(gate.peak.load(Ordering::SeqCst), 2);
+        eprintln!(
+            "image debug burst six elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
     }
 }

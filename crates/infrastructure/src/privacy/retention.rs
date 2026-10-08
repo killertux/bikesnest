@@ -8,9 +8,7 @@
 use crate::Db;
 use crate::privacy::SqlxAnonymizationRepository;
 use async_trait::async_trait;
-use bikesnest_application::{
-    AnonymizationRepository, ObjectStorage, PrivacyError, RetentionRepository, StorageError,
-};
+use bikesnest_application::{ObjectStorage, PrivacyError, RetentionRepository, StorageError};
 use bikesnest_domain::{RetentionPolicy, UserId};
 use chrono::{DateTime, Duration, Utc};
 use std::collections::HashSet;
@@ -64,49 +62,115 @@ impl RetentionRepository for SqlxRetentionRepository {
         &self,
         now: DateTime<Utc>,
     ) -> Result<u64, PrivacyError> {
-        let res = sqlx::query("DELETE FROM password_reset_tokens WHERE expires_at < $1")
-            .bind(now)
-            .execute(self.db.pool())
+        let mut conn = self
+            .db
+            .acquire()
             .await
             .map_err(|e| db_err("retention.purge_expired_password_reset_tokens", e))?;
-        Ok(res.rows_affected())
+        let count: i64 = sqlx::query_scalar(r#"
+            WITH scrub AS (
+              UPDATE background_job SET payload='{}'::jsonb,
+                state=CASE WHEN state IN ('pending','running') THEN 'failed' ELSE state END,
+                last_error=CASE WHEN state IN ('pending','running','failed') THEN 'mail credential expired' ELSE NULL END,
+                finished_at=CASE WHEN state IN ('pending','running') THEN COALESCE(finished_at,$1) ELSE finished_at END,
+                claimed_by=NULL, lease_expires_at=NULL, heartbeat_at=NULL,
+                mail_recipient_hash=NULL, mail_transition_audit_id=NULL,
+                payload_redacted_at=COALESCE(payload_redacted_at,$1), updated_at=now()
+              WHERE kind='email.send' AND mail_purpose='reset' AND mail_token_expires_at < $1
+            ), deleted AS (DELETE FROM password_reset_tokens WHERE expires_at < $1 RETURNING 1)
+            SELECT count(*) FROM deleted"#)
+            .bind(now)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| db_err("retention.purge_expired_password_reset_tokens", e))?;
+        Ok(count as u64)
     }
 
     async fn purge_expired_email_verification_tokens(
         &self,
         now: DateTime<Utc>,
     ) -> Result<u64, PrivacyError> {
-        let res = sqlx::query("DELETE FROM email_verification_tokens WHERE expires_at < $1")
-            .bind(now)
-            .execute(self.db.pool())
+        let mut conn = self
+            .db
+            .acquire()
             .await
             .map_err(|e| db_err("retention.purge_expired_email_verification_tokens", e))?;
-        Ok(res.rows_affected())
+        let count: i64 = sqlx::query_scalar(r#"
+            WITH scrub AS (
+              UPDATE background_job SET payload='{}'::jsonb,
+                state=CASE WHEN state IN ('pending','running') THEN 'failed' ELSE state END,
+                last_error=CASE WHEN state IN ('pending','running','failed') THEN 'mail credential expired' ELSE NULL END,
+                finished_at=CASE WHEN state IN ('pending','running') THEN COALESCE(finished_at,$1) ELSE finished_at END,
+                claimed_by=NULL, lease_expires_at=NULL, heartbeat_at=NULL,
+                mail_recipient_hash=NULL, mail_transition_audit_id=NULL,
+                payload_redacted_at=COALESCE(payload_redacted_at,$1), updated_at=now()
+              WHERE kind='email.send' AND mail_purpose IN ('verify','change') AND mail_token_expires_at < $1
+            ), deleted AS (DELETE FROM email_verification_tokens WHERE expires_at < $1 RETURNING 1)
+            SELECT count(*) FROM deleted"#)
+            .bind(now)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| db_err("retention.purge_expired_email_verification_tokens", e))?;
+        Ok(count as u64)
     }
 
     async fn purge_expired_sessions(&self, now: DateTime<Utc>) -> Result<u64, PrivacyError> {
-        let idle_cutoff = now - self.policy.session_idle;
-        let res = sqlx::query("DELETE FROM sessions WHERE expires_at < $1 OR last_seen_at < $2")
-            .bind(now)
-            .bind(idle_cutoff)
-            .execute(self.db.pool())
+        let mut conn = self
+            .db
+            .acquire()
             .await
             .map_err(|e| db_err("retention.purge_expired_sessions", e))?;
-        Ok(res.rows_affected())
+        let idle_cutoff = now - self.policy.session_idle;
+        // Fold each purged session's `last_seen_at` into the account's durable
+        // `last_active_at` in the same statement. Inactive-account
+        // anonymization runs later in this job and must not mistake "session
+        // cleaned up" for "never active".
+        let purged: i64 = sqlx::query_scalar(
+            r#"
+            WITH purged AS (
+                DELETE FROM sessions WHERE expires_at < $1 OR last_seen_at < $2
+                RETURNING user_id, last_seen_at
+            ), latest AS (
+                SELECT user_id, max(last_seen_at) AS seen FROM purged GROUP BY user_id
+            ), touched AS (
+                UPDATE users u SET last_active_at = latest.seen
+                FROM latest
+                WHERE u.id = latest.user_id AND u.last_active_at < latest.seen
+                RETURNING 1
+            )
+            SELECT count(*) FROM purged
+            "#,
+        )
+        .bind(now)
+        .bind(idle_cutoff)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| db_err("retention.purge_expired_sessions", e))?;
+        Ok(purged as u64)
     }
 
     async fn purge_expired_parked_here(&self, now: DateTime<Utc>) -> Result<u64, PrivacyError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("retention.purge_expired_parked_here", e))?;
         let res = sqlx::query("DELETE FROM verification WHERE kind = 'parked_here' AND expires_at IS NOT NULL AND expires_at < $1").bind(now)
-        .execute(self.db.pool())
+        .execute(&mut *conn)
         .await
         .map_err(|e| db_err("retention.purge_expired_parked_here", e))?;
         Ok(res.rows_affected())
     }
 
     async fn purge_expired_exports(&self, now: DateTime<Utc>) -> Result<u64, PrivacyError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("retention.purge_expired_exports", e))?;
         let res = sqlx::query("DELETE FROM personal_data_export WHERE expires_at < $1")
             .bind(now)
-            .execute(self.db.pool())
+            .execute(&mut *conn)
             .await
             .map_err(|e| db_err("retention.purge_expired_exports", e))?;
         Ok(res.rows_affected())
@@ -167,14 +231,21 @@ impl RetentionRepository for SqlxRetentionRepository {
             ),
             ("review_photo", "retention.reconcile_pending_photos.review"),
         ] {
-            let rows: Vec<(i64, String)> = sqlx::query_as(&format!(
-                "SELECT id, storage_key FROM {table} \
-                 WHERE moderation_state = 'PENDING_REVIEW' AND created_at < $1"
-            ))
-            .bind(cutoff)
-            .fetch_all(self.db.pool())
-            .await
-            .map_err(|e| db_err("retention.reconcile_pending_photos", e))?;
+            let rows: Vec<(i64, String)> = {
+                let mut conn = self
+                    .db
+                    .acquire()
+                    .await
+                    .map_err(|e| db_err("retention.reconcile_pending_photos", e))?;
+                sqlx::query_as(&format!(
+                    "SELECT id, storage_key FROM {table} \
+                     WHERE moderation_state = 'PENDING_REVIEW' AND created_at < $1"
+                ))
+                .bind(cutoff)
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(|e| db_err("retention.reconcile_pending_photos", e))?
+            };
 
             for (id, key) in rows {
                 if self
@@ -185,9 +256,14 @@ impl RetentionRepository for SqlxRetentionRepository {
                 {
                     continue;
                 }
+                let mut conn = self
+                    .db
+                    .acquire()
+                    .await
+                    .map_err(|e| db_err("retention.reconcile_pending_photos", e))?;
                 let res = sqlx::query(&format!("DELETE FROM {table} WHERE id = $1"))
                     .bind(id)
-                    .execute(self.db.pool())
+                    .execute(&mut *conn)
                     .await
                     .map_err(|e| db_err("retention.reconcile_pending_photos", e))?;
                 deleted += res.rows_affected();
@@ -204,36 +280,61 @@ impl RetentionRepository for SqlxRetentionRepository {
         struct IdRow {
             id: i64,
         }
-        let candidates: Vec<i64> = sqlx::query_as::<_, IdRow>(r#"
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("retention.anonymize_inactive_accounts", e))?;
+        // `last_active_at` is durable: it survives the session purge that ran
+        // earlier in this job. A live session newer than the cutoff also keeps
+        // the account, in case its trigger write was skipped.
+        let candidates: Vec<i64> = sqlx::query_as::<_, IdRow>(
+            r#"
             SELECT u.id FROM users u
             WHERE u.account_state <> 'DELETED'
               AND NOT EXISTS (SELECT 1 FROM user_roles r WHERE r.user_id = u.id AND r.role = 'ADMIN')
-              AND COALESCE(
-                    (SELECT max(s.last_seen_at) FROM sessions s WHERE s.user_id = u.id),
-                    u.created_at
-                  ) < $1
-            "#).bind(cutoff)
-        .fetch_all(self.db.pool())
+              AND u.last_active_at < $1
+              AND NOT EXISTS (
+                    SELECT 1 FROM sessions s
+                    WHERE s.user_id = u.id AND s.last_seen_at >= $1
+              )
+            "#,
+        )
+        .bind(cutoff)
+        .fetch_all(&mut *conn)
         .await
         .map_err(|e| db_err("retention.anonymize_inactive_accounts", e))?
         .into_iter()
         .map(|r| r.id)
         .collect();
+        drop(conn);
 
+        // Each account is re-checked under its row lock: one that became
+        // active after the list above was read is skipped, not erased.
         let anonymizer = SqlxAnonymizationRepository::new(self.db.clone());
         let mut count = 0u64;
         for id in candidates {
-            let _ = anonymizer.anonymize(UserId(id), Utc::now()).await?;
-            count += 1;
+            if anonymizer
+                .anonymize_if_inactive(UserId(id), cutoff, Utc::now())
+                .await?
+                .is_some()
+            {
+                count += 1;
+            }
         }
         Ok(count)
     }
 
     async fn purge_deleted_accounts(&self, cutoff: DateTime<Utc>) -> Result<u64, PrivacyError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("retention.purge_deleted_accounts", e))?;
         let res =
             sqlx::query("DELETE FROM users WHERE account_state = 'DELETED' AND deleted_at < $1")
                 .bind(cutoff)
-                .execute(self.db.pool())
+                .execute(&mut *conn)
                 .await
                 .map_err(|e| db_err("retention.purge_deleted_accounts", e))?;
         Ok(res.rows_affected())
@@ -249,6 +350,11 @@ impl SqlxRetentionRepository {
         if candidate_keys.is_empty() {
             return Ok(HashSet::new());
         }
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("retention.referenced", e))?;
         let rows = sqlx::query_scalar::<_, String>(
             r#"
             SELECT storage_key FROM parking_photo WHERE storage_key = ANY($1)
@@ -261,7 +367,7 @@ impl SqlxRetentionRepository {
             "#,
         )
         .bind(candidate_keys)
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *conn)
         .await
         .map_err(|e| db_err("retention.referenced", e))?;
         Ok(rows.into_iter().collect())
