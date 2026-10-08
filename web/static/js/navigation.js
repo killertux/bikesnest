@@ -9,6 +9,7 @@
   var maps = new Map();
   var observers = new Map();
   var pending;
+  var moduleFailed = false;
   var assetTimeoutMs = 10000;
 
   function allowedAsset(node, rawUrl) {
@@ -25,21 +26,33 @@
   function load(node) {
     var url = node.src || node.href;
     if (!allowedAsset(node, url)) return Promise.reject(new Error("map_asset_refused"));
-    if (assets.has(url)) return assets.get(url);
     // A hard-loaded map page already has these styles in its head.
-    if (node.tagName === "LINK") {
+    if (!assets.has(url) && node.tagName === "LINK") {
       var existing = Array.from(document.querySelectorAll('head link[rel="stylesheet"]'))
         .find(function (link) { return link.href === url; });
       if (existing && existing.sheet) return Promise.resolve();
       if (existing) existing.remove();
     }
-    var promise = new Promise(function (resolve, reject) {
-      var el = document.createElement(node.tagName.toLowerCase());
+    if (!assets.has(url)) assets.set(url, fetchAsset(node, url));
+    // The timeout bounds how long the page shows "loading", not the download:
+    // the element stays in flight, a Retry waits on that same element instead
+    // of inserting a duplicate, and a late arrival restarts the map itself.
+    var download = assets.get(url);
+    return new Promise(function (resolve, reject) {
       var timer = setTimeout(function () {
-        assets.delete(url);
-        el.remove();
+        download.timedOut = true;
         reject(new Error("map_asset_timeout"));
       }, assetTimeoutMs);
+      download.then(
+        function () { clearTimeout(timer); resolve(); },
+        function (error) { clearTimeout(timer); reject(error); }
+      );
+    });
+  }
+
+  function fetchAsset(node, url) {
+    var download = new Promise(function (resolve, reject) {
+      var el = document.createElement(node.tagName.toLowerCase());
       if (node.tagName === "SCRIPT") {
         el.src = url;
         el.async = false;
@@ -47,17 +60,23 @@
         if (documentNonce) el.nonce = documentNonce;
       }
       else { el.rel = "stylesheet"; el.href = url; }
-      el.onload = function () { clearTimeout(timer); resolve(); };
+      el.onload = function () { resolve(); };
       el.onerror = function () {
-        clearTimeout(timer);
         assets.delete(url);
         el.remove();
+        // The browser's module map remembers a failed module graph for the
+        // document's lifetime, so inserting the same module again can never
+        // succeed: only a reload recovers it.
+        if (node.type === "module") moduleFailed = true;
         reject(new Error("map_asset_unavailable"));
       };
       document.head.appendChild(el);
     });
-    assets.set(url, promise);
-    return promise;
+    download.then(function () {
+      // Arrived after the page already reported the failure: carry on.
+      if (download.timedOut) initMaps();
+    }, function () {});
+    return download;
   }
 
   function initMaps() {
@@ -149,6 +168,10 @@
   }
 
   function retryMaps() {
+    if (moduleFailed) {
+      location.reload();
+      return;
+    }
     maps.forEach(function (map, el) {
       if (!el.isConnected) return;
       map.destroy();
@@ -176,6 +199,101 @@
       maps.delete(el);
     });
   }
+
+  // A request that never got an answer (offline, dropped connection, timeout)
+  // would otherwise fail silently: htmx 4 reports it as `htmx:error` with no
+  // `ctx.response`. An answered request — any status — has its own swapped
+  // message, and a request aborted by `hx-sync` replacement is not a failure.
+  var failedRequest = null;
+
+  function requestNotice() {
+    var region = document.getElementById("request-error");
+    if (!region) return null;
+    return {
+      region: region,
+      box: region.querySelector("[data-request-error-box]"),
+      message: region.querySelector("[data-request-error-message]"),
+      retry: region.querySelector("[data-request-retry]"),
+      dismiss: region.querySelector("[data-request-dismiss]"),
+    };
+  }
+
+  function hideRequestError() {
+    failedRequest = null;
+    var notice = requestNotice();
+    if (!notice || !notice.box) return;
+    notice.box.hidden = true;
+    notice.message.textContent = "";
+  }
+
+  function showRequestError(ctx) {
+    var notice = requestNotice();
+    if (!notice || !notice.box) return;
+    var active = document.activeElement;
+    var focusLost = !active || active === document.body || !active.isConnected;
+    // Only a read is retried: a change may have reached the server even
+    // though its answer did not, so resending it is the visitor's call.
+    var isRead = /^GET$/i.test(ctx.request.method || "");
+    failedRequest = {
+      read: isRead,
+      url: ctx.request.action,
+      source: ctx.sourceElement,
+      target: ctx.target,
+    };
+    notice.retry.hidden = !isRead;
+    notice.box.hidden = false;
+    // Live regions announce changed text, not a box that becomes visible.
+    notice.message.textContent = "";
+    setTimeout(function () { notice.message.textContent = notice.region.dataset.message || ""; }, 50);
+    if (focusLost) (isRead ? notice.retry : notice.dismiss).focus();
+  }
+
+  function requestTimedOut(ctx) {
+    var timeout = ctx.request.timeout != null ? htmx.parseInterval(ctx.request.timeout) : htmx.config.defaultTimeout;
+    return !!timeout && !!ctx.bikesnestStartedAt && Date.now() - ctx.bikesnestStartedAt >= timeout - 50;
+  }
+
+  function retryRequest() {
+    var failed = failedRequest;
+    var notice = requestNotice();
+    var hadFocus = notice && notice.box.contains(document.activeElement);
+    hideRequestError();
+    if (!failed || !failed.read) return;
+    var source = failed.source && failed.source.isConnected ? failed.source : null;
+    var target = failed.target && failed.target.isConnected ? failed.target : null;
+    if (!target || target === document.body || !source) {
+      // A page navigation (or a fragment whose page is gone): navigate for real.
+      if (new URL(failed.url, location.href).href === location.href) location.reload();
+      else location.assign(failed.url);
+      return;
+    }
+    if (hadFocus) source.focus();
+    Promise.resolve(htmx.ajax("GET", failed.url, { source: source, target: target })).catch(function () {});
+  }
+
+  function dismissRequestError() {
+    var failed = failedRequest;
+    var notice = requestNotice();
+    var hadFocus = notice && notice.box.contains(document.activeElement);
+    hideRequestError();
+    var source = failed && failed.source;
+    if (hadFocus && source && source.isConnected) source.focus();
+  }
+
+  document.addEventListener("htmx:before:request", function (event) {
+    if (event.detail.ctx) event.detail.ctx.bikesnestStartedAt = Date.now();
+  });
+  document.addEventListener("htmx:error", function (event) {
+    var ctx = event.detail.ctx;
+    var error = event.detail.error;
+    if (!ctx || !ctx.request || ctx.response) return;
+    if (error && error.name === "AbortError" && !requestTimedOut(ctx)) return;
+    showRequestError(ctx);
+  });
+  document.addEventListener("htmx:after:request", function () {
+    var notice = requestNotice();
+    if (notice && notice.box && !notice.box.hidden && !notice.box.contains(document.activeElement)) hideRequestError();
+  });
 
   window.BikesNestMaps = {
     observe: function (el, observer) { observers.set(el, observer); },
@@ -263,6 +381,8 @@
   });
   document.addEventListener("click", function (event) {
     if (event.target.closest("[data-map-retry]")) retryMaps();
+    else if (event.target.closest("[data-request-retry]")) retryRequest();
+    else if (event.target.closest("[data-request-dismiss]")) dismissRequestError();
   });
   window.addEventListener("pageshow", initMaps);
   window.addEventListener("online", initMaps);

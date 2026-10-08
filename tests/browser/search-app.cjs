@@ -258,10 +258,15 @@ const deadline = setTimeout(() => {
     const waitForPagerSettle = await armHtmxEvent(page, 'htmx:after:settle');
     await page.getByRole('link', { name: 'Next page' }).click();
     await waitForPagerSettle();
+    // The pager link was inside the results it replaced; focus moves to the
+    // new page of results rather than falling back to <body>.
+    assert.equal(await page.evaluate(() => document.activeElement && document.activeElement.id), 'results-list');
     const historyLength = await page.evaluate(() => history.length);
     const waitForRackSettle = await armHtmxEvent(page, 'htmx:after:settle');
     await page.locator('#search-filter-form input[name="type"][value="rack"]').check();
     await waitForRackSettle();
+    assert.equal(await page.evaluate(() => document.activeElement && document.activeElement.value), 'rack',
+      'a filter swap leaves focus on the filter');
     assert.equal(await page.evaluate(() => history.length), historyLength,
       'a filter change replaces the history entry');
 

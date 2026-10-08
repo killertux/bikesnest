@@ -904,22 +904,54 @@ document.addEventListener('alpine:init', function () {
   });
 });
 
-/* ---- parking_details.html: move focus after a verification swap ------------
- * `#verification-panel`'s own forms (verify.still_exists / no_longer_exists /
- * info_changed / parked_here) all target `hx-target="#verification-panel"
- * hx-swap="innerHTML"`, so the form that fired the request is *inside* the
- * subtree htmx just replaced — it is gone once the swap lands. htmx 4 reacts
- * to exactly that (see the `!e.sourceElement?.isConnected` branch right
- * before the `htmx:after:swap` dispatch in web/static/vendor/htmx.js) by
- * firing the event on the swap target instead, so `e.target` here already is
- * `#verification-panel` and needs no lookup. Not Alpine-specific — a plain
- * `document` listener, guarded the same way search.js guards its own (a
- * boosted navigation reruns every script, this one included). */
+/* ---- Keep focus where the visitor was across fragment swaps ----------------
+ * A swap that destroys the focused control drops focus to <body>; a keyboard
+ * or screen-reader user then starts over from the top of the page. htmx 4
+ * reacts to a destroyed source (see the `!e.sourceElement?.isConnected`
+ * branch right before the `htmx:after:swap` dispatch in
+ * web/static/vendor/htmx.js) by firing the event on the swap target instead
+ * and recording that target as `ctx.sourceElement`, which is how the cases
+ * below recognise "the control that was used is gone":
+ *
+ * - `#verification-panel`: its own forms target the panel's innerHTML, so the
+ *   panel itself takes focus.
+ * - `#results`: the pager and clear-filters links live inside the results
+ *   they replace. Focus the new list (or the heading when there is no list),
+ *   which also scrolls the new page of results into view. A swap started from
+ *   the search form or a filter checkbox leaves focus on that control.
+ * - `#favorite-button`: `outerMorph` keeps the button the same node, but
+ *   `hx-disable` only re-enables it after this event, and a disabled button
+ *   cannot hold focus — so focus it on the next task.
+ *
+ * Not Alpine-specific — a plain `document` listener, guarded the same way
+ * search.js guards its own (a boosted navigation reruns every script, this
+ * one included). */
 if (!window.__bnA11yBound) {
   window.__bnA11yBound = true;
+  var focusQuietly = function (el) {
+    if (!el) return;
+    if (!el.hasAttribute('tabindex') && !el.matches('a[href], button, input, select, textarea')) {
+      el.setAttribute('tabindex', '-1');
+    }
+    el.focus();
+  };
   document.addEventListener('htmx:after:swap', function (e) {
     if (e.target && e.target.id === 'verification-panel') {
       e.target.focus();
+      return;
+    }
+    var ctx = e.detail && e.detail.ctx;
+    var target = ctx && ctx.target;
+    if (!target || !target.id) return;
+    if (target.id === 'results' && ctx.sourceElement === target) {
+      var active = document.activeElement;
+      if (active && active !== document.body && active.isConnected) return;
+      focusQuietly(document.getElementById('results-list') || document.getElementById('search-heading'));
+    } else if (target.id === 'favorite-button') {
+      setTimeout(function () {
+        var button = document.getElementById('favorite-toggle');
+        if (button && !button.disabled) button.focus();
+      }, 0);
     }
   });
 }
