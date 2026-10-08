@@ -11,7 +11,7 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 /// The public-page router: the real providers the test `Config` selects (fake
-/// email/geocoder, in-memory limiter, the compose MinIO for media).
+/// email/geocoder, in-memory limiter, the compose RustFS for media).
 async fn test_app(tx: &mut bikesnest_test_support::TestTx) -> axum::Router {
     let db = tx.db().await;
     bikesnest_web::app_router(std::sync::Arc::new(test_config()), db)

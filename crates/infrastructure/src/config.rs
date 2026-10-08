@@ -208,7 +208,7 @@ impl Default for GeocodeLimits {
 }
 
 /// S3-compatible object storage. `endpoint` is `None` for the standard AWS
-/// endpoint; development defaults to the compose MinIO.
+/// endpoint; development defaults to the compose RustFS.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct S3Config {
     /// Endpoint used for server-side S3 operations.
@@ -535,13 +535,16 @@ const DEV_S3_ENDPOINT: &str = "http://localhost:9000";
 /// what `bikesnest_test_support::TestObjectStorage::presigned_get` signs its
 /// URLs under — a single source of truth so the CSP test's rendered-photo
 /// origin and its configured `media_hosts` can never drift apart. Deliberately
-/// not `http://localhost:9000` (the real dev MinIO origin): a test that hits
+/// not `http://localhost:9000` (the real dev RustFS origin): a test that hits
 /// this exact string is asserting on the *test double's* URL shape, not on
-/// dev/MinIO wiring, and `.invalid` (RFC 2606) can never resolve to a real host.
+/// dev/RustFS wiring, and `.invalid` (RFC 2606) can never resolve to a real host.
 pub const TEST_MEDIA_ORIGIN: &str = "http://media.test.invalid";
 pub const DEFAULT_S3_REGION: &str = "us-east-1";
 pub const DEFAULT_S3_BUCKET: &str = "bikesnest";
-const DEV_S3_KEY: &str = "minioadmin";
+const DEV_S3_KEY: &str = "rustfsadmin";
+/// Well-known default credentials of local S3-compatible servers. None may
+/// reach production.
+const DEFAULT_S3_KEYS: [&str; 2] = [DEV_S3_KEY, "minioadmin"];
 const DEFAULT_EMAIL_FROM: &str = "no-reply@bikesnest.local";
 const DEFAULT_POLICY_VERSION: &str = "2026-09-08.1";
 /// Compile-time location of the static assets, used only when neither
@@ -650,7 +653,7 @@ impl Config {
             ));
         }
 
-        // Object storage: the MinIO development defaults must not survive.
+        // Object storage: the development defaults must not survive.
         match self.storage.endpoint.as_deref() {
             Some(e) if !e.is_empty() => {}
             _ => errs.push("S3_ENDPOINT must be set".to_string()),
@@ -664,10 +667,12 @@ impl Config {
         if self.storage.secret_access_key.is_empty() {
             errs.push("S3_SECRET_ACCESS_KEY must be set".to_string());
         }
-        if self.storage.access_key_id == DEV_S3_KEY || self.storage.secret_access_key == DEV_S3_KEY
+        if DEFAULT_S3_KEYS
+            .iter()
+            .any(|key| self.storage.access_key_id == *key || self.storage.secret_access_key == *key)
         {
             errs.push(
-                "S3 credentials must not be the MinIO development defaults (minioadmin)"
+                "S3 credentials must not be development defaults (rustfsadmin/minioadmin)"
                     .to_string(),
             );
         }
@@ -772,7 +777,7 @@ impl Config {
     }
 
     /// A development configuration for tests: fakes everywhere, no network
-    /// dependencies beyond the database and the compose MinIO.
+    /// dependencies beyond the database and the compose RustFS.
     pub fn for_tests(database_url: impl Into<String>) -> Self {
         Self {
             app_env: AppEnv::Development,
@@ -966,7 +971,7 @@ fn rate_limiter_config(env: &EnvSource<'_>) -> RateLimiterConfig {
     }
 }
 
-/// `S3_*`. Development falls back to the compose MinIO so `cargo run` works;
+/// `S3_*`. Development falls back to the compose RustFS so `cargo run` works;
 /// production gets no defaults at all, so anything missing surfaces in
 /// [`Config::validate_for_production`]. An explicitly empty `S3_ENDPOINT` means
 /// "the standard AWS endpoint".
@@ -1503,19 +1508,21 @@ mod tests {
     }
 
     #[test]
-    fn production_rejects_localhost_base_url_and_minio_credentials() {
-        let mut env = production_env();
-        env.retain(|(k, _)| {
-            !matches!(*k, "BASE_URL" | "S3_ACCESS_KEY_ID" | "S3_SECRET_ACCESS_KEY")
-        });
-        env.extend([
-            ("BASE_URL", "http://localhost:8080"),
-            ("S3_ACCESS_KEY_ID", "minioadmin"),
-            ("S3_SECRET_ACCESS_KEY", "minioadmin"),
-        ]);
-        let errs = config(&env).validate_for_production().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("localhost")), "{errs:?}");
-        assert!(errs.iter().any(|e| e.contains("minioadmin")), "{errs:?}");
+    fn production_rejects_localhost_base_url_and_default_s3_credentials() {
+        for default_key in DEFAULT_S3_KEYS {
+            let mut env = production_env();
+            env.retain(|(k, _)| {
+                !matches!(*k, "BASE_URL" | "S3_ACCESS_KEY_ID" | "S3_SECRET_ACCESS_KEY")
+            });
+            env.extend([
+                ("BASE_URL", "http://localhost:8080"),
+                ("S3_ACCESS_KEY_ID", default_key),
+                ("S3_SECRET_ACCESS_KEY", default_key),
+            ]);
+            let errs = config(&env).validate_for_production().unwrap_err();
+            assert!(errs.iter().any(|e| e.contains("localhost")), "{errs:?}");
+            assert!(errs.iter().any(|e| e.contains(default_key)), "{errs:?}");
+        }
     }
 
     #[test]
@@ -1558,10 +1565,10 @@ mod tests {
     fn public_s3_endpoint_can_differ_from_the_internal_endpoint() {
         let cfg = config(&[
             DB,
-            ("S3_ENDPOINT", "http://minio:9000"),
+            ("S3_ENDPOINT", "http://rustfs:9000"),
             ("S3_PUBLIC_ENDPOINT", "http://localhost:9000"),
         ]);
-        assert_eq!(cfg.storage.endpoint.as_deref(), Some("http://minio:9000"));
+        assert_eq!(cfg.storage.endpoint.as_deref(), Some("http://rustfs:9000"));
         assert_eq!(
             cfg.storage.public_endpoint.as_deref(),
             Some("http://localhost:9000")

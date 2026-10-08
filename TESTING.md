@@ -248,7 +248,7 @@ signs every URL under `bikesnest_infrastructure::TEST_MEDIA_ORIGIN`
 resolve to anything real), and `Config::for_tests` puts that exact string in
 `security.media_hosts` — one constant, so the two can never drift apart. This
 means the rendered photo is a genuine *absolute-origin* URL, the same shape a
-real S3/MinIO presigned URL has, not a same-origin `/media/...` placeholder —
+real S3/RustFS presigned URL has, not a same-origin `/media/...` placeholder —
 the test additionally asserts (`assert_page_has_media_origin_img`) that the
 moderation queue (while it still holds the test's own pending upload) and the
 published parking page each render at least one `<img src>` at that origin, so
@@ -445,7 +445,7 @@ without waiting for the integration suite:
 - **Format** runs `cargo fmt --all -- --check`.
 - **Clippy** runs `cargo clippy --workspace --all-targets --locked -- -D warnings`.
 - **Tests** runs `cargo test --workspace --locked` against PostgreSQL/PostGIS,
-  ValKey, and MinIO, followed by the rendered CSRF lifecycle in Chromium. The
+  ValKey, and RustFS, followed by the rendered CSRF lifecycle in Chromium. The
   provider smoke tests remain opt-in and skip when their external API keys are
   absent.
 - **Frontend assets** rebuilds the vendored JavaScript/CSS and Tailwind output,

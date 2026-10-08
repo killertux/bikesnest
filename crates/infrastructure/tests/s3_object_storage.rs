@@ -1,11 +1,11 @@
-//! Integration test for the S3-compatible [`S3ObjectStorage`] (****),
-//! against a real MinIO server (or any S3-compatible target).
+//! Integration test for the S3-compatible [`S3ObjectStorage`],
+//! against a real RustFS server (or any S3-compatible target).
 //!
 //! Gated on env so `cargo test` stays green without a storage service. Defaults
-//! target a local MinIO (`docker compose up -d minio minio-init`):
+//! target a local RustFS (`docker compose up -d rustfs rustfs-init`):
 //! - `S3_TEST_ENDPOINT` (default `http://localhost:9000`)
 //! - `S3_TEST_BUCKET` (default `bikesnest`)
-//! - `S3_TEST_ACCESS_KEY_ID` / `S3_TEST_SECRET_ACCESS_KEY` (default `minioadmin`)
+//! - `S3_TEST_ACCESS_KEY_ID` / `S3_TEST_SECRET_ACCESS_KEY` (default `rustfsadmin`)
 //!
 //! Run it live with:
 //! ```bash
@@ -28,8 +28,8 @@ fn store() -> S3ObjectStorage {
         Some(env_or("S3_TEST_ENDPOINT", "http://localhost:9000")),
         env_or("S3_TEST_REGION", "us-east-1"),
         env_or("S3_TEST_BUCKET", "bikesnest"),
-        env_or("S3_TEST_ACCESS_KEY_ID", "minioadmin"),
-        env_or("S3_TEST_SECRET_ACCESS_KEY", "minioadmin"),
+        env_or("S3_TEST_ACCESS_KEY_ID", "rustfsadmin"),
+        env_or("S3_TEST_SECRET_ACCESS_KEY", "rustfsadmin"),
     )
 }
 
@@ -54,7 +54,7 @@ async fn put_presign_delete_round_trip() {
         .await;
     let Ok(k) = stored else {
         eprintln!(
-            "S3 put failed (is MinIO up? `docker compose up -d minio minio-init`): {stored:?}"
+            "S3 put failed (is RustFS up? `docker compose up -d rustfs rustfs-init`): {stored:?}"
         );
         return;
     };

@@ -1,17 +1,17 @@
 //! S3-compatible object storage.
 //!
 //! Replaces the local-disk store with an S3-compatible backend (AWS S3,
-//! Cloudflare R2, Backblaze B2, MinIO). Writes go to the bucket; object reads
+//! Cloudflare R2, Backblaze B2, RustFS, MinIO). Writes go to the bucket; object reads
 //! are served via **direct S3 presigned GET URLs** that point straight at the
 //! bucket — the browser hits the bucket and S3's SigV4 signature authorizes the
 //! read, so the app is not a media proxy and no app-side signing secret is
 //! needed.
 //!
 //! The `S3_*` block of [`crate::config::Config`] supplies endpoint, region,
-//! bucket and credentials; development defaults target the compose MinIO while
+//! bucket and credentials; development defaults target the compose RustFS while
 //! production gets no defaults at all.
 //!
-//! Path-style addressing is always on (required for MinIO; also fine for AWS/R2).
+//! Path-style addressing is always on (required for RustFS/MinIO; also fine for AWS/R2).
 
 use crate::config::S3Config;
 use async_trait::async_trait;
@@ -297,23 +297,23 @@ mod tests {
     #[tokio::test]
     async fn presigned_get_uses_the_browser_facing_endpoint() {
         let s = S3ObjectStorage::new_with_public_endpoint(
-            Some("http://minio:9000".to_string()),
+            Some("http://rustfs:9000".to_string()),
             Some("http://localhost:9000".to_string()),
             "us-east-1".to_string(),
             "bikesnest".to_string(),
-            "minioadmin".to_string(),
-            "minioadmin".to_string(),
+            "rustfsadmin".to_string(),
+            "rustfsadmin".to_string(),
         );
         let url = s
             .presigned_get("seed/x.jpg", Duration::from_secs(60))
             .await
             .expect("presigning does not contact either endpoint");
         assert!(url.starts_with("http://localhost:9000/bikesnest/seed/x.jpg?"));
-        assert!(!url.contains("minio:9000"));
+        assert!(!url.contains("rustfs:9000"));
     }
 
     #[test]
-    fn development_config_targets_the_compose_minio() {
+    fn development_config_targets_the_compose_rustfs() {
         let s3 = Config::for_tests("postgres://localhost/x").storage;
         assert_eq!(s3.bucket, crate::config::DEFAULT_S3_BUCKET);
         assert_eq!(s3.region, crate::config::DEFAULT_S3_REGION);

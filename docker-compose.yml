@@ -47,17 +47,17 @@ services:
       BIND_ADDR: ${COMPOSE_BIND_ADDR:-0.0.0.0:8080}
       RUST_LOG: ${RUST_LOG:-info}
       # Where the development e-mail outbox writes readable messages. Media
-      # itself lives in MinIO below; nothing reads this directory for photos.
+      # itself lives in RustFS below; nothing reads this directory for photos.
       MEDIA_ROOT: ${COMPOSE_MEDIA_ROOT:-/app/media}
-      # Object storage: MinIO (S3-compatible) for dev. Media is
+      # Object storage: RustFS (S3-compatible) for dev. Media is
       # served via direct S3 presigned URLs (no app signing secret).
-      S3_ENDPOINT: ${COMPOSE_S3_ENDPOINT:-http://minio:9000}
+      S3_ENDPOINT: ${COMPOSE_S3_ENDPOINT:-http://rustfs:9000}
       # Presigned URLs are opened by the host browser, not by this container.
       S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-http://localhost:9000}
       S3_REGION: ${S3_REGION:-us-east-1}
       S3_BUCKET: ${S3_BUCKET:-bikesnest}
-      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-minioadmin}
-      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-minioadmin}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-rustfsadmin}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-rustfsadmin}
       CSP_MEDIA_HOSTS: ${CSP_MEDIA_HOSTS:-http://localhost:9000}
       # Rate limiter: ValKey backend, shared across auth/photo/
       # contribution/moderation. Ephemeral keys (TTL), so no persistence.
@@ -80,7 +80,7 @@ services:
         condition: service_started
       valkey:
         condition: service_healthy
-      minio:
+      rustfs:
         condition: service_started
     # NOTE: literal block (|) with the `cargo watch` invocation on ONE physical
     # line. A folded (>) block keeps extra-indented lines as newlines, which in
@@ -154,40 +154,42 @@ services:
       timeout: 3s
       retries: 10
 
-  # MinIO: S3-compatible object storage for dev media. The app
-  # (S3_* env) writes here and serves media via signed /media URLs. Console at
-  # http://localhost:9001 (minioadmin/minioadmin).
-  minio:
-    image: minio/minio:latest
-    container_name: bikesnest-minio
-    command: server /data --console-address ":9001"
+  # RustFS: S3-compatible object storage for dev media. The app (S3_* env)
+  # writes here and serves media via direct presigned URLs. Console at
+  # http://localhost:9001/rustfs/console/ (rustfsadmin/rustfsadmin).
+  rustfs:
+    image: rustfs/rustfs:1.0.0
+    container_name: bikesnest-rustfs
     environment:
-      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:-minioadmin}
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY_ID:-rustfsadmin}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_ACCESS_KEY:-rustfsadmin}
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
     ports:
-      - "${MINIO_API_HOST_PORT:-9000}:9000"       # S3 API
-      - "${MINIO_CONSOLE_HOST_PORT:-9001}:9001"  # web console
+      - "${S3_API_HOST_PORT:-9000}:9000"       # S3 API
+      - "${S3_CONSOLE_HOST_PORT:-9001}:9001"  # web console
     volumes:
-      - bikesnest-minio:/data
+      - bikesnest-rustfs:/data
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:9000/minio/health/live || exit 1"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/health || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 20
 
   # One-shot: create the bucket the app writes to (idempotent).
-  minio-init:
-    image: minio/mc:latest
+  rustfs-init:
+    image: amazon/aws-cli:2.36.47
     depends_on:
-      minio:
+      rustfs:
         condition: service_healthy
     entrypoint: ["sh", "-c"]
     environment:
-      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:-minioadmin}
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-rustfsadmin}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-rustfsadmin}
+      AWS_DEFAULT_REGION: ${S3_REGION:-us-east-1}
       S3_BUCKET: ${S3_BUCKET:-bikesnest}
     command:
-      - 'mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" && mc mb --ignore-existing "local/$$S3_BUCKET"'
+      - 'aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket "$$S3_BUCKET" 2>/dev/null || aws --endpoint-url http://rustfs:9000 s3 mb "s3://$$S3_BUCKET"'
 
   # A real ValKey cluster (cluster path) is optional — see
   # docker-compose.valkey-cluster.yml (single cluster-enabled node covering all
@@ -196,7 +198,7 @@ services:
 volumes:
   bikesnest-pgdata:
   bikesnest-valkeydata:
-  bikesnest-minio:
+  bikesnest-rustfs:
   cargo-target:
   cargo-registry:
   node_modules:

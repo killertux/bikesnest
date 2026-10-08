@@ -16,7 +16,7 @@ docker build -t bikesnest:$(git rev-parse --short HEAD) .
 The multi-stage `Dockerfile` (`rust:1.95` builder → `debian:bookworm-slim`) bakes
 the release binary and `web/static/`. Templates and migrations are **embedded**
 (Askama / `sqlx::migrate!`), so nothing else is copied. Uploaded media lives in an
-**S3-compatible bucket** (MinIO in dev), not the image; the bucket is the
+**S3-compatible bucket** (RustFS in dev), not the image; the bucket is the
 configured store (`S3_*` env). Media is served via **direct S3 presigned GET
 URLs** (the browser hits the bucket; the app is not a media proxy).
 
@@ -55,9 +55,9 @@ All knobs are documented in `.env.example`; production sets them as real secrets
 | `TRUSTED_PROXY_HOPS` | how many reverse proxies in front of the app may be trusted to have appended to `X-Forwarded-For`; `0` (default) uses the TCP peer address only. See the reverse-proxy guidance below |
 | `BASE_URL` | the public origin, e.g. `https://bikesnest.com` — builds links + canonical URLs. **Must be reachable** |
 | `MEDIA_ROOT` | directory the **development e-mail outbox** writes to (`EMAIL_PROVIDER=fake` only; default `media`). No longer a media directory: media lives in the S3 bucket, and the retention orphan sweep lists the bucket |
-| `S3_ENDPOINT` | **Object storage:** the S3-compatible endpoint. Unset defaults to `http://localhost:9000` (MinIO) in development only; set it empty for the standard AWS endpoint. **Required in production** |
+| `S3_ENDPOINT` | **Object storage:** the S3-compatible endpoint. Unset defaults to `http://localhost:9000` (RustFS) in development only; set it empty for the standard AWS endpoint. **Required in production** |
 | `S3_REGION` / `S3_BUCKET` | region (default `us-east-1`) + bucket name (development default `bikesnest`; **required in production**) |
-| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | S3 credentials (development default MinIO `minioadmin`, which production rejects outright) |
+| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | S3 credentials (development default RustFS `rustfsadmin`; production rejects it and `minioadmin` outright) |
 | `TLS_ON` | set `true` to emit HSTS behind a real TLS terminator |
 | `VALKEY_URL` | **Rate limiter:** single node, e.g. `valkey://valkey:6379`. Shared across auth/photo/contribution/moderation, survives restarts, aggregates across instances |
 | `VALKEY_CLUSTER_URLS` | comma-separated node URLs → **cluster** mode (wins over `VALKEY_URL`) |
@@ -118,8 +118,8 @@ problem on stderr) unless all of the following hold:
 - `BASE_URL` is set and does not point at `localhost` / `127.0.0.1` — otherwise
   every verification and password-reset e-mail links to the wrong host.
 - `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` are
-  all set, and the credentials are not the MinIO development default
-  (`minioadmin`).
+  all set, and the credentials are not a development default
+  (`rustfsadmin`/`minioadmin`).
 - `EMAIL_PROVIDER` is `smtp` or `resend`, with its credentials present. The
   `fake` provider discards every message, so production never runs on it.
 - `LOCATION_PROVIDER=mapbox` or `google`, with that profile's credentials. The
@@ -272,10 +272,10 @@ Coordinates already submitted by the browser skip direct geocoding. Provider
 errors render the localized location-service unavailable state.
 
 **Object storage.** Media is stored in an S3-compatible bucket
-(MinIO in dev, AWS/S3/R2/B2 in prod; `S3_*` env) and served via **direct S3
+(RustFS in dev, AWS/S3/R2/B2 in prod; `S3_*` env) and served via **direct S3
 presigned GET URLs** — the browser hits the bucket and S3's SigV4 signature
 authorizes the read (no app-side proxy, no app signing secret). Selectable by
-`S3_ENDPOINT`/`S3_BUCKET`; the compose MinIO is the DEVELOPMENT default only —
+`S3_ENDPOINT`/`S3_BUCKET`; the compose RustFS is the DEVELOPMENT default only —
 production must set every `S3_*` value (see “Required environment” above).
 
 **Email — done in code.** Provider is selected by `EMAIL_PROVIDER`
