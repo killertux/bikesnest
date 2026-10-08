@@ -1,4 +1,4 @@
-//! M6 privacy & account lifecycle: the data hub, personal-data exports,
+//! Privacy and account lifecycle: the data hub, personal-data exports,
 //! rights requests and account deletion.
 
 use axum::extract::{Form, Path, Query, State};
@@ -11,6 +11,7 @@ use serde_json::json;
 use crate::auth::{
     Auth, clear_session_cookie, cookie_value, export_cookie_name, set_export_cookie,
 };
+use crate::client_ip::ClientIp;
 use crate::i18n::{Locale, Translator};
 use crate::state::AppState;
 use crate::view;
@@ -19,19 +20,30 @@ use crate::{AccountDeletePage, AccountExportPage, AccountPrivacyPage, PageLayout
 use super::auth::redirect_with_cookie;
 use super::common::render;
 
-/// C6 — privacy & data hub.
+#[derive(Debug, Default, serde::Deserialize)]
+pub(crate) struct PrivacyHubNotices {
+    /// Why the last export request failed: `rate_limited`, or anything else
+    /// for a generic failure.
+    #[serde(default)]
+    export_error: Option<String>,
+}
+
+/// The privacy and data hub.
 pub(crate) async fn account_privacy(
     State(state): State<AppState>,
     locale: Locale,
     auth: Auth,
+    Query(q): Query<PrivacyHubNotices>,
 ) -> Response {
     let tr = Translator::new(locale);
-    let user = match auth.require_user() {
-        Ok(u) => u,
-        Err(resp) => return resp,
-    };
-    let _ = user;
+    if let Err(resp) = auth.require_user() {
+        return resp;
+    }
     let notice = None;
+    let error = q.export_error.as_deref().map(|code| match code {
+        "rate_limited" => tr.t("auth.error.rate_limited").to_string(),
+        _ => tr.t("export.error").to_string(),
+    });
     render(
         AccountPrivacyPage {
             layout: PageLayout::for_request(
@@ -44,6 +56,7 @@ pub(crate) async fn account_privacy(
             request_types: view::privacy_request_kind_options(tr),
             consent_records: false,
             notice,
+            error,
         },
         StatusCode::OK,
     )
@@ -58,17 +71,21 @@ pub(crate) async fn account_privacy(
 pub(crate) async fn account_export_post(
     State(state): State<AppState>,
     _locale: Locale,
+    ClientIp(ip): ClientIp,
     auth: Auth,
 ) -> Response {
     let user = match auth.require_user() {
         Ok(u) => u,
         Err(resp) => return resp,
     };
-    match state.privacy.request_export(user).await {
+    match state.privacy.request_export(&ip, user).await {
         Ok(req) => redirect_with_cookie(
             &format!("/account/export/{}", req.id),
             &set_export_cookie(req.id, &req.token),
         ),
+        Err(PrivacyError::RateLimited) => {
+            Redirect::to("/account/privacy?export_error=rate_limited").into_response()
+        }
         Err(_) => Redirect::to("/account/privacy?export_error=1").into_response(),
     }
 }
@@ -125,7 +142,7 @@ pub(crate) fn export_token(headers: &HeaderMap, id: i64, q: &ExportQuery) -> Opt
     cookie_value(headers, &export_cookie_name(id)).or_else(|| q.token.clone())
 }
 
-/// C7 — export status + single-use download link.
+/// Export status + single-use download link.
 pub(crate) async fn account_export(
     State(state): State<AppState>,
     locale: Locale,
@@ -212,7 +229,7 @@ pub(crate) async fn account_export_download(
             (StatusCode::FORBIDDEN, "Forbidden").into_response()
         }
         // The legitimate "link no longer works" cases (expired / already used /
-        // bad token) land back on the owner's C7 page with a notice.
+        // bad token) land back on the owner's export page with a notice.
         Err(
             PrivacyError::Expired | PrivacyError::AlreadyDownloaded | PrivacyError::InvalidToken,
         ) => Redirect::to(&format!("/account/export/{id}?error=1")).into_response(),
@@ -256,6 +273,7 @@ pub(crate) async fn account_delete(
 pub(crate) async fn account_delete_post(
     State(state): State<AppState>,
     locale: Locale,
+    ClientIp(ip): ClientIp,
     auth: Auth,
     Form(form): Form<DeleteForm>,
 ) -> Response {
@@ -287,7 +305,7 @@ pub(crate) async fn account_delete_post(
     let delete_err = |tr: Translator, key: &str| delete_err_status(tr, key, StatusCode::OK);
     match state
         .privacy
-        .request_deletion(user, password, &form.email)
+        .request_deletion(&ip, user, password, &form.email)
         .await
     {
         Ok(()) => {
@@ -299,6 +317,9 @@ pub(crate) async fn account_delete_post(
         }
         Err(PrivacyError::LastAdmin) => delete_err(tr, "delete.last_admin_error"),
         Err(PrivacyError::ReauthRequired) => delete_err(tr, "delete.reauth_error"),
+        Err(PrivacyError::RateLimited) => {
+            delete_err_status(tr, "auth.error.rate_limited", StatusCode::TOO_MANY_REQUESTS)
+        }
         Err(PrivacyError::Conflict) => {
             delete_err_status(tr, "error.conflict", StatusCode::CONFLICT)
         }

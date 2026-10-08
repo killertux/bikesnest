@@ -413,6 +413,7 @@ impl AuthOutbox for SqlxAuthOutbox {
         token: &VerificationToken,
         at: DateTime<Utc>,
         old_address_notice: EmailMessage,
+        proven_credential_hash: Option<&str>,
     ) -> Result<Option<EmailConfirmationOutcome>, AuthError> {
         let token_hash = sha256_hex(token.as_bytes());
         let mut conn = self
@@ -461,6 +462,25 @@ impl AuthOutbox for SqlxAuthOutbox {
         let changed = !old_email.eq_ignore_ascii_case(&new_email);
         if changed && state != "ACTIVE" {
             return Ok(None);
+        }
+        // Activation needs the password the caller verified to still be the
+        // account's credential. Locking the identity row here linearizes with
+        // a re-registration, which replaces the credential under this lock.
+        if state == "PENDING_EMAIL_VERIFICATION" {
+            let Some(proven) = proven_credential_hash else {
+                return Ok(None);
+            };
+            let stored: Option<Option<String>> = sqlx::query_scalar(
+                "SELECT credential_hash FROM authentication_identities
+                 WHERE user_id=$1 AND provider='password' FOR UPDATE",
+            )
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| db_err("auth_outbox.confirm_email", e))?;
+            if stored.flatten().as_deref() != Some(proven) {
+                return Ok(None);
+            }
         }
         let parsed_email = UserEmail::parse(&new_email).map_err(|_| AuthError::Internal)?;
         let consumed = sqlx::query(

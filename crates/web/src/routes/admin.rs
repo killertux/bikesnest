@@ -4,7 +4,7 @@
 use axum::extract::{Form, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
-use bikesnest_application::AuditFilter;
+use bikesnest_application::{AuditFilter, AuthError};
 use bikesnest_domain::{Role, UserId};
 
 use crate::auth::Auth;
@@ -32,7 +32,11 @@ pub(crate) async fn admin_user_suspend(
     };
     match state.auth.suspend_user(actor, UserId(id)).await {
         Ok(()) => axum::response::Redirect::to("/admin/users?suspended=1").into_response(),
-        Err(_) => axum::response::Redirect::to("/admin/users?error=1").into_response(),
+        Err(err) => axum::response::Redirect::to(&format!(
+            "/admin/users?error={}",
+            account_action_error_code(&err)
+        ))
+        .into_response(),
     }
 }
 
@@ -48,11 +52,38 @@ pub(crate) async fn admin_user_restore(
     };
     match state.auth.restore_user(actor, UserId(id)).await {
         Ok(()) => axum::response::Redirect::to("/admin/users?restored=1").into_response(),
-        Err(_) => axum::response::Redirect::to("/admin/users?error=1").into_response(),
+        Err(err) => axum::response::Redirect::to(&format!(
+            "/admin/users?error={}",
+            account_action_error_code(&err)
+        ))
+        .into_response(),
     }
 }
 
-/// GET /admin/users/{id}/contributions — a target user's C5 feed (MODERATOR/ADMIN).
+/// The `?error=` code a refused suspend/restore redirects with, so the user
+/// list can say *why* instead of a generic failure.
+fn account_action_error_code(err: &AuthError) -> &'static str {
+    match err {
+        AuthError::SelfSuspension => "self_suspension",
+        AuthError::LastActiveAdmin => "last_active_admin",
+        AuthError::StateUnchanged => "state_unchanged",
+        _ => "1",
+    }
+}
+
+/// The message for an `?error=` code on the admin user list.
+fn admin_users_error(tr: Translator, code: &str) -> String {
+    let key = match code {
+        "self_suspension" => "auth.error.self_suspension",
+        "last_active_admin" => "auth.error.last_active_admin",
+        "state_unchanged" => "auth.error.state_unchanged",
+        _ => "admin.role_error",
+    };
+    tr.t(key).to_string()
+}
+
+/// GET /admin/users/{id}/contributions — a target user's contribution feed
+/// (MODERATOR/ADMIN).
 pub(crate) async fn admin_user_contributions(
     State(state): State<AppState>,
     locale: Locale,
@@ -75,7 +106,7 @@ pub(crate) async fn admin_user_contributions(
         .and_then(|labels| labels.get(&id).cloned())
         .unwrap_or_else(|| format!("#{id}"));
     // Bounded to the newest DEFAULT_PAGE_LIMIT entries; this admin inspection
-    // view has no "load more" control (out of WP11's named template list).
+    // view has no "load more" control.
     let items = state
         .moderation
         .user_contribution_history(user, target, None, DEFAULT_PAGE_LIMIT)
@@ -299,10 +330,7 @@ pub(crate) async fn admin_users(
             } else {
                 None
             },
-            error: q
-                .error
-                .as_ref()
-                .map(|_| tr.t("admin.role_error").to_string()),
+            error: q.error.as_deref().map(|code| admin_users_error(tr, code)),
         },
         StatusCode::OK,
     )

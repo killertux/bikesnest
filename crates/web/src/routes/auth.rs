@@ -4,7 +4,7 @@
 use axum::extract::{Form, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use bikesnest_application::{AuthError, TermsAcceptance};
+use bikesnest_application::{AuthError, TermsAcceptance, VerificationPurpose};
 use bikesnest_domain::{Role, UserEmail};
 
 use crate::auth::{Auth, clear_session_cookie, random_state_hex, set_session_cookie};
@@ -38,6 +38,9 @@ pub(crate) fn auth_error_message(tr: Translator, err: &AuthError) -> String {
             tr.t("auth.error.invalid_token").to_string()
         }
         AuthError::RefuseAdminSelfRevoke => tr.t("auth.error.last_admin").to_string(),
+        AuthError::LastActiveAdmin => tr.t("auth.error.last_active_admin").to_string(),
+        AuthError::SelfSuspension => tr.t("auth.error.self_suspension").to_string(),
+        AuthError::StateUnchanged => tr.t("auth.error.state_unchanged").to_string(),
         AuthError::Conflict => tr.t("error.conflict").to_string(),
         AuthError::Unavailable => tr.t("error.unavailable").to_string(),
         _ => tr.t("auth.error.generic").to_string(),
@@ -429,6 +432,52 @@ pub(crate) struct VerifyParams {
     token: Option<String>,
 }
 
+/// What the verification page shows: the activation form, the email-change
+/// confirmation, or the "invalid link" state with the resend form.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VerifyView {
+    Activate,
+    ConfirmChange,
+    Invalid,
+}
+
+impl VerifyView {
+    fn mode(self) -> &'static str {
+        match self {
+            VerifyView::Activate => "activate",
+            VerifyView::ConfirmChange => "confirm",
+            VerifyView::Invalid => "invalid",
+        }
+    }
+}
+
+fn render_verify_page(
+    state: &AppState,
+    tr: Translator,
+    auth: &Auth,
+    view: VerifyView,
+    token: String,
+    error: Option<String>,
+) -> Response {
+    let t = auth.csrf_value();
+    render_anon(
+        VerifyEmailPage {
+            layout: PageLayout::new(&state.map, tr.t("auth.verify_title").to_string(), "auth")
+                .csp_nonce(auth.csp_nonce.clone())
+                .csrf(t.clone()),
+            tr,
+            mode: view.mode(),
+            token,
+            error,
+        },
+        &t,
+    )
+}
+
+/// GET /verify-email — the link in the verification email. It never spends
+/// the token: link scanners and previews prefetch URLs, so a GET only shows
+/// the form whose POST applies it. A pending account's form asks for the
+/// account password; an email-change confirmation is a single button.
 pub(crate) async fn verify_email(
     State(state): State<AppState>,
     locale: Locale,
@@ -437,38 +486,62 @@ pub(crate) async fn verify_email(
 ) -> Response {
     let tr = Translator::new(locale);
     let Some(token) = q.token.filter(|t| !t.is_empty()) else {
-        let t = auth.csrf_value();
-        return render_anon(
-            VerifyEmailPage {
-                layout: PageLayout::new(&state.map, tr.t("auth.verify_title").to_string(), "auth")
-                    .csp_nonce(auth.csp_nonce.clone())
-                    .csrf(t.clone()),
-                tr,
-                success: false,
-                error: Some(tr.t("auth.error.invalid_token").to_string()),
-            },
-            &t,
-        );
+        let error = Some(tr.t("auth.error.invalid_token").to_string());
+        return render_verify_page(&state, tr, &auth, VerifyView::Invalid, String::new(), error);
     };
-    match state.auth.verify_email(&token).await {
-        Ok(()) => axum::response::Redirect::to("/login?verified=1").into_response(),
+    match state.auth.verification_purpose(&token).await {
+        Ok(VerificationPurpose::ActivateAccount) => {
+            render_verify_page(&state, tr, &auth, VerifyView::Activate, token, None)
+        }
+        Ok(VerificationPurpose::ConfirmEmailChange) => {
+            render_verify_page(&state, tr, &auth, VerifyView::ConfirmChange, token, None)
+        }
         Err(err) => {
-            let t = auth.csrf_value();
-            render_anon(
-                VerifyEmailPage {
-                    layout: PageLayout::new(
-                        &state.map,
-                        tr.t("auth.verify_title").to_string(),
-                        "auth",
-                    )
-                    .csp_nonce(auth.csp_nonce.clone())
-                    .csrf(t.clone()),
-                    tr,
-                    success: false,
-                    error: Some(auth_error_message(tr, &err)),
-                },
-                &t,
-            )
+            let error = Some(auth_error_message(tr, &err));
+            render_verify_page(&state, tr, &auth, VerifyView::Invalid, String::new(), error)
+        }
+    }
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub(crate) struct VerifyForm {
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    password: String,
+}
+
+/// POST /verify-email — apply the token. Activation checks the password; a
+/// wrong one re-renders the form (the token stays unspent).
+pub(crate) async fn verify_email_post(
+    State(state): State<AppState>,
+    locale: Locale,
+    ClientIp(ip): ClientIp,
+    auth: Auth,
+    Form(form): Form<VerifyForm>,
+) -> Response {
+    let tr = Translator::new(locale);
+    let password = (!form.password.is_empty()).then_some(form.password.as_str());
+    match state.auth.verify_email(&ip, &form.token, password).await {
+        Ok(()) => axum::response::Redirect::to("/login?verified=1").into_response(),
+        Err(AuthError::InvalidCredentials) => {
+            tracing::warn!("email verification password mismatch"); // no PII
+            let error = Some(tr.t("auth.verify.password_incorrect").to_string());
+            let mut response =
+                render_verify_page(&state, tr, &auth, VerifyView::Activate, form.token, error);
+            *response.status_mut() = StatusCode::UNPROCESSABLE_ENTITY;
+            response
+        }
+        Err(AuthError::RateLimited) => {
+            let error = Some(auth_error_message(tr, &AuthError::RateLimited));
+            let mut response =
+                render_verify_page(&state, tr, &auth, VerifyView::Activate, form.token, error);
+            *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+            response
+        }
+        Err(err) => {
+            let error = Some(auth_error_message(tr, &err));
+            render_verify_page(&state, tr, &auth, VerifyView::Invalid, String::new(), error)
         }
     }
 }
@@ -835,6 +908,7 @@ pub(crate) async fn account_password(
 pub(crate) async fn account_password_post(
     State(state): State<AppState>,
     locale: Locale,
+    ClientIp(ip): ClientIp,
     auth: Auth,
     Form(form): Form<ChangePasswordForm>,
 ) -> Response {
@@ -850,7 +924,13 @@ pub(crate) async fn account_password_post(
     };
     match state
         .auth
-        .change_password(user.id, &form.current_password, &form.new_password, session)
+        .change_password(
+            &ip,
+            user.id,
+            &form.current_password,
+            &form.new_password,
+            session,
+        )
         .await
     {
         Ok(()) => axum::response::Redirect::to("/account?pw_changed=1").into_response(),
@@ -866,8 +946,18 @@ pub(crate) async fn account_password_post(
                 error: Some(auth_error_message(tr, &err)),
                 notice: None,
             },
-            StatusCode::OK,
+            reauth_status(&err),
         ),
+    }
+}
+
+/// A throttled password re-entry is a 429, so clients and monitoring can tell
+/// it apart from a wrong password (which re-renders the form with 200).
+fn reauth_status(err: &AuthError) -> StatusCode {
+    if *err == AuthError::RateLimited {
+        StatusCode::TOO_MANY_REQUESTS
+    } else {
+        StatusCode::OK
     }
 }
 
@@ -909,6 +999,7 @@ pub(crate) async fn account_email(
 pub(crate) async fn account_email_post(
     State(state): State<AppState>,
     locale: Locale,
+    ClientIp(ip): ClientIp,
     auth: Auth,
     Form(form): Form<ChangeEmailForm>,
 ) -> Response {
@@ -936,7 +1027,7 @@ pub(crate) async fn account_email_post(
     };
     match state
         .auth
-        .change_email(user.id, &form.current_password, &new_email)
+        .change_email(&ip, user.id, &form.current_password, &new_email)
         .await
     {
         Ok(()) => axum::response::Redirect::to("/account?email_pending=1").into_response(),
@@ -953,7 +1044,7 @@ pub(crate) async fn account_email_post(
                 error: Some(auth_error_message(tr, &err)),
                 notice: None,
             },
-            StatusCode::OK,
+            reauth_status(&err),
         ),
     }
 }
@@ -988,5 +1079,13 @@ mod tests {
             auth_error_message(en(), &AuthError::Unavailable),
             en().t("error.unavailable")
         );
+        for (err, key) in [
+            (AuthError::LastActiveAdmin, "auth.error.last_active_admin"),
+            (AuthError::SelfSuspension, "auth.error.self_suspension"),
+            (AuthError::StateUnchanged, "auth.error.state_unchanged"),
+        ] {
+            assert_eq!(auth_error_message(en(), &err), en().t(key));
+            assert_ne!(auth_error_message(en(), &err), en().t("auth.error.generic"));
+        }
     }
 }

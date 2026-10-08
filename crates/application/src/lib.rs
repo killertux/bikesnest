@@ -28,6 +28,7 @@ pub use auth::{
     AuthenticatedUser, Clock, EmailConfirmationOutcome, EmailVerificationOutcome, IdentityRecord,
     LoginOutcome, NewAccount, OAuthProvider, PasswordHasher, ResolvedSession, Session,
     SessionStore, TermsAcceptance, TokenGenerator, TokenStore, UserActivity, UserSearch,
+    VerificationPurpose,
 };
 pub use community::{
     AddParkingLocationOutcome, AttributeSummary, CommunityParkingDetails, ContributionDeps,

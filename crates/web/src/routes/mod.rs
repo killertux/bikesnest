@@ -44,7 +44,7 @@ use auth::{
     account_public_name_post, auth_google, auth_google_callback, auth_google_fake_consent,
     login_page, login_post, logout, password_reset_new, password_reset_new_post,
     password_reset_page, password_reset_post, register_page, register_post, verify_email,
-    verify_resend,
+    verify_email_post, verify_resend,
 };
 use community::{
     parking_edit_page, parking_edit_post, parking_new_page, parking_new_post,
@@ -103,7 +103,7 @@ pub(crate) fn routes(state: &AppState) -> Router<AppState> {
         .route("/register", get(register_page).post(register_post))
         .route("/login", get(login_page).post(login_post))
         .route("/logout", post(logout))
-        .route("/verify-email", get(verify_email))
+        .route("/verify-email", get(verify_email).post(verify_email_post))
         .route("/verify-email/resend", post(verify_resend))
         .route(
             "/password-reset",

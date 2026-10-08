@@ -757,13 +757,15 @@ pub struct LoginPage {
     pub google_enabled: bool,
 }
 
-/// A3 — email verified (success or invalid/expired) + resend.
+/// Email verification: activation form (`mode` "activate"), email-change
+/// confirmation ("confirm"), or invalid link + resend ("invalid").
 #[derive(Template)]
 #[template(path = "pages/verify_email.html")]
 pub struct VerifyEmailPage {
     pub layout: PageLayout,
     pub tr: Translator,
-    pub success: bool,
+    pub mode: &'static str,
+    pub token: String,
     pub error: Option<String>,
 }
 
@@ -899,6 +901,7 @@ pub struct AccountPrivacyPage {
     pub request_types: Vec<view::PrivacyRequestKindVm>,
     pub consent_records: bool,
     pub notice: Option<String>,
+    pub error: Option<String>,
 }
 
 /// Data export status.

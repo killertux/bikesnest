@@ -183,6 +183,7 @@ pub fn app_router_with<H: PasswordHasher + Clone + 'static>(
         hasher: Box::new(hasher),
         tokens_gen: Box::new(RealTokenGenerator),
         clock: Box::new(SystemClock),
+        rate_limiter: Box::new(SharedRateLimiter::new(rate_limiter.clone())),
     });
     let policy_adapter = Arc::new(SqlxPolicyReader::new(db.clone()));
     let policy_reader: Arc<dyn bikesnest_application::PolicyReader> = policy_adapter.clone();

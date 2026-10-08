@@ -89,6 +89,8 @@ fn anon_source_for(uri: &str) -> Option<&str> {
         Some("/login")
     } else if uri.starts_with("/register") {
         Some("/register")
+    } else if uri == "/verify-email" {
+        Some("/verify-email")
     } else {
         None
     }
@@ -207,10 +209,15 @@ async fn verified_cookie(app: &axum::Router, email: &FakeEmailProvider, addr: &s
         None,
     )
     .await;
-    let token = email
-        .token_for("/verify-email")
-        .expect("verification email captured");
+    let token = verification_token_to(email, addr);
     get_full(app, &format!("/verify-email?token={token}"), None).await;
+    post_form(
+        app,
+        "/verify-email",
+        &[("token", &token), ("password", "password123")],
+        None,
+    )
+    .await;
     let (_, _, cookie) = post_form(
         app,
         "/login",
@@ -234,10 +241,15 @@ async fn admin_cookie(
         None,
     )
     .await;
-    let token = email
-        .token_for("/verify-email")
-        .expect("admin verification email");
+    let token = verification_token_to(email, addr);
     get_full(app, &format!("/verify-email?token={token}"), None).await;
+    post_form(
+        app,
+        "/verify-email",
+        &[("token", &token), ("password", "password123")],
+        None,
+    )
+    .await;
     let mut conn = db.acquire().await.unwrap();
     let (uid,): (i64,) = sqlx::query_as("SELECT id FROM users WHERE email = $1")
         .bind(addr)
@@ -563,4 +575,20 @@ async fn csp_allows_every_asset_origin_it_renders(tx: &mut bikesnest_test_suppor
             "img-src must list the configured media host {host}: {img_src}"
         );
     }
+}
+
+/// The newest verification link mailed to `addr`. `token_for` returns the
+/// first captured link, which belongs to whichever account registered first.
+fn verification_token_to(email: &FakeEmailProvider, addr: &str) -> String {
+    let mail = email
+        .emails()
+        .into_iter()
+        .rev()
+        .find(|m| m.to == addr && m.text.contains("/verify-email?token="))
+        .expect("verification email captured");
+    regex::Regex::new(r"verify-email\?token=([A-Za-z0-9_-]+)")
+        .unwrap()
+        .captures(&mail.text)
+        .unwrap()[1]
+        .to_string()
 }

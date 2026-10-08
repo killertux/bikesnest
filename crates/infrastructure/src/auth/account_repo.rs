@@ -321,6 +321,14 @@ impl AccountRepository for SqlxAccountRepository {
             .begin()
             .await
             .map_err(|e| db_err("account.suspend", e))?;
+        // Lock the ADMIN role rows first (the same lock `revoke_role_guarded`
+        // takes), so concurrent suspensions and demotions of admins serialize
+        // and each one counts the others' committed outcome.
+        let admins: Vec<i64> =
+            sqlx::query_scalar("SELECT user_id FROM user_roles WHERE role = 'ADMIN' FOR UPDATE")
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| db_err("account.suspend", e))?;
         let state = sqlx::query_scalar::<_, String>(
             "SELECT account_state FROM users WHERE id = $1 FOR UPDATE",
         )
@@ -333,6 +341,21 @@ impl AccountRepository for SqlxAccountRepository {
             Some("ACTIVE" | "PENDING_EMAIL_VERIFICATION")
         ) {
             return Ok(false);
+        }
+        // Only an active admin counts toward the floor; suspending a pending
+        // one leaves the number of usable admins unchanged.
+        if state.as_deref() == Some("ACTIVE") && admins.contains(&id.0) {
+            let other_active_admins: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM user_roles r JOIN users u ON u.id = r.user_id
+                 WHERE r.role = 'ADMIN' AND r.user_id <> $1 AND u.account_state = 'ACTIVE'",
+            )
+            .bind(id.0)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| db_err("account.suspend", e))?;
+            if other_active_admins == 0 {
+                return Err(AuthError::LastActiveAdmin);
+            }
         }
         let updated = sqlx::query(
             "UPDATE users SET account_state = 'SUSPENDED', suspended_at = now(), updated_at = now()
@@ -700,18 +723,14 @@ impl AccountRepository for SqlxAccountRepository {
     }
 }
 
-/// Last-seen plus one contribution total per account, for a whole page of the
-/// admin user list in one round trip. The counted events are the ones the C5
-/// contribution feed lists, so the number on the admin row and the number of
-/// rows on the user's own history page agree.
+/// Last activity plus one contribution total per account, for a whole page of
+/// the admin user list in one round trip. Last activity is the durable
+/// `users.last_active_at`, which survives session purges (the newest session
+/// does not). The counted events are the ones the contribution feed lists, so
+/// the number on the admin row and the number of rows on the user's own
+/// history page agree.
 const ACTIVITY_SQL: &str = r#"
 WITH ids AS (SELECT unnest($1::bigint[]) AS user_id),
-last_seen AS (
-    SELECT s.user_id, max(s.last_seen_at) AS last_active_at
-    FROM sessions s
-    JOIN ids ON ids.user_id = s.user_id
-    GROUP BY s.user_id
-),
 contributions AS (
     SELECT user_id, sum(n)::bigint AS n FROM (
         SELECT creator_id AS user_id, count(*) AS n FROM parking_location
@@ -737,9 +756,9 @@ contributions AS (
     ) parts
     GROUP BY user_id
 )
-SELECT ids.user_id, last_seen.last_active_at, contributions.n AS contributions
+SELECT ids.user_id, u.last_active_at, contributions.n AS contributions
 FROM ids
-LEFT JOIN last_seen ON last_seen.user_id = ids.user_id
+LEFT JOIN users u ON u.id = ids.user_id
 LEFT JOIN contributions ON contributions.user_id = ids.user_id
 "#;
 

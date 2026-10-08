@@ -13,9 +13,10 @@
 
 use crate::audit::{AuditEvent, AuditLog};
 use crate::auth::{
-    AccountRepository, AuthError, AuthenticatedUser, Clock, PasswordHasher, SessionStore,
-    TokenGenerator,
+    AccountRepository, AuthError, AuthenticatedUser, Clock, PasswordHasher, REAUTH_IP_LIMIT,
+    REAUTH_USER_LIMIT, REAUTH_WINDOW, SessionStore, TokenGenerator, reauth_ip_key, reauth_user_key,
 };
+use crate::rate_limit::{RateLimitError, RateLimiter};
 use async_trait::async_trait;
 use bikesnest_domain::{
     AuthenticationProvider, ExportState, Password, PolicyKind, PrivacyRequestKind,
@@ -38,6 +39,8 @@ pub enum PrivacyError {
     LastAdmin,
     #[error("re-authentication required")]
     ReauthRequired,
+    #[error("too many attempts, try again later")]
+    RateLimited,
     #[error("invalid download token")]
     InvalidToken,
     #[error("this export has expired")]
@@ -69,6 +72,12 @@ impl From<AuthError> for PrivacyError {
             AuthError::InvalidCredentials => PrivacyError::ReauthRequired,
             _ => PrivacyError::Internal,
         }
+    }
+}
+
+impl From<RateLimitError> for PrivacyError {
+    fn from(_: RateLimitError) -> Self {
+        PrivacyError::RateLimited
     }
 }
 
@@ -182,6 +191,10 @@ pub struct ExportAccount {
     pub account_state: String,
     pub email_verified_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// The durable last-activity timestamp the inactive-account retention
+    /// rule reads. `None` only in exports written before it was added.
+    #[serde(default)]
+    pub last_active_at: Option<DateTime<Utc>>,
     pub roles: Vec<String>,
 }
 
@@ -291,7 +304,8 @@ pub struct NewExport {
     pub expires_at: DateTime<Utc>,
 }
 
-/// An export row as listed on C7 (no payload — never rendered inline).
+/// An export row as listed on the export status page (no payload — never
+/// rendered inline).
 #[derive(Debug, Clone)]
 pub struct Export {
     pub id: i64,
@@ -543,6 +557,10 @@ pub trait TermsAcknowledgementStore: Send + Sync {
 
 /// Kinds that go through the manual operator-fulfilled queue rather than the
 /// automatic export/deletion flows.
+/// Personal-data exports per account, and per IP, in one hour.
+const EXPORT_USER_LIMIT: u32 = 3;
+const EXPORT_IP_LIMIT: u32 = 10;
+
 pub const MANUAL_REQUEST_KINDS: &[PrivacyRequestKind] = &[
     PrivacyRequestKind::Rectification,
     PrivacyRequestKind::Restriction,
@@ -566,6 +584,9 @@ pub struct PrivacyDeps {
     pub hasher: Box<dyn PasswordHasher>,
     pub tokens_gen: Box<dyn TokenGenerator>,
     pub clock: Box<dyn Clock>,
+    /// Throttles exports and the deletion password re-entry. Shared with the
+    /// auth service, so re-entering a password anywhere draws on one budget.
+    pub rate_limiter: Box<dyn RateLimiter>,
 }
 
 pub struct PrivacyService {
@@ -597,6 +618,26 @@ impl PrivacyService {
 
     fn now(&self) -> DateTime<Utc> {
         self.deps.clock.now()
+    }
+
+    async fn allowed(
+        &self,
+        key: &str,
+        limit: u32,
+        window: std::time::Duration,
+        sensitive: bool,
+    ) -> Result<(), PrivacyError> {
+        let limiter = &self.deps.rate_limiter;
+        let admitted = if sensitive {
+            limiter.check_sensitive(key, limit, window).await?
+        } else {
+            limiter.check(key, limit, window).await?
+        };
+        if admitted {
+            Ok(())
+        } else {
+            Err(PrivacyError::RateLimited)
+        }
     }
 
     fn require_admin(&self, actor: &AuthenticatedUser) -> Result<(), PrivacyError> {
@@ -636,10 +677,24 @@ impl PrivacyService {
     /// Request a personal-data export: assemble the payload, mint a single-use
     /// token, store the export as `READY` (24h TTL), audit. Returns the id, the
     /// owner-only token and the expiry so the web layer can render the link.
+    ///
+    /// Assembling the payload reads every table that holds the user's data,
+    /// so requests are throttled per account and per IP.
     pub async fn request_export(
         &self,
+        ip: &str,
         user: &AuthenticatedUser,
     ) -> Result<ExportRequested, PrivacyError> {
+        let window = std::time::Duration::from_secs(60 * 60);
+        self.allowed(
+            &format!("export:user:{}", user.id.0),
+            EXPORT_USER_LIMIT,
+            window,
+            false,
+        )
+        .await?;
+        self.allowed(&format!("export:ip:{ip}"), EXPORT_IP_LIMIT, window, false)
+            .await?;
         let now = self.now();
         let payload = self.deps.exports.assemble_payload(user.id).await?;
         let token: [u8; 32] = self.deps.tokens_gen.generate();
@@ -671,7 +726,7 @@ impl PrivacyService {
         })
     }
 
-    /// List a user's own exports (C7 status). Owner-only.
+    /// List a user's own exports (the export status page). Owner-only.
     pub async fn list_exports(
         &self,
         user: &AuthenticatedUser,
@@ -722,14 +777,25 @@ impl PrivacyService {
     /// `password` is required for password accounts (verified against the stored
     /// hash); `confirm_email` is always required (both account types must type
     /// the account email). OAuth-only accounts rely on the active session as the
-    /// second factor (it is already 2FA'd upstream at Google).
+    /// second factor (it is already 2FA'd upstream at Google). Attempts draw on
+    /// the shared password re-entry budget (per account and per IP).
     pub async fn request_deletion(
         &self,
+        ip: &str,
         user: &AuthenticatedUser,
         password: Option<&str>,
         confirm_email: &str,
     ) -> Result<(), PrivacyError> {
-        // 1) Re-authentication.
+        // 1) Re-authentication, throttled like the other password re-entries.
+        self.allowed(
+            &reauth_user_key(user.id),
+            REAUTH_USER_LIMIT,
+            REAUTH_WINDOW,
+            true,
+        )
+        .await?;
+        self.allowed(&reauth_ip_key(ip), REAUTH_IP_LIMIT, REAUTH_WINDOW, true)
+            .await?;
         if confirm_email.trim().to_lowercase() != user.email.as_str() {
             return Err(PrivacyError::ReauthRequired);
         }
@@ -855,7 +921,8 @@ impl PrivacyService {
     }
 }
 
-/// The returned handle for a newly requested export (C7 renders the link).
+/// The returned handle for a newly requested export (the export status page
+/// renders the link).
 #[derive(Debug, Clone)]
 pub struct ExportRequested {
     pub id: i64,
@@ -1051,6 +1118,7 @@ mod tests {
                 account_state: "ACTIVE".to_string(),
                 email_verified_at: None,
                 created_at: Utc::now(),
+                last_active_at: None,
                 roles: vec![],
             },
             vec![],
@@ -1369,6 +1437,27 @@ mod tests {
         }
     }
 
+    /// Counts admissions per key; refuses once a key reaches its limit.
+    #[derive(Default)]
+    struct FakeRate(std::sync::Mutex<std::collections::HashMap<String, u32>>);
+    #[async_trait]
+    impl RateLimiter for FakeRate {
+        async fn check(
+            &self,
+            key: &str,
+            limit: u32,
+            _window: std::time::Duration,
+        ) -> Result<bool, RateLimitError> {
+            let mut counts = self.0.lock().unwrap();
+            let n = counts.entry(key.to_string()).or_default();
+            if *n >= limit {
+                return Ok(false);
+            }
+            *n += 1;
+            Ok(true)
+        }
+    }
+
     struct FakeHasher;
     #[async_trait]
     impl PasswordHasher for FakeHasher {
@@ -1447,6 +1536,7 @@ mod tests {
             hasher: Box::new(FakeHasher),
             tokens_gen: Box::new(FakeTokens(false)),
             clock: Box::new(FakeClock(now)),
+            rate_limiter: Box::new(FakeRate::default()),
         }
     }
 
@@ -1454,7 +1544,10 @@ mod tests {
     async fn request_export_returns_id_and_token() {
         let now = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
         let svc = PrivacyService::new(deps(now));
-        let req = svc.request_export(&actor()).await.expect("export");
+        let req = svc
+            .request_export("1.1.1.1", &actor())
+            .await
+            .expect("export");
         assert_eq!(req.id, 1);
         assert!(!req.token.is_empty());
         assert_eq!(req.expires_at - now, Duration::hours(24));
@@ -1467,7 +1560,7 @@ mod tests {
         // Force a stored token differing from the one the actor submits.
         d.tokens_gen = Box::new(FakeTokens(false));
         let svc = PrivacyService::new(d);
-        svc.request_export(&actor()).await.unwrap();
+        svc.request_export("1.1.1.1", &actor()).await.unwrap();
         let bad = b64url_encode(&[1u8; 32]);
         let res = svc.download_export(&actor(), 1, &bad).await;
         assert!(matches!(res, Err(PrivacyError::InvalidToken)));
@@ -1479,6 +1572,7 @@ mod tests {
         let svc = PrivacyService::new(deps(now));
         let res = svc
             .request_deletion(
+                "1.1.1.1",
                 &actor(),
                 Some("correct-password"),
                 "not-my-email@example.com",
@@ -1492,9 +1586,52 @@ mod tests {
         let now = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
         let svc = PrivacyService::new(deps(now));
         // Password identity exists but FakeHasher always verifies true.
-        svc.request_deletion(&actor(), Some("correct-password"), "a@example.com")
-            .await
-            .expect("deletion");
+        svc.request_deletion(
+            "1.1.1.1",
+            &actor(),
+            Some("correct-password"),
+            "a@example.com",
+        )
+        .await
+        .expect("deletion");
+    }
+
+    #[tokio::test]
+    async fn request_export_is_throttled_per_account_and_per_ip() {
+        let now = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let svc = PrivacyService::new(deps(now));
+        for _ in 0..EXPORT_USER_LIMIT {
+            svc.request_export("1.1.1.1", &actor()).await.unwrap();
+        }
+        // A fresh IP does not help: the per-account bucket is spent.
+        let res = svc.request_export("2.2.2.2", &actor()).await;
+        assert!(matches!(res, Err(PrivacyError::RateLimited)), "{res:?}");
+
+        // And the per-IP bucket holds across accounts.
+        let svc = PrivacyService::new(deps(now));
+        for id in 0..EXPORT_IP_LIMIT {
+            let mut other = actor();
+            other.id = UserId(100 + i64::from(id));
+            svc.request_export("3.3.3.3", &other).await.unwrap();
+        }
+        let res = svc.request_export("3.3.3.3", &actor()).await;
+        assert!(matches!(res, Err(PrivacyError::RateLimited)), "{res:?}");
+    }
+
+    #[tokio::test]
+    async fn request_deletion_password_reentry_is_throttled() {
+        let now = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let svc = PrivacyService::new(deps(now));
+        for _ in 0..REAUTH_USER_LIMIT {
+            let res = svc
+                .request_deletion("1.1.1.1", &actor(), Some("pw"), "wrong@example.com")
+                .await;
+            assert!(matches!(res, Err(PrivacyError::ReauthRequired)), "{res:?}");
+        }
+        let res = svc
+            .request_deletion("4.4.4.4", &actor(), Some("pw"), "a@example.com")
+            .await;
+        assert!(matches!(res, Err(PrivacyError::RateLimited)), "{res:?}");
     }
 
     #[tokio::test]

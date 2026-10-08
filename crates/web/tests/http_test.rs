@@ -1911,6 +1911,23 @@ async fn get_c(app: &axum::Router, uri: &str, cookie: Option<&str>) -> (StatusCo
     (status, body)
 }
 
+/// Follow a verification link the way a person does: open it (a GET that only
+/// renders the form), then submit the form with the account password.
+/// Returns the POST status (303 to `/login?verified=1` on success).
+async fn follow_verification(app: &axum::Router, token: &str, password: &str) -> StatusCode {
+    let (status, page) = get_c(app, &format!("/verify-email?token={token}"), None).await;
+    assert_eq!(status, StatusCode::OK, "the link opens a form");
+    assert!(page.contains(r#"action="/verify-email""#), "{page}");
+    let (status, _, _) = post_form(
+        app,
+        "/verify-email",
+        &[("token", token), ("password", password)],
+        None,
+    )
+    .await;
+    status
+}
+
 /// Which page to GET to obtain the anonymous double-submit CSRF cookie for a
 /// given POST route (the form with the hidden `csrf` lives there).
 fn anon_source_for(uri: &str) -> Option<&str> {
@@ -1918,7 +1935,7 @@ fn anon_source_for(uri: &str) -> Option<&str> {
         Some("/password-reset/new")
     } else if uri.starts_with("/password-reset") {
         Some("/password-reset")
-    } else if uri.starts_with("/verify-email/resend") {
+    } else if uri.starts_with("/verify-email/resend") || uri == "/verify-email" {
         Some("/verify-email")
     } else if uri.starts_with("/register") {
         Some("/register")
@@ -2092,8 +2109,11 @@ async fn register_verify_login_account_logout(tx: &mut bikesnest_test_support::T
     assert!(account_before.contains(EMAIL));
 
     // Verify via the email link, then log in again (verified).
-    let (s, _) = get_c(&app, &format!("/verify-email?token={token}"), None).await;
-    assert_eq!(s, StatusCode::SEE_OTHER, "verify redirects to login");
+    assert_eq!(
+        follow_verification(&app, &token, "password123").await,
+        StatusCode::SEE_OTHER,
+        "verify redirects to login"
+    );
     let (_, _, cookie2) = post_form(
         &app,
         "/login",
@@ -2117,6 +2137,332 @@ async fn register_verify_login_account_logout(tx: &mut bikesnest_test_support::T
     assert!(
         matches!(s, StatusCode::SEE_OTHER | StatusCode::FOUND),
         "logged-out user is redirected"
+    );
+}
+
+async fn account_state_of(db: &Db, addr: &str) -> String {
+    sqlx::query_scalar("SELECT account_state::text FROM users WHERE email = $1")
+        .bind(addr)
+        .fetch_one(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap()
+}
+
+/// The verification link is a GET that link scanners prefetch, so it only
+/// renders a form; activating a pending account takes the account password,
+/// so an attacker's re-registration cannot be activated by the owner's click.
+#[db_test]
+async fn verification_link_renders_a_password_form_and_only_post_activates(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
+    const EMAIL: &str = "activate-form@example.com";
+    post_form(
+        &app,
+        "/register",
+        &[("email", EMAIL), ("password", "password123")],
+        None,
+    )
+    .await;
+    let token = email.token_for("/verify-email").unwrap();
+
+    // Opening the link (twice, as a scanner then the person) spends nothing.
+    for _ in 0..2 {
+        let (s, page) = get_c(&app, &format!("/verify-email?token={token}"), None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(page.contains("Activate your account"), "{page}");
+        assert!(page.contains(r#"name="password""#));
+        assert!(page.contains(r#"autocomplete="current-password""#));
+        assert!(page.contains(r#"<label for="password""#), "labelled field");
+        assert!(page.contains(&format!(r#"name="token" value="{token}""#)));
+    }
+    assert_eq!(
+        account_state_of(&db, EMAIL).await,
+        "PENDING_EMAIL_VERIFICATION"
+    );
+
+    // The form is CSRF-protected like every other anonymous POST.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/verify-email")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from(format!("token={token}&password=password123")))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+
+    // A wrong password re-renders the form with an accessible error and
+    // leaves the account pending and the token usable.
+    let (s, body, _) = post_form(
+        &app,
+        "/verify-email",
+        &[("token", &token), ("password", "not-my-password")],
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        body.contains("That password does not match this account"),
+        "{body}"
+    );
+    assert!(body.contains(r#"role="alert""#));
+    assert!(body.contains(r#"aria-invalid="true""#));
+    assert!(body.contains(&format!(r#"name="token" value="{token}""#)));
+    assert_eq!(
+        account_state_of(&db, EMAIL).await,
+        "PENDING_EMAIL_VERIFICATION"
+    );
+
+    // The right password activates and lands on the login notice.
+    let (s, _, _) = post_form(
+        &app,
+        "/verify-email",
+        &[("token", &token), ("password", "password123")],
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::SEE_OTHER);
+    assert_eq!(account_state_of(&db, EMAIL).await, "ACTIVE");
+
+    // The token is spent: the link now shows the invalid state + resend form.
+    let (s, page) = get_c(&app, &format!("/verify-email?token={token}"), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(
+        page.contains("Verification link invalid or expired"),
+        "{page}"
+    );
+    assert!(page.contains(r#"action="/verify-email/resend""#));
+    assert!(!page.contains(r#"name="password""#));
+}
+
+#[db_test]
+async fn verification_form_is_translated_for_pt_br(tx: &mut bikesnest_test_support::TestTx) {
+    let (app, email) = auth_app(tx).await;
+    post_form(
+        &app,
+        "/register",
+        &[("email", "ativar@example.com"), ("password", "password123")],
+        None,
+    )
+    .await;
+    let token = email.token_for("/verify-email").unwrap();
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/verify-email?token={token}"))
+                .header("Accept-Language", "pt-BR")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("Ative sua conta"), "{body}");
+    assert!(body.contains("Verificar e ativar"));
+}
+
+/// An email change is confirmed with one POST and no password (the password
+/// was re-entered to request it); the GET alone changes nothing.
+#[db_test]
+async fn email_change_link_confirms_on_post_without_a_password(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
+    const OLD: &str = "change-old@example.com";
+    const NEW: &str = "change-new@example.com";
+    let cookie = verified_cookie(&app, &email, OLD).await;
+    let (_, page) = get_c(&app, "/account/email", Some(&cookie)).await;
+    let csrf = extract_csrf(&page);
+    let (s, _, _) = post_form(
+        &app,
+        "/account/email",
+        &[
+            ("csrf", &csrf),
+            ("current_password", "password123"),
+            ("new_email", NEW),
+        ],
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(s, StatusCode::SEE_OTHER);
+    let mail = email
+        .emails()
+        .into_iter()
+        .rev()
+        .find(|m| m.to == NEW)
+        .expect("confirmation sent to the new address");
+    let token = regex::Regex::new(r"verify-email\?token=([A-Za-z0-9_-]+)")
+        .unwrap()
+        .captures(&mail.text)
+        .unwrap()[1]
+        .to_string();
+
+    let (s, page) = get_c(&app, &format!("/verify-email?token={token}"), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(page.contains("Confirm your new email"), "{page}");
+    assert!(
+        !page.contains(r#"name="password""#),
+        "no password for a change"
+    );
+    let (current,): (String,) = sqlx::query_as("SELECT email FROM users WHERE email = $1")
+        .bind(OLD)
+        .fetch_one(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(current, OLD, "the GET did not apply the change");
+
+    let (s, _, _) = post_form(&app, "/verify-email", &[("token", &token)], None).await;
+    assert_eq!(s, StatusCode::SEE_OTHER);
+    assert_eq!(account_state_of(&db, NEW).await, "ACTIVE");
+}
+
+/// Password re-entry on the settings forms is throttled; the sixth attempt is
+/// a 429 with the translated "too many attempts" message.
+#[db_test]
+async fn settings_password_reentry_is_rate_limited(tx: &mut bikesnest_test_support::TestTx) {
+    let (app, email) = auth_app(tx).await;
+    let cookie = verified_cookie(&app, &email, "reauth-web@example.com").await;
+    let (_, page) = get_c(&app, "/account/password", Some(&cookie)).await;
+    let csrf = extract_csrf(&page);
+    for _ in 0..5 {
+        let (s, body, _) = post_form(
+            &app,
+            "/account/password",
+            &[
+                ("csrf", &csrf),
+                ("current_password", "wrong-guess"),
+                ("new_password", "new-password-1"),
+            ],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(body.contains("incorrect"), "{body}");
+    }
+    let (s, body, _) = post_form(
+        &app,
+        "/account/email",
+        &[
+            ("csrf", &csrf),
+            ("current_password", "password123"),
+            ("new_email", "elsewhere@example.com"),
+        ],
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+    assert!(body.contains("Too many attempts"), "{body}");
+    let (s, body, _) = post_form(
+        &app,
+        "/account/delete",
+        &[
+            ("csrf", &csrf),
+            ("email", "reauth-web@example.com"),
+            ("password", "password123"),
+        ],
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::TOO_MANY_REQUESTS,
+        "deletion shares the budget"
+    );
+    assert!(body.contains("Too many attempts"), "{body}");
+}
+
+#[db_test]
+async fn export_requests_are_rate_limited_with_a_translated_notice(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let (app, email) = auth_app(tx).await;
+    let cookie = verified_cookie(&app, &email, "export-limit@example.com").await;
+    let (_, page) = get_c(&app, "/account/privacy", Some(&cookie)).await;
+    let csrf = extract_csrf(&page);
+    let mut last = String::new();
+    for _ in 0..4 {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/account/privacy/export")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", &cookie)
+            .body(Body::from(format!("csrf={csrf}")))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        last = res.headers()["location"].to_str().unwrap().to_string();
+    }
+    assert_eq!(last, "/account/privacy?export_error=rate_limited");
+    let (s, body) = get_c(&app, &last, Some(&cookie)).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(body.contains("Too many attempts"), "{body}");
+    assert!(body.contains(r#"role="alert""#));
+}
+
+#[db_test]
+async fn admin_cannot_suspend_themselves_and_sees_why(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
+    const ADMIN: &str = "self-suspend-admin@example.com";
+    let admin_cookie = admin_cookie(&db, &app, &email, ADMIN).await;
+    let (_, page) = get_c(&app, "/admin/users", Some(&admin_cookie)).await;
+    let csrf = extract_csrf(&page);
+    let (uid,): (i64,) = sqlx::query_as("SELECT id FROM users WHERE email = $1")
+        .bind(ADMIN)
+        .fetch_one(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/admin/users/{uid}/suspend"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("cookie", &admin_cookie)
+        .body(Body::from(format!("csrf={csrf}")))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::SEE_OTHER);
+    let location = res.headers()["location"].to_str().unwrap().to_string();
+    assert_eq!(location, "/admin/users?error=self_suspension");
+    assert_eq!(account_state_of(&db, ADMIN).await, "ACTIVE");
+    let (_, body) = get_c(&app, &location, Some(&admin_cookie)).await;
+    assert!(
+        body.contains("You cannot suspend your own account"),
+        "{body}"
+    );
+    assert!(!body.contains("User suspended"));
+
+    // Suspending an account that is already suspended is reported too.
+    verified_cookie(&app, &email, "twice@example.com").await;
+    let (target,): (i64,) = sqlx::query_as("SELECT id FROM users WHERE email = $1")
+        .bind("twice@example.com")
+        .fetch_one(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    let mut locations = Vec::new();
+    for _ in 0..2 {
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/admin/users/{target}/suspend"))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", &admin_cookie)
+            .body(Body::from(format!("csrf={csrf}")))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        locations.push(res.headers()["location"].to_str().unwrap().to_string());
+    }
+    assert_eq!(
+        locations,
+        [
+            "/admin/users?suspended=1",
+            "/admin/users?error=state_unchanged"
+        ]
     );
 }
 
@@ -2197,7 +2543,7 @@ async fn privacy_public_pages_gating_and_export_flow(tx: &mut bikesnest_test_sup
     let token = email
         .token_for("/verify-email")
         .expect("verification email captured");
-    get_c(&app, &format!("/verify-email?token={token}"), None).await;
+    follow_verification(&app, &token, "password123").await;
     let (_, _, cookie) = post_form(
         &app,
         "/login",
@@ -2979,10 +3325,8 @@ async fn verified_cookie(
         None,
     )
     .await;
-    let token = email
-        .token_for("/verify-email")
-        .expect("verification email captured");
-    get_c(app, &format!("/verify-email?token={token}"), None).await;
+    let token = verification_token_to(email, addr);
+    follow_verification(app, &token, "password123").await;
     let (_, _, cookie) = post_form(
         app,
         "/login",
@@ -3855,10 +4199,8 @@ async fn moderator_cookie(
         None,
     )
     .await;
-    let token = email
-        .token_for("/verify-email")
-        .expect("moderator verification email");
-    get_c(app, &format!("/verify-email?token={token}"), None).await;
+    let token = verification_token_to(email, addr);
+    follow_verification(app, &token, "password123").await;
     let (uid,): (i64,) = sqlx::query_as("SELECT id FROM users WHERE email = $1")
         .bind(addr)
         .fetch_one(&mut *db.acquire().await.unwrap())
@@ -4229,10 +4571,8 @@ async fn admin_cookie(
         None,
     )
     .await;
-    let token = email
-        .token_for("/verify-email")
-        .expect("admin verification email");
-    get_c(app, &format!("/verify-email?token={token}"), None).await;
+    let token = verification_token_to(email, addr);
+    follow_verification(app, &token, "password123").await;
     let (uid,): (i64,) = sqlx::query_as("SELECT id FROM users WHERE email = $1")
         .bind(addr)
         .fetch_one(&mut *db.acquire().await.unwrap())
@@ -9114,4 +9454,23 @@ fn no_hardcoded_english_sentences_in_static_js() {
          i18n catalog, read from a server-rendered data attribute):\n{}",
         offenders.join("\n")
     );
+}
+
+/// The newest verification link mailed to `addr`. `token_for` returns the
+/// first captured link, which belongs to whichever account registered first.
+fn verification_token_to(
+    email: &bikesnest_infrastructure::FakeEmailProvider,
+    addr: &str,
+) -> String {
+    let mail = email
+        .emails()
+        .into_iter()
+        .rev()
+        .find(|m| m.to == addr && m.text.contains("/verify-email?token="))
+        .expect("verification email captured");
+    regex::Regex::new(r"verify-email\?token=([A-Za-z0-9_-]+)")
+        .unwrap()
+        .captures(&mail.text)
+        .unwrap()[1]
+        .to_string()
 }

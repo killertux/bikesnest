@@ -96,6 +96,12 @@ Value objects and rules, no I/O. Notable concepts:
 - **Accounts/auth** — `AccountState` (`PendingEmailVerification | Active |
   Suspended | Deleted`), `Role` (`User | Moderator | Admin`), `Password` (with
   policy).
+  Verification links never act on GET (link scanners prefetch them): the
+  page renders a form, and activating a *pending* account also requires the
+  account password, because re-registering a pending address replaces its
+  credential. Email-change confirmation is a plain POST, since the change was
+  requested with the current password. Password re-entry (change password,
+  change email, delete account) shares one per-account and per-IP budget.
 - **`PhotoModerationState`** — `PendingReview | Approved | Rejected | Hidden`;
   upload constants (10 MiB, 20 MP, JPEG q85, 400 px thumbnail, jpeg/png/webp).
 - **`ReportState`** — `Open | UnderReview | Resolved | Dismissed`, plus the

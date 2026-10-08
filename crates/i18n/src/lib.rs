@@ -1083,13 +1083,28 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "auth.google_soon" => ("Coming soon", "Em breve"),
         "auth.oauth_note" => ("Or", "Ou"),
 
-        // --- auth: verification (A3) ---------------------------------------
+        // --- auth: verification -------------------------------------------
         "auth.verify_title" => ("Verify your email", "Verifique seu e-mail"),
-        "auth.verify_success" => ("Email verified", "E-mail verificado"),
-        "auth.verify_success_body" => (
-            "Your account is active. You can now log in and contribute.",
-            "Sua conta está ativa. Agora você pode entrar e contribuir.",
+        "auth.verify.activate_title" => ("Activate your account", "Ative sua conta"),
+        "auth.verify.activate_body" => (
+            "Enter the password you chose when you signed up to finish verifying your email.",
+            "Digite a senha que você escolheu no cadastro para concluir a verificação do seu e-mail.",
         ),
+        "auth.verify.activate_hint" => (
+            "Forgot it? Sign up again with this email to choose a new password and get a new link.",
+            "Esqueceu? Cadastre-se de novo com este e-mail para escolher outra senha e receber um novo link.",
+        ),
+        "auth.verify.activate_submit" => ("Verify and activate", "Verificar e ativar"),
+        "auth.verify.password_incorrect" => (
+            "That password does not match this account. If you did not choose it, sign up again with this email to set your own password.",
+            "Essa senha não confere com esta conta. Se não foi você quem a escolheu, cadastre-se de novo com este e-mail para definir sua própria senha.",
+        ),
+        "auth.verify.confirm_title" => ("Confirm your new email", "Confirme seu novo e-mail"),
+        "auth.verify.confirm_body" => (
+            "Confirm to make this address the one you sign in with. You will be signed out everywhere.",
+            "Confirme para passar a entrar com este endereço. Você será desconectado de todos os dispositivos.",
+        ),
+        "auth.verify.confirm_submit" => ("Confirm new email", "Confirmar novo e-mail"),
         "auth.verify_invalid" => (
             "Verification link invalid or expired",
             "Link de verificação inválido ou expirado",
@@ -1158,6 +1173,18 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "auth.error.last_admin" => (
             "The system must keep at least one admin.",
             "O sistema precisa manter ao menos um admin.",
+        ),
+        "auth.error.last_active_admin" => (
+            "The system must keep at least one active admin.",
+            "O sistema precisa manter ao menos um admin ativo.",
+        ),
+        "auth.error.self_suspension" => (
+            "You cannot suspend your own account.",
+            "Você não pode suspender a sua própria conta.",
+        ),
+        "auth.error.state_unchanged" => (
+            "That account is not in a state that allows this action.",
+            "Essa conta não está em um estado que permita essa ação.",
         ),
         "auth.error.generic" => (
             "Something went wrong. Try again.",

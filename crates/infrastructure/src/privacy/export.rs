@@ -40,6 +40,7 @@ struct AccountRow {
     account_state: String,
     email_verified_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
+    last_active_at: DateTime<Utc>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -197,7 +198,8 @@ impl ExportRepository for SqlxExportRepository {
             let row = sqlx::query_as::<_, AccountRow>(
                 r#"
                 SELECT id, email, display_name, public_contribution_name,
-                       public_contribution_name_updated_at, account_state, email_verified_at, created_at
+                       public_contribution_name_updated_at, account_state, email_verified_at, created_at,
+                       last_active_at
                 FROM users WHERE id = $1
                 "#,
             )
@@ -225,6 +227,7 @@ impl ExportRepository for SqlxExportRepository {
                 account_state: row.account_state,
                 email_verified_at: row.email_verified_at,
                 created_at: row.created_at,
+                last_active_at: Some(row.last_active_at),
                 roles,
             }
         };

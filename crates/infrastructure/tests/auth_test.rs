@@ -66,8 +66,14 @@ async fn confirm_email(
             notification_id: format!("test-confirm-{}", token.to_hex()),
         },
     );
+    // Stand-in for the service's password proof: the credential currently on
+    // the account (activation of a pending account requires it).
+    let proven = SqlxAccountRepository::new(db.clone())
+        .find_identity(AuthenticationProvider::Password, user.email.as_str())
+        .await?
+        .and_then(|identity| identity.credential_hash);
     SqlxAuthOutbox::new(db.clone(), 3)
-        .confirm_email(token, at, notice)
+        .confirm_email(token, at, notice, proven.as_deref())
         .await
 }
 
@@ -1775,6 +1781,128 @@ async fn suspension_revokes_security_tokens_and_sessions_across_restore(
     assert_eq!(user.account_state, AccountState::PendingEmailVerification);
 }
 
+/// Activating a pending account needs the credential the service proved the
+/// submitted password against; a missing or replaced credential leaves the
+/// token unspent and the account pending.
+#[db_test]
+async fn pending_activation_requires_the_proven_current_credential(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let accounts = SqlxAccountRepository::new(db.clone());
+    let tokens = SqlxTokenStore::new(db.clone());
+    let email = UserEmail::parse(&unique_email("pending-proof")).unwrap();
+    let user_id = accounts
+        .create(bikesnest_application::NewAccount {
+            email: &email,
+            display_name: None,
+            password_hash: "current-hash",
+            state: AccountState::PendingEmailVerification,
+            locale: bikesnest_domain::LocaleCode::En,
+        })
+        .await
+        .unwrap();
+    let token = VerificationToken::new([97; 32]);
+    let now = Utc::now();
+    assert!(
+        tokens
+            .issue_verification(
+                user_id,
+                email.as_str(),
+                &token,
+                now,
+                AccountState::PendingEmailVerification,
+            )
+            .await
+            .unwrap()
+    );
+    let notice = || {
+        EmailMessage::linked(
+            user_id,
+            email.as_str(),
+            LocaleCode::En,
+            EmailKind::EmailAddressChanged {
+                account_link: "https://bikesnest.test/login".into(),
+                notification_id: "proof".into(),
+            },
+        )
+    };
+    let outbox = SqlxAuthOutbox::new(db.clone(), 3);
+    for proven in [None, Some("stale-hash")] {
+        assert!(
+            outbox
+                .confirm_email(&token, now, notice(), proven)
+                .await
+                .unwrap()
+                .is_none(),
+            "{proven:?} must not activate"
+        );
+    }
+    assert_eq!(
+        persisted_account_state(&db, user_id).await.0,
+        "PENDING_EMAIL_VERIFICATION"
+    );
+    assert_eq!(unused_verification_tokens(&db, user_id).await, 1);
+    let outcome = outbox
+        .confirm_email(&token, now, notice(), Some("current-hash"))
+        .await
+        .unwrap()
+        .expect("the proven current credential activates");
+    assert_eq!(outcome.user_id, user_id);
+    assert_eq!(persisted_account_state(&db, user_id).await.0, "ACTIVE");
+}
+
+/// The last active admin cannot be suspended; a pending admin does not count
+/// toward the floor, and once another admin is active the guard lifts.
+#[db_test]
+async fn suspension_keeps_at_least_one_active_admin(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
+    let accounts = SqlxAccountRepository::new(db.clone());
+    // Start from a known admin set: this test owns every ADMIN row it sees.
+    sqlx::query("DELETE FROM user_roles WHERE role = 'ADMIN'")
+        .execute(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    let make_admin = |label: &'static str, state| {
+        let accounts = &accounts;
+        async move {
+            let email = UserEmail::parse(&unique_email(label)).unwrap();
+            let id = accounts
+                .create(bikesnest_application::NewAccount {
+                    email: &email,
+                    display_name: None,
+                    password_hash: "hash",
+                    state,
+                    locale: bikesnest_domain::LocaleCode::PtBr,
+                })
+                .await
+                .unwrap();
+            accounts.grant_role(id, Role::Admin, id).await.unwrap();
+            id
+        }
+    };
+    let first = make_admin("guard-first", AccountState::Active).await;
+    let pending = make_admin("guard-pending", AccountState::PendingEmailVerification).await;
+
+    assert_eq!(
+        accounts.suspend_by_admin(first, pending).await,
+        Err(bikesnest_application::AuthError::LastActiveAdmin),
+        "a pending admin is not an active one"
+    );
+    assert_eq!(persisted_account_state(&db, first).await.0, "ACTIVE");
+    // Suspending the pending admin leaves the active count unchanged.
+    assert!(accounts.suspend_by_admin(pending, first).await.unwrap());
+
+    let second = make_admin("guard-second", AccountState::Active).await;
+    assert!(accounts.suspend_by_admin(first, second).await.unwrap());
+    assert_eq!(
+        accounts.suspend_by_admin(second, first).await,
+        Err(bikesnest_application::AuthError::LastActiveAdmin),
+        "the remaining active admin is protected"
+    );
+    assert_eq!(persisted_account_state(&db, second).await.0, "ACTIVE");
+}
+
 #[db_test]
 async fn administrator_account_transition_state_matrix_and_exact_audits(
     tx: &mut bikesnest_test_support::TestTx,
@@ -3247,14 +3375,24 @@ async fn activity_for_reports_last_seen_and_a_contribution_total(
         .unwrap()
         .0;
 
-    // A brand-new account: present in the map, with nothing to report.
+    // A brand-new account: its durable activity stamp starts at creation.
     let activity = repo.activity_for(&[id]).await.unwrap();
     let a = activity[&id];
-    assert_eq!(a.last_active_at, None, "never signed in");
+    assert!(
+        a.last_active_at
+            .is_some_and(|at| (Utc::now() - at).num_minutes().abs() < 5),
+        "a new account's last activity is its creation: {:?}",
+        a.last_active_at
+    );
     assert_eq!(a.contributions, 0);
 
-    // A session gives it a last-seen; a location and a proposal give it two
-    // contributions, counted in the same statement.
+    // Backdate it, then a session advances it (the 0030 trigger); a location
+    // and a proposal give it two contributions, counted in the same statement.
+    sqlx::query("UPDATE users SET last_active_at = now() - interval '30 days' WHERE id = $1")
+        .bind(id)
+        .execute(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
     let seen = Utc::now() - Duration::hours(2);
     sqlx::query(
         "INSERT INTO sessions (token_hash, user_id, csrf_token, last_seen_at, expires_at) \
@@ -3293,12 +3431,27 @@ async fn activity_for_reports_last_seen_and_a_contribution_total(
     assert!(
         a.last_active_at
             .is_some_and(|at| (at - seen).num_seconds().abs() < 2),
-        "last-seen comes from the newest session: {:?}",
+        "last activity follows the newest session: {:?}",
         a.last_active_at
     );
     assert_eq!(
         a.contributions, 2,
         "one location + one proposal, in a single batched query"
+    );
+
+    // Purging the session (as retention does) keeps the durable stamp: the
+    // admin list no longer reads `max(sessions.last_seen_at)`.
+    sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+        .bind(id)
+        .execute(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    let a = repo.activity_for(&[id]).await.unwrap()[&id];
+    assert!(
+        a.last_active_at
+            .is_some_and(|at| (at - seen).num_seconds().abs() < 2),
+        "last activity survives the session purge: {:?}",
+        a.last_active_at
     );
 
     // Unknown ids come back with a zeroed row rather than being missing, so

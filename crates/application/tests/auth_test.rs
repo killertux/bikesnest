@@ -150,6 +150,16 @@ impl AccountRepository for FakeRepo {
     }
     async fn suspend_by_admin(&self, id: UserId, actor: UserId) -> Result<bool, AuthError> {
         let mut db = self.db.lock().unwrap();
+        // Mirrors the SQL guard: never suspend the last active ADMIN.
+        let other_active_admins = db
+            .users
+            .iter()
+            .filter(|u| {
+                u.id != id
+                    && u.roles.contains(&Role::Admin)
+                    && u.account_state == AccountState::Active
+            })
+            .count();
         let Some(user) = db.users.iter_mut().find(|u| u.id == id) else {
             return Ok(false);
         };
@@ -158,6 +168,12 @@ impl AccountRepository for FakeRepo {
             AccountState::Active | AccountState::PendingEmailVerification
         ) {
             return Ok(false);
+        }
+        if user.account_state == AccountState::Active
+            && user.roles.contains(&Role::Admin)
+            && other_active_admins == 0
+        {
+            return Err(AuthError::LastActiveAdmin);
         }
         user.account_state = AccountState::Suspended;
         for (_, session) in &mut db.sessions {
@@ -620,7 +636,7 @@ impl AuthOutbox for FakeRepo {
         &self,
         new: NewAccount<'_>,
         token: &VerificationToken,
-        _at: DateTime<Utc>,
+        at: DateTime<Utc>,
         mut message: EmailMessage,
         _terms: Option<&bikesnest_application::TermsAcceptance>,
     ) -> Result<Option<AdmittedAuthMail>, AuthError> {
@@ -628,20 +644,49 @@ impl AuthOutbox for FakeRepo {
         if db.queue_broken {
             return Err(AuthError::Unavailable);
         }
-        if let Some(id) = db
+        // Mirrors `SqlxAuthOutbox::register`: an existing address is neutral
+        // unless it is still pending, in which case the latest submission
+        // replaces the credential and display name, revokes every session,
+        // retires every earlier verification link and queues a fresh one.
+        if let Some((id, state, locale)) = db
             .users
             .iter()
             .find(|u| u.email == *new.email)
-            .map(|u| u.id)
+            .map(|u| (u.id, u.account_state, u.locale))
         {
-            return Ok(db
-                .outbox
-                .iter()
-                .rev()
-                .find(|mail| {
-                    mail.message.account_id == id.0 && !db.dispatched.contains(&mail.job_id)
-                })
-                .cloned());
+            if state != AccountState::PendingEmailVerification {
+                return Ok(None);
+            }
+            let Some(identity) = db.identities.iter_mut().find(|identity| {
+                identity.user_id == id && identity.provider == AuthenticationProvider::Password
+            }) else {
+                return Err(AuthError::Internal);
+            };
+            identity.credential_hash = Some(new.password_hash.into());
+            if let Some(user) = db.users.iter_mut().find(|u| u.id == id) {
+                user.display_name = new.display_name.map(str::to_string);
+            }
+            for (_, session) in &mut db.sessions {
+                if session.user_id == id {
+                    session.revoked_at = Some(at);
+                }
+            }
+            for (_, user_id, _, used) in &mut db.verification {
+                if *user_id == id {
+                    *used = true;
+                }
+            }
+            db.verification
+                .push((token.to_hex(), id, new.email.as_str().into(), false));
+            message.account_id = id.0;
+            message.locale = locale;
+            db.next_id += 1;
+            let mail = AdmittedAuthMail {
+                job_id: db.next_id,
+                message,
+            };
+            db.outbox.push(mail.clone());
+            return Ok(Some(mail));
         }
         db.next_id += 1;
         let id = UserId(db.next_id);
@@ -751,6 +796,7 @@ impl AuthOutbox for FakeRepo {
         token: &VerificationToken,
         at: DateTime<Utc>,
         old_address_notice: EmailMessage,
+        proven_credential_hash: Option<&str>,
     ) -> Result<Option<EmailVerificationOutcome>, AuthError> {
         let mut db = self.db.lock().unwrap();
         let key = token.to_hex();
@@ -773,7 +819,25 @@ impl AuthOutbox for FakeRepo {
         }
         let parsed_email = UserEmail::parse(&email).map_err(|_| AuthError::Internal)?;
         let changed = db.users[user_position].email != parsed_email;
-        db.verification[position].3 = true;
+        let pending =
+            db.users[user_position].account_state == AccountState::PendingEmailVerification;
+        if changed && pending {
+            return Ok(None);
+        }
+        // Activation only for the credential the caller proved, as the SQL
+        // adapter re-checks under the account lock.
+        if pending {
+            let stored = db
+                .identities
+                .iter()
+                .find(|identity| {
+                    identity.user_id == id && identity.provider == AuthenticationProvider::Password
+                })
+                .and_then(|identity| identity.credential_hash.as_deref());
+            if proven_credential_hash.is_none() || stored != proven_credential_hash {
+                return Ok(None);
+            }
+        }
         db.users[user_position].email = parsed_email;
         db.users[user_position].email_verified_at = Some(at);
         db.users[user_position].account_state = AccountState::Active;
@@ -782,19 +846,30 @@ impl AuthOutbox for FakeRepo {
                 identity.provider_subject = email.clone();
             }
         }
-        if changed {
+        // An address change, or the first verification of a pending account,
+        // ends every session; every outstanding link is retired.
+        if changed || pending {
             for (_, session) in &mut db.sessions {
                 if session.user_id == id {
                     session.revoked_at = Some(at);
                 }
             }
-            db.audits.push(AuditEvent::success(
-                Some(id),
-                "auth.email_changed",
-                "user",
-                id.0.to_string(),
-            ));
         }
+        for (_, user_id, _, used) in &mut db.verification {
+            if *user_id == id {
+                *used = true;
+            }
+        }
+        db.audits.push(AuditEvent::success(
+            Some(id),
+            if changed {
+                "auth.email_changed"
+            } else {
+                "auth.email_verified"
+            },
+            "user",
+            id.0.to_string(),
+        ));
         let mail = if changed {
             db.next_id += 1;
             let admitted = AdmittedAuthMail {
@@ -1203,6 +1278,7 @@ async fn later_messages_use_the_stored_account_locale() {
         .await
         .unwrap();
     auth.change_email(
+        "1.1.1.1",
         id,
         "correct-horse",
         &UserEmail::parse("new@example.com").unwrap(),
@@ -1272,7 +1348,22 @@ async fn verify_email_consumes_token_single_use() {
     assert!(db.lock().unwrap().users[0].email_verified_at.is_none());
 
     let token = find_token(&db, "/verify-email");
-    assert!(auth.verify_email(&token).await.is_ok());
+    // The link alone does not activate a pending account: the password does.
+    assert_eq!(
+        auth.verify_email("1.1.1.1", &token, None).await,
+        Err(AuthError::InvalidCredentials)
+    );
+    assert_eq!(
+        auth.verify_email("1.1.1.1", &token, Some("wrong-password"))
+            .await,
+        Err(AuthError::InvalidCredentials)
+    );
+    assert!(db.lock().unwrap().users[0].email_verified_at.is_none());
+    assert!(
+        auth.verify_email("1.1.1.1", &token, Some("password123"))
+            .await
+            .is_ok()
+    );
 
     let users = db.lock().unwrap();
     let u = users.users.iter().find(|u| u.id == user_id).unwrap();
@@ -1282,7 +1373,8 @@ async fn verify_email_consumes_token_single_use() {
 
     // Second use of the same token fails (single-use).
     assert!(matches!(
-        auth.verify_email(&token).await,
+        auth.verify_email("1.1.1.1", &token, Some("password123"))
+            .await,
         Err(AuthError::TokenInvalid)
     ));
 }
@@ -1305,7 +1397,8 @@ async fn suspended_or_deleted_accounts_cannot_verify_and_resend_is_neutral() {
         db.lock().unwrap().users[0].account_state = blocked_state;
 
         assert_eq!(
-            auth.verify_email(&token).await,
+            auth.verify_email("1.1.1.1", &token, Some("password123"))
+                .await,
             Err(AuthError::TokenInvalid)
         );
         let emails_before = db.lock().unwrap().emails.len();
@@ -1343,7 +1436,8 @@ async fn suspension_revokes_old_tokens_even_after_restore() {
     auth.restore_user(&admin, target).await.unwrap();
 
     assert_eq!(
-        auth.verify_email(&verification_token).await,
+        auth.verify_email("1.1.1.1", &verification_token, Some("password123"))
+            .await,
         Err(AuthError::TokenInvalid)
     );
     assert_eq!(
@@ -1385,10 +1479,18 @@ async fn administrator_account_transitions_preserve_deleted_and_verification_sta
 
     auth.suspend_user(&admin, verified).await.unwrap();
     auth.suspend_user(&admin, pending).await.unwrap();
-    auth.suspend_user(&admin, deleted).await.unwrap();
+    // A deleted account cannot be suspended or restored, and the refusal is
+    // reported rather than passed off as success.
+    assert_eq!(
+        auth.suspend_user(&admin, deleted).await,
+        Err(AuthError::StateUnchanged)
+    );
     auth.restore_user(&admin, verified).await.unwrap();
     auth.restore_user(&admin, pending).await.unwrap();
-    auth.restore_user(&admin, deleted).await.unwrap();
+    assert_eq!(
+        auth.restore_user(&admin, deleted).await,
+        Err(AuthError::StateUnchanged)
+    );
 
     let locked = db.lock().unwrap();
     assert_eq!(
@@ -1433,6 +1535,238 @@ async fn administrator_account_transitions_preserve_deleted_and_verification_sta
             .filter(|event| event.action == "user.restored")
             .count(),
         2
+    );
+}
+
+#[tokio::test]
+async fn suspend_refuses_self_and_the_last_active_admin() {
+    let db = Arc::new(Mutex::new(FakeDb::default()));
+    let auth = make_service(db.clone());
+    let admin_id = seed_user_with_roles(&db, "only-admin@example.com", vec![Role::Admin]);
+    let other_id = seed_user_with_roles(&db, "other-admin@example.com", vec![Role::Admin]);
+    let admin = actor_for(&db, admin_id);
+
+    assert_eq!(
+        auth.suspend_user(&admin, admin_id).await,
+        Err(AuthError::SelfSuspension),
+        "an admin cannot suspend their own account"
+    );
+    // Suspending the other admin leaves `admin` as the only active one, so a
+    // second admin acting on `admin` is refused, and the refusal is distinct.
+    auth.suspend_user(&admin, other_id).await.unwrap();
+    let suspended_actor = actor_for(&db, other_id);
+    assert_eq!(
+        auth.suspend_user(&suspended_actor, admin_id).await,
+        Err(AuthError::LastActiveAdmin)
+    );
+    assert_eq!(
+        auth.suspend_user(&admin, other_id).await,
+        Err(AuthError::StateUnchanged),
+        "suspending an already suspended account is not reported as success"
+    );
+    let locked = db.lock().unwrap();
+    let state = |id| {
+        locked
+            .users
+            .iter()
+            .find(|u| u.id == id)
+            .unwrap()
+            .account_state
+    };
+    assert_eq!(state(admin_id), AccountState::Active);
+    assert_eq!(state(other_id), AccountState::Suspended);
+}
+
+#[tokio::test]
+async fn password_reentry_is_throttled_per_account_across_settings_forms() {
+    let db = Arc::new(Mutex::new(FakeDb::default()));
+    seed_active_user(&db, "reauth@example.com", "correct-horse");
+    let auth = make_service(db.clone());
+    let session = auth
+        .login("1.1.1.1", "reauth@example.com", "correct-horse")
+        .await
+        .unwrap()
+        .session;
+    let new_email = UserEmail::parse("elsewhere@example.com").unwrap();
+    // Five wrong guesses split across both forms and two IPs spend the
+    // per-account budget...
+    for attempt in 0..5 {
+        let ip = if attempt % 2 == 0 {
+            "1.1.1.1"
+        } else {
+            "2.2.2.2"
+        };
+        let result = if attempt < 3 {
+            auth.change_password(ip, UserId(1), "guess", "new-password", &session)
+                .await
+        } else {
+            auth.change_email(ip, UserId(1), "guess", &new_email).await
+        };
+        assert_eq!(result, Err(AuthError::InvalidCurrentPassword));
+    }
+    // ...so even the right password from a fresh IP is refused for now.
+    assert_eq!(
+        auth.change_password(
+            "3.3.3.3",
+            UserId(1),
+            "correct-horse",
+            "new-password",
+            &session
+        )
+        .await,
+        Err(AuthError::RateLimited)
+    );
+    assert_eq!(
+        auth.change_email("3.3.3.3", UserId(1), "correct-horse", &new_email)
+            .await,
+        Err(AuthError::RateLimited)
+    );
+}
+
+#[tokio::test]
+async fn password_reentry_is_throttled_per_ip_across_accounts() {
+    let db = Arc::new(Mutex::new(FakeDb::default()));
+    let auth = make_service(db.clone());
+    for n in 0..10 {
+        let id = seed_active_user(&db, &format!("ip{n}@example.com"), "secret-pass");
+        let session = SessionId::new([n as u8 + 100; 32]);
+        assert_eq!(
+            auth.change_password("9.9.9.9", id, "guess", "new-password", &session)
+                .await,
+            Err(AuthError::InvalidCurrentPassword)
+        );
+    }
+    let id = seed_active_user(&db, "ip-last@example.com", "secret-pass");
+    let session = SessionId::new([200; 32]);
+    assert_eq!(
+        auth.change_password("9.9.9.9", id, "guess", "new-password", &session)
+            .await,
+        Err(AuthError::RateLimited)
+    );
+}
+
+/// The residual pending-registration hole: an attacker re-registers the
+/// owner's still-pending address with their own password. The owner's click
+/// on the fresh link must not activate the attacker's credential.
+#[tokio::test]
+async fn activation_requires_the_password_of_the_current_credential() {
+    let db = Arc::new(Mutex::new(FakeDb::default()));
+    let auth = make_service(db.clone());
+    auth.register(
+        "1.1.1.1",
+        "owner@example.com",
+        Some("Owner"),
+        "owner-password",
+        LocaleCode::En,
+    )
+    .await
+    .unwrap();
+    let owner_link = find_token(&db, "/verify-email");
+    auth.register(
+        "6.6.6.6",
+        "owner@example.com",
+        Some("Mallory"),
+        "attacker-password",
+        LocaleCode::PtBr,
+    )
+    .await
+    .unwrap();
+    {
+        let locked = db.lock().unwrap();
+        assert_eq!(locked.users.len(), 1, "re-registration reuses the account");
+        assert_eq!(locked.users[0].display_name.as_deref(), Some("Mallory"));
+        assert_eq!(
+            locked.identities[0].credential_hash.as_deref(),
+            Some("h:attacker-password"),
+            "the latest registration replaces the pending credential"
+        );
+        let fresh = locked.emails.last().unwrap();
+        assert_eq!(fresh.locale, LocaleCode::En, "the stored locale is kept");
+        assert_eq!(locked.emails.len(), 2, "a fresh link is queued");
+    }
+    // The earlier link is retired by the re-registration.
+    assert_eq!(
+        auth.verify_email("1.1.1.1", &owner_link, Some("owner-password"))
+            .await,
+        Err(AuthError::TokenInvalid)
+    );
+    let fresh_link = token_from(db.lock().unwrap().emails[1].kind.action_link());
+    // Looking at the link (a GET, or a mail scanner) spends nothing.
+    assert_eq!(
+        auth.verification_purpose(&fresh_link).await,
+        Ok(bikesnest_application::VerificationPurpose::ActivateAccount)
+    );
+    // The owner clicks the fresh link but does not know the attacker's
+    // password, so the account stays pending and the link stays usable.
+    assert_eq!(
+        auth.verify_email("1.1.1.1", &fresh_link, Some("owner-password"))
+            .await,
+        Err(AuthError::InvalidCredentials)
+    );
+    assert_eq!(
+        db.lock().unwrap().users[0].account_state,
+        AccountState::PendingEmailVerification
+    );
+    // Re-registering puts the owner's own credential back in charge.
+    auth.register(
+        "1.1.1.1",
+        "owner@example.com",
+        Some("Owner"),
+        "owner-password",
+        LocaleCode::En,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        auth.verify_email("1.1.1.1", &fresh_link, Some("attacker-password"))
+            .await,
+        Err(AuthError::TokenInvalid),
+        "the attacker-era link is retired"
+    );
+    let owner_link = token_from(db.lock().unwrap().emails[2].kind.action_link());
+    auth.verify_email("1.1.1.1", &owner_link, Some("owner-password"))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.lock().unwrap().users[0].account_state,
+        AccountState::Active
+    );
+    assert_eq!(
+        auth.login("6.6.6.6", "owner@example.com", "attacker-password")
+            .await
+            .unwrap_err(),
+        AuthError::InvalidCredentials
+    );
+}
+
+#[tokio::test]
+async fn activation_password_attempts_are_throttled_and_leave_the_token_unspent() {
+    let db = Arc::new(Mutex::new(FakeDb::default()));
+    let auth = make_service(db.clone());
+    auth.register(
+        "1.1.1.1",
+        "throttle@example.com",
+        None,
+        "password123",
+        LocaleCode::En,
+    )
+    .await
+    .unwrap();
+    let token = find_token(&db, "/verify-email");
+    for _ in 0..5 {
+        assert_eq!(
+            auth.verify_email("1.1.1.1", &token, Some("guess")).await,
+            Err(AuthError::InvalidCredentials)
+        );
+    }
+    assert_eq!(
+        auth.verify_email("2.2.2.2", &token, Some("password123"))
+            .await,
+        Err(AuthError::RateLimited)
+    );
+    assert!(
+        !db.lock().unwrap().verification[0].3,
+        "refused attempts never spend the token"
     );
 }
 
@@ -1792,6 +2126,7 @@ async fn change_email_to_a_taken_address_is_refused_before_any_token() {
 
     let err = auth
         .change_email(
+            "1.1.1.1",
             user,
             "correct-horse",
             &UserEmail::parse("taken@example.com").unwrap(),
@@ -1947,16 +2282,22 @@ async fn change_password_requires_current_and_verifies_new() {
 
     // Wrong current password is rejected.
     assert_eq!(
-        auth.change_password(UserId(1), "wrong", "new-password", &session)
+        auth.change_password("1.1.1.1", UserId(1), "wrong", "new-password", &session)
             .await
             .unwrap_err(),
         AuthError::InvalidCurrentPassword
     );
     // Correct current password succeeds.
     db.lock().unwrap().dispatch_broken = true;
-    auth.change_password(UserId(1), "correct-horse", "new-password", &session)
-        .await
-        .unwrap();
+    auth.change_password(
+        "1.1.1.1",
+        UserId(1),
+        "correct-horse",
+        "new-password",
+        &session,
+    )
+    .await
+    .unwrap();
 
     // The stored hash is updated → old password fails, new password logs in.
     assert_eq!(
@@ -1984,7 +2325,7 @@ async fn change_email_switches_address_and_revokes_sessions() {
     let session = outcome.session;
 
     let new_email = UserEmail::parse("new@example.com").unwrap();
-    auth.change_email(UserId(1), "correct-horse", &new_email)
+    auth.change_email("1.1.1.1", UserId(1), "correct-horse", &new_email)
         .await
         .unwrap();
 
@@ -1996,7 +2337,8 @@ async fn change_email_switches_address_and_revokes_sessions() {
         "verification token sent to the new email"
     );
     db.lock().unwrap().dispatch_broken = true;
-    auth.verify_email(&token).await.unwrap();
+    // Confirming a change needs no password: it was re-entered to request it.
+    auth.verify_email("1.1.1.1", &token, None).await.unwrap();
 
     assert_eq!(
         db.lock().unwrap().users[0].email.as_str(),
