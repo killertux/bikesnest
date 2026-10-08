@@ -75,6 +75,48 @@ pub trait Geocoder: Send + Sync {
     ) -> Result<Option<GeoHit>, GeocodeError> {
         Ok(None)
     }
+
+    /// The answer [`Self::geocode`] would return *without* calling a billable
+    /// provider, if the adapter already holds one (an in-process cache).
+    ///
+    /// Must not record anything or reach the network. Adapters without a cache
+    /// keep the default `None`, which means "resolving this costs a call".
+    fn peek(&self, _query: &str) -> Option<GeoHit> {
+        None
+    }
+}
+
+/// One geocoder shared by several holders (the search use case and the
+/// destination-resolution use case read the same cache).
+#[async_trait]
+impl<T: Geocoder + ?Sized> Geocoder for std::sync::Arc<T> {
+    async fn geocode(&self, query: &str) -> Result<Option<GeoHit>, GeocodeError> {
+        (**self).geocode(query).await
+    }
+
+    async fn suggest(
+        &self,
+        query: &str,
+        limit: usize,
+        session_token: Option<&str>,
+        language_code: &str,
+    ) -> Result<Vec<AddressSuggestion>, GeocodeError> {
+        (**self)
+            .suggest(query, limit, session_token, language_code)
+            .await
+    }
+
+    async fn resolve_suggestion(
+        &self,
+        reference: &str,
+        session_token: Option<&str>,
+    ) -> Result<Option<GeoHit>, GeocodeError> {
+        (**self).resolve_suggestion(reference, session_token).await
+    }
+
+    fn peek(&self, query: &str) -> Option<GeoHit> {
+        (**self).peek(query)
+    }
 }
 
 // ---------------------------------------------------------------------------

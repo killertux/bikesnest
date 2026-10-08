@@ -14,15 +14,15 @@ use std::sync::Arc;
 use axum::{Router, middleware};
 use bikesnest_application::{
     AuthMailDispatcher, AuthService, CheckReadiness, ContributionDeps, ContributionService,
-    EmailProvider, GetParkingDetails, ModerationDeps, ModerationService, ObjectStorage,
-    ParkingPhotoReader, PasswordHasher, PhotoDeps, PhotoService, PrivacyDeps, PrivacyService,
-    RateLimiter, SearchParking,
+    DatabaseProbe, EmailProvider, GeocodeBudget, Geocoder, GetParkingDetails, ModerationDeps,
+    ModerationService, ObjectStorage, ParkingPhotoReader, PasswordHasher, PhotoDeps, PhotoService,
+    PrivacyDeps, PrivacyService, RateLimiter, ResolveDestination, SearchParking,
 };
 use bikesnest_infrastructure::probe::SqlxDatabaseProbe;
 use bikesnest_infrastructure::{
     Argon2PasswordHasher, Config, ConfigError, Db, DurableAuthMailDispatcher, FakeOAuthProvider,
     InlineAuthMailDispatcher, LocalImageProcessor, OfflineTimezoneResolver, RealTokenGenerator,
-    S3ObjectStorage, SharedGeocoder, SharedObjectStorage, SharedRateLimiter, SqlxAccountRepository,
+    S3ObjectStorage, SharedObjectStorage, SharedRateLimiter, SqlxAccountRepository,
     SqlxAnonymizationRepository, SqlxAuditLog, SqlxAuditLogReader, SqlxAuthOutbox,
     SqlxContributionHistoryReader, SqlxExportRepository, SqlxFavoriteRepository,
     SqlxModerationRepository, SqlxParkingContributionRepository, SqlxParkingDetailsReader,
@@ -99,13 +99,22 @@ pub fn app_router_with<H: PasswordHasher + Clone + 'static>(
     let oauth = oauth.unwrap_or_else(|| FakeOAuthProvider::from_config(&config.fake_oauth));
     let google_oauth_enabled = config.google_oauth_enabled;
     let rate_limiter: Arc<dyn RateLimiter> = Arc::from(rate_limiter);
-    let probe = SqlxDatabaseProbe::new(db.clone(), config.probe_timeout);
-    // One geocoder instance, wrapped in the in-process cache, shared by the
-    // use case and the handler: `/search` asks the cache whether a query is
+    let probe: Box<dyn DatabaseProbe> =
+        Box::new(SqlxDatabaseProbe::new(db.clone(), config.probe_timeout));
+    // One geocoder instance, wrapped in the in-process cache, shared by both
+    // use cases: destination resolution asks the cache whether a query is
     // already resolved before it spends any of the caller's geocode budget.
-    let geocoder = Arc::new(caching_geocoder_from_config(&config.geocoder));
+    let geocoder: Arc<dyn Geocoder> = Arc::new(caching_geocoder_from_config(&config.geocoder));
+    let destinations = ResolveDestination::new(
+        geocoder.clone(),
+        rate_limiter.clone(),
+        GeocodeBudget {
+            per_client: config.geocode.per_ip,
+            window: config.geocode.window,
+        },
+    );
     let search_uc = SearchParking::new(
-        Box::new(SharedGeocoder::new(geocoder.clone())),
+        Box::new(geocoder),
         Box::new(SqlxParkingSearchReader::new(
             db.clone(),
             config.recommendation,
@@ -199,9 +208,8 @@ pub fn app_router_with<H: PasswordHasher + Clone + 'static>(
     let state = AppState {
         readiness: Arc::new(CheckReadiness::new(probe)),
         search: Arc::new(search_uc),
-        geocoder: geocoder.clone(),
+        destinations: Arc::new(destinations),
         rate_limiter: rate_limiter.clone(),
-        geocode_limits: config.geocode,
         details: Arc::new(details),
         freshness: config.freshness,
         photos,

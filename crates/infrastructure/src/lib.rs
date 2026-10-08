@@ -45,7 +45,7 @@ pub use email::{
 pub use fresh_seed::{FreshSeedResetError, reset_all_data};
 pub use geocoding::{
     CachingGeocoder, FEATURED_BBOX_HALF_DEG, FEATURED_ORIGIN, FakeGeocoder, GoogleGeocoder,
-    MapboxGeocoder, SharedGeocoder, caching_geocoder_from_config, geocoder_from_config,
+    MapboxGeocoder, caching_geocoder_from_config, geocoder_from_config,
 };
 pub use job::{
     ClaimedJob, EXHAUSTED_LEASE_ERROR, ExhaustedLease, JOBS_GC_RECURRING_KEY, JobRegistry,

@@ -410,8 +410,12 @@ pub async fn auth_middleware(
     // as `GET` (axum answers `HEAD` with the `GET` route), so requiring one
     // there only broke `HEAD`.
     let is_safe = matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
+    // Browsers POST CSP violation reports without any token. That one exact
+    // route only logs (rate limited, size capped), so it is exempt.
+    let is_csp_report =
+        *req.method() == Method::POST && req.uri().path() == crate::security::CSP_REPORT_PATH;
 
-    if !is_safe {
+    if !is_safe && !is_csp_report {
         // Token sources, in order:
         //   1. `X-CSRF-Token` — every htmx request (web/static/js/auth.js reads
         //      `<meta name="csrf">` in `htmx:config:request`);

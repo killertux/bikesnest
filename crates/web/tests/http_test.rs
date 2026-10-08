@@ -395,6 +395,17 @@ async fn htmx_search_fragment_updates_result_count_out_of_band(tx: &mut TestTx) 
     let html = String::from_utf8_lossy(&body);
     assert!(html.contains(r#"id="result-count""#), "fragment: {html}");
     assert!(html.contains("hx-swap-oob"), "fragment: {html}");
+    // The live region and the heading are patched in place, never replaced:
+    // a swapped-out live region is a new node screen readers do not announce,
+    // and the heading keeps the page's own classes.
+    assert!(
+        html.contains(r#"<p id="result-count" hx-swap-oob="innerHTML">"#),
+        "fragment: {html}"
+    );
+    assert!(
+        html.contains(r#"<h1 id="search-heading" hx-swap-oob="innerHTML">"#),
+        "fragment: {html}"
+    );
 }
 
 #[db_test]
@@ -646,7 +657,10 @@ async fn browsing_a_box_lists_numbered_cards_and_no_next_page(tx: &mut TestTx) {
         "from-centre note"
     );
     // Numbered cards, and the same numbers in the map payload.
-    assert!(body.contains(r#"aria-label="Spot 1""#), "card number badge");
+    assert!(
+        body.contains(r#"<span class="sr-only">Spot 1</span>"#),
+        "card number badge"
+    );
     let json_block = search_data_block(&body);
     let parsed: serde_json::Value = serde_json::from_str(&json_block).expect("valid JSON block");
     let first = &parsed["items"][0];
@@ -3832,6 +3846,193 @@ async fn proposing_a_move_creates_pending_proposal(tx: &mut bikesnest_test_suppo
     );
 }
 
+/// The "mark gone" form only ever proposes removal: no "still exists" choice,
+/// a required confirmation inside a fieldset, and a server that refuses a
+/// hand-crafted `existence=exists` with the edit form re-rendered (input kept,
+/// error as an alert) rather than a redirect to a success-styled banner.
+#[db_test]
+async fn existence_proposals_must_propose_removal_and_errors_rerender_the_form(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
+    const EMAIL: &str = "b5a-existence@example.com";
+    let cookie = verified_cookie(&app, &email, EMAIL).await;
+    let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
+    let csrf = extract_csrf(&form);
+    let id = add_location(&db, &app, &cookie, &csrf, "Existence Spot", &[]).await;
+
+    let (_, edit_html) = get_c(&app, &format!("/parking/{id}/edit"), Some(&cookie)).await;
+    assert!(
+        !edit_html.contains(r#"value="exists""#),
+        "no no-op 'still exists' choice"
+    );
+    assert!(edit_html.contains("<fieldset>") && edit_html.contains("<legend"));
+    assert!(
+        edit_html.contains(r#"name="existence" value="removed" required"#),
+        "the removal confirmation is required"
+    );
+    let ecsrf = extract_csrf(&edit_html);
+    let proposals = async || -> i64 {
+        sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM parking_proposal WHERE location_id = $1")
+            .bind(id)
+            .fetch_one(&mut *db.acquire().await.unwrap())
+            .await
+            .unwrap()
+            .0
+    };
+
+    for (existence, message) in [
+        ("exists", "This spot is already listed."),
+        ("info_changed", "This spot is already listed."),
+        ("", "Confirm that the spot no longer exists"),
+    ] {
+        let (s, body, _) = post_form(
+            &app,
+            &format!("/parking/{id}/proposal"),
+            &[
+                ("csrf", &ecsrf),
+                ("kind", "change_existence"),
+                ("existence", existence),
+                ("reason", "kept-reason-text"),
+            ],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{existence:?}");
+        assert!(body.contains(message), "{existence:?}: {body}");
+        assert!(
+            body.contains(r#"id="removal-error" role="alert""#),
+            "{existence:?}: the error is an alert"
+        );
+        assert!(
+            body.contains(r#"value="kept-reason-text""#),
+            "{existence:?}: the reason survives"
+        );
+        assert!(
+            body.contains("Existence Spot"),
+            "the edit form is pre-filled"
+        );
+    }
+    assert_eq!(proposals().await, 0, "no no-op proposal was filed");
+
+    let (s, _, _) = post_form(
+        &app,
+        &format!("/parking/{id}/proposal"),
+        &[
+            ("csrf", &ecsrf),
+            ("kind", "change_existence"),
+            ("existence", "removed"),
+            ("reason", "demolished"),
+        ],
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(s, StatusCode::SEE_OTHER, "a removal proposal is accepted");
+    assert_eq!(proposals().await, 1);
+}
+
+/// A move proposal with coordinates that do not parse comes back to the edit
+/// page with what the rider typed, and the error next to that form.
+#[db_test]
+async fn a_rejected_move_proposal_keeps_the_input(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
+    const EMAIL: &str = "b5a-move-error@example.com";
+    let cookie = verified_cookie(&app, &email, EMAIL).await;
+    let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
+    let csrf = extract_csrf(&form);
+    let id = add_location(&db, &app, &cookie, &csrf, "Move Error Spot", &[]).await;
+
+    let (s, body, _) = post_form(
+        &app,
+        &format!("/parking/{id}/proposal"),
+        &[
+            ("csrf", &csrf),
+            ("kind", "move_location"),
+            ("lat", "-25.5"),
+            ("lon", "west"),
+            ("timezone", "America/Sao_Paulo"),
+            ("reason", "across-the-street"),
+        ],
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(body.contains(r#"id="move-error" role="alert""#), "{body}");
+    assert!(body.contains("Enter a valid latitude and longitude"));
+    assert!(body.contains(r#"value="-25.5""#), "the latitude survives");
+    assert!(body.contains(r#"value="America/Sao_Paulo""#));
+    assert!(body.contains(r#"value="across-the-street""#));
+}
+
+/// A failed proposal vote lands on the details page with an error alert, not
+/// in the success banner.
+#[db_test]
+async fn the_details_proposal_error_is_an_alert(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
+    const EMAIL: &str = "b5a-details-alert@example.com";
+    let cookie = verified_cookie(&app, &email, EMAIL).await;
+    let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
+    let csrf = extract_csrf(&form);
+    let id = add_location(&db, &app, &cookie, &csrf, "Alert Spot", &[]).await;
+
+    let (s, body) = get_c(
+        &app,
+        &format!("/parking/{id}?proposal_error=1"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let at = body
+        .find("This change could not be recorded.")
+        .expect("the error is shown");
+    let banner = &body[body[..at].rfind("<div").unwrap()..at];
+    assert!(banner.contains(r#"role="alert""#), "{banner}");
+    assert!(banner.contains("text-danger"), "{banner}");
+}
+
+/// The details breadcrumb returns to the search the rider came from.
+#[db_test]
+async fn the_details_breadcrumb_returns_to_the_referring_search(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let id = ParkingBuilder::new()
+        .with_name("Breadcrumb Spot")
+        .create(&mut db.acquire().await.unwrap())
+        .await
+        .unwrap()
+        .id();
+    let app = scoped_test_app(db);
+    let page = async |referer: &str| -> String {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/parking/{id}"))
+                    .header("Accept-Language", "en")
+                    .header("host", "bikesnest.test")
+                    .header("referer", referer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    let body = page("http://bikesnest.test/search?q=Rua+XV&type=rack").await;
+    assert!(
+        body.contains(r#"<a href="/search?q=Rua+XV&#38;type=rack" class="hover:text-fg">"#),
+        "{body}"
+    );
+    let body = page("http://elsewhere.test/search?q=x").await;
+    assert!(body.contains(r#"<a href="/search" class="hover:text-fg">"#));
+}
+
 #[db_test]
 async fn review_create_updates_aggregate(tx: &mut bikesnest_test_support::TestTx) {
     let db = tx.db().await;
@@ -5391,22 +5592,46 @@ fn web_sources() -> Vec<(std::path::PathBuf, String)> {
 /// only infrastructure types it may mention are the parsed configuration
 /// values it renders (`MapConfig`, the featured origin, …).
 ///
-/// `wiring.rs` is where the `Sqlx…` constructors belong (`state.rs` names one
-/// probe type, in the signature of the readiness use case it holds).
+/// `wiring.rs` is where the `Sqlx…` constructors belong. `AppState` (in
+/// `state.rs`) is what every handler sees, so it must hold ports and use
+/// cases, never a concrete adapter: the only infrastructure names `state.rs`
+/// may mention are the parsed configuration values it carries.
 #[test]
 fn route_handlers_never_reach_for_infrastructure() {
-    const ALLOWED_INFRA_TYPES: &[&str] = &[
-        "Config",
-        "MapConfig",
-        "SecurityConfig",
-        "FEATURED_ORIGIN",
-        "GeocodeLimits",
-    ];
+    const ALLOWED_INFRA_TYPES: &[&str] =
+        &["Config", "MapConfig", "SecurityConfig", "FEATURED_ORIGIN"];
+    const STATE_ALLOWED_INFRA_TYPES: &[&str] = &["Config", "MapConfig"];
     const FORBIDDEN: &[&str] = &["Sqlx", "sqlx::", "S3ObjectStorage", "Db::", "db.pool()"];
 
     let infra = regex::Regex::new(r"bikesnest_infrastructure::\{?([A-Za-z_0-9]+)").unwrap();
+    // Every path `state.rs` reaches into the infrastructure crate through,
+    // including grouped and nested imports (`{probe::SqlxDatabaseProbe, …}`).
+    let infra_path =
+        regex::Regex::new(r"bikesnest_infrastructure::(\{[^;]*\}|[A-Za-z_0-9:]+)").unwrap();
+    let type_name = regex::Regex::new(r"\b[A-Z][A-Za-z0-9_]*").unwrap();
     let mut offenders = Vec::new();
     for (path, contents) in web_sources() {
+        if path.file_name().is_some_and(|name| name == "state.rs") {
+            for caps in infra_path.captures_iter(&contents) {
+                for name in type_name.find_iter(caps.get(1).unwrap().as_str()) {
+                    if !STATE_ALLOWED_INFRA_TYPES.contains(&name.as_str()) {
+                        offenders.push(format!(
+                            "{}: AppState module names bikesnest_infrastructure::{}",
+                            path.display(),
+                            name.as_str()
+                        ));
+                    }
+                }
+            }
+            for (n, line) in contents.lines().enumerate() {
+                for needle in FORBIDDEN.iter().chain(&["Caching", "Probe<"]) {
+                    if line.contains(needle) {
+                        offenders.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+                    }
+                }
+            }
+            continue;
+        }
         if !path.components().any(|c| c.as_os_str() == "routes") {
             continue;
         }
@@ -7242,6 +7467,25 @@ async fn proposal_queue_flags_stale_and_unreadable_proposals(
     let (stale, unreadable) = (ids[0], ids[1]);
     drop(conn);
 
+    // A proposal the community approved but that could not merge is flagged
+    // for moderators and leads the queue.
+    let (escalated,): (i64,) = sqlx::query_as(
+        "INSERT INTO parking_proposal (location_id, proposer_id, base_version, kind, proposed, status, escalated_at) VALUES ($1, $2, 7, 'change_existence', $3, 'PENDING', now()) RETURNING id")
+        .bind(loc).bind(proposer.id.0)
+        .bind(serde_json::json!({"existence": "removed"}))
+        .fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
+    let (s, body) = get_c(&app, "/moderation/proposals", Some(&mod_cookie)).await;
+    assert_eq!(s, StatusCode::OK);
+    let badge = body
+        .find("Approved, needs a moderator")
+        .expect("the escalated proposal carries a badge");
+    let first_card = body.find("<article").expect("a queue card");
+    assert!(
+        body[first_card..badge].matches("<article").count() == 1,
+        "the escalated proposal is the first card"
+    );
+    assert!(body.contains(&format!("/moderation/proposals/{escalated}/approve")));
+
     let queue_url = format!("/moderation/proposals?after_id={}", stale - 1);
     let (s, body) = get_c(&app, &queue_url, Some(&mod_cookie)).await;
     assert_eq!(s, StatusCode::OK, "an unreadable payload does not 500");
@@ -8476,7 +8720,9 @@ async fn a_script_free_submission_records_hours_and_a_definitive_no(tx: &mut Tes
     let (status, body) = get_c(&app, &format!("/parking/{id}"), Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        body.contains(r#"aria-label="No">✗</span><span class="text-muted">CCTV"#),
+        body.contains(
+            r#"aria-hidden="true">✗</span><span class="sr-only">No</span><span class="text-muted">CCTV"#
+        ),
         "the details page marks CCTV as absent: {body}"
     );
     assert!(
@@ -9090,10 +9336,19 @@ async fn search_results_list_has_no_script_child_and_listitems_are_direct_childr
         "search-data must render before #results, not inside it"
     );
 
-    // The first element inside `#results` must be a listitem, not a wrapper
-    // div — nothing but whitespace stands between the list's own opening tag
-    // and its first child.
-    let after_results = &body[results_at..];
+    // `#results` holds notes and the pager as well as cards, so it is not the
+    // list; the cards sit in `#results-list`, and the first element inside it
+    // must be a listitem — nothing but whitespace stands between the list's
+    // own opening tag and its first child.
+    assert!(
+        !body[results_at..].starts_with(r#"<div id="results" role="list""#),
+        "the swap target is not itself the list"
+    );
+    let list_at = body
+        .find(r#"<div id="results-list" role="list""#)
+        .expect("the results list");
+    assert!(list_at > results_at, "the list lives inside #results");
+    let after_results = &body[list_at..];
     let open_end = after_results.find('>').unwrap() + 1;
     let after_open = &after_results[open_end..];
     let next_tag_at = after_open.find('<').expect("a child tag follows");

@@ -7,14 +7,12 @@
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use bikesnest_application::Geocoder;
+use bikesnest_application::DestinationError;
 
 use crate::auth::Auth;
 use crate::client_ip::ClientIp;
 use crate::i18n::Locale;
 use crate::state::AppState;
-
-use super::search::geocode_within_budget;
 
 #[derive(Debug, Default, serde::Deserialize)]
 pub(crate) struct GeocodeQuery {
@@ -55,17 +53,19 @@ pub(crate) async fn address_suggestions_api(
     if query_len > MAX_SUGGESTION_QUERY_CHARS {
         return json(StatusCode::BAD_REQUEST, "[]".to_string());
     }
-    if !geocode_within_budget(&state, &ip).await {
-        return json(StatusCode::TOO_MANY_REQUESTS, "[]".to_string());
-    }
-
     let session = match valid_session_token(q.session.as_deref()) {
         Ok(session) => session,
         Err(()) => return json(StatusCode::BAD_REQUEST, "[]".to_string()),
     };
     match state
-        .geocoder
-        .suggest(query, MAX_ADDRESS_SUGGESTIONS, session, locale.html_lang())
+        .destinations
+        .suggest(
+            &ip,
+            query,
+            MAX_ADDRESS_SUGGESTIONS,
+            session,
+            locale.html_lang(),
+        )
         .await
     {
         Ok(hits) => json(
@@ -85,7 +85,10 @@ pub(crate) async fn address_suggestions_api(
             )
             .to_string(),
         ),
-        Err(_) => json(StatusCode::SERVICE_UNAVAILABLE, "[]".to_string()),
+        Err(DestinationError::OverBudget) => json(StatusCode::TOO_MANY_REQUESTS, "[]".to_string()),
+        Err(DestinationError::Geocode(_)) => {
+            json(StatusCode::SERVICE_UNAVAILABLE, "[]".to_string())
+        }
     }
 }
 
@@ -105,10 +108,11 @@ pub(crate) async fn resolve_address_suggestion_api(
         Ok(session) => session,
         Err(()) => return json(StatusCode::BAD_REQUEST, "{}".to_string()),
     };
-    if !geocode_within_budget(&state, &ip).await {
-        return json(StatusCode::TOO_MANY_REQUESTS, "{}".to_string());
-    }
-    match state.geocoder.resolve_suggestion(reference, session).await {
+    match state
+        .destinations
+        .resolve_suggestion(&ip, reference, session)
+        .await
+    {
         Ok(Some(hit)) => json(
             StatusCode::OK,
             serde_json::json!({
@@ -119,7 +123,14 @@ pub(crate) async fn resolve_address_suggestion_api(
             .to_string(),
         ),
         Ok(None) => json(StatusCode::NOT_FOUND, "{}".to_string()),
-        Err(_) => json(StatusCode::SERVICE_UNAVAILABLE, "{}".to_string()),
+        Err(error) => destination_error(error),
+    }
+}
+
+fn destination_error(error: DestinationError) -> Response {
+    match error {
+        DestinationError::OverBudget => json(StatusCode::TOO_MANY_REQUESTS, "{}".to_string()),
+        DestinationError::Geocode(_) => json(StatusCode::SERVICE_UNAVAILABLE, "{}".to_string()),
     }
 }
 
@@ -154,19 +165,11 @@ pub(crate) async fn geocode_api(
         return json(StatusCode::NOT_FOUND, "{}".to_string());
     }
 
-    // A cached answer is free, so it must not be charged — same rule as the
-    // search page's budget check.
-    let cached = state.geocoder.peek(query);
-    if cached.is_none() && !geocode_within_budget(&state, &ip).await {
-        return json(StatusCode::TOO_MANY_REQUESTS, "{}".to_string());
-    }
-
-    let hit = match cached {
-        Some(hit) => Some(hit),
-        None => match state.geocoder.geocode(query).await {
-            Ok(hit) => hit,
-            Err(_) => return json(StatusCode::SERVICE_UNAVAILABLE, "{}".to_string()),
-        },
+    // A cached answer is free; anything else is charged to this network's
+    // budget first — the same rule as the search page.
+    let hit = match state.destinations.geocode(&ip, query).await {
+        Ok(hit) => hit,
+        Err(error) => return destination_error(error),
     };
     match hit {
         Some(hit) => json(

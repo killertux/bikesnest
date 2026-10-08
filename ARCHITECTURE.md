@@ -111,8 +111,10 @@ Value objects and rules, no I/O. Notable concepts:
 
 Use cases + ports. Each feature is a service that receives its dependencies as
 ports and returns domain results; it never touches HTTP, SQL, or filesystem
-directly. Examples: `SearchParking`, `ContributionService`, `AuthService`,
-`ModerationService`, `PhotoService`, `RetentionJob`, the job `Worker`.
+directly. Examples: `SearchParking`, `ResolveDestination` (the per-client
+geocode budget: a destination the geocoder already holds is free, anything else
+is charged first), `ContributionService`, `AuthService`, `ModerationService`,
+`PhotoService`, `RetentionJob`, the job `Worker`.
 
 **Ports** (the full list of `trait`s the application declares):
 
@@ -198,7 +200,8 @@ The router is split three ways:
   This is the only module that may name a concrete adapter.
 - **`state.rs`** — `AppState`: the services, the read-side ports and the
   configuration-derived values (map, security policy, base URL, asset
-  manifest), cloned per request. It holds no connection pool.
+  manifest), cloned per request. It holds no connection pool and no concrete
+  adapter (ports and use cases only).
 - **`routes/`** — one module per slice, each owning its handlers, its
   form/query structs, its form → domain mapping and its error → response
   mapping: `public` (home, about, robots/sitemap, language, health), `search`,
@@ -206,10 +209,12 @@ The router is split three ways:
   `reviews` (review/verify/parked-here/favorite + the account activity lists),
   `photo` (upload and photo queue), `moderation` (reports and queues),
   `admin` (users, audit, privacy requests), `privacy` (export/delete),
-  `legal` (policy pages), plus `common` (shared render/fragment helpers) and
-  `errors` (the styled 404/500 family). `routes/mod.rs` holds the URL → handler
-  table. Two tests guard the shape: no file over 1200 lines, and nothing under
-  `routes/` may name a repository, a pool or an adapter.
+  `legal` (policy pages), `api` (address autocomplete/geocode JSON),
+  `csp_report` (the CSP violation sink), plus `common` (shared
+  render/fragment helpers) and `errors` (the styled 404/500 family).
+  `routes/mod.rs` holds the URL → handler table. Two tests guard the shape: no
+  file over 1200 lines, and neither `AppState` nor anything under `routes/` may
+  name a repository, a pool or an adapter.
 
 `lib.rs` holds the Askama view-model structs; `i18n.rs` holds the en + pt-BR
 catalogs; `security.rs` the headers/CSP; `observability.rs` the JSON structured
@@ -382,10 +387,17 @@ Key modeling notes:
   localStorage snapshot cache; the installed-library browser regression guards
   that version-dependent property. Only successful static assets retain
   explicit cacheable policies. The currently enforced CSP remains the known
-  provider-compatible baseline. Each HTML response also carries a fresh nonce
-  on trusted script elements and a nonce/`strict-dynamic` candidate in
-  `Content-Security-Policy-Report-Only`; Google alone retains its documented
-  `unsafe-eval` exception there. Promotion waits on live Google and edge-beacon
+  provider-compatible baseline. The `CSP_*` origins are validated as bare
+  `scheme://host[:port]` at startup and both policies are built once. With the
+  Google profile, its `'unsafe-inline' 'unsafe-eval'` allowances ride only map
+  pages (pages declaring `template[data-map-assets]`); because a boosted
+  navigation keeps its first document's policy, a boosted GET of a map page is
+  answered with `HX-Redirect` so it becomes a real load. Each HTML response also
+  carries a fresh nonce on trusted script elements and a nonce/`strict-dynamic`
+  candidate in `Content-Security-Policy-Report-Only`; Google map pages alone
+  retain its documented `unsafe-eval` exception there. Both policies report to
+  `POST /csp-report` (CSRF-exempt, size-capped, per-IP rate-limited; logs a
+  redacted summary). Promotion waits on live Google and edge-beacon
   validation. Dynamic map loaders retain the original document nonce and never
   trust swapped manifests or request headers. See `crates/web/src/security.rs`.
 - **Observability:** `APP_ENV=production` → JSON structured logs; PII-free.

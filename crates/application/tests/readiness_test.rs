@@ -1,4 +1,4 @@
-//! Application-layer tests for the readiness use case (fake probes — /).
+//! Application-layer tests for the readiness use case (fake probes).
 use async_trait::async_trait;
 use bikesnest_application::{CheckReadiness, DatabaseProbe, ProbeError, Readiness};
 
@@ -44,4 +44,12 @@ async fn dependency_down_is_distinct_from_app_error() {
 
     let broken = CheckReadiness::new(FakeProbe(ProbeError::Unexpected));
     assert_eq!(broken.execute().await, Readiness::AppError);
+}
+
+#[tokio::test]
+async fn a_boxed_probe_backs_the_default_readiness_type() {
+    // The web layer holds `CheckReadiness` (boxed probe) so it never names the
+    // concrete adapter.
+    let uc: CheckReadiness = CheckReadiness::new(Box::new(OkProbe));
+    assert_eq!(uc.execute().await, Readiness::Ready);
 }

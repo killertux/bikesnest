@@ -17,6 +17,7 @@ pub mod auth;
 pub mod common;
 pub mod community;
 pub mod contribution_form;
+pub mod csp_report;
 pub mod details;
 pub mod errors;
 pub mod legal;
@@ -99,6 +100,12 @@ pub(crate) fn routes(state: &AppState) -> Router<AppState> {
         .route("/lang/{code}", get(set_lang))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        // The one CSRF-exempt route (browsers send reports without a token);
+        // its body is capped before the handler parses anything.
+        .route(
+            crate::security::CSP_REPORT_PATH,
+            post(csp_report::csp_report).layer(DefaultBodyLimit::max(csp_report::MAX_REPORT_BYTES)),
+        )
         // --- Accounts and authentication ---
         .route("/register", get(register_page).post(register_post))
         .route("/login", get(login_page).post(login_post))

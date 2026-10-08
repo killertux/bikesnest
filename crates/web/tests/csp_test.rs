@@ -28,8 +28,26 @@ use tower::ServiceExt;
 // ---------------------------------------------------------------------------
 
 fn csp_app(db: Db) -> (axum::Router, FakeEmailProvider) {
+    csp_app_with(db, test_config())
+}
+
+/// The Google Maps profile: its script allowances belong to map pages only.
+fn google_app(db: Db) -> axum::Router {
+    let config = bikesnest_infrastructure::Config {
+        map: bikesnest_infrastructure::MapConfig::Google {
+            browser_api_key: "test-browser-key".to_string(),
+            map_id: "test-map-id".to_string(),
+        },
+        ..test_config()
+    };
+    csp_app_with(db, config).0
+}
+
+fn csp_app_with(
+    db: Db,
+    config: bikesnest_infrastructure::Config,
+) -> (axum::Router, FakeEmailProvider) {
     let email = FakeEmailProvider::with_root(None);
-    let config = test_config();
     let deps = RouterDeps {
         email: std::sync::Arc::new(email.clone()),
         oauth: Some(FakeOAuthProvider::new(
@@ -373,9 +391,30 @@ fn origin_of(url: &str) -> String {
     format!("{}{}", &url[..scheme_end + 3], &after[..host_end])
 }
 
-/// A relative URL is covered by `'self'`; an absolute one must have its exact
-/// origin present in `directive_value` (a simple substring check — good
-/// enough for the small, literal host lists this app emits).
+/// Is `origin` named in `sources`, literally or through a `scheme://*.parent`
+/// wildcard (the Google profile's host list is wildcards)?
+fn source_list_allows(sources: &str, origin: &str) -> bool {
+    if sources.contains(origin) {
+        return true;
+    }
+    let Some((scheme, host)) = origin.split_once("://") else {
+        return false;
+    };
+    let mut parent = host;
+    while let Some((_, rest)) = parent.split_once('.') {
+        if sources
+            .split_whitespace()
+            .any(|source| source == format!("{scheme}://*.{rest}"))
+        {
+            return true;
+        }
+        parent = rest;
+    }
+    false
+}
+
+/// A relative URL is covered by `'self'`; an absolute one must have its
+/// origin present in `directive_value`, literally or by wildcard.
 fn assert_origin_allowed(
     page: &str,
     label: &str,
@@ -395,7 +434,7 @@ fn assert_origin_allowed(
     }
     let origin = origin_of(url);
     assert!(
-        directive_value.contains(origin.as_str()),
+        source_list_allows(directive_value, &origin),
         "{page}: {label} {url} (origin {origin}) is not allowed by {directive}: {directive_value:?}"
     );
 }
@@ -445,7 +484,7 @@ async fn assert_page_is_csp_consistent(app: &axum::Router, uri: &str, cookie: Op
             }
             let origin = origin_of(&url);
             assert!(
-                csp.contains(origin.as_str()),
+                source_list_allows(&csp, &origin),
                 "{uri}: preconnect origin {origin} does not appear anywhere in the CSP: {csp:?}"
             );
             continue;
@@ -591,4 +630,230 @@ fn verification_token_to(email: &FakeEmailProvider, addr: &str) -> String {
         .captures(&mail.text)
         .unwrap()[1]
         .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Google profile: map-page-only allowances
+// ---------------------------------------------------------------------------
+
+/// Send `req` and return the status, headers and body.
+async fn send(
+    app: &axum::Router,
+    req: Request<Body>,
+) -> (StatusCode, axum::http::HeaderMap, String) {
+    let res = app.clone().oneshot(req).await.unwrap();
+    let status = res.status();
+    let headers = res.headers().clone();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    (status, headers, String::from_utf8_lossy(&body).to_string())
+}
+
+fn header<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> &'a str {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+}
+
+/// A GET carrying the given htmx headers.
+fn htmx_get(uri: &str, hx: &[(&str, &str)]) -> Request<Body> {
+    let mut b = Request::builder()
+        .uri(uri)
+        .header("Accept-Language", "en")
+        .header("HX-Request", "true");
+    for (name, value) in hx {
+        b = b.header(*name, *value);
+    }
+    b.body(Body::empty()).unwrap()
+}
+
+#[db_test]
+async fn google_script_allowances_ride_only_map_pages(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
+    let loc = fixture_location(&db, "CSP Google Spot").await;
+    let app = google_app(db);
+
+    for uri in ["/search?q=Rua+XV+de+Novembro", &format!("/parking/{loc}")] {
+        let (status, body, csp) = get_full(&app, uri, None).await;
+        assert_eq!(status, StatusCode::OK, "GET {uri}");
+        assert!(
+            body.contains("<template data-map-assets"),
+            "{uri} is a map page"
+        );
+        assert!(
+            csp.contains("script-src 'self' 'unsafe-inline' 'unsafe-eval'"),
+            "{uri}: {csp}"
+        );
+        assert_page_is_csp_consistent(&app, uri, None).await;
+    }
+
+    for uri in ["/", "/about", "/login"] {
+        let (status, body, csp) = get_full(&app, uri, None).await;
+        assert_eq!(status, StatusCode::OK, "GET {uri}");
+        assert!(!body.contains("<template data-map-assets"), "{uri}");
+        assert!(!csp.contains("unsafe-eval"), "{uri}: {csp}");
+        assert!(
+            !csp.contains("'unsafe-inline' 'unsafe-eval'"),
+            "{uri}: {csp}"
+        );
+        assert!(!csp.contains("googleapis"), "{uri}: {csp}");
+        assert_page_is_csp_consistent(&app, uri, None).await;
+    }
+}
+
+/// A boosted navigation keeps the policy of the document it started from, so
+/// under the Google profile a boosted read of a map page must become a real
+/// document load (`HX-Redirect`) that carries the map policy.
+#[db_test]
+async fn boosted_navigation_into_a_google_map_page_is_a_full_load(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let app = google_app(db.clone());
+    let target = "/search?q=Rua+XV+de+Novembro";
+
+    for hx in [
+        &[("HX-Boosted", "true")][..],
+        &[("HX-History-Restore-Request", "true")][..],
+        &[("HX-Request-Type", "full")][..],
+    ] {
+        let (status, headers, body) = send(&app, htmx_get(target, hx)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{hx:?}");
+        assert_eq!(header(&headers, "hx-redirect"), target, "{hx:?}");
+        assert!(body.is_empty(), "{hx:?}");
+        assert!(header(&headers, "vary").contains("HX-Request"), "{hx:?}");
+        assert!(
+            !header(&headers, "content-security-policy").contains("unsafe-eval"),
+            "{hx:?}"
+        );
+    }
+
+    // A fragment swap inside the (already map-policied) search page is served.
+    let (status, headers, body) =
+        send(&app, htmx_get(target, &[("HX-Request-Type", "partial")])).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers.get("hx-redirect").is_none());
+    assert!(!body.is_empty());
+
+    // A boosted navigation to an ordinary page stays a swap.
+    let (status, headers, _) = send(&app, htmx_get("/about", &[("HX-Boosted", "true")])).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers.get("hx-redirect").is_none());
+
+    // Without the Google profile every page shares one policy: no reload.
+    let (maplibre, _) = csp_app(db);
+    let (status, headers, _) = send(&maplibre, htmx_get(target, &[("HX-Boosted", "true")])).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers.get("hx-redirect").is_none());
+}
+
+// ---------------------------------------------------------------------------
+// /csp-report
+// ---------------------------------------------------------------------------
+
+fn csp_report(content_type: &str, body: impl Into<Body>) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/csp-report")
+        .header("content-type", content_type)
+        .header("sec-fetch-site", "same-origin")
+        .body(body.into())
+        .unwrap()
+}
+
+#[db_test]
+async fn csp_reports_are_accepted_without_csrf_and_bounded(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let (app, _) = csp_app(tx.db().await);
+
+    // Every response names the endpoint the policies report to.
+    let (_, headers, _) = send(
+        &app,
+        Request::builder().uri("/").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(
+        header(&headers, "reporting-endpoints"),
+        "csp-endpoint=\"/csp-report\""
+    );
+    for policy in [
+        "content-security-policy",
+        "content-security-policy-report-only",
+    ] {
+        let csp = header(&headers, policy);
+        assert!(csp.contains("report-uri /csp-report"), "{policy}: {csp}");
+        assert!(csp.contains("report-to csp-endpoint"), "{policy}: {csp}");
+    }
+
+    // Both wire formats, no cookie and no CSRF token.
+    let legacy = serde_json::json!({"csp-report": {
+        "document-uri": "http://localhost:8080/search?q=secret",
+        "violated-directive": "script-src-elem",
+        "blocked-uri": "https://evil.example/x.js",
+        "disposition": "report",
+    }});
+    let (status, _, _) = send(
+        &app,
+        csp_report("application/csp-report", legacy.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let reporting = serde_json::json!([{"type": "csp-violation", "body": {
+        "documentURL": "http://localhost:8080/",
+        "effectiveDirective": "img-src",
+        "blockedURL": "data",
+        "disposition": "enforce",
+    }}]);
+    let (status, _, _) = send(
+        &app,
+        csp_report("application/reports+json", reporting.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Anything else is refused before it is parsed or counted.
+    let (status, _, _) = send(&app, csp_report("text/plain", "hello")).await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    let (status, _, _) = send(
+        &app,
+        csp_report("application/csp-report", "x".repeat(17 * 1024)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let (status, _, _) = send(&app, csp_report("application/csp-report", "{}")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // The exemption is this exact route: a neighbour still needs a token.
+    let (status, _, _) = send(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri("/csp-report/extra")
+            .header("content-type", "application/csp-report")
+            .body(Body::from(legacy.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // One client gets a bounded number of reports per window.
+    let mut statuses = Vec::new();
+    for _ in 0..40 {
+        let (status, _, _) = send(
+            &app,
+            csp_report("application/csp-report", legacy.to_string()),
+        )
+        .await;
+        statuses.push(status);
+    }
+    assert!(
+        statuses.contains(&StatusCode::TOO_MANY_REQUESTS),
+        "{statuses:?}"
+    );
+    assert!(
+        statuses
+            .iter()
+            .all(|s| *s == StatusCode::NO_CONTENT || *s == StatusCode::TOO_MANY_REQUESTS)
+    );
 }

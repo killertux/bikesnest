@@ -104,9 +104,19 @@ pub(crate) fn locale_code(locale: Locale) -> LocaleCode {
     LocaleCode::parse(locale.html_lang()).unwrap_or_default()
 }
 
+/// Render a page. A page that declares `template[data-map-assets]` is marked
+/// [`MapPage`](crate::security::MapPage) so the security middleware can give
+/// it the map provider's policy.
 pub(crate) fn render<T: Template>(template: T, status: StatusCode) -> Response {
     match template.render() {
-        Ok(html) => (status, Html(html)).into_response(),
+        Ok(html) => {
+            let map_page = html.contains("<template data-map-assets");
+            let mut response = (status, Html(html)).into_response();
+            if map_page {
+                response.extensions_mut().insert(crate::security::MapPage);
+            }
+            response
+        }
         // A render failure is a bug; keep the fallback minimal (no template).
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response(),
     }

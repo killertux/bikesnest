@@ -69,8 +69,13 @@ All knobs are documented in `.env.example`; production sets them as real secrets
 | `JOBS_HISTORY_RETENTION_DAYS` | `jobs.gc` deletes `succeeded`/`failed` rows older than this (default 7) |
 | `PASSWORD_HASH_CONCURRENCY` / `PASSWORD_HASH_QUEUE_CAPACITY` / `PASSWORD_HASH_ADMISSION_TIMEOUT_MS` | shared Argon2 hash+verify running budget, finite waiter count, and waiter deadline (defaults 2 / 8 / 2000; queue 0 disables waiting) |
 | `PHOTO_PROCESSING_CONCURRENCY` | process-wide simultaneous image decode/encode limit (default `1`). Keep at `1` until a release capacity test proves memory headroom for a higher value |
-| `CSP_TILE_HOSTS` / `CSP_GEOCODE_HOSTS` | extra origins allowed by the strict CSP for MapLibre tiles / browser geocoding. Required Mapbox and Google Maps origins are added automatically for their profiles |
+| `CSP_TILE_HOSTS` / `CSP_GEOCODE_HOSTS` | extra origins allowed by the strict CSP for MapLibre tiles / browser geocoding. Required Mapbox and Google Maps origins are added automatically for their profiles (Google's only on map pages) |
 | `CSP_MEDIA_HOSTS` | object-storage origin(s) allowed in the CSP `img-src` that parking photos are served from as direct pre-signed URLs (dev: `http://localhost:9000`; AWS: `https://<bucket>.s3.<region>.amazonaws.com`) |
+
+Every `CSP_*` entry must be a bare origin — `http://` or `https://`, a host
+(optionally `*.`-prefixed) and an optional `:port`, comma-separated. A path, a
+`;`, whitespace, a control character or a CSP keyword fails startup with an
+error naming the variable, in every environment.
 | `APP_ENV` | `production` → JSON structured logs (machine-parseable, forward to a log aggregator) **and the startup validation described below** |
 | `STATIC_ROOT` | directory `/static` is served from; the image sets `/app/web/static`. Unset falls back to `web/static` beside the working directory, then to the compile-time path |
 | `LOCATION_PROVIDER` | **Location stack:** `google` \| `mapbox` \| `fake` (default `fake`). One value selects direct geocoding, autocomplete, suggestion resolution, and map rendering |
@@ -138,6 +143,32 @@ one pass rather than one restart per missing variable. Independently of
 reached) is a hard startup error — the app never silently downgrades to a fake.
 
 Development runs no validation; it logs a `warn!` naming each fake in use.
+
+### Reviewing CSP violation reports
+
+Both the enforced `Content-Security-Policy` and the nonce-based
+`Content-Security-Policy-Report-Only` candidate send violations to
+`POST /csp-report` (`report-uri` for older browsers, `report-to` with the
+`Reporting-Endpoints` header for the rest). The endpoint accepts
+`application/csp-report` and `application/reports+json`, caps the body at
+16 KiB, admits 30 reports per client IP per minute, and stores nothing. Each
+accepted violation becomes one `WARN` log line, target `bikesnest::csp`,
+message `csp violation reported`, with four redacted fields:
+
+| Field | Content |
+|---|---|
+| `directive` | the effective directive name only (`script-src-elem`, `img-src`, …) |
+| `blocked` | the blocked origin `scheme://host[:port]` (never a path or query), or the browser's keyword (`inline`, `eval`, `data`, `blob`) |
+| `document` | the page path, with no query string or fragment |
+| `disposition` | `enforce` (the live policy blocked it) or `report` (the candidate only) |
+
+To review, filter the JSON logs on `message = "csp violation reported"` and
+group by `disposition`, `directive` and `blocked`. `enforce` rows are breakage
+users saw: an origin missing from `CSP_*` or a provider change. `report` rows
+are what promoting the report-only candidate would break; it can be promoted
+once a full release cycle shows only extension or edge noise there. A sudden
+spike of `inline` or unknown origins on one `document` is worth treating as a
+possible injection attempt.
 
 ## 3. TLS, reverse proxy, health checks
 
