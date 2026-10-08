@@ -200,13 +200,20 @@ Migrations are **forward-only** (`sqlx` records applied versions). This means:
 
 - **Deploy = run the new image.** The migration runs before the server accepts
   traffic (`readyz` gates until migrations are applied).
-- **Rollback = redeploy the previous image.** Because migrations are
-  forward-only, a *rollback* is a restore of the previous release, **not** an
-  automated down-migration. New columns introduced by the rolled-back release
-  become harmless (ignored) but remain in the schema.
+- **An older image cannot start against a newer schema.** On startup the
+  migrator refuses to run when the database has applied migrations the binary
+  does not contain (`sqlx` `VersionMissing`), and the process exits. So once a
+  release that adds a migration has started even once, redeploying the
+  previous image fails at boot.
+- **Rollback = roll forward, or restore.** For a release that added
+  migrations, either deploy a fix built on top of it (it carries every applied
+  migration), or restore the pre-release database backup and then run the
+  previous image — see `docs/backups.md`. Restoring discards every write made
+  since the backup. Only a release that added **no** migration can be undone
+  by simply redeploying the previous image tag.
 
-> If a release must be undone and the schema is incompatible, restore the
-> pre-release data backup and re-run the old image — see `docs/backups.md`.
+Before deploying a release that adds migrations, take a fresh backup and record
+the last migration version the previous image knows about.
 
 Migrations run on a dedicated connection with `statement_timeout` disabled and
 closed afterwards, so `DB_STATEMENT_TIMEOUT_MS` never aborts an index build
@@ -378,9 +385,10 @@ verify that each key has exactly one row, the schedule is present, running
 ownership was not changed, and a successful execution returns the same row to
 `pending` with a future `run_at`. Do not delete job history as a repair.
 
-Rollback to the previous binary does not require a schema rollback (this change
-adds no migration). It can finish and reschedule a row whose schedule is already
-persisted, but cannot recreate or safely repair a missing/legacy row. Keep the
+The previous binary cannot start once this release's migrations are applied
+(see section 4), so recovery here means rolling forward. A binary built from this
+release can finish and reschedule a row whose schedule is already persisted, but
+cannot recreate or safely repair a missing/legacy row. Keep the
 persisted schedules intact, use the documented manual retention command only
 with explicit operational approval, and roll forward promptly. Alert separately
 on each built-in's completion timestamp and state, lateness beyond its expected
@@ -489,8 +497,11 @@ notice rows exist is unsupported; pause mail and forward-fix instead.
 2. Push to the registry; deploy the new image to one instance.
 3. Wait for `readyz` to go green on that instance (migrations applied).
 4. Drain the old instance; promote the new one.
-5. On failure: stop the rollout, redeploy the **previous** image tag, and if the
-   schema is incompatible restore the pre-release backup (see /`docs/backups.md`).
+5. On failure: stop the rollout. If the release added **no** migration,
+   redeploy the **previous** image tag. If it added migrations, the previous
+   image will refuse to start (section 4): roll forward with a fix, or restore
+   the pre-release backup and then run the previous image (see
+   `docs/backups.md`).
 
 ## 6a. Legal pages (privacy / terms / cookies)
 
