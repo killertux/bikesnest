@@ -458,6 +458,22 @@ impl SqlxJobRepository {
         // Not a compile-time-checked `query_as!` (this crate builds without a
         // database; see the module-level note), so branching the SQL text on
         // whether a kind filter was asked for costs nothing extra.
+        //
+        // The two claimable populations are separate branches, each served by
+        // its own partial index: due `pending` rows by `background_job_due`
+        // (walked in `(run_at, id)` order, stopping at the limit) and expired
+        // leases by `background_job_lease_idx`. A single `pending OR running`
+        // filter can only bitmap-OR both indexes and then heap-visit and sort
+        // every pending row, future-scheduled ones included. The clock is read
+        // once through a materialized CTE: a bare `clock_timestamp()` is
+        // volatile, so it can't be an index condition, while a subquery over
+        // it is an init-plan parameter that can. (`now()` would be indexable
+        // but is frozen at transaction start, which the savepoint-scoped test
+        // harness would expose.) Each branch locks at most `$1` rows; the
+        // union is re-ordered and cut to `$1`, so the result is the same
+        // oldest-`run_at`-first batch the single query picked. Rows a branch
+        // locked but didn't keep stay locked only until the claim's
+        // (autocommit) transaction ends.
         let kind_clause = if kinds.is_some() {
             "AND kind = ANY($4)"
         } else {
@@ -465,15 +481,34 @@ impl SqlxJobRepository {
         };
         let sql = format!(
             r#"
-            WITH candidate AS (
-                SELECT id FROM background_job
-                WHERE (state = 'pending'
-                       OR (state = 'running' AND lease_expires_at < clock_timestamp()
-                           AND attempts < max_attempts))
-                  AND run_at <= clock_timestamp()
+            WITH clock AS MATERIALIZED (SELECT clock_timestamp() AS ts),
+            pending AS (
+                SELECT id, run_at FROM background_job
+                WHERE state = 'pending'
+                  AND run_at <= (SELECT ts FROM clock)
                   {kind_clause}
                 ORDER BY run_at, id
                 FOR UPDATE SKIP LOCKED
+                LIMIT $1
+            ),
+            expired AS (
+                SELECT id, run_at FROM background_job
+                WHERE state = 'running'
+                  AND lease_expires_at < (SELECT ts FROM clock)
+                  AND attempts < max_attempts
+                  AND run_at <= (SELECT ts FROM clock)
+                  {kind_clause}
+                ORDER BY run_at, id
+                FOR UPDATE SKIP LOCKED
+                LIMIT $1
+            ),
+            candidate AS (
+                SELECT id FROM (
+                    SELECT id, run_at FROM pending
+                    UNION ALL
+                    SELECT id, run_at FROM expired
+                ) due
+                ORDER BY run_at, id
                 LIMIT $1
             )
             UPDATE background_job j
