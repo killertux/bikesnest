@@ -4,6 +4,7 @@
 //! append a ``moderation`` revision in one transaction.
 
 use crate::Db;
+use crate::community::voting::DECISION_TALLY_SET;
 use async_trait::async_trait;
 use bikesnest_application::{
     ModerationError, ModerationRepository, PhotoKind, Proposal, ProposalApplication,
@@ -45,6 +46,54 @@ struct QueueCountsRow {
 }
 
 impl SqlxModerationRepository {
+    /// Flip a review between `ACTIVE` and `HIDDEN` and recompute its
+    /// location's rating aggregate in the same transaction, with the location
+    /// locked first, exactly as a review upsert does.
+    async fn set_review_state(
+        &self,
+        id: i64,
+        from: &str,
+        to: &str,
+        context: &'static str,
+    ) -> Result<(), ModerationError> {
+        let mut conn = self
+            .db
+            .acquire()
+            .await
+            .map_err(|e| db_err("moderation.acquire", e))?;
+        let mut tx = conn.begin().await.map_err(|e| db_err(context, e))?;
+        let location_id: Option<i64> =
+            sqlx::query_scalar("SELECT location_id FROM review WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| db_err(context, e))?;
+        let Some(location_id) = location_id else {
+            return Err(ModerationError::InvalidState);
+        };
+        crate::community::review::lock_location_for_rating(&mut tx, location_id)
+            .await
+            .map_err(|e| db_err(context, e))?;
+        let res = sqlx::query(
+            "UPDATE review SET moderation_state = $3, updated_at = now()
+             WHERE id = $1 AND moderation_state = $2",
+        )
+        .bind(id)
+        .bind(from)
+        .bind(to)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| db_err(context, e))?;
+        if res.rows_affected() != 1 {
+            return Err(ModerationError::InvalidState);
+        }
+        crate::community::review::recompute_rating(&mut tx, location_id)
+            .await
+            .map_err(|e| db_err(context, e))?;
+        tx.commit().await.map_err(|e| db_err(context, e))?;
+        Ok(())
+    }
+
     /// Runs the dashboard-counts query against any executor — the pool (what
     /// [`ModerationRepository::queue_counts`] uses) or a specific
     /// connection/transaction. Exposed so a test can take a race-free
@@ -303,46 +352,14 @@ impl ModerationRepository for SqlxModerationRepository {
 
     async fn hide_review(&self, id: i64, moderator: UserId) -> Result<(), ModerationError> {
         let _ = moderator;
-        let res = sqlx::query(
-            "UPDATE review SET moderation_state = 'HIDDEN', updated_at = now()
-             WHERE id = $1 AND moderation_state = 'ACTIVE'",
-        )
-        .bind(id)
-        .execute(
-            &mut *self
-                .db
-                .acquire()
-                .await
-                .map_err(|e| db_err("moderation.acquire", e))?,
-        )
-        .await
-        .map_err(|e| db_err("moderation.hide_review", e))?;
-        if res.rows_affected() != 1 {
-            return Err(ModerationError::InvalidState);
-        }
-        Ok(())
+        self.set_review_state(id, "ACTIVE", "HIDDEN", "moderation.hide_review")
+            .await
     }
 
     async fn restore_review(&self, id: i64, moderator: UserId) -> Result<(), ModerationError> {
         let _ = moderator;
-        let res = sqlx::query(
-            "UPDATE review SET moderation_state = 'ACTIVE', updated_at = now()
-             WHERE id = $1 AND moderation_state = 'HIDDEN'",
-        )
-        .bind(id)
-        .execute(
-            &mut *self
-                .db
-                .acquire()
-                .await
-                .map_err(|e| db_err("moderation.acquire", e))?,
-        )
-        .await
-        .map_err(|e| db_err("moderation.restore_review", e))?;
-        if res.rows_affected() != 1 {
-            return Err(ModerationError::InvalidState);
-        }
-        Ok(())
+        self.set_review_state(id, "HIDDEN", "ACTIVE", "moderation.restore_review")
+            .await
     }
 
     async fn hide_photo(
@@ -451,6 +468,10 @@ impl ModerationRepository for SqlxModerationRepository {
             snapshot,
         )
         .await?;
+        // The bump above makes every pending proposal's `base_version` stale,
+        // so none of them could ever be voted on or approved again. Retire
+        // them now, as publishing a proposal does for its siblings.
+        supersede_pending_proposals(&mut tx, row.id, None).await?;
         tx.commit()
             .await
             .map_err(|e| db_err("moderation.set_parking_state", e))?;
@@ -562,10 +583,11 @@ impl ModerationRepository for SqlxModerationRepository {
         reason: &str,
     ) -> Result<(), ModerationError> {
         let res = sqlx::query(
-            r#"UPDATE parking_proposal SET status = 'REJECTED', resolved_by = $2, resolved_at = now(), decision_reason = NULLIF($3, ''),
-              decision_approvals = (SELECT COUNT(*) FROM parking_proposal_vote v JOIN users u ON u.id = v.voter_id WHERE v.proposal_id = parking_proposal.id AND v.vote = 'APPROVE' AND u.account_state = 'ACTIVE' AND u.email_verified_at IS NOT NULL),
-              decision_rejections = (SELECT COUNT(*) FROM parking_proposal_vote v JOIN users u ON u.id = v.voter_id WHERE v.proposal_id = parking_proposal.id AND v.vote = 'REJECT' AND u.account_state = 'ACTIVE' AND u.email_verified_at IS NOT NULL)
-             WHERE id = $1 AND status = 'PENDING'"#,
+            &format!(
+                "UPDATE parking_proposal SET status = 'REJECTED', resolved_by = $2, resolved_at = now(), \
+                 decision_reason = NULLIF($3, ''), {DECISION_TALLY_SET} \
+                 WHERE id = $1 AND status = 'PENDING'"
+            ),
         )
         .bind(id)
         .bind(moderator.0)
@@ -872,36 +894,45 @@ pub(crate) async fn approve_in_transaction(
     };
     insert_revision(tx, location_id, row.version, moderator, summary, snapshot).await?;
 
-    sqlx::query(r#"
-            UPDATE parking_proposal SET status = 'APPROVED', resolved_by = $2, resolved_at = now(),
-              decision_approvals = (SELECT COUNT(*) FROM parking_proposal_vote v JOIN users u ON u.id = v.voter_id WHERE v.proposal_id = parking_proposal.id AND v.vote = 'APPROVE' AND u.account_state = 'ACTIVE' AND u.email_verified_at IS NOT NULL),
-              decision_rejections = (SELECT COUNT(*) FROM parking_proposal_vote v JOIN users u ON u.id = v.voter_id WHERE v.proposal_id = parking_proposal.id AND v.vote = 'REJECT' AND u.account_state = 'ACTIVE' AND u.email_verified_at IS NOT NULL)
-            WHERE id = $1
-        "#)
-            .bind(id)
-            .bind(moderator.0)
-            .execute(&mut **tx)
-            .await
-            .map_err(|e| db_err("moderation.approve_proposal", e))?;
-    // Supersede the other PENDING proposals on this location. The
-    // sub-select takes their row locks in id order, so two transactions
-    // that reach this point on different locations never cross-lock.
-    sqlx::query(
-        r#"
-            UPDATE parking_proposal SET status = 'SUPERSEDED'
-            WHERE id IN (
-                SELECT id FROM parking_proposal
-                WHERE location_id = $1 AND status = 'PENDING' AND id <> $2
-                ORDER BY id
-                FOR UPDATE
-            )
-            "#,
-    )
-    .bind(location_id)
+    sqlx::query(&format!(
+        "UPDATE parking_proposal SET status = 'APPROVED', resolved_by = $2, resolved_at = now(), \
+         {DECISION_TALLY_SET} WHERE id = $1"
+    ))
     .bind(id)
+    .bind(moderator.0)
     .execute(&mut **tx)
     .await
     .map_err(|e| db_err("moderation.approve_proposal", e))?;
+    supersede_pending_proposals(tx, location_id, Some(id)).await?;
 
+    Ok(())
+}
+
+/// Mark a location's other `PENDING` proposals `SUPERSEDED`, sparing `except`.
+/// The caller must already hold the location row lock. The sub-select takes
+/// the proposals' row locks in id order, so two transactions that reach this
+/// point on different locations never cross-lock.
+async fn supersede_pending_proposals(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    location_id: i64,
+    except: Option<i64>,
+) -> Result<(), ModerationError> {
+    sqlx::query(
+        r#"
+        UPDATE parking_proposal SET status = 'SUPERSEDED'
+        WHERE id IN (
+            SELECT id FROM parking_proposal
+            WHERE location_id = $1 AND status = 'PENDING'
+              AND ($2::bigint IS NULL OR id <> $2::bigint)
+            ORDER BY id
+            FOR UPDATE
+        )
+        "#,
+    )
+    .bind(location_id)
+    .bind(except)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| db_err("moderation.supersede_pending_proposals", e))?;
     Ok(())
 }

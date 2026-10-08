@@ -4,6 +4,11 @@
 //! transaction: one `INSERT … ON CONFLICT DO UPDATE` for the row, append a
 //! `review_revision` holding the values just published, and recompute the
 //! location rating aggregate from `ACTIVE` reviews.
+//!
+//! Every write that changes which reviews are `ACTIVE` (an upsert, a moderator
+//! hiding or restoring one) locks the location row first and then calls
+//! [`recompute_rating`], so concurrent writers on one location queue up and
+//! the last to commit always aggregates every review committed before it.
 
 use crate::Db;
 use async_trait::async_trait;
@@ -38,6 +43,13 @@ impl ReviewRepository for SqlxReviewRepository {
             .begin()
             .await
             .map_err(|e| db_err("review.upsert_review", e))?;
+
+        // Location first, then the author: the same order `create_proposal`
+        // uses, so a review and a proposal by one user never deadlock.
+        lock_location_for_rating(&mut tx, location_id)
+            .await
+            .map_err(|e| db_err("review.lock_location", e))?
+            .ok_or(ContributionError::NotFound)?;
 
         let public_author: bool = sqlx::query_scalar(
             "SELECT public_contribution_name FROM users WHERE id = $1 FOR UPDATE",
@@ -87,24 +99,9 @@ impl ReviewRepository for SqlxReviewRepository {
             .map_err(|e| db_err("review.upsert_review", e))?;
 
         // Recompute the denormalized aggregate in the same transaction (no drift).
-        sqlx::query(
-            r#"
-            UPDATE parking_location
-            SET rating_avg = (
-                    SELECT AVG(rating)::numeric(3,2) FROM review
-                    WHERE location_id = $1 AND moderation_state = 'ACTIVE'
-                ),
-                rating_count = (
-                    SELECT COUNT(*)::integer FROM review
-                    WHERE location_id = $1 AND moderation_state = 'ACTIVE'
-                )
-            WHERE id = $1
-            "#,
-        )
-        .bind(location_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| db_err("review.upsert_review", e))?;
+        recompute_rating(&mut tx, location_id)
+            .await
+            .map_err(|e| db_err("review.upsert_review", e))?;
 
         tx.commit()
             .await
@@ -184,6 +181,49 @@ impl ReviewRepository for SqlxReviewRepository {
         .map_err(|e| db_err("review.list_active", e))?;
         rows.into_iter().map(review_from_row).collect()
     }
+}
+
+/// Lock a location row before changing which of its reviews are `ACTIVE`.
+///
+/// Without it, two transactions reviewing one location under READ COMMITTED
+/// each aggregate from a snapshot taken before the other committed, and the
+/// later commit leaves a stale `rating_count`/`rating_avg`. Returns `None` if
+/// the location does not exist.
+pub(crate) async fn lock_location_for_rating(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    location_id: i64,
+) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar("SELECT id FROM parking_location WHERE id = $1 FOR UPDATE")
+        .bind(location_id)
+        .fetch_optional(&mut **tx)
+        .await
+}
+
+/// Recompute `parking_location.rating_avg`/`rating_count` from the location's
+/// `ACTIVE` reviews. Call it inside the transaction that changed a review,
+/// after [`lock_location_for_rating`].
+pub(crate) async fn recompute_rating(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    location_id: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE parking_location
+        SET rating_avg = (
+                SELECT AVG(rating)::numeric(3,2) FROM review
+                WHERE location_id = $1 AND moderation_state = 'ACTIVE'
+            ),
+            rating_count = (
+                SELECT COUNT(*)::integer FROM review
+                WHERE location_id = $1 AND moderation_state = 'ACTIVE'
+            )
+        WHERE id = $1
+        "#,
+    )
+    .bind(location_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 #[derive(sqlx::FromRow)]

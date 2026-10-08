@@ -720,3 +720,170 @@ fn sixth_vote_and_voter_suspension_have_a_consistent_eligibility_boundary() {
         );
     });
 }
+
+#[db_test]
+async fn community_approved_proposal_that_cannot_merge_is_escalated_to_moderators(tx: &mut TestTx) {
+    let db = tx.db().await;
+    let proposer = eligible(&db, "escalate-author").await;
+    let mut conn = db.acquire().await.unwrap();
+    let location = ParkingBuilder::new()
+        .with_name("Escalate")
+        .create(&mut conn)
+        .await
+        .unwrap();
+    // A stored payload that no longer reads as a change: submission validates
+    // payloads, so only a row written by another version can look like this.
+    let proposal: i64 = sqlx::query_scalar(
+        "INSERT INTO parking_proposal (location_id, proposer_id, base_version, kind, proposed)
+         VALUES ($1, $2, 1, 'edit_details', '{\"unexpected\":true}') RETURNING id",
+    )
+    .bind(location.id())
+    .bind(proposer.0)
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    drop(conn);
+
+    let repo = SqlxParkingContributionRepository::new(db.clone());
+    let threshold = bikesnest_domain::COMMUNITY_APPROVALS_TO_PUBLISH;
+    let mut last = None;
+    for index in 0..threshold {
+        let voter = eligible(&db, &format!("escalate-voter-{index}")).await;
+        last = Some(
+            repo.vote_on_proposal(proposal, voter, ProposalVote::Approve)
+                .await
+                .expect("a vote on an unmergeable proposal still records"),
+        );
+    }
+    let last = last.unwrap();
+    assert_eq!(last.approvals, threshold);
+    assert!(
+        !last.published,
+        "nothing can be published from this payload"
+    );
+
+    let escalated = async || -> (String, Option<chrono::DateTime<chrono::Utc>>, i64) {
+        sqlx::query_as(
+            "SELECT p.status, p.escalated_at, l.version
+             FROM parking_proposal p JOIN parking_location l ON l.id = p.location_id
+             WHERE p.id = $1",
+        )
+        .bind(proposal)
+        .fetch_one(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap()
+    };
+    let (status, first_escalation, version) = escalated().await;
+    assert_eq!(status, "PENDING", "the proposal waits for a moderator");
+    assert!(
+        first_escalation.is_some(),
+        "the proposal is flagged for review"
+    );
+    assert_eq!(version, 1, "the listing is unchanged");
+    assert!(
+        SqlxModerationRepository::new(db.clone())
+            .list_pending_proposals(None, 200)
+            .await
+            .unwrap()
+            .iter()
+            .any(|p| p.id == proposal),
+        "the escalated proposal is in the moderation queue"
+    );
+
+    // Later votes do not retry the merge or move the escalation time.
+    let late = eligible(&db, "escalate-voter-late").await;
+    let totals = repo
+        .vote_on_proposal(proposal, late, ProposalVote::Approve)
+        .await
+        .unwrap();
+    assert_eq!(totals.approvals, threshold + 1);
+    assert!(!totals.published);
+    assert_eq!(escalated().await.1, first_escalation);
+}
+
+#[db_test]
+async fn every_vote_tally_counts_the_same_eligible_voters(tx: &mut TestTx) {
+    let db = tx.db().await;
+    let proposer = eligible(&db, "tally-author").await;
+    let moderator = eligible(&db, "tally-moderator").await;
+    let mut conn = db.acquire().await.unwrap();
+    let location = ParkingBuilder::new()
+        .with_name("Tally")
+        .create(&mut conn)
+        .await
+        .unwrap();
+    drop(conn);
+    let repo = SqlxParkingContributionRepository::new(db.clone());
+    let proposal = repo
+        .create_proposal(&NewProposal {
+            location_id: location.id(),
+            proposer_id: proposer,
+            base_version: 1,
+            kind: ProposalKind::EditDetails,
+            proposed: ParkingEdit::from_location(&location).to_json(),
+        })
+        .await
+        .unwrap();
+    let mut voters = Vec::new();
+    for (index, vote) in [
+        ProposalVote::Approve,
+        ProposalVote::Approve,
+        ProposalVote::Approve,
+        ProposalVote::Reject,
+        ProposalVote::Reject,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let voter = eligible(&db, &format!("tally-voter-{index}")).await;
+        repo.vote_on_proposal(proposal, voter, vote).await.unwrap();
+        voters.push(voter);
+    }
+    // One approver is suspended and one rejecter loses verification: neither
+    // counts any more, in any tally.
+    let mut conn = db.acquire().await.unwrap();
+    sqlx::query("UPDATE users SET account_state='SUSPENDED' WHERE id=$1")
+        .bind(voters[0].0)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET email_verified_at=NULL WHERE id=$1")
+        .bind(voters[3].0)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    drop(conn);
+
+    let voting = repo
+        .vote_on_proposal(
+            proposal,
+            eligible(&db, "tally-voter-last").await,
+            ProposalVote::Reject,
+        )
+        .await
+        .unwrap();
+    assert_eq!((voting.approvals, voting.rejections), (2, 2));
+
+    let listed = repo.listing_proposals(location.id(), 10).await.unwrap();
+    let listed = listed.iter().find(|p| p.id == proposal).unwrap();
+    assert_eq!((listed.approvals, listed.rejections), (2, 2));
+    let (page, _, _) = repo
+        .listing_proposals_page(location.id(), None, 10)
+        .await
+        .unwrap();
+    let paged = page.iter().find(|p| p.id == proposal).unwrap();
+    assert_eq!((paged.approvals, paged.rejections), (2, 2));
+
+    SqlxModerationRepository::new(db.clone())
+        .reject_proposal(proposal, moderator, "not needed")
+        .await
+        .unwrap();
+    let decided: (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT decision_approvals, decision_rejections FROM parking_proposal WHERE id=$1",
+    )
+    .bind(proposal)
+    .fetch_one(&mut *db.acquire().await.unwrap())
+    .await
+    .unwrap();
+    assert_eq!(decided, (Some(2), Some(2)));
+}

@@ -19,7 +19,7 @@ use bikesnest_infrastructure::{
     SqlxContributionHistoryReader, SqlxFavoriteRepository, SqlxParkingContributionRepository,
     SqlxReviewPhotosReader, SqlxReviewRepository, SqlxVerificationRepository,
 };
-use bikesnest_test_support::{UserBuilder, db_test};
+use bikesnest_test_support::{ParkingBuilder, UserBuilder, db_test, run_isolated_database_test};
 
 async fn fresh_user(db: &bikesnest_infrastructure::Db, email: &str) -> UserId {
     let mut conn = db.acquire().await.unwrap();
@@ -942,4 +942,107 @@ async fn history_reads_contributions_across_sources(tx: &mut bikesnest_test_supp
     assert!(kinds.contains(&"added"));
     assert!(kinds.contains(&"favorited"));
     assert!(items.len() >= 2);
+}
+
+#[db_test]
+async fn review_on_a_missing_location_is_not_found(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
+    let user = fresh_user(&db, "c-review-missing@test.dev").await;
+    let reviews = SqlxReviewRepository::new(db.clone());
+    let result = reviews
+        .upsert_review(
+            i64::MAX,
+            user,
+            StarRating::new(4).unwrap(),
+            &ReviewBody::new("nowhere").unwrap(),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(ContributionError::NotFound)),
+        "{result:?}"
+    );
+}
+
+/// Two first reviews of one location committed at the same moment: under READ
+/// COMMITTED each transaction's aggregate used to see only its own review, so
+/// the later commit left `rating_count = 1`. The location lock taken before
+/// the upsert makes the second writer aggregate after the first commits.
+#[test]
+fn concurrent_reviews_on_one_location_keep_the_rating_aggregate_exact() {
+    run_isolated_database_test(|pool: sqlx::PgPool| async move {
+        let db = bikesnest_infrastructure::Db::from_pool(pool.clone());
+        let first = fresh_user(&db, "c-review-race-1@test.dev").await;
+        let second = fresh_user(&db, "c-review-race-2@test.dev").await;
+        let location = ParkingBuilder::new()
+            .with_name("Review race")
+            .create(&mut db.acquire().await.unwrap())
+            .await
+            .unwrap()
+            .id();
+
+        // `NO KEY UPDATE` lets the review inserts reference the row, so
+        // without the location lock both writers would get as far as the
+        // aggregate UPDATE and race there; with it, both queue up front.
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM parking_location WHERE id = $1 FOR NO KEY UPDATE")
+            .bind(location)
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let (a, b) = (
+            SqlxReviewRepository::new(db.clone()),
+            SqlxReviewRepository::new(db.clone()),
+        );
+        let (great, meh) = (
+            ReviewBody::new("great").unwrap(),
+            ReviewBody::new("meh").unwrap(),
+        );
+        let mut writes = Box::pin(async move {
+            tokio::join!(
+                a.upsert_review(location, first, StarRating::new(5).unwrap(), &great,),
+                b.upsert_review(location, second, StarRating::new(2).unwrap(), &meh,),
+            )
+        });
+        let waited = tokio::select! {
+            _ = wait_for_lockers(&pool, 2) => true,
+            _ = &mut writes => false,
+        };
+        blocker.rollback().await.unwrap();
+        assert!(waited, "both review writers must reach the location lock");
+        let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(10), writes)
+            .await
+            .expect("both reviews commit after the lock is released");
+        a.unwrap();
+        b.unwrap();
+
+        let (avg, count): (Option<f64>, i32) = sqlx::query_as(
+            "SELECT rating_avg::float8, rating_count FROM parking_location WHERE id = $1",
+        )
+        .bind(location)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 2, "both concurrent reviews are counted");
+        assert!((avg.unwrap() - 3.5).abs() < 0.001, "avg = {avg:?}");
+    });
+}
+
+async fn wait_for_lockers(pool: &sqlx::PgPool, expected: i64) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if waiting >= expected {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("all competing operations must reach real database locks");
 }

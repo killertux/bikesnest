@@ -9,7 +9,7 @@ use bikesnest_domain::{PhotoDimensions, PhotoLimits, UserId};
 use bikesnest_infrastructure::{
     Db, LocalImageProcessor, SqlxParkingPhotoReader, SqlxPhotoRepository,
 };
-use bikesnest_test_support::{ParkingBuilder, UserBuilder, db_test};
+use bikesnest_test_support::{ParkingBuilder, UserBuilder, db_test, run_isolated_database_test};
 use sqlx::Row;
 
 // ---------------------------------------------------------------------------
@@ -340,10 +340,25 @@ async fn repo_approve_sets_position_and_reviewer(tx: &mut bikesnest_test_support
         .await
         .unwrap();
 
-    let moderator = fx.moderator_id;
-    repo.approve(PhotoKind::Parking, id, moderator, 5)
+    let earlier = repo
+        .insert_pending(&new_pending(&fx, "approve-earlier"))
         .await
         .unwrap();
+    let moderator = fx.moderator_id;
+    assert_eq!(
+        repo.approve(PhotoKind::Parking, earlier, moderator)
+            .await
+            .unwrap(),
+        1,
+        "the first approved photo opens the gallery"
+    );
+    assert_eq!(
+        repo.approve(PhotoKind::Parking, id, moderator)
+            .await
+            .unwrap(),
+        2,
+        "the next approval goes to the end of the gallery"
+    );
 
     let row = sqlx::query(
         "SELECT moderation_state, position, reviewed_by FROM parking_photo WHERE id = $1",
@@ -353,12 +368,12 @@ async fn repo_approve_sets_position_and_reviewer(tx: &mut bikesnest_test_support
     .await
     .unwrap();
     assert_eq!(row.get::<String, _>("moderation_state"), "APPROVED");
-    assert_eq!(row.get::<i32, _>("position"), 5);
+    assert_eq!(row.get::<i32, _>("position"), 2);
     assert_eq!(row.get::<Option<i64>, _>("reviewed_by"), Some(moderator.0));
 
     // Approving a non-pending photo again → NotPending.
     assert!(matches!(
-        repo.approve(PhotoKind::Parking, id, moderator, 6).await,
+        repo.approve(PhotoKind::Parking, id, moderator).await,
         Err(PhotoError::NotPending)
     ));
 }
@@ -400,17 +415,11 @@ async fn repo_reject_records_reason_and_returns_keys(tx: &mut bikesnest_test_sup
 }
 
 #[db_test]
-async fn repo_max_position_and_queue_ordering(tx: &mut bikesnest_test_support::TestTx) {
+async fn repo_queue_ordering(tx: &mut bikesnest_test_support::TestTx) {
     let db = tx.db().await;
     let fx = fresh_fixture(&db, "photo-order@example.com").await;
     let repo = SqlxPhotoRepository::new(db.clone());
 
-    assert_eq!(
-        repo.max_position(PhotoTarget::Parking(fx.location_id))
-            .await
-            .unwrap(),
-        0
-    );
     let first = repo
         .insert_pending(&new_pending(&fx, "order-1"))
         .await
@@ -419,13 +428,6 @@ async fn repo_max_position_and_queue_ordering(tx: &mut bikesnest_test_support::T
         .insert_pending(&new_pending(&fx, "order-2"))
         .await
         .unwrap();
-    // max_position counts APPROVED + all photos (position default 0 here).
-    assert_eq!(
-        repo.max_position(PhotoTarget::Parking(fx.location_id))
-            .await
-            .unwrap(),
-        0
-    );
 
     // Both scoped fixture photos appear oldest first relative to each other.
     // Unrelated committed baseline rows may exist; concurrent scoped fixtures
@@ -448,7 +450,7 @@ async fn reader_returns_thumbnail_key_for_processed_photo(tx: &mut bikesnest_tes
         .await
         .unwrap();
     // Approve so the gallery reader returns it.
-    repo.approve(PhotoKind::Parking, id, fx.moderator_id, 1)
+    repo.approve(PhotoKind::Parking, id, fx.moderator_id)
         .await
         .unwrap();
 
@@ -460,4 +462,84 @@ async fn reader_returns_thumbnail_key_for_processed_photo(tx: &mut bikesnest_tes
         .expect("photo");
     assert_eq!(p.key, "uploads/thumb/full.jpg");
     assert_eq!(p.thumbnail_key.as_deref(), Some("uploads/thumb/thumb.jpg"));
+}
+
+/// Two moderators approving two photos of one location at the same moment
+/// must not both read the same "last position": the position is assigned
+/// inside the approve transaction while the location row is locked.
+#[test]
+fn concurrent_approvals_for_one_location_get_distinct_positions() {
+    run_isolated_database_test(|pool: sqlx::PgPool| async move {
+        let db = Db::from_pool(pool.clone());
+        let fx = fresh_fixture(&db, "photo-race@example.com").await;
+        let repo = SqlxPhotoRepository::new(db.clone());
+        let first = repo
+            .insert_pending(&new_pending(&fx, "race-1"))
+            .await
+            .unwrap();
+        let second = repo
+            .insert_pending(&new_pending(&fx, "race-2"))
+            .await
+            .unwrap();
+
+        // Hold the location so both approvals start and queue on it.
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM parking_location WHERE id = $1 FOR NO KEY UPDATE")
+            .bind(fx.location_id)
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let (a, b) = (
+            SqlxPhotoRepository::new(db.clone()),
+            SqlxPhotoRepository::new(db.clone()),
+        );
+        let moderator = fx.moderator_id;
+        let mut approvals = Box::pin(async move {
+            tokio::join!(
+                a.approve(PhotoKind::Parking, first, moderator),
+                b.approve(PhotoKind::Parking, second, moderator),
+            )
+        });
+        let waited = tokio::select! {
+            _ = wait_for_lockers(&pool, 2) => true,
+            _ = &mut approvals => false,
+        };
+        blocker.rollback().await.unwrap();
+        assert!(waited, "both approvals must wait on the location lock");
+        let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(10), approvals)
+            .await
+            .expect("both approvals finish after the lock is released");
+        let mut positions = vec![a.unwrap(), b.unwrap()];
+        positions.sort_unstable();
+        assert_eq!(positions, vec![1, 2]);
+
+        let stored: Vec<i32> = sqlx::query_scalar(
+            "SELECT position FROM parking_photo WHERE location_id = $1 ORDER BY position",
+        )
+        .bind(fx.location_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, vec![1, 2]);
+    });
+}
+
+async fn wait_for_lockers(pool: &sqlx::PgPool, expected: i64) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if waiting >= expected {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("all competing operations must reach real database locks");
 }

@@ -6,7 +6,7 @@ use crate::Db;
 use async_trait::async_trait;
 use bikesnest_application::{
     NewPendingPhoto, PendingPhoto, PhotoError, PhotoForModeration, PhotoKind, PhotoRepository,
-    PhotoTarget, RejectedPhoto,
+    RejectedPhoto,
 };
 use bikesnest_domain::{PhotoModerationState, UserId};
 use sqlx::FromRow;
@@ -119,23 +119,6 @@ impl PhotoRepository for SqlxPhotoRepository {
         Ok(id)
     }
 
-    async fn max_position(&self, target: PhotoTarget) -> Result<i32, PhotoError> {
-        let mut conn = self
-            .db
-            .acquire()
-            .await
-            .map_err(|e| db_err("photo.max_position", e))?;
-        let (table, parent_col) = (target.kind().table(), parent_col(target.kind()));
-        let row = sqlx::query_as::<_, (Option<i32>,)>(&format!(
-            "SELECT COALESCE(MAX(position), 0) AS position FROM {table} WHERE {parent_col} = $1"
-        ))
-        .bind(target.parent_id())
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(|e| db_err("photo.max_position", e))?;
-        Ok(row.0.unwrap_or(0))
-    }
-
     async fn delete(&self, kind: PhotoKind, id: i64) -> Result<(), PhotoError> {
         let mut conn = self
             .db
@@ -155,28 +138,55 @@ impl PhotoRepository for SqlxPhotoRepository {
         kind: PhotoKind,
         id: i64,
         moderator: UserId,
-        position: i32,
-    ) -> Result<(), PhotoError> {
+    ) -> Result<i32, PhotoError> {
+        let (table, parent_col) = (kind.table(), parent_col(kind));
+        let parent_table = match kind {
+            PhotoKind::Parking => "parking_location",
+            PhotoKind::Review => "review",
+        };
         let mut conn = self
             .db
             .acquire()
             .await
             .map_err(|e| db_err("photo.approve", e))?;
-        let rows = sqlx::query(&format!(
-            "UPDATE {} SET moderation_state = 'APPROVED', position = $3, reviewed_by = $2, reviewed_at = now() \
-             WHERE id = $1 AND moderation_state = 'PENDING_REVIEW'",
-            kind.table()
+        let mut tx = conn.begin().await.map_err(|e| db_err("photo.approve", e))?;
+        let parent_id: Option<i64> =
+            sqlx::query_scalar(&format!("SELECT {parent_col} FROM {table} WHERE id = $1"))
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| db_err("photo.approve", e))?;
+        let Some(parent_id) = parent_id else {
+            return Err(PhotoError::NotPending);
+        };
+        // Serialize approvals per target: the gallery's next position is read
+        // and written while this lock is held, so two moderators approving
+        // photos of one target at once get distinct positions. `NO KEY
+        // UPDATE` still lets uploads and reviews reference the row meanwhile.
+        sqlx::query(&format!(
+            "SELECT 1 FROM {parent_table} WHERE id = $1 FOR NO KEY UPDATE"
+        ))
+        .bind(parent_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| db_err("photo.approve", e))?;
+        let position: Option<i32> = sqlx::query_scalar(&format!(
+            "UPDATE {table} SET moderation_state = 'APPROVED', reviewed_by = $2, reviewed_at = now(), \
+                 position = (SELECT COALESCE(MAX(position), 0) + 1 FROM {table} WHERE {parent_col} = $3) \
+             WHERE id = $1 AND moderation_state = 'PENDING_REVIEW' \
+             RETURNING position"
         ))
         .bind(id)
         .bind(moderator.0)
-        .bind(position)
-        .execute(&mut *conn)
+        .bind(parent_id)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| db_err("photo.approve", e))?;
-        if rows.rows_affected() != 1 {
+        let Some(position) = position else {
             return Err(PhotoError::NotPending);
-        }
-        Ok(())
+        };
+        tx.commit().await.map_err(|e| db_err("photo.approve", e))?;
+        Ok(position)
     }
 
     async fn reject(

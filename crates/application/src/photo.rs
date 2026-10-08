@@ -5,11 +5,9 @@
 //! verified-email gate, rate limiting, and the upload validation rules
 //! and the moderation lifecycle all live here.
 //!
-//! M5 generalizes the service over [`PhotoTarget`] so a single queue serves
-//! both location photos (`PhotoTarget::Parking`) and review photos
-//! (`PhotoTarget::Review`). The `ImageProcessor` / domain constants /
-//! derivative policy are unchanged; only the repository dispatch and the target
-//! type changed as moderation behavior evolved.
+//! The service is generic over [`PhotoTarget`], so a single queue serves both
+//! location photos (`PhotoTarget::Parking`) and review photos
+//! (`PhotoTarget::Review`).
 
 use crate::audit::{AuditEvent, AuditLog};
 use crate::auth::Clock;
@@ -172,7 +170,7 @@ pub struct NewPendingPhoto {
     pub processed_at: DateTime<Utc>,
 }
 
-/// A photo in the moderator queue (M2 screen), oldest first, across both photo
+/// A photo in the moderator queue, oldest first, across both photo
 /// kinds. `uploader_id` is never rendered publicly — the queue only ever shows
 /// "Contributor #id".
 #[derive(Debug, Clone)]
@@ -240,18 +238,15 @@ pub trait PhotoRepository: Send + Sync {
     /// and dimensions, and return its id. The objects are already in storage by
     /// the time this is called.
     async fn insert_pending(&self, p: &NewPendingPhoto) -> Result<i64, PhotoError>;
-    /// Highest `position` currently used by a target's photos.
-    async fn max_position(&self, target: PhotoTarget) -> Result<i32, PhotoError>;
     /// Remove a photo row (compensation for a failed storage write).
     async fn delete(&self, kind: PhotoKind, id: i64) -> Result<(), PhotoError>;
-    /// Flip to `APPROVED` and set `position`/reviewer columns (one transaction).
-    async fn approve(
-        &self,
-        kind: PhotoKind,
-        id: i64,
-        moderator: UserId,
-        position: i32,
-    ) -> Result<(), PhotoError>;
+    /// Flip a pending photo to `APPROVED`, place it at the end of its target's
+    /// gallery and set the reviewer columns, all in one transaction that holds
+    /// a lock on the target, so concurrent approvals for one target never
+    /// share a position. Returns the assigned position; `NotPending` if the
+    /// photo is no longer pending.
+    async fn approve(&self, kind: PhotoKind, id: i64, moderator: UserId)
+    -> Result<i32, PhotoError>;
     /// Flip to `REJECTED`, record the reason + reviewer, and return the keys to
     /// delete (one transaction).
     async fn reject(
@@ -511,16 +506,7 @@ impl PhotoService {
                 return Err(PhotoError::NotPending);
             }
         }
-        let position = self
-            .deps
-            .repository
-            .max_position(PhotoTarget::for_kind(kind, photo.parent_id))
-            .await?
-            + 1;
-        self.deps
-            .repository
-            .approve(kind, id, moderator.id, position)
-            .await?;
+        let position = self.deps.repository.approve(kind, id, moderator.id).await?;
         self.audit(
             Some(moderator.id),
             "photo.approved",
@@ -564,8 +550,8 @@ impl PhotoService {
             .repository
             .reject(kind, id, moderator.id, reason)
             .await?;
-        // Best-effort deletes (a missing object is not an error) during M4 a
-        // rejected photo's bytes are gone; leftover in-flight objects are M6.
+        // Best-effort deletes (a missing object is not an error): a rejected
+        // photo's bytes go now; leftover in-flight objects are swept later.
         let _ = self.deps.storage.delete(&rejected.storage_key).await;
         if let Some(thumb) = &rejected.thumbnail_key {
             let _ = self.deps.storage.delete(thumb).await;

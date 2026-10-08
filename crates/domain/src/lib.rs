@@ -21,9 +21,10 @@ pub use auth::{
     Role, SessionId, User, VerificationToken,
 };
 pub use community::{
-    AttributeResult, ChangeKind, Confidence, ExistenceResult, ExistenceSignal, ProposalKind,
-    ProposalPayload, ProposalStatus, ProposedChange, ReviewBody, RevisionSummary, StarRating,
-    VerificationKind, confidence, is_known_attribute_code,
+    AttributeResult, COMMUNITY_APPROVALS_TO_PUBLISH, ChangeKind, Confidence, ExistenceResult,
+    ExistenceSignal, ProposalKind, ProposalPayload, ProposalStatus, ProposedChange, ReviewBody,
+    RevisionSummary, StarRating, VerificationKind, confidence, is_known_attribute_code,
+    should_publish,
 };
 pub use freshness::{DEFAULT_THRESHOLDS, FreshnessCategory, FreshnessThresholds, categorize};
 pub use hours::{OpenStatus, OpeningHours, TimeRange, hms};
