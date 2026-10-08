@@ -8,9 +8,7 @@
 use crate::Db;
 use crate::privacy::SqlxAnonymizationRepository;
 use async_trait::async_trait;
-use bikesnest_application::{
-    AnonymizationRepository, ObjectStorage, PrivacyError, RetentionRepository, StorageError,
-};
+use bikesnest_application::{ObjectStorage, PrivacyError, RetentionRepository, StorageError};
 use bikesnest_domain::{RetentionPolicy, UserId};
 use chrono::{DateTime, Duration, Utc};
 use std::collections::HashSet;
@@ -123,13 +121,32 @@ impl RetentionRepository for SqlxRetentionRepository {
             .await
             .map_err(|e| db_err("retention.purge_expired_sessions", e))?;
         let idle_cutoff = now - self.policy.session_idle;
-        let res = sqlx::query("DELETE FROM sessions WHERE expires_at < $1 OR last_seen_at < $2")
-            .bind(now)
-            .bind(idle_cutoff)
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| db_err("retention.purge_expired_sessions", e))?;
-        Ok(res.rows_affected())
+        // Fold each purged session's `last_seen_at` into the account's durable
+        // `last_active_at` in the same statement. Inactive-account
+        // anonymization runs later in this job and must not mistake "session
+        // cleaned up" for "never active".
+        let purged: i64 = sqlx::query_scalar(
+            r#"
+            WITH purged AS (
+                DELETE FROM sessions WHERE expires_at < $1 OR last_seen_at < $2
+                RETURNING user_id, last_seen_at
+            ), latest AS (
+                SELECT user_id, max(last_seen_at) AS seen FROM purged GROUP BY user_id
+            ), touched AS (
+                UPDATE users u SET last_active_at = latest.seen
+                FROM latest
+                WHERE u.id = latest.user_id AND u.last_active_at < latest.seen
+                RETURNING 1
+            )
+            SELECT count(*) FROM purged
+            "#,
+        )
+        .bind(now)
+        .bind(idle_cutoff)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| db_err("retention.purge_expired_sessions", e))?;
+        Ok(purged as u64)
     }
 
     async fn purge_expired_parked_here(&self, now: DateTime<Utc>) -> Result<u64, PrivacyError> {
@@ -268,15 +285,22 @@ impl RetentionRepository for SqlxRetentionRepository {
             .acquire()
             .await
             .map_err(|e| db_err("retention.anonymize_inactive_accounts", e))?;
-        let candidates: Vec<i64> = sqlx::query_as::<_, IdRow>(r#"
+        // `last_active_at` is durable: it survives the session purge that ran
+        // earlier in this job. A live session newer than the cutoff also keeps
+        // the account, in case its trigger write was skipped.
+        let candidates: Vec<i64> = sqlx::query_as::<_, IdRow>(
+            r#"
             SELECT u.id FROM users u
             WHERE u.account_state <> 'DELETED'
               AND NOT EXISTS (SELECT 1 FROM user_roles r WHERE r.user_id = u.id AND r.role = 'ADMIN')
-              AND COALESCE(
-                    (SELECT max(s.last_seen_at) FROM sessions s WHERE s.user_id = u.id),
-                    u.created_at
-                  ) < $1
-            "#).bind(cutoff)
+              AND u.last_active_at < $1
+              AND NOT EXISTS (
+                    SELECT 1 FROM sessions s
+                    WHERE s.user_id = u.id AND s.last_seen_at >= $1
+              )
+            "#,
+        )
+        .bind(cutoff)
         .fetch_all(&mut *conn)
         .await
         .map_err(|e| db_err("retention.anonymize_inactive_accounts", e))?
@@ -285,11 +309,18 @@ impl RetentionRepository for SqlxRetentionRepository {
         .collect();
         drop(conn);
 
+        // Each account is re-checked under its row lock: one that became
+        // active after the list above was read is skipped, not erased.
         let anonymizer = SqlxAnonymizationRepository::new(self.db.clone());
         let mut count = 0u64;
         for id in candidates {
-            let _ = anonymizer.anonymize(UserId(id), Utc::now()).await?;
-            count += 1;
+            if anonymizer
+                .anonymize_if_inactive(UserId(id), cutoff, Utc::now())
+                .await?
+                .is_some()
+            {
+                count += 1;
+            }
         }
         Ok(count)
     }

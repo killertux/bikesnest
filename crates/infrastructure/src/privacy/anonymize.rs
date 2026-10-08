@@ -72,6 +72,34 @@ impl AnonymizationRepository for SqlxAnonymizationRepository {
         user_id: UserId,
         now: DateTime<Utc>,
     ) -> Result<AnonymizationReport, PrivacyError> {
+        self.anonymize_guarded(user_id, now, None)
+            .await?
+            .ok_or(PrivacyError::Internal)
+    }
+}
+
+impl SqlxAnonymizationRepository {
+    /// Retention's variant of [`AnonymizationRepository::anonymize`]: erase
+    /// the account only if it is *still* inactive since `inactive_before` once
+    /// its `users` row is locked. The retention job reads its candidate list
+    /// up front, so an account that signed in after that read must be skipped
+    /// rather than erased. Returns `None` when the account was skipped.
+    pub async fn anonymize_if_inactive(
+        &self,
+        user_id: UserId,
+        inactive_before: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<Option<AnonymizationReport>, PrivacyError> {
+        self.anonymize_guarded(user_id, now, Some(inactive_before))
+            .await
+    }
+
+    async fn anonymize_guarded(
+        &self,
+        user_id: UserId,
+        now: DateTime<Utc>,
+        inactive_before: Option<DateTime<Utc>>,
+    ) -> Result<Option<AnonymizationReport>, PrivacyError> {
         let mut conn = self
             .db
             .acquire()
@@ -81,6 +109,35 @@ impl AnonymizationRepository for SqlxAnonymizationRepository {
             .begin()
             .await
             .map_err(|e| db_err("anonymize.anonymize", e))?;
+
+        // Re-check inactivity under the row lock. A login or session refresh
+        // advances `last_active_at` through a trigger that has to update this
+        // same row, so once the lock is held the answer cannot change under
+        // us. A live session seen after `inactive_before` also counts, in case
+        // its trigger write was skipped while the row was busy.
+        if let Some(cutoff) = inactive_before {
+            let still_inactive = sqlx::query_scalar::<_, i64>(
+                r#"
+                SELECT u.id FROM users u
+                WHERE u.id = $1
+                  AND u.account_state <> 'DELETED'
+                  AND u.last_active_at < $2
+                  AND NOT EXISTS (
+                        SELECT 1 FROM sessions s
+                        WHERE s.user_id = u.id AND s.last_seen_at >= $2
+                  )
+                FOR UPDATE OF u
+                "#,
+            )
+            .bind(user_id.0)
+            .bind(cutoff)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| db_err("anonymize.recheck_inactive", e))?;
+            if still_inactive.is_none() {
+                return Ok(None);
+            }
+        }
 
         // The last-admin guard runs here, holding a row lock, rather than as a
         // separate query before the transaction: otherwise two simultaneous
@@ -344,7 +401,7 @@ impl AnonymizationRepository for SqlxAnonymizationRepository {
             .await
             .map_err(|e| db_err("anonymize.anonymize", e))?;
 
-        Ok(AnonymizationReport {
+        Ok(Some(AnonymizationReport {
             identities,
             roles,
             roles_granted_by_anonymized,
@@ -368,7 +425,7 @@ impl AnonymizationRepository for SqlxAnonymizationRepository {
             audit_events_anonymized,
             audit_targets_anonymized,
             privacy_requests_anonymized,
-        })
+        }))
     }
 }
 

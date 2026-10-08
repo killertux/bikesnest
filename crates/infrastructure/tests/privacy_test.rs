@@ -1580,3 +1580,236 @@ fn revoke_role_guarded_refuses_the_sole_admin_in_sql() {
         assert_eq!(admins_left, 1, "the system is never left without an admin");
     });
 }
+
+// ---------------------------------------------------------------------------
+// Inactive-account anonymization uses the durable `users.last_active_at`.
+// ---------------------------------------------------------------------------
+
+struct FixedClock(DateTime<Utc>);
+
+impl bikesnest_application::Clock for FixedClock {
+    fn now(&self) -> DateTime<Utc> {
+        self.0
+    }
+}
+
+/// An account created long ago whose `last_active_at` is pinned to `active_at`
+/// (as if every session had been purged and nothing advanced it since).
+async fn aged_user(db: &Db, label: &str, active_at: DateTime<Utc>) -> i64 {
+    let user = UserBuilder::new()
+        .with_email(format!("{}@example.com", unique_tag(label)))
+        .create(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE users SET account_state = 'ACTIVE', created_at = now() - interval '730 days', \
+         last_active_at = $2 WHERE id = $1",
+    )
+    .bind(user.id.0)
+    .bind(active_at)
+    .execute(&mut *db.acquire().await.unwrap())
+    .await
+    .unwrap();
+    user.id.0
+}
+
+async fn insert_session(db: &Db, uid: i64, last_seen_at: DateTime<Utc>) {
+    sqlx::query(
+        "INSERT INTO sessions (token_hash, user_id, csrf_token, created_at, last_seen_at, expires_at) \
+         VALUES ($1, $2, 'csrf', $3, $3, $3 + interval '90 days')",
+    )
+    .bind(unique_tag("tok"))
+    .bind(uid)
+    .bind(last_seen_at)
+    .execute(&mut *db.acquire().await.unwrap())
+    .await
+    .unwrap();
+}
+
+async fn account_state(db: &Db, uid: i64) -> String {
+    sqlx::query_scalar("SELECT account_state FROM users WHERE id = $1")
+        .bind(uid)
+        .fetch_one(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap()
+}
+
+async fn last_active_at(db: &Db, uid: i64) -> DateTime<Utc> {
+    sqlx::query_scalar("SELECT last_active_at FROM users WHERE id = $1")
+        .bind(uid)
+        .fetch_one(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap()
+}
+
+/// The regression: the retention job purges idle sessions *before* it looks
+/// for inactive accounts. A two-year-old account whose last session ended 31
+/// days ago lost that session to the purge and then fell back to `created_at`,
+/// so a 365-day threshold anonymized it. The whole job runs here, in order.
+#[db_test]
+async fn retention_job_keeps_recently_active_account_whose_sessions_were_purged(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let now = Utc::now();
+    let recent = aged_user(&db, "inactive-recent", now - Duration::days(730)).await;
+    // Signing in advanced `last_active_at` through the sessions trigger.
+    insert_session(&db, recent, now - Duration::days(31)).await;
+    let dormant = aged_user(&db, "inactive-dormant", now - Duration::days(400)).await;
+
+    let job = bikesnest_application::RetentionJob::new(
+        Box::new(SqlxRetentionRepository::new(
+            db.clone(),
+            RetentionPolicy::default(),
+            std::sync::Arc::new(TestObjectStorage::new()),
+        )),
+        Box::new(SqlxAuditLog::new(db.clone())),
+        Box::new(FixedClock(now)),
+        bikesnest_application::RetentionConfig {
+            inactive_account_anonymize_after_days: 365,
+            deleted_account_purge_after_days: 0,
+        },
+    );
+    job.run().await.unwrap();
+
+    let sessions_left: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions WHERE user_id = $1")
+        .bind(recent)
+        .fetch_one(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(sessions_left, 0, "the 31-day idle session was purged");
+    assert_eq!(
+        account_state(&db, recent).await,
+        "ACTIVE",
+        "active 31 days ago: must survive a 365-day threshold"
+    );
+    assert!((last_active_at(&db, recent).await - (now - Duration::days(31))).num_seconds() == 0);
+    assert_eq!(
+        account_state(&db, dormant).await,
+        "DELETED",
+        "a genuinely inactive account is still anonymized"
+    );
+}
+
+#[db_test]
+async fn anonymize_inactive_accounts_counts_only_inactive_accounts(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let now = Utc::now();
+    let dormant = aged_user(&db, "inactive-count", now - Duration::days(400)).await;
+    let active = aged_user(&db, "active-count", now - Duration::days(10)).await;
+    let repo = SqlxRetentionRepository::new(
+        db.clone(),
+        RetentionPolicy::default(),
+        std::sync::Arc::new(TestObjectStorage::new()),
+    );
+    let n = repo
+        .anonymize_inactive_accounts(now - Duration::days(365))
+        .await
+        .unwrap();
+    assert!(n >= 1);
+    assert_eq!(account_state(&db, dormant).await, "DELETED");
+    assert_eq!(account_state(&db, active).await, "ACTIVE");
+}
+
+/// The candidate list is read once, before the loop. An account that becomes
+/// active after that read must be skipped by the locked re-check rather than
+/// erased on the strength of the stale list.
+#[db_test]
+async fn anonymize_if_inactive_skips_account_active_since_candidate_selection(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let now = Utc::now();
+    let cutoff = now - Duration::days(365);
+    let uid = aged_user(&db, "recheck", now - Duration::days(400)).await;
+
+    // Selected as a candidate...
+    let candidate: bool = sqlx::query_scalar("SELECT last_active_at < $2 FROM users WHERE id = $1")
+        .bind(uid)
+        .bind(cutoff)
+        .fetch_one(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    assert!(candidate);
+    // ...then signs in before its turn comes.
+    insert_session(&db, uid, now).await;
+    assert!(last_active_at(&db, uid).await >= cutoff);
+
+    let anonymizer = SqlxAnonymizationRepository::new(db.clone());
+    let report = anonymizer
+        .anonymize_if_inactive(UserId(uid), cutoff, now)
+        .await
+        .unwrap();
+    assert!(report.is_none(), "a now-active account is skipped");
+    assert_eq!(account_state(&db, uid).await, "ACTIVE");
+
+    // A live session newer than the cutoff also keeps the account even if the
+    // trigger's write to `last_active_at` was skipped (row busy at the time).
+    sqlx::query("UPDATE users SET last_active_at = now() - interval '400 days' WHERE id = $1")
+        .bind(uid)
+        .execute(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    let report = anonymizer
+        .anonymize_if_inactive(UserId(uid), cutoff, now)
+        .await
+        .unwrap();
+    assert!(report.is_none(), "a live recent session keeps the account");
+    assert_eq!(account_state(&db, uid).await, "ACTIVE");
+}
+
+/// `last_active_at` is advanced by session creation and by the (throttled)
+/// `last_seen_at` refresh, never rewound, and the session purge folds the
+/// purged rows into it so a skipped trigger write cannot be lost.
+#[db_test]
+async fn last_active_at_tracks_sessions_and_survives_purge(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let now = Utc::now();
+    let uid = aged_user(&db, "tracks", now - Duration::days(700)).await;
+
+    insert_session(&db, uid, now - Duration::days(40)).await;
+    assert_eq!(
+        (last_active_at(&db, uid).await - (now - Duration::days(40))).num_seconds(),
+        0,
+        "creating a session advances it"
+    );
+    sqlx::query("UPDATE sessions SET last_seen_at = $2 WHERE user_id = $1")
+        .bind(uid)
+        .bind(now - Duration::days(35))
+        .execute(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        (last_active_at(&db, uid).await - (now - Duration::days(35))).num_seconds(),
+        0,
+        "refreshing last_seen_at advances it"
+    );
+    insert_session(&db, uid, now - Duration::days(600)).await;
+    assert_eq!(
+        (last_active_at(&db, uid).await - (now - Duration::days(35))).num_seconds(),
+        0,
+        "an older session never rewinds it"
+    );
+
+    // Simulate a trigger write that was skipped, then purge.
+    sqlx::query("UPDATE users SET last_active_at = now() - interval '700 days' WHERE id = $1")
+        .bind(uid)
+        .execute(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    let repo = SqlxRetentionRepository::new(
+        db.clone(),
+        RetentionPolicy::default(),
+        std::sync::Arc::new(TestObjectStorage::new()),
+    );
+    assert!(repo.purge_expired_sessions(now).await.unwrap() >= 2);
+    assert_eq!(
+        (last_active_at(&db, uid).await - (now - Duration::days(35))).num_seconds(),
+        0,
+        "the purge folds the newest purged session into last_active_at"
+    );
+}

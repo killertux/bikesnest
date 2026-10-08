@@ -70,6 +70,14 @@ fails if a metadata key appears that has not been classified.
   `cargo run -p bikesnest-web -- retention` (schedule it daily; see
   `docs/deployment.md`). The same steps run as the recurring `retention`
   background job.
+- A failing step does not stop the others: every step still runs, the
+  `retention.purged` audit event is written with `result = "failure"` and the
+  failed step marked `"failed"` under `steps`, and the run reports an error
+  naming the failed steps (an object-store outage in the orphan sweep no longer
+  skips account purges). The job retries with backoff; if that occurrence
+  exhausts its attempts the error is kept in `background_job.last_error` and the
+  job moves to its next daily run instead of being dead-lettered, so a brief
+  outage delays retention by one cycle rather than stopping it.
 - Mail delivery locks the account row, validates the exact account, purpose,
   recipient, token hash and database expiry, and holds that lock through the
   bounded provider call. If deletion commits first, even a worker's preclaimed
@@ -92,7 +100,11 @@ fails if a metadata key appears that has not been classified.
   media moved to S3, swallowed the `read_dir` failure and reported success, so
   media retention was a silent no-op.
 - `INACTIVE_ACCOUNT_ANONYMIZE_AFTER_DAYS` **must stay 0** unless the policy text
-  is changed first (it promises notice).
+  is changed first (it promises notice). When enabled, inactivity is measured
+  from `users.last_active_at`, which sign-in and session refresh advance and
+  which survives the session purge (the purge folds each deleted session's
+  `last_seen_at` into it). Each candidate is re-checked under its row lock, so
+  an account that signs in while the job runs is skipped.
 - **Not yet automated:** the proposed 5-year purge of `audit_events` and
   `privacy_request` rows. After counsel approves a period, schedule a retention
   step before the earliest retained row reaches it (config-gated,

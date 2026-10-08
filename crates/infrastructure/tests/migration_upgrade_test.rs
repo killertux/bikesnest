@@ -29,7 +29,7 @@ fn committed_0027_schema_upgrades_to_current_without_losing_policy_data() {
 
         let legacy_id: i64 = sqlx::query_scalar(
             "INSERT INTO policy_version(kind,locale,version,effective_at,content) \
-             VALUES('terms','en','pre-b19','2026-01-01','preserve me') RETURNING id",
+             VALUES('terms','en','pre-terms','2026-01-01','preserve me') RETURNING id",
         )
         .fetch_one(&pool)
         .await
@@ -43,7 +43,8 @@ fn committed_0027_schema_upgrades_to_current_without_losing_policy_data() {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(after, (29, 29, true));
+        let latest = CURRENT.iter().map(|m| m.version).max().unwrap();
+        assert_eq!(after, (CURRENT.iter().count() as i64, latest, true));
         let preserved: (i64, String, bool) = sqlx::query_as(
             "SELECT id,content,requires_acknowledgement FROM policy_version WHERE id=$1",
         )
