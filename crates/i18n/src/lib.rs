@@ -214,7 +214,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
             "Create an account to add a spot",
             "Crie uma conta para adicionar uma vaga",
         ),
-        "menu.open" => ("Open menu", "Abrir menu"),
+        "menu.toggle" => ("Main menu", "Menu principal"),
         "lang.group" => ("Language", "Idioma"),
         "lang.pt_aria" => ("Português (Brasil)", "Português (Brasil)"),
         "lang.en_aria" => ("English", "English"),
@@ -686,7 +686,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "search.count.one" => ("1 parking spot", "1 vaga"),
         "search.count.other" => ("{n} parking spots", "{n} vagas"),
         "search.map.show" => ("Show map", "Mostrar mapa"),
-        "search.map.hide" => ("Show list", "Mostrar lista"),
+        "search.map.hide" => ("Hide map", "Ocultar mapa"),
         "search.map.recenter" => ("Recenter", "Recentralizar"),
         "search.map.title" => ("Map", "Mapa"),
         "map.loading" => ("Loading map…", "Carregando mapa…"),
@@ -1057,8 +1057,14 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
             "The service is temporarily unavailable. Please try again in a moment.",
             "O serviço está temporariamente indisponível. Tente novamente em instantes.",
         ),
+        "error.network" => (
+            "Couldn't reach BikesNest. Check your connection and try again.",
+            "Não foi possível conectar ao BikesNest. Verifique sua conexão e tente de novo.",
+        ),
+        "error.network_retry" => ("Try again", "Tentar de novo"),
+        "error.network_dismiss" => ("Dismiss", "Dispensar"),
 
-        // --- auth: register / login (A1/A2) -------------------------------
+        // --- auth: register / login --------------------------------------
         "auth.register_title" => ("Create your account", "Crie sua conta"),
         "auth.register_subtitle" => (
             "A community account keeps your contributions and the map honest.",
@@ -1083,13 +1089,28 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "auth.google_soon" => ("Coming soon", "Em breve"),
         "auth.oauth_note" => ("Or", "Ou"),
 
-        // --- auth: verification (A3) ---------------------------------------
+        // --- auth: verification -------------------------------------------
         "auth.verify_title" => ("Verify your email", "Verifique seu e-mail"),
-        "auth.verify_success" => ("Email verified", "E-mail verificado"),
-        "auth.verify_success_body" => (
-            "Your account is active. You can now log in and contribute.",
-            "Sua conta está ativa. Agora você pode entrar e contribuir.",
+        "auth.verify.activate_title" => ("Activate your account", "Ative sua conta"),
+        "auth.verify.activate_body" => (
+            "Enter the password you chose when you signed up to finish verifying your email.",
+            "Digite a senha que você escolheu no cadastro para concluir a verificação do seu e-mail.",
         ),
+        "auth.verify.activate_hint" => (
+            "Forgot it? Sign up again with this email to choose a new password and get a new link.",
+            "Esqueceu? Cadastre-se de novo com este e-mail para escolher outra senha e receber um novo link.",
+        ),
+        "auth.verify.activate_submit" => ("Verify and activate", "Verificar e ativar"),
+        "auth.verify.password_incorrect" => (
+            "That password does not match this account. If you did not choose it, sign up again with this email to set your own password.",
+            "Essa senha não confere com esta conta. Se não foi você quem a escolheu, cadastre-se de novo com este e-mail para definir sua própria senha.",
+        ),
+        "auth.verify.confirm_title" => ("Confirm your new email", "Confirme seu novo e-mail"),
+        "auth.verify.confirm_body" => (
+            "Confirm to make this address the one you sign in with. You will be signed out everywhere.",
+            "Confirme para passar a entrar com este endereço. Você será desconectado de todos os dispositivos.",
+        ),
+        "auth.verify.confirm_submit" => ("Confirm new email", "Confirmar novo e-mail"),
         "auth.verify_invalid" => (
             "Verification link invalid or expired",
             "Link de verificação inválido ou expirado",
@@ -1103,7 +1124,7 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
             "Reenviar e-mail de verificação",
         ),
 
-        // --- auth: password reset (A4/A5) ---------------------------------
+        // --- auth: password reset ----------------------------------------
         "auth.reset_title" => ("Reset your password", "Redefinir sua senha"),
         "auth.reset_subtitle" => (
             "Enter your email and we will send a reset link if it exists.",
@@ -1158,6 +1179,18 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "auth.error.last_admin" => (
             "The system must keep at least one admin.",
             "O sistema precisa manter ao menos um admin.",
+        ),
+        "auth.error.last_active_admin" => (
+            "The system must keep at least one active admin.",
+            "O sistema precisa manter ao menos um admin ativo.",
+        ),
+        "auth.error.self_suspension" => (
+            "You cannot suspend your own account.",
+            "Você não pode suspender a sua própria conta.",
+        ),
+        "auth.error.state_unchanged" => (
+            "That account is not in a state that allows this action.",
+            "Essa conta não está em um estado que permita essa ação.",
         ),
         "auth.error.generic" => (
             "Something went wrong. Try again.",
@@ -1333,13 +1366,32 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "edit.move.title" => ("Move the pin", "Mover o ponto"),
         "edit.move.submit" => ("Propose new location", "Propor novo local"),
         "edit.remove.title" => ("Remove / mark gone", "Remover / marcar como sumido"),
-        "edit.remove.submit" => ("Propose change", "Propor mudança"),
+        "edit.remove.submit" => ("Propose removal", "Propor remoção"),
+        "edit.remove.confirm" => ("This spot no longer exists", "Esta vaga não existe mais"),
+        "edit.remove.details_hint" => (
+            "Is it still there, with different details?",
+            "Ela ainda existe, mas com outros detalhes?",
+        ),
+        "edit.remove.details_link" => ("Edit the details instead.", "Edite os detalhes."),
+        "edit.remove.error.required" => (
+            "Confirm that the spot no longer exists to propose its removal.",
+            "Confirme que a vaga não existe mais para propor a remoção.",
+        ),
+        "edit.remove.error.exists" => (
+            "This spot is already listed. To correct it, edit its details instead.",
+            "Esta vaga já está cadastrada. Para corrigi-la, edite os detalhes.",
+        ),
+        "edit.move.error.coordinates" => (
+            "Enter a valid latitude and longitude, or pick the spot on the map.",
+            "Informe uma latitude e longitude válidas ou escolha o ponto no mapa.",
+        ),
         "edit.reason" => ("Reason", "Motivo"),
 
         // --- reviews ------------------------------------------------------
         "review.title" => ("Write a review", "Escrever uma avaliação"),
         "review.subtitle" => ("How was it to park here?", "Como foi estacionar aqui?"),
         "review.rating" => ("Rating", "Avaliação"),
+        "review.stars_label" => ("{n} of 5 stars", "{n} de 5 estrelas"),
         "review.select" => ("Choose a rating", "Escolha uma nota"),
         "review.body" => ("Your review", "Sua avaliação"),
         "review.length_hint" => (
@@ -1772,6 +1824,14 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
             "Map showing the current and proposed positions of the pin.",
             "Mapa mostrando as posições atual e proposta do ponto.",
         ),
+        "proposal.escalated.badge" => (
+            "Approved, needs a moderator",
+            "Aprovada, precisa de moderação",
+        ),
+        "proposal.escalated.hint" => (
+            "The community approved this proposal, but it could not be published automatically. Approve it with corrected values, or reject it.",
+            "A comunidade aprovou esta proposta, mas ela não pôde ser publicada automaticamente. Aprove-a com valores corrigidos ou rejeite-a.",
+        ),
         "proposal.stale.badge" => ("Out of date", "Desatualizada"),
         "proposal.stale.hint" => (
             "The location changed after this proposal was written, so approving it would overwrite an edit the proposer never saw. Ask for a fresh proposal, or reject it.",
@@ -1880,6 +1940,52 @@ pub fn msg(locale: Locale, key: &str) -> &'static str {
         "admin.audit.metadata" => ("Metadata", "Metadados"),
         "admin.audit.when" => ("When", "Quando"),
         "admin.audit.next" => ("Next page", "Próxima página"),
+        // --- admin: background-job health --------------------------------
+        "admin.jobs.title" => ("Background jobs", "Tarefas em segundo plano"),
+        "admin.jobs.subtitle" => (
+            "Whether the recurring jobs keep up and the queue drains. Times are UTC.",
+            "Se as tarefas recorrentes estão em dia e a fila está sendo processada. Horários em UTC.",
+        ),
+        "admin.jobs.checked_at" => ("Checked at", "Verificado em"),
+        "admin.jobs.all_healthy" => (
+            "All background jobs are on schedule.",
+            "Todas as tarefas em segundo plano estão em dia.",
+        ),
+        "admin.jobs.attention" => (
+            "Some background work needs attention.",
+            "Algumas tarefas em segundo plano precisam de atenção.",
+        ),
+        "admin.jobs.recurring" => ("Recurring jobs", "Tarefas recorrentes"),
+        "admin.jobs.empty" => (
+            "No recurring jobs are registered. Is a worker running?",
+            "Nenhuma tarefa recorrente registrada. Há um worker em execução?",
+        ),
+        "admin.jobs.kind" => ("Job", "Tarefa"),
+        "admin.jobs.status" => ("Status", "Situação"),
+        "admin.jobs.schedule" => ("Schedule", "Agenda"),
+        "admin.jobs.schedule.every" => ("Every {d}", "A cada {d}"),
+        "admin.jobs.last_success" => ("Last success", "Último sucesso"),
+        "admin.jobs.next_run" => ("Next run", "Próxima execução"),
+        "admin.jobs.overdue" => ("{d} overdue", "{d} de atraso"),
+        "admin.jobs.attempts" => ("Attempts", "Tentativas"),
+        "admin.jobs.last_error" => ("Last error", "Último erro"),
+        "admin.jobs.queue" => ("One-off jobs", "Tarefas avulsas"),
+        "admin.jobs.overdue_pending" => (
+            "Waiting more than 15 minutes past due",
+            "Aguardando há mais de 15 minutos do horário",
+        ),
+        "admin.jobs.failed_last_day" => (
+            "Gave up in the last 24 hours",
+            "Abandonadas nas últimas 24 horas",
+        ),
+        "admin.jobs.health.dead" => ("Stopped", "Parada"),
+        "admin.jobs.health.stuck" => ("Stuck", "Travada"),
+        "admin.jobs.health.late" => ("Late", "Atrasada"),
+        "admin.jobs.health.failing" => ("Failing", "Falhando"),
+        "admin.jobs.health.running" => ("Running", "Em execução"),
+        "admin.jobs.health.healthy" => ("On schedule", "Em dia"),
+        "moderation.dashboard.link.jobs" => ("Background jobs", "Tarefas em segundo plano"),
+        // --- end admin: background-job health ----------------------------
         "pagination.more" => ("Load more", "Carregar mais"),
         "audit.system" => ("System", "Sistema"),
         "audit.result.success" => ("Success", "Sucesso"),

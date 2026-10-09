@@ -17,7 +17,7 @@
   {% endfor %}
   {% if !is_verified %}
     <div class="mt-4 rounded-lg border border-aging/30 bg-aging/10 px-4 py-4">
-      <p class="font-medium text-aging">{{ tr.t("account.banner_title") }}</p>
+      <p class="font-medium text-aging-strong">{{ tr.t("account.banner_title") }}</p>
       <p class="mt-1 text-sm text-muted">{{ tr.t("account.banner_body") }}</p>
       <form action="/verify-email/resend" method="post" class="mt-3 flex items-center gap-3">
         <input type="hidden" name="csrf" value="{{ layout.csrf }}" />

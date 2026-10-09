@@ -17,6 +17,7 @@ pub mod auth;
 pub mod common;
 pub mod community;
 pub mod contribution_form;
+pub mod csp_report;
 pub mod details;
 pub mod errors;
 pub mod legal;
@@ -35,8 +36,9 @@ use axum::routing::{get, post};
 use crate::state::AppState;
 
 use admin::{
-    admin_audit, admin_privacy_request_fulfill, admin_privacy_requests, admin_role_post,
-    admin_user_contributions, admin_user_restore, admin_user_suspend, admin_users,
+    admin_audit, admin_jobs, admin_jobs_status, admin_privacy_request_fulfill,
+    admin_privacy_requests, admin_role_post, admin_user_contributions, admin_user_restore,
+    admin_user_suspend, admin_users,
 };
 use api::{address_suggestions_api, geocode_api, resolve_address_suggestion_api};
 use auth::{
@@ -44,7 +46,7 @@ use auth::{
     account_public_name_post, auth_google, auth_google_callback, auth_google_fake_consent,
     login_page, login_post, logout, password_reset_new, password_reset_new_post,
     password_reset_page, password_reset_post, register_page, register_post, verify_email,
-    verify_resend,
+    verify_email_post, verify_resend,
 };
 use community::{
     parking_edit_page, parking_edit_post, parking_new_page, parking_new_post,
@@ -99,11 +101,17 @@ pub(crate) fn routes(state: &AppState) -> Router<AppState> {
         .route("/lang/{code}", get(set_lang))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        // The one CSRF-exempt route (browsers send reports without a token);
+        // its body is capped before the handler parses anything.
+        .route(
+            crate::security::CSP_REPORT_PATH,
+            post(csp_report::csp_report).layer(DefaultBodyLimit::max(csp_report::MAX_REPORT_BYTES)),
+        )
         // --- Accounts and authentication ---
         .route("/register", get(register_page).post(register_post))
         .route("/login", get(login_page).post(login_post))
         .route("/logout", post(logout))
-        .route("/verify-email", get(verify_email))
+        .route("/verify-email", get(verify_email).post(verify_email_post))
         .route("/verify-email/resend", post(verify_resend))
         .route(
             "/password-reset",
@@ -256,6 +264,8 @@ pub(crate) fn routes(state: &AppState) -> Router<AppState> {
             get(admin_user_contributions),
         )
         .route("/admin/audit", get(admin_audit))
+        .route("/admin/jobs", get(admin_jobs))
+        .route("/admin/jobs/status", get(admin_jobs_status))
         // Content-hashed assets: a more specific static segment
         // ("h") than the `/static/{*rest}` the `nest_service` below expands
         // to, so this route wins the match for any hashed URL. Validates the

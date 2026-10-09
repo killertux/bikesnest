@@ -1,4 +1,5 @@
 use super::*;
+use auth::Auth;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use bikesnest_infrastructure::MapConfig;
 use i18n::Locale;

@@ -26,12 +26,24 @@ pub(crate) fn error_page(
     crate::error_response(headers, map, auth, tr, status, tr.t(body_key).to_string())
 }
 
+/// The styled 500. `error` is what went wrong; it is logged here at error
+/// level with its whole `source()` chain, because the page itself says only
+/// "something went wrong" and a stored row that no longer decodes would
+/// otherwise fail silently. Callers pass application errors, whose messages
+/// carry codes and kinds (a bad timezone name, an unknown state code, a
+/// database failure class), never request input or account data.
 pub(crate) fn internal_error(
     headers: &HeaderMap,
     map: &MapConfig,
     auth: &Auth,
     tr: Translator,
+    error: &(dyn std::error::Error + 'static),
 ) -> Response {
+    tracing::error!(
+        category = "internal_error",
+        error = %error_chain(error),
+        "request failed with an internal error"
+    );
     error_page(
         headers,
         map,
@@ -40,6 +52,18 @@ pub(crate) fn internal_error(
         StatusCode::INTERNAL_SERVER_ERROR,
         "error.500.body",
     )
+}
+
+/// `error` and each of its sources, joined as `outer: inner: root`.
+pub(crate) fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = error.to_string();
+    let mut source = error.source();
+    while let Some(e) = source {
+        out.push_str(": ");
+        out.push_str(&e.to_string());
+        source = e.source();
+    }
+    out
 }
 
 pub(crate) fn not_found_page(
@@ -58,7 +82,7 @@ pub(crate) fn not_found_page(
     )
 }
 
-/// Router fallback (E1). A 404 is reachable by every kind of request — a typed
+/// Router fallback. A 404 is reachable by every kind of request — a typed
 /// URL, a boosted link, a stale htmx fragment poll — so it answers each in its
 /// own shape rather than always emitting a whole document. `auth` renders the
 /// right header (a signed-in user's stray/mistyped link still shows Sair, not
@@ -111,7 +135,7 @@ pub(crate) fn status_message(tr: Translator, status: StatusCode) -> String {
     tr.t(key).to_string()
 }
 
-/// Last line of defence for E1/E2: any failing response that is still bare text
+/// Last line of defence for the 404/500 family: any failing response that is still bare text
 /// (axum's extractor rejections, the router's 405, a stray literal) is re-rendered
 /// as the styled error page — or as `partials/fragment_error.html` when htmx
 /// asked for a fragment, because htmx 4 swaps 4xx/5xx bodies too.
@@ -162,4 +186,37 @@ pub(crate) async fn styled_errors(
         }
     }
     styled
+}
+
+#[cfg(test)]
+mod tests {
+    use super::error_chain;
+
+    #[test]
+    fn error_chain_includes_every_source() {
+        let err = bikesnest_application::DetailsError::Read(
+            bikesnest_application::ReaderError::Unexpected("bad timezone Mars/Olympus".into()),
+        );
+        // `DetailsError::Read` is transparent, so the chain is the reader's
+        // message followed by nothing else.
+        assert_eq!(
+            error_chain(&err),
+            "database error: bad timezone Mars/Olympus"
+        );
+
+        #[derive(Debug)]
+        struct Outer(std::io::Error);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("outer")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let nested = Outer(std::io::Error::other("root cause"));
+        assert_eq!(error_chain(&nested), "outer: root cause");
+    }
 }

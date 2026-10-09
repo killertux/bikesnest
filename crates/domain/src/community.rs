@@ -362,7 +362,21 @@ impl ProposalPayload {
     }
 }
 
-/// Lifecycle of a proposal. creates `Pending`; resolution is.
+/// How many approvals from distinct eligible community members publish a
+/// pending proposal without a moderator.
+pub const COMMUNITY_APPROVALS_TO_PUBLISH: i64 = 6;
+
+/// Whether a proposal's tally of eligible approvals is enough for the
+/// community to publish it. Rejections do not offset approvals: a contested
+/// change is still published once enough people vouch for it, and a
+/// moderator can always reject it first.
+pub fn should_publish(approvals: i64) -> bool {
+    approvals >= COMMUNITY_APPROVALS_TO_PUBLISH
+}
+
+/// Lifecycle of a proposal. Submission creates `Pending`; a moderator
+/// decision, enough community approvals, or a sibling being published
+/// resolves it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProposalStatus {
     Pending,
@@ -557,6 +571,23 @@ mod tests {
         now: DateTime<Utc>,
     ) -> ExistenceSignal {
         ExistenceSignal::new(UserId(user), result, now - chrono::Duration::days(days_ago))
+    }
+
+    // --- Community publishing threshold -----------------------------------
+
+    #[test]
+    fn six_approvals_publish_and_five_do_not() {
+        assert_eq!(COMMUNITY_APPROVALS_TO_PUBLISH, 6);
+        assert!(!should_publish(0));
+        assert!(!should_publish(5));
+        assert!(should_publish(6));
+        assert!(should_publish(7));
+    }
+
+    #[test]
+    fn negative_or_zero_tallies_never_publish() {
+        assert!(!should_publish(-1));
+        assert!(!should_publish(i64::MIN));
     }
 
     // --- StarRating / ReviewBody -----------------------------------------

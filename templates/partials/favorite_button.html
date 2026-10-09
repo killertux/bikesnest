@@ -1,17 +1,21 @@
-{# The single definition of the favorite control: the P3 aside includes it and
+{# The single definition of the favorite control: the details aside includes it and
    the toggle endpoint answers with it, so both render the same markup.
    `hx-disable` names the elements htmx disables for the duration of the request
    and `hx-sync="this:drop"` drops a second click while the first is in flight —
-   together they stop a double-click toggling the favorite twice. #}
+   together they stop a double-click toggling the favorite twice. `aria-pressed`
+   makes it a toggle button. `outerMorph` keeps the clicked button the same
+   node across the swap, and app.js puts focus back on it once htmx has
+   re-enabled it, so a keyboard user stays where they were. #}
 <div id="favorite-button" class="w-full">
   <form action="/parking/{{ id }}/favorite" method="post">
     <input type="hidden" name="csrf" value="{{ csrf }}" />
-    <button type="submit"
+    <button type="submit" id="favorite-toggle"
       hx-post="/parking/{{ id }}/favorite"
       hx-target="#favorite-button"
-      hx-swap="outerHTML"
+      hx-swap="outerMorph"
       hx-disable="this"
       hx-sync="this:drop"
+      aria-pressed="{% if is_favorited %}true{% else %}false{% endif %}"
       class="w-full inline-flex items-center justify-center gap-2 rounded-xl border px-4 py-2.5 text-sm font-medium transition-colors {% if is_favorited %}border-accent bg-accent-soft text-accent-strong{% else %}border-border text-muted hover:text-fg{% endif %}">
       <svg aria-hidden="true" class="h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 9.5a5.5 5.5 0 0 1 9.591-3.676.56.56 0 0 0 .818 0A5.49 5.49 0 0 1 22 9.5c0 2.29-1.5 4-3 5.5l-5.492 5.313a2 2 0 0 1-3 .019L5 15c-1.5-1.5-3-3.2-3-5.5" /></svg>
       {% if is_favorited %}{{ tr.t("favorites.saved") }}{% else %}{{ tr.t("favorites.save") }}{% endif %}

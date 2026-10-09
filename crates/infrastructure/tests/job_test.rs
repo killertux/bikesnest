@@ -588,6 +588,98 @@ async fn claim_reclaims_a_crashed_workers_running_job(tx: &mut bikesnest_test_su
     );
 }
 
+/// The claim runs as two indexed branches (due `pending`, expired `running`)
+/// merged back into one batch. The batch must still be the oldest-`run_at`
+/// rows across both branches, honour the limit, and skip future and
+/// live-leased rows.
+#[db_test]
+async fn claim_merges_pending_and_expired_lease_branches_by_run_at(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let r = SqlxJobRepository::new(db.clone());
+    let now = Utc::now();
+    let kind = format!(
+        "test.{}.claim_merges_pending_and_expired_lease_branches_by_run_at.{}",
+        module_path!(),
+        std::process::id()
+    );
+    // expired lease, oldest pending, newer pending, future pending, live lease
+    let offsets = [
+        Duration::minutes(-60),
+        Duration::minutes(-30),
+        Duration::minutes(-10),
+        Duration::hours(1),
+        Duration::hours(-2),
+    ];
+    let mut ids = Vec::new();
+    for offset in offsets {
+        ids.push(
+            r.enqueue(&kind, &json!({}), now + offset, Some(5), None)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    let [
+        expired,
+        oldest_pending,
+        newer_pending,
+        _future_pending,
+        live_lease,
+    ] = ids[..]
+    else {
+        unreachable!()
+    };
+    let mut conn = db.acquire().await.unwrap();
+    for (id, owner, lease) in [
+        (expired, "dead-worker", "-1 second"),
+        (live_lease, "live-worker", "1 hour"),
+    ] {
+        sqlx::query(
+            "UPDATE background_job SET state='running', claimed_by=$2,
+                lease_expires_at=clock_timestamp() + $3::interval, attempts=1
+             WHERE id=$1",
+        )
+        .bind(id)
+        .bind(owner)
+        .bind(lease)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    }
+    drop(conn);
+
+    let ttl = std::time::Duration::from_secs(60);
+    let mut first: Vec<i64> = r
+        .claim_kinds(2, "worker-a", ttl, &[&kind])
+        .await
+        .unwrap()
+        .iter()
+        .map(|j| j.id)
+        .collect();
+    first.sort_unstable();
+    let mut want = vec![expired, oldest_pending];
+    want.sort_unstable();
+    assert_eq!(
+        first, want,
+        "a batch of 2 takes the two oldest due rows, one from each branch"
+    );
+
+    let second: Vec<i64> = r
+        .claim_kinds(10, "worker-b", ttl, &[&kind])
+        .await
+        .unwrap()
+        .iter()
+        .map(|j| j.id)
+        .collect();
+    assert_eq!(
+        second,
+        vec![newer_pending],
+        "future-scheduled and live-leased rows are never claimed"
+    );
+}
+
 #[db_test]
 async fn exhausted_expired_lease_is_not_reclaimed_and_is_dead_lettered(
     tx: &mut bikesnest_test_support::TestTx,
@@ -903,8 +995,10 @@ fn worker_claims_only_capacity_and_heartbeats_every_active_lease() {
         let config = JobConfig {
             batch_size: 2,
             poll_interval: std::time::Duration::from_millis(5),
-            lease_ttl: std::time::Duration::from_millis(120),
-            handler_timeout: std::time::Duration::from_secs(5),
+            // Long enough that a slow CI host still heartbeats (every ttl/3)
+            // well before expiry; the sleep below outlasts one whole TTL.
+            lease_ttl: std::time::Duration::from_secs(1),
+            handler_timeout: std::time::Duration::from_secs(10),
             ..JobConfig::default()
         };
         let shutdown = CancellationToken::new();
@@ -922,7 +1016,9 @@ fn worker_claims_only_capacity_and_heartbeats_every_active_lease() {
         repo.enqueue(CAPACITY_KIND, &json!({}), Utc::now(), Some(3), None)
             .await
             .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Past the original lease: both rows are only still leased because
+        // their heartbeats extended them.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         let states:(i64,i64,i64)=sqlx::query_as("SELECT count(*) FILTER(WHERE state='running'),count(*) FILTER(WHERE state='pending'),count(*) FILTER(WHERE state='running' AND lease_expires_at>clock_timestamp()) FROM background_job WHERE kind=$1").bind(CAPACITY_KIND).fetch_one(&pool).await.unwrap();
         assert_eq!(states, (2, 1, 2));
         assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 2);
@@ -1491,8 +1587,8 @@ fn heartbeat_ownership_loss_cancels_the_active_handler() {
         let config = JobConfig {
             batch_size: 1,
             poll_interval: std::time::Duration::from_secs(5),
-            lease_ttl: std::time::Duration::from_millis(90),
-            handler_timeout: std::time::Duration::from_secs(5),
+            lease_ttl: std::time::Duration::from_secs(1),
+            handler_timeout: std::time::Duration::from_secs(10),
             ..JobConfig::default()
         };
         let worker = Worker::new(repo, registry, config);
@@ -1505,7 +1601,8 @@ fn heartbeat_ownership_loss_cancels_the_active_handler() {
             .execute(&pool)
             .await
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        // The next heartbeat (every ttl/3) notices the lost lease.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while active.load(std::sync::atomic::Ordering::SeqCst) != 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }

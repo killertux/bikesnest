@@ -3,6 +3,7 @@
 //! and the audit-log reader filter/pagination. Approval scenarios use automatic
 //! transaction rollback; legacy scenarios still use committed pooled fixtures.
 
+use bikesnest_application::ReviewRepository;
 use bikesnest_application::{
     AuditFilter, AuditLogReader, ModerationError, ModerationRepository, NewReport,
     ProposalApplication, ReportRepository,
@@ -11,8 +12,9 @@ use bikesnest_domain::{
     ModerationState, ProposedChange, ReportDescription, ReportOutcome, ReportState,
     ReportTargetType, UserId,
 };
+use bikesnest_domain::{ReviewBody, StarRating};
 use bikesnest_infrastructure::{
-    SqlxAuditLogReader, SqlxModerationRepository, SqlxReportRepository,
+    SqlxAuditLogReader, SqlxModerationRepository, SqlxReportRepository, SqlxReviewRepository,
 };
 use bikesnest_test_support::{ParkingBuilder, UserBuilder, db_test};
 
@@ -524,6 +526,62 @@ async fn proposal_list_keyset_pagination_is_disjoint_and_stable(
     let _ = tx;
 }
 
+/// Escalated proposals (six approvals that could not publish) lead the queue,
+/// each group oldest first, and the bare `after_id` cursor walks that order
+/// with no gap or repeat across the escalated/regular boundary.
+#[db_test]
+async fn escalated_proposals_lead_the_queue_and_the_cursor_follows(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let proposer = scoped_user(&db, "b5a-escalated-queue@example.com", "USER").await;
+    let loc = ParkingBuilder::new()
+        .with_name("Escalated Queue Spot")
+        .with_fixture_tag("b5a-escalated-queue")
+        .create(&mut db.acquire().await.unwrap())
+        .await
+        .unwrap()
+        .id();
+    let mut ids = Vec::new();
+    for _ in 0..4 {
+        let (pid,): (i64,) = sqlx::query_as(
+            "INSERT INTO parking_proposal (location_id, proposer_id, base_version, kind, proposed, status) \
+             VALUES ($1, $2, 1, 'change_existence', '{\"existence\":\"removed\"}', 'PENDING') RETURNING id")
+            .bind(loc).bind(proposer).fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
+        ids.push(pid);
+    }
+    let (a, b, c, d) = (ids[0], ids[1], ids[2], ids[3]);
+    sqlx::query("UPDATE parking_proposal SET escalated_at = now() WHERE id = ANY($1)")
+        .bind(vec![a, c])
+        .execute(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+
+    let repo = SqlxModerationRepository::new(db.clone());
+    let mut seen = Vec::new();
+    let mut escalated = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = repo.list_pending_proposals(cursor, 2).await.unwrap();
+        for p in &page {
+            if ids.contains(&p.id) {
+                seen.push(p.id);
+                if p.escalated_at.is_some() {
+                    escalated.push(p.id);
+                }
+            }
+        }
+        if page.len() < 2 {
+            break;
+        }
+        cursor = page.last().map(|p| p.id);
+    }
+    assert_eq!(seen, vec![a, c, b, d], "escalated first, each group by id");
+    assert_eq!(escalated, vec![a, c], "the flag reaches the read model");
+
+    let _ = tx;
+}
+
 /// `queue_counts()` reads four global tables the whole suite shares, so a
 /// before/after delta taken via two separate pool connections can be thrown
 /// off by another test's concurrent commits (this happened in practice: a
@@ -835,4 +893,186 @@ async fn report_previews_resolve_every_target_kind_to_its_location(
 
     // An empty request does no work.
     assert!(repo.report_previews(&[]).await.unwrap().is_empty());
+}
+
+async fn rating_of(db: &bikesnest_infrastructure::Db, location: i64) -> (Option<f64>, i32) {
+    sqlx::query_as("SELECT rating_avg::float8, rating_count FROM parking_location WHERE id = $1")
+        .bind(location)
+        .fetch_one(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap()
+}
+
+#[db_test]
+async fn hiding_and_restoring_a_review_recomputes_the_location_rating(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let fan = scoped_user(&db, "rating-hide-fan@example.com", "USER").await;
+    let critic = scoped_user(&db, "rating-hide-critic@example.com", "USER").await;
+    let moderator = scoped_user(&db, "rating-hide-mod@example.com", "MODERATOR").await;
+    let location = ParkingBuilder::new()
+        .with_name("Rating Hide")
+        .create(&mut db.acquire().await.unwrap())
+        .await
+        .unwrap()
+        .id();
+    let reviews = SqlxReviewRepository::new(db.clone());
+    reviews
+        .upsert_review(
+            location,
+            UserId(fan),
+            StarRating::new(5).unwrap(),
+            &ReviewBody::new("love it").unwrap(),
+        )
+        .await
+        .unwrap();
+    reviews
+        .upsert_review(
+            location,
+            UserId(critic),
+            StarRating::new(1).unwrap(),
+            &ReviewBody::new("spam spam spam").unwrap(),
+        )
+        .await
+        .unwrap();
+    let (avg, count) = rating_of(&db, location).await;
+    assert_eq!(count, 2);
+    assert!((avg.unwrap() - 3.0).abs() < 0.001, "avg = {avg:?}");
+
+    let critic_review = reviews
+        .find_own(location, UserId(critic))
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let repo = SqlxModerationRepository::new(db.clone());
+    repo.hide_review(critic_review, UserId(moderator))
+        .await
+        .unwrap();
+    let (avg, count) = rating_of(&db, location).await;
+    assert_eq!(count, 1, "a hidden review leaves the aggregate");
+    assert!((avg.unwrap() - 5.0).abs() < 0.001, "avg = {avg:?}");
+
+    // Hiding twice is an invalid transition and changes nothing.
+    assert!(matches!(
+        repo.hide_review(critic_review, UserId(moderator)).await,
+        Err(ModerationError::InvalidState)
+    ));
+    assert_eq!(rating_of(&db, location).await.1, 1);
+
+    repo.restore_review(critic_review, UserId(moderator))
+        .await
+        .unwrap();
+    let (avg, count) = rating_of(&db, location).await;
+    assert_eq!(count, 2, "a restored review rejoins the aggregate");
+    assert!((avg.unwrap() - 3.0).abs() < 0.001, "avg = {avg:?}");
+
+    // Hiding the only remaining reviews empties the aggregate.
+    let fan_review = reviews
+        .find_own(location, UserId(fan))
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    repo.hide_review(fan_review, UserId(moderator))
+        .await
+        .unwrap();
+    repo.hide_review(critic_review, UserId(moderator))
+        .await
+        .unwrap();
+    assert_eq!(rating_of(&db, location).await, (None, 0));
+
+    // An unknown review is an invalid transition, not an internal error.
+    assert!(matches!(
+        repo.hide_review(i64::MAX, UserId(moderator)).await,
+        Err(ModerationError::InvalidState)
+    ));
+}
+
+#[db_test]
+async fn changing_a_spot_state_supersedes_its_pending_proposals(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let moderator = scoped_user(&db, "state-supersede-mod@example.com", "MODERATOR").await;
+    let proposer = scoped_user(&db, "state-supersede-author@example.com", "USER").await;
+    let mut conn = db.acquire().await.unwrap();
+    let location = ParkingBuilder::new()
+        .with_name("State Supersede")
+        .create(&mut conn)
+        .await
+        .unwrap()
+        .id();
+    let other = ParkingBuilder::new()
+        .with_name("State Supersede Elsewhere")
+        .create(&mut conn)
+        .await
+        .unwrap()
+        .id();
+    let insert = "INSERT INTO parking_proposal (location_id, proposer_id, base_version, kind, proposed, status) \
+                  VALUES ($1, $2, 1, 'change_existence', '{\"existence\":\"removed\"}', $3) RETURNING id";
+    let pending: i64 = sqlx::query_scalar(insert)
+        .bind(location)
+        .bind(proposer)
+        .bind("PENDING")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    let rejected: i64 = sqlx::query_scalar(insert)
+        .bind(location)
+        .bind(proposer)
+        .bind("REJECTED")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    let elsewhere: i64 = sqlx::query_scalar(insert)
+        .bind(other)
+        .bind(proposer)
+        .bind("PENDING")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    drop(conn);
+
+    let repo = SqlxModerationRepository::new(db.clone());
+    repo.set_parking_state(
+        location,
+        &[ModerationState::Active],
+        ModerationState::Invalid,
+        UserId(moderator),
+    )
+    .await
+    .unwrap();
+
+    let status = async |id: i64| -> String {
+        sqlx::query_scalar("SELECT status FROM parking_proposal WHERE id = $1")
+            .bind(id)
+            .fetch_one(&mut *db.acquire().await.unwrap())
+            .await
+            .unwrap()
+    };
+    assert_eq!(
+        status(pending).await,
+        "SUPERSEDED",
+        "a proposal against the old version can never be decided, so it is retired"
+    );
+    assert_eq!(
+        status(rejected).await,
+        "REJECTED",
+        "decided proposals keep their outcome"
+    );
+    assert_eq!(
+        status(elsewhere).await,
+        "PENDING",
+        "other spots are untouched"
+    );
+    assert!(
+        repo.list_pending_proposals(None, 200)
+            .await
+            .unwrap()
+            .iter()
+            .all(|p| p.id != pending),
+        "the moderation queue no longer offers the dead proposal"
+    );
 }

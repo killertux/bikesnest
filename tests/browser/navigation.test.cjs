@@ -31,8 +31,12 @@ async function pageHtml(kind, provider) {
   const scripts = renderAssets(base.split('</head>')[0].match(/<script[^>]+><\/script>/g).join('\n'), provider);
   const header = base.match(/<header id="top"[\s\S]*?>/)[0];
   const menu = base.match(/<div id="mobile-menu"[^>]*>/)[0];
-  const button = base.match(/<button\s+@click="toggle" :aria-expanded="open"[\s\S]*?<\/button>/)[0]
+  const button = base.match(/<button\s+type="button" @click="toggle" :aria-expanded="open"\s+class="grid[\s\S]*?<\/button>/)[0]
     .replace(/{{.*?}}/g, 'menu');
+  const requestError = base.match(/<div id="request-error"[\s\S]*?<\/div>\s*<\/div>\s*<\/div>/)[0]
+    .replace('{{ tr.t("error.network") }}', 'Connection failed')
+    .replace('{{ tr.t("error.network_retry") }}', 'Try again')
+    .replace('{{ tr.t("error.network_dismiss") }}', 'Dismiss');
   let content = '', assets = '';
   if (consumers[kind]) {
     const [template, markup] = consumers[kind];
@@ -71,7 +75,7 @@ async function pageHtml(kind, provider) {
     '</head><body hx-boost:inherited="true" data-document-lang="pt-BR" data-document-title="' + kind + '" data-document-canonical="/' + kind + '" data-document-description="' + kind + ' description" data-map-provider="' + provider + '">' +
     header + button + menu + '<a id="menu-link" href="/details/' + provider + '">details</a></div></header>' +
     '<div x-data="accountMenu"><button id="account-toggle" @click="toggle">account</button><div id="account-menu" x-show="open" x-cloak>account items</div></div><p id="page-change-announcement" aria-live="polite" data-page-changed="Page changed"></p><div hidden data-document-meta data-lang="pt-BR" data-title="' + kind + '" data-canonical="/' + kind + '" data-description="' + kind + ' description"></div>' +
-    '<main id="content"><h1>' + kind + '</h1>' + content + '</main>' +
+    requestError + '<main id="content"><h1>' + kind + '</h1>' + content + '</main>' +
     Object.keys({ plain: 1, ...consumers }).map(k => '<a id="go-' + k + '" href="/' + k + '/' + provider + '">' + k + '</a>').join(' ') +
     assets + '</body></html>';
 }
@@ -289,18 +293,53 @@ test('failed provider download can retry on a later navigation', async () => {
   await page.close();
 });
 
-test('stalled map asset reaches finite failure and retries on the same page', async () => {
+test('stalled map asset reaches finite failure and Retry waits on the same download', async () => {
   const page = await browser.newPage();
-  let release;
-  const stall = route => new Promise(resolve => {
-    release = async () => { try { await route.continue(); } catch (_) { /* timed-out script removal aborted it */ } resolve(); };
-  });
+  let release, requests = 0;
+  const stall = route => { requests++; return new Promise(resolve => {
+    release = async () => { await route.continue(); resolve(); };
+  }); };
   await page.route('**/map-provider-google.js', stall);
   await page.goto(origin + '/details/google', { waitUntil: 'domcontentloaded' });
   await page.getByRole('button', { name: 'Retry map' }).waitFor({ timeout: 12000 });
-  await page.unroute('**/map-provider-google.js', stall);
-  await release();
   await page.getByRole('button', { name: 'Retry map' }).evaluate(button => button.click());
+  assert.equal(await page.locator('[data-map-status]').textContent(), 'Loading map');
+  await release();
+  await assertMaps(page, 'details');
+  await page.locator('[data-map-status]').waitFor({ state: 'hidden' });
+  assert.equal(requests, 1, 'Retry must not insert a second copy of an in-flight script');
+  assert.equal(await page.evaluate(() => window.providerLoads), 1);
+  await page.close();
+});
+
+test('a map asset arriving after the timeout starts the map without a Retry', async () => {
+  const page = await browser.newPage();
+  let release;
+  await page.route('**/map-provider-google.js', route => new Promise(resolve => {
+    release = async () => { await route.continue(); resolve(); };
+  }));
+  await page.goto(origin + '/details/google', { waitUntil: 'domcontentloaded' });
+  await page.getByRole('button', { name: 'Retry map' }).waitFor({ timeout: 12000 });
+  await release();
+  await assertMaps(page, 'details');
+  await page.locator('[data-map-status]').waitFor({ state: 'hidden' });
+  assert.equal(await page.getByRole('button', { name: 'Retry map' }).count(), 0);
+  await page.close();
+});
+
+test('a failed map module recovers through a reload, not a re-insert', async () => {
+  const page = await browser.newPage();
+  let fail = true;
+  await page.route('**/maplibre-loader.mjs', route => fail ? route.abort() : route.continue());
+  await page.goto(origin + '/details/maplibre');
+  await page.getByRole('button', { name: 'Retry map' }).waitFor();
+  fail = false;
+  await page.evaluate(() => { window.beforeReload = true; });
+  await Promise.all([
+    page.waitForEvent('load'),
+    page.getByRole('button', { name: 'Retry map' }).evaluate(button => button.click()),
+  ]);
+  assert.equal(await page.evaluate(() => window.beforeReload), undefined);
   await assertMaps(page, 'details');
   await page.close();
 });
@@ -626,5 +665,136 @@ test('leaving before dependencies finish never initializes a detached map', asyn
   assert.equal(await page.evaluate(() => window.created), 0);
   await navigate(page, 'edit');
   await assertMaps(page, 'edit');
+  await page.close();
+});
+
+async function favoriteHtml(isFavorited) {
+  return (await source('templates/partials/favorite_button.html'))
+    .replace(/{#[\s\S]*?#}/g, '')
+    .replace(/{% if is_favorited %}([\s\S]*?){% else %}([\s\S]*?){% endif %}/g, (_, yes, no) => isFavorited ? yes : no)
+    .replace(/{{ id }}/g, '1').replace(/{{ csrf }}/g, 'test-csrf')
+    .replace(/{{ tr.t\("favorites.saved"\) }}/g, 'Saved').replace(/{{ tr.t\("favorites.save"\) }}/g, 'Save');
+}
+
+test('fragment swaps keep focus with the control the visitor used', async () => {
+  const page = await browser.newPage();
+  const errors = [];
+  page.on('pageerror', e => errors.push(e.message));
+  await page.goto(origin + '/plain/google');
+  let favorited = false;
+  await page.route('**/parking/1/favorite', async route => {
+    favorited = !favorited;
+    await new Promise(r => setTimeout(r, 100));
+    await route.fulfill({ contentType: 'text/html', body: await favoriteHtml(favorited) });
+  });
+  await page.route('**/page2', route => route.fulfill({
+    contentType: 'text/html',
+    body: '<div id="results-list" role="list" aria-label="Results"><div role="listitem">second page</div></div>',
+  }));
+  await page.route('**/filtered', route => route.fulfill({
+    contentType: 'text/html', body: '<div id="results-list" role="list"><div role="listitem">filtered</div></div>',
+  }));
+  const favorite = await favoriteHtml(false);
+  await page.evaluate(html => {
+    const main = document.querySelector('main');
+    main.insertAdjacentHTML('beforeend', html +
+      '<input id="filter" type="checkbox" hx-get="/filtered" hx-target="#results" hx-swap="innerHTML">' +
+      '<div id="results"><nav><a id="next" href="/page2" hx-get="/page2" hx-target="#results" hx-swap="innerHTML">Next</a></nav></div>');
+    htmx.process(main);
+  }, favorite);
+
+  // The pager link is inside the results it replaces: focus lands on the new list.
+  await page.locator('#next').focus();
+  await page.keyboard.press('Enter');
+  await page.waitForFunction(() => document.activeElement && document.activeElement.id === 'results-list');
+
+  // A swap started from a control outside the results leaves focus there.
+  await page.locator('#filter').focus();
+  await page.keyboard.press('Space');
+  await page.locator('#results-list', { hasText: 'filtered' }).waitFor();
+  await page.waitForTimeout(50);
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'filter');
+
+  // The favorite toggle stays focused and reports its state.
+  const toggle = page.locator('#favorite-toggle');
+  assert.equal(await toggle.getAttribute('aria-pressed'), 'false');
+  await toggle.focus();
+  await page.keyboard.press('Enter');
+  await page.waitForFunction(() => document.querySelector('#favorite-toggle').getAttribute('aria-pressed') === 'true');
+  await page.waitForFunction(() => document.activeElement && document.activeElement.id === 'favorite-toggle');
+  await page.keyboard.press('Enter');
+  await page.waitForFunction(() => document.querySelector('#favorite-toggle').getAttribute('aria-pressed') === 'false');
+  await page.waitForFunction(() => document.activeElement && document.activeElement.id === 'favorite-toggle');
+  assert.equal(await page.locator('#favorite-button').count(), 1);
+  assert.deepEqual(errors, []);
+  await page.close();
+});
+
+test('a request without an answer shows a dismissible notice that retries reads only', async () => {
+  const page = await browser.newPage();
+  const errors = [];
+  page.on('pageerror', e => errors.push(e.message));
+  await page.goto(origin + '/plain/google');
+  let fail = true, mutations = 0;
+  await page.route('**/frag', async route => {
+    if (fail) return route.abort('internetdisconnected');
+    await route.fulfill({ contentType: 'text/html', body: '<p id="frag-ok">loaded</p>' });
+  });
+  await page.route('**/mutate', route => { mutations++; return route.abort('internetdisconnected'); });
+  await page.route('**/slow', async route => {
+    await new Promise(r => setTimeout(r, 300));
+    try { await route.fulfill({ contentType: 'text/html', body: '<p id="slow-ok">slow</p>' }); } catch (_) { /* replaced */ }
+  });
+  await page.evaluate(() => {
+    const main = document.querySelector('main');
+    main.insertAdjacentHTML('beforeend',
+      '<div id="frag-target"></div>' +
+      '<a id="frag-link" href="/frag" hx-get="/frag" hx-target="#frag-target">load</a>' +
+      '<button id="mutate" hx-post="/mutate" hx-target="#frag-target">change</button>' +
+      '<button id="slow" hx-get="/slow" hx-target="#frag-target" hx-sync="this:replace">slow</button>');
+    htmx.process(main);
+  });
+  const box = page.locator('[data-request-error-box]');
+  const retry = page.getByRole('button', { name: 'Try again' });
+  const dismiss = page.getByRole('button', { name: 'Dismiss' });
+  assert.equal(await box.isVisible(), false);
+  assert.equal(await page.locator('#request-error').getAttribute('aria-live'), 'assertive');
+
+  // A failed read: the notice is announced and Retry repeats the same request.
+  await page.locator('#frag-link').click();
+  await box.waitFor({ state: 'visible' });
+  await page.waitForFunction(() => document.querySelector('[data-request-error-message]').textContent === 'Connection failed');
+  assert.equal(await retry.isVisible(), true);
+  fail = false;
+  await retry.click();
+  await page.locator('#frag-ok').waitFor();
+  assert.equal(await box.isVisible(), false);
+
+  // A failed change is never resent: no Retry, and Dismiss returns focus.
+  await page.locator('#mutate').click();
+  await box.waitFor({ state: 'visible' });
+  assert.equal(await retry.isVisible(), false);
+  await dismiss.click();
+  assert.equal(await box.isVisible(), false);
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'mutate');
+  assert.equal(mutations, 1);
+
+  // A request that hx-sync replaced was aborted on purpose, not lost.
+  await page.locator('#slow').click();
+  await page.locator('#slow').click();
+  await page.locator('#slow-ok').waitFor();
+  await page.waitForTimeout(100);
+  assert.equal(await box.isVisible(), false);
+
+  // A failed page navigation retries as a real navigation.
+  let navFail = true;
+  await page.route('**/details/google', route => navFail ? route.abort('internetdisconnected') : route.continue());
+  await page.locator('#go-details').click();
+  await box.waitFor({ state: 'visible' });
+  assert.equal(await page.locator('h1').first().textContent(), 'plain');
+  navFail = false;
+  await Promise.all([page.waitForEvent('load'), retry.click()]);
+  await page.waitForFunction(() => document.querySelector('main h1').textContent === 'details');
+  assert.deepEqual(errors, []);
   await page.close();
 });

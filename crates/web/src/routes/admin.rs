@@ -1,24 +1,27 @@
 //! Admin-only pages: the user directory and its role/state actions, the
-//! audit-log viewer and the manual privacy-request queue.
+//! audit-log viewer, the manual privacy-request queue and the background-job
+//! health view.
 
 use axum::extract::{Form, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
-use bikesnest_application::AuditFilter;
+use bikesnest_application::{AuditFilter, AuthError, JobHealthError};
 use bikesnest_domain::{Role, UserId};
 
 use crate::auth::Auth;
+use crate::htmx::{is_fragment_request, vary_fragment};
 use crate::i18n::{Locale, Translator};
 use crate::state::AppState;
 use crate::view;
 use crate::{
-    AdminAuditPage, AdminPrivacyRequestsPage, AdminUserContributionsPage, AdminUsersPage,
-    PageLayout,
+    AdminAuditPage, AdminJobsPage, AdminJobsStatusVm, AdminPrivacyRequestsPage,
+    AdminUserContributionsPage, AdminUsersPage, PageLayout,
 };
 
 use super::common::{
     DEFAULT_PAGE_LIMIT, parse_after_id, parse_datetime, render, urlencoding_query,
 };
+use super::errors::{error_page, internal_error};
 
 /// POST /admin/users/{id}/suspend — ADMIN-only; revokes sessions + audits.
 pub(crate) async fn admin_user_suspend(
@@ -32,7 +35,11 @@ pub(crate) async fn admin_user_suspend(
     };
     match state.auth.suspend_user(actor, UserId(id)).await {
         Ok(()) => axum::response::Redirect::to("/admin/users?suspended=1").into_response(),
-        Err(_) => axum::response::Redirect::to("/admin/users?error=1").into_response(),
+        Err(err) => axum::response::Redirect::to(&format!(
+            "/admin/users?error={}",
+            account_action_error_code(&err)
+        ))
+        .into_response(),
     }
 }
 
@@ -48,11 +55,38 @@ pub(crate) async fn admin_user_restore(
     };
     match state.auth.restore_user(actor, UserId(id)).await {
         Ok(()) => axum::response::Redirect::to("/admin/users?restored=1").into_response(),
-        Err(_) => axum::response::Redirect::to("/admin/users?error=1").into_response(),
+        Err(err) => axum::response::Redirect::to(&format!(
+            "/admin/users?error={}",
+            account_action_error_code(&err)
+        ))
+        .into_response(),
     }
 }
 
-/// GET /admin/users/{id}/contributions — a target user's C5 feed (MODERATOR/ADMIN).
+/// The `?error=` code a refused suspend/restore redirects with, so the user
+/// list can say *why* instead of a generic failure.
+fn account_action_error_code(err: &AuthError) -> &'static str {
+    match err {
+        AuthError::SelfSuspension => "self_suspension",
+        AuthError::LastActiveAdmin => "last_active_admin",
+        AuthError::StateUnchanged => "state_unchanged",
+        _ => "1",
+    }
+}
+
+/// The message for an `?error=` code on the admin user list.
+fn admin_users_error(tr: Translator, code: &str) -> String {
+    let key = match code {
+        "self_suspension" => "auth.error.self_suspension",
+        "last_active_admin" => "auth.error.last_active_admin",
+        "state_unchanged" => "auth.error.state_unchanged",
+        _ => "admin.role_error",
+    };
+    tr.t(key).to_string()
+}
+
+/// GET /admin/users/{id}/contributions — a target user's contribution feed
+/// (MODERATOR/ADMIN).
 pub(crate) async fn admin_user_contributions(
     State(state): State<AppState>,
     locale: Locale,
@@ -75,7 +109,7 @@ pub(crate) async fn admin_user_contributions(
         .and_then(|labels| labels.get(&id).cloned())
         .unwrap_or_else(|| format!("#{id}"));
     // Bounded to the newest DEFAULT_PAGE_LIMIT entries; this admin inspection
-    // view has no "load more" control (out of WP11's named template list).
+    // view has no "load more" control.
     let items = state
         .moderation
         .user_contribution_history(user, target, None, DEFAULT_PAGE_LIMIT)
@@ -299,10 +333,7 @@ pub(crate) async fn admin_users(
             } else {
                 None
             },
-            error: q
-                .error
-                .as_ref()
-                .map(|_| tr.t("admin.role_error").to_string()),
+            error: q.error.as_deref().map(|code| admin_users_error(tr, code)),
         },
         StatusCode::OK,
     )
@@ -411,5 +442,85 @@ pub(crate) async fn admin_privacy_request_fulfill(
     match state.privacy.fulfill_request(admin, id).await {
         Ok(()) => Redirect::to("/admin/privacy-requests?fulfilled=1").into_response(),
         Err(_) => Redirect::to("/admin/privacy-requests?error=1").into_response(),
+    }
+}
+
+/// GET /admin/jobs — ADMIN-only background-job health: each recurring job's
+/// last success, next run, lateness, attempts and last error, plus one-shot
+/// queue pressure.
+pub(crate) async fn admin_jobs(
+    State(state): State<AppState>,
+    locale: Locale,
+    auth: Auth,
+    headers: HeaderMap,
+) -> Response {
+    let tr = Translator::new(locale);
+    let admin = match auth.require_role(Role::Admin) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    match state.jobs.report(admin).await {
+        Ok(report) => render(
+            AdminJobsPage {
+                layout: PageLayout::for_request(
+                    tr.t("admin.jobs.title").to_string(),
+                    "admin",
+                    &auth,
+                    &state.map,
+                ),
+                tr,
+                health: view::job_health_vm(tr, &report),
+            },
+            StatusCode::OK,
+        ),
+        Err(err) => job_health_error(&headers, &state, &auth, tr, &err),
+    }
+}
+
+/// GET /admin/jobs/status — the region `/admin/jobs` polls. Only a real
+/// fragment request gets the partial; anything else is sent to the page.
+pub(crate) async fn admin_jobs_status(
+    State(state): State<AppState>,
+    locale: Locale,
+    auth: Auth,
+    headers: HeaderMap,
+) -> Response {
+    let tr = Translator::new(locale);
+    let admin = match auth.require_role(Role::Admin) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if !is_fragment_request(&headers) {
+        return Redirect::to("/admin/jobs").into_response();
+    }
+    match state.jobs.report(admin).await {
+        Ok(report) => vary_fragment(render(
+            AdminJobsStatusVm {
+                tr,
+                health: view::job_health_vm(tr, &report),
+            },
+            StatusCode::OK,
+        )),
+        Err(err) => job_health_error(&headers, &state, &auth, tr, &err),
+    }
+}
+
+fn job_health_error(
+    headers: &HeaderMap,
+    state: &AppState,
+    auth: &Auth,
+    tr: Translator,
+    err: &JobHealthError,
+) -> Response {
+    match err {
+        JobHealthError::Forbidden => error_page(
+            headers,
+            &state.map,
+            auth,
+            tr,
+            StatusCode::FORBIDDEN,
+            "error.forbidden",
+        ),
+        JobHealthError::Read(_) => internal_error(headers, &state.map, auth, tr, err),
     }
 }

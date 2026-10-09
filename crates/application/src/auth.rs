@@ -49,6 +49,16 @@ pub enum AuthError {
     /// whether the actor is demoting themselves or another admin.
     #[error("the system must keep at least one admin")]
     RefuseAdminSelfRevoke,
+    /// An administrator tried to suspend their own account.
+    #[error("you cannot suspend your own account")]
+    SelfSuspension,
+    /// The suspension would leave the system with no active ADMIN.
+    #[error("the system must keep at least one active admin")]
+    LastActiveAdmin,
+    /// The account is not in a state this transition applies to (suspending
+    /// an already suspended or deleted account, restoring an unsuspended one).
+    #[error("the account is not in a state that allows this action")]
+    StateUnchanged,
     /// Storage refused a duplicate, or a concurrent writer won the race
     /// (unique violation, serialization failure, deadlock).
     #[error("that change conflicts with an existing record")]
@@ -196,11 +206,18 @@ pub trait AuthOutbox: Send + Sync {
         at: DateTime<Utc>,
         message: EmailMessage,
     ) -> Result<Option<AdmittedAuthMail>, AuthError>;
+    /// Consume a verification token and apply it. Activating a pending
+    /// account requires `proven_credential_hash`: the password credential the
+    /// caller just verified the submitted password against. The adapter
+    /// compares it with the stored credential under the account lock, so a
+    /// credential replaced after the check (a re-registration) cannot be
+    /// activated. Email-change confirmations pass `None`.
     async fn confirm_email(
         &self,
         token: &VerificationToken,
         at: DateTime<Utc>,
         old_address_notice: EmailMessage,
+        proven_credential_hash: Option<&str>,
     ) -> Result<Option<EmailConfirmationOutcome>, AuthError>;
     async fn complete_password_reset(
         &self,
@@ -230,8 +247,9 @@ pub trait AuthMailDispatcher: Send + Sync {
 /// suspend/grant decision is not made from an email address alone.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UserActivity {
-    /// Newest `sessions.last_seen_at` for the account; `None` for an account
-    /// that has never signed in (or whose sessions have been purged).
+    /// The durable `users.last_active_at`: advanced by every session write and
+    /// kept when sessions are purged. `None` only for an account an adapter
+    /// cannot report on.
     pub last_active_at: Option<DateTime<Utc>>,
     /// Locations added, edits, proposals, reviews, verifications and photos —
     /// the same events the contribution feed lists, counted.
@@ -263,6 +281,11 @@ pub trait AccountRepository: Send + Sync {
     /// outstanding verification and password-reset tokens, and write the
     /// administrator audit event while holding the account row lock. Deleted
     /// and already-suspended accounts are unchanged and return `false`.
+    ///
+    /// Suspending the last *active* ADMIN is refused with
+    /// [`AuthError::LastActiveAdmin`]. The guard locks the ADMIN role rows
+    /// first, so two administrators suspending each other serialize and the
+    /// second sees the first one's suspension.
     async fn suspend_by_admin(&self, id: UserId, actor: UserId) -> Result<bool, AuthError>;
     /// Atomically restore only a suspended account and write its administrator
     /// audit event. A verified account becomes active; an unverified account
@@ -319,6 +342,15 @@ pub trait AccountRepository: Send + Sync {
     async fn labels_for(&self, ids: &[i64]) -> Result<HashMap<i64, String>, AuthError>;
     /// Last-seen + contribution counters for a batch of ids (one query).
     async fn activity_for(&self, ids: &[i64]) -> Result<HashMap<i64, UserActivity>, AuthError>;
+}
+
+/// What a verification link does once its form is submitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationPurpose {
+    /// First verification of a pending registration. Requires the password.
+    ActivateAccount,
+    /// Switch a signed-up account to a new, now-proven address.
+    ConfirmEmailChange,
 }
 
 /// A resolved server-side session.
@@ -741,13 +773,27 @@ impl AuthService {
         Ok(())
     }
 
-    /// Verify an email via a single-use token. Handles both registration
-    /// (token email == account email → set verified + Active) and change-email
-    /// (token email != account email → switch canonical email + verify).
-    pub async fn verify_email(&self, raw_token: &str) -> Result<(), AuthError> {
-        let now = self.now();
+    /// What a verification link is for, judged **without consuming it**. The
+    /// link page calls this on GET, so a mail scanner that prefetches the link
+    /// spends nothing: only the form that page renders applies the token.
+    pub async fn verification_purpose(
+        &self,
+        raw_token: &str,
+    ) -> Result<VerificationPurpose, AuthError> {
         let token = decode_token(raw_token).ok_or(AuthError::TokenInvalid)?;
-        let Some(user_id) = self.tokens.find_verification(&token, now).await? else {
+        let (user, _) = self.verification_target(&token).await?;
+        Ok(match user.account_state {
+            AccountState::PendingEmailVerification => VerificationPurpose::ActivateAccount,
+            _ => VerificationPurpose::ConfirmEmailChange,
+        })
+    }
+
+    async fn verification_target(
+        &self,
+        token: &VerificationToken,
+    ) -> Result<(User, DateTime<Utc>), AuthError> {
+        let now = self.now();
+        let Some(user_id) = self.tokens.find_verification(token, now).await? else {
             return Err(AuthError::TokenInvalid);
         };
         let Some(user) = self.accounts.find_by_id(user_id).await? else {
@@ -759,10 +805,42 @@ impl AuthService {
         ) {
             return Err(AuthError::TokenInvalid);
         }
+        Ok((user, now))
+    }
+
+    /// Apply a single-use verification token. Handles both registration
+    /// (token email == account email → set verified + Active) and change-email
+    /// (token email != account email → switch canonical email + verify).
+    ///
+    /// Activating a **pending** account also requires the account password.
+    /// Anyone can register any address, and re-registering a pending address
+    /// replaces its password, so a link alone proves only that the mailbox
+    /// owner clicked — not that the password on the account is theirs. Without
+    /// this check, an attacker who re-registered the owner's address could
+    /// sign in with their own password once the owner followed the fresh link.
+    /// A wrong or missing password is [`AuthError::InvalidCredentials`] and
+    /// leaves the token unspent; attempts are throttled per account and per IP.
+    ///
+    /// Confirming an email *change* takes no password: the change was requested
+    /// from a signed-in session that re-entered the current password, and the
+    /// token itself proves control of the new mailbox.
+    pub async fn verify_email(
+        &self,
+        ip: &str,
+        raw_token: &str,
+        password: Option<&str>,
+    ) -> Result<(), AuthError> {
+        let token = decode_token(raw_token).ok_or(AuthError::TokenInvalid)?;
+        let (user, now) = self.verification_target(&token).await?;
+        let proven_hash = if user.account_state == AccountState::PendingEmailVerification {
+            Some(self.prove_activation_password(ip, &user, password).await?)
+        } else {
+            None
+        };
         let notice = self.security_notice(user.id, &user.email, user.locale, true);
         let Some(outcome) = self
             .outbox
-            .confirm_email(&token, now, notice)
+            .confirm_email(&token, now, notice, proven_hash.as_deref())
             .await
             .map_err(|e| match e {
                 AuthError::Conflict => AuthError::EmailTaken,
@@ -775,6 +853,46 @@ impl AuthService {
             self.dispatch_committed_notice(mail).await;
         }
         Ok(())
+    }
+
+    /// Check the password a pending account is being activated with and return
+    /// the credential hash it matched, for the outbox to re-check atomically.
+    async fn prove_activation_password(
+        &self,
+        ip: &str,
+        user: &User,
+        password: Option<&str>,
+    ) -> Result<String, AuthError> {
+        self.allowed(
+            &format!("activate:user:{}", user.id.0),
+            ACTIVATE_USER_LIMIT,
+            std::time::Duration::from_secs(15 * 60),
+        )
+        .await?;
+        self.allowed(
+            &format!("activate:ip:{ip}"),
+            ACTIVATE_IP_LIMIT,
+            std::time::Duration::from_secs(15 * 60),
+        )
+        .await?;
+        let password = Password::new(password.unwrap_or_default());
+        let hash = self
+            .accounts
+            .find_identity(AuthenticationProvider::Password, user.email.as_str())
+            .await?
+            .filter(|identity| identity.user_id == user.id)
+            .and_then(|identity| identity.credential_hash)
+            .filter(|hash| !hash.is_empty());
+        let Some(hash) = hash else {
+            // Same cost as a real check, so the reply time does not reveal
+            // whether the pending account has a password at all.
+            let _ = self.hasher.verify(&password, DUMMY_HASH).await;
+            return Err(AuthError::InvalidCredentials);
+        };
+        if !self.hasher.verify(&password, &hash).await? {
+            return Err(AuthError::InvalidCredentials);
+        }
+        Ok(hash)
     }
 
     /// Resend a verification email. Neutral even when no such account exists.
@@ -1039,15 +1157,28 @@ impl AuthService {
     // Authenticated settings
     // -----------------------------------------------------------------------
 
+    /// Admit one password re-entry for a signed-in account: per account and
+    /// per IP, like the login buckets, so a stolen session cannot be used to
+    /// guess the current password without limit.
+    async fn admit_reauth(&self, ip: &str, user_id: UserId) -> Result<(), AuthError> {
+        self.allowed(&reauth_user_key(user_id), REAUTH_USER_LIMIT, REAUTH_WINDOW)
+            .await?;
+        self.allowed(&reauth_ip_key(ip), REAUTH_IP_LIMIT, REAUTH_WINDOW)
+            .await
+    }
+
     /// Change the password. Requires the current password; revokes all *other*
-    /// sessions (keeps `current`).
+    /// sessions (keeps `current`). Attempts are throttled (see
+    /// [`AuthService::admit_reauth`]).
     pub async fn change_password(
         &self,
+        ip: &str,
         user_id: UserId,
         current: &str,
         new: &str,
         current_session: &SessionId,
     ) -> Result<(), AuthError> {
+        self.admit_reauth(ip, user_id).await?;
         let Some(user) = self.accounts.find_by_id(user_id).await? else {
             return Err(AuthError::InvalidCredentials);
         };
@@ -1085,13 +1216,16 @@ impl AuthService {
 
     /// Request an email change. Verifies the current password, then issues a
     /// verification token for the *new* address. The actual switch happens in
-    /// [`AuthService::verify_email`] when that token is consumed.
+    /// [`AuthService::verify_email`] when that token is consumed. Attempts are
+    /// throttled (see [`AuthService::admit_reauth`]).
     pub async fn change_email(
         &self,
+        ip: &str,
         user_id: UserId,
         current_password: &str,
         new_email: &UserEmail,
     ) -> Result<(), AuthError> {
+        self.admit_reauth(ip, user_id).await?;
         let Some(user) = self.accounts.find_by_id(user_id).await? else {
             return Err(AuthError::InvalidCredentials);
         };
@@ -1339,6 +1473,12 @@ impl AuthService {
     // -----------------------------------------------------------------------
 
     /// Suspend an account: set `Suspended`, revoke all sessions, audit.
+    ///
+    /// Refuses the actor's own account ([`AuthError::SelfSuspension`]) and
+    /// the last active admin ([`AuthError::LastActiveAdmin`], enforced by the
+    /// repository under a lock). An account that is not active or pending
+    /// (already suspended, deleted, unknown) is [`AuthError::StateUnchanged`],
+    /// so the caller never reports a suspension that did not happen.
     pub async fn suspend_user(
         &self,
         actor: &AuthenticatedUser,
@@ -1347,11 +1487,18 @@ impl AuthService {
         if !actor.has_role(Role::Admin) {
             return Err(AuthError::Unauthorized);
         }
-        self.accounts.suspend_by_admin(target, actor.id).await?;
-        Ok(())
+        if actor.id == target {
+            return Err(AuthError::SelfSuspension);
+        }
+        if self.accounts.suspend_by_admin(target, actor.id).await? {
+            Ok(())
+        } else {
+            Err(AuthError::StateUnchanged)
+        }
     }
 
-    /// Restore a suspended account to its verification-appropriate state.
+    /// Restore a suspended account to its verification-appropriate state. An
+    /// account that is not suspended is [`AuthError::StateUnchanged`].
     pub async fn restore_user(
         &self,
         actor: &AuthenticatedUser,
@@ -1360,8 +1507,11 @@ impl AuthService {
         if !actor.has_role(Role::Admin) {
             return Err(AuthError::Unauthorized);
         }
-        self.accounts.restore_by_admin(target, actor.id).await?;
-        Ok(())
+        if self.accounts.restore_by_admin(target, actor.id).await? {
+            Ok(())
+        } else {
+            Err(AuthError::StateUnchanged)
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1457,3 +1607,21 @@ const RESET_IP_LIMIT: u32 = 3;
 const RESET_EMAIL_LIMIT: u32 = 3;
 const VERIFY_RESEND_USER_LIMIT: u32 = 3;
 const VERIFY_RESEND_IP_LIMIT: u32 = 5;
+const ACTIVATE_USER_LIMIT: u32 = 5;
+const ACTIVATE_IP_LIMIT: u32 = 10;
+/// Password re-entry on authenticated settings (change password, change
+/// email, delete account). The bucket is shared with the privacy service, so
+/// every place that verifies the current password draws on one budget.
+pub const REAUTH_USER_LIMIT: u32 = 5;
+pub const REAUTH_IP_LIMIT: u32 = 10;
+pub const REAUTH_WINDOW: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Rate-limit keys for password re-entry, shared by [`AuthService`] and the
+/// privacy service so the budget is per account, not per form.
+pub fn reauth_user_key(user_id: UserId) -> String {
+    format!("reauth:user:{}", user_id.0)
+}
+
+pub fn reauth_ip_key(ip: &str) -> String {
+    format!("reauth:ip:{ip}")
+}

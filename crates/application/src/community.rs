@@ -25,7 +25,7 @@ use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ContributionError {
-    /// The session principal has not verified their email (the  gate).
+    /// The session principal has not verified their email.
     #[error("verify your email to contribute")]
     NotVerified,
     #[error("too many attempts, try again later")]
@@ -827,6 +827,13 @@ impl ContributionService {
         let mut payload = bikesnest_domain::ProposalPayload::from_json(kind, &proposed);
         if payload.change == bikesnest_domain::ProposedChange::Unknown {
             return Err(ContributionError::InvalidField("invalid proposal".into()));
+        }
+        // `require_active` above means the spot is published; proposing that
+        // it exists would file a proposal that changes nothing when merged.
+        if payload.change == (bikesnest_domain::ProposedChange::ChangeExistence { exists: true }) {
+            return Err(ContributionError::InvalidField(
+                "an active spot already exists".into(),
+            ));
         }
         if let bikesnest_domain::ProposedChange::MoveLocation { lat, lon, timezone } =
             &mut payload.change

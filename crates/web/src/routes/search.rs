@@ -277,38 +277,6 @@ pub(crate) fn results_notice(tr: Translator, key: &str) -> ResultsData {
     }
 }
 
-/// Would serving this search cost a geocode the provider actually bills?
-///
-/// No, when the request carries coordinates (they win over the query),
-/// when there is no query to resolve, or when the in-process cache already
-/// holds the answer. A cached destination is free, so it must not count
-/// against anyone's budget.
-pub(crate) fn geocode_is_billable(state: &AppState, input: &SearchInput) -> bool {
-    if input.lat.is_some() && input.lon.is_some() {
-        return false;
-    }
-    match input.query.as_deref().map(str::trim) {
-        Some(q) if !q.is_empty() => state.geocoder.peek(q).is_none(),
-        _ => false,
-    }
-}
-
-/// Is this network still inside its per-IP geocode budget?
-///
-/// A limiter error counts as *over* budget: `fail_open` (the default) is
-/// applied inside the limiter, so an error reaching here means the operator
-/// asked to refuse rather than let calls through unmetered.
-pub(crate) async fn geocode_within_budget(state: &AppState, ip: &str) -> bool {
-    let limits = state.geocode_limits;
-    matches!(
-        state
-            .rate_limiter
-            .check(&format!("geocode:ip:{ip}"), limits.per_ip, limits.window)
-            .await,
-        Ok(true)
-    )
-}
-
 /// Search results (full page, or HTMX fragment when requested).
 pub(crate) async fn search(
     State(state): State<AppState>,
@@ -350,7 +318,8 @@ pub(crate) async fn search(
 
     // One view of `/search?q=…` can be one billable geocode, so a page that
     // has to resolve free text is metered per IP before the use case runs.
-    if geocode_is_billable(&state, &input) && !geocode_within_budget(&state, &ip).await {
+    // Coordinates, an empty query or a cached destination cost nothing.
+    if !state.destinations.admit_search(&ip, &input).await {
         return render_search(
             &state,
             tr,
@@ -388,7 +357,7 @@ pub(crate) async fn search(
         Err(bikesnest_application::SearchError::Geocode(_)) => {
             results_notice(tr, "search.geocode_unavailable")
         }
-        Err(_) => return internal_error(&headers, &state.map, &auth, tr),
+        Err(e) => return internal_error(&headers, &state.map, &auth, tr, &e),
     };
 
     render_search(&state, tr, &auth, &params, results, is_htmx, StatusCode::OK)
@@ -436,7 +405,7 @@ async fn browse(
         Err(bikesnest_application::SearchError::BoundsNotPaginated) => {
             notice("search.browse.no_pages")
         }
-        Err(_) => internal_error(headers, &state.map, auth, tr),
+        Err(e) => internal_error(headers, &state.map, auth, tr, &e),
     }
 }
 

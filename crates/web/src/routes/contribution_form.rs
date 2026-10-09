@@ -534,6 +534,32 @@ pub fn security_fields_from(security: &[SecurityFeature]) -> [String; 8] {
 // View models
 // ---------------------------------------------------------------------------
 
+/// The two proposal forms under the edit page ("move the pin" and "mark
+/// gone"). A rejected proposal re-renders the edit page with what the rider
+/// entered and the error next to the form they submitted.
+#[derive(Debug, Clone, Default)]
+pub struct ProposalFormsVm {
+    pub move_lat: String,
+    pub move_lon: String,
+    pub move_timezone: String,
+    pub move_reason: String,
+    pub move_error: Option<String>,
+    pub removal_confirmed: bool,
+    pub removal_reason: String,
+    pub removal_error: Option<String>,
+}
+
+impl ProposalFormsVm {
+    /// Blank forms, with the "move" inputs seeded at the spot's current position.
+    pub fn at(lat: f64, lon: f64) -> Self {
+        Self {
+            move_lat: lat.to_string(),
+            move_lon: lon.to_string(),
+            ..Self::default()
+        }
+    }
+}
+
 /// One day's row in the hours editor.
 #[derive(Debug, Clone)]
 pub struct HoursDayVm {

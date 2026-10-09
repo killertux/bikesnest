@@ -1,0 +1,60 @@
+{# The job-health region. Rendered inside pages/admin_jobs.html and on its
+   own by GET /admin/jobs/status, which this element polls to replace itself. #}
+<div id="job-health" class="mt-6" hx-get="/admin/jobs/status" hx-trigger="every 60s" hx-swap="outerHTML">
+  <p class="text-xs text-muted">{{ tr.t("admin.jobs.checked_at") }} <span class="font-mono">{{ health.checked_label }}</span></p>
+
+  {% if health.all_healthy %}
+    <p class="mt-4 rounded-2xl border border-border p-4 text-sm" data-job-health="ok">{{ tr.t("admin.jobs.all_healthy") }}</p>
+  {% else %}
+    <p class="mt-4 rounded-2xl border border-danger/40 bg-danger/10 p-4 text-sm text-danger" data-job-health="attention">{{ tr.t("admin.jobs.attention") }}</p>
+  {% endif %}
+
+  <h2 class="mt-8 font-display text-lg font-semibold">{{ tr.t("admin.jobs.recurring") }}</h2>
+  {% if health.rows.is_empty() %}
+    <div class="mt-3 rounded-2xl border border-border p-8 text-center text-sm text-muted">{{ tr.t("admin.jobs.empty") }}</div>
+  {% else %}
+  <div class="mt-3 overflow-x-auto rounded-2xl border border-border">
+    <table class="w-full text-left text-sm">
+      <thead class="bg-bg">
+        <tr>
+          <th class="px-4 py-3 font-semibold">{{ tr.t("admin.jobs.kind") }}</th>
+          <th class="px-4 py-3 font-semibold">{{ tr.t("admin.jobs.status") }}</th>
+          <th class="px-4 py-3 font-semibold">{{ tr.t("admin.jobs.schedule") }}</th>
+          <th class="px-4 py-3 font-semibold">{{ tr.t("admin.jobs.last_success") }}</th>
+          <th class="px-4 py-3 font-semibold">{{ tr.t("admin.jobs.next_run") }}</th>
+          <th class="px-4 py-3 font-semibold">{{ tr.t("admin.jobs.attempts") }}</th>
+          <th class="px-4 py-3 font-semibold">{{ tr.t("admin.jobs.last_error") }}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for j in health.rows %}
+        <tr class="border-t border-border align-top" data-job-kind="{{ j.kind }}" data-job-status="{{ j.health_code }}">
+          <td class="px-4 py-3 font-mono text-xs">{{ j.kind }}</td>
+          <td class="px-4 py-3 text-xs"><span class="{{ j.health_badge_class }}">{{ j.health_label }}</span></td>
+          <td class="px-4 py-3 text-xs">{{ j.schedule_label }}</td>
+          <td class="whitespace-nowrap px-4 py-3 font-mono text-xs" title="{{ j.last_success_title }}">{{ j.last_success_label }}</td>
+          <td class="whitespace-nowrap px-4 py-3 font-mono text-xs">
+            {{ j.next_run_label }}
+            {% if let Some(late) = j.lateness_label %}<span class="block text-danger">{{ late }}</span>{% endif %}
+          </td>
+          <td class="px-4 py-3 font-mono text-xs">{{ j.attempts_label }}</td>
+          <td class="px-4 py-3 font-mono text-xs text-muted">{% if let Some(err) = j.last_error %}{{ err }}{% else %}—{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  <h2 class="mt-8 font-display text-lg font-semibold">{{ tr.t("admin.jobs.queue") }}</h2>
+  <dl class="mt-3 grid gap-4 sm:grid-cols-2">
+    <div class="rounded-2xl border border-border p-5">
+      <dt class="text-sm text-muted">{{ tr.t("admin.jobs.overdue_pending") }}</dt>
+      <dd class="mt-2 font-display text-3xl font-bold text-fg" data-job-queue="overdue">{{ health.overdue_pending }}</dd>
+    </div>
+    <div class="rounded-2xl border border-border p-5">
+      <dt class="text-sm text-muted">{{ tr.t("admin.jobs.failed_last_day") }}</dt>
+      <dd class="mt-2 font-display text-3xl font-bold text-fg" data-job-queue="failed">{{ health.failed_last_day }}</dd>
+    </div>
+  </dl>
+</div>

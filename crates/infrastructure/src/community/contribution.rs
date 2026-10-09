@@ -4,6 +4,7 @@
 //! detection. User edits enter as `PENDING` proposals; approval publishes them.
 
 use crate::Db;
+use crate::community::voting::{eligible_voter, eligible_votes_join};
 use crate::parking::SqlxParkingDetailsReader;
 use async_trait::async_trait;
 use bikesnest_application::{
@@ -13,7 +14,7 @@ use bikesnest_application::{
 };
 use bikesnest_domain::{
     ChangeKind, Cost, GeoPoint, OpeningHours, ParkingLocation, RevisionSummary, SecurityFeature,
-    SecurityState, UserId,
+    SecurityState, TimeRange, UserId,
 };
 
 /// Advisory duplicate radius in metres.
@@ -310,9 +311,11 @@ impl ParkingContributionRepository for SqlxParkingContributionRepository {
         // The preference setter takes this same user-row lock before it clears
         // live attribution. Reading the preference under the lock means an
         // opt-out cannot race this insert and reveal a new proposal.
-        let public_author: Option<(bool,)> = sqlx::query_as(
-            "SELECT public_contribution_name FROM users WHERE id = $1 AND account_state = 'ACTIVE' AND email_verified_at IS NOT NULL FOR UPDATE",
-        )
+        let public_author: Option<(bool,)> = sqlx::query_as(concat!(
+            "SELECT u.public_contribution_name FROM users u WHERE u.id = $1 AND ",
+            eligible_voter!(),
+            " FOR UPDATE OF u"
+        ))
         .bind(p.proposer_id.0)
         .fetch_optional(&mut *tx)
         .await
@@ -368,6 +371,7 @@ impl ParkingContributionRepository for SqlxParkingContributionRepository {
             base_version: i64,
             kind: String,
             proposed: serde_json::Value,
+            escalated_at: Option<chrono::DateTime<chrono::Utc>>,
         }
         let location: (i64,) =
             sqlx::query_as("SELECT location_id FROM parking_proposal WHERE id = $1")
@@ -389,7 +393,7 @@ impl ParkingContributionRepository for SqlxParkingContributionRepository {
             return Err(ContributionError::LocationNotActive);
         }
         let locked = sqlx::query_as::<_, LockedProposal>(
-            "SELECT proposer_id, status, base_version, kind, proposed FROM parking_proposal WHERE id = $1 FOR UPDATE",
+            "SELECT proposer_id, status, base_version, kind, proposed, escalated_at FROM parking_proposal WHERE id = $1 FOR UPDATE",
         )
         .bind(proposal_id)
         .fetch_optional(&mut *tx)
@@ -408,10 +412,14 @@ impl ParkingContributionRepository for SqlxParkingContributionRepository {
         // Do not lock the account row: deletion/anonymization owns that row
         // before cleaning vote rows. The final tally rechecks eligibility at
         // its statement snapshot instead of trusting eligibility at vote time.
-        let eligible: Option<(i64,)> = sqlx::query_as(
-            "SELECT id FROM users WHERE id = $1 AND account_state = 'ACTIVE' AND email_verified_at IS NOT NULL"
-        ).bind(voter.0).fetch_optional(&mut *tx).await
-            .map_err(|e| db_err("contribution.vote_on_proposal", e))?;
+        let eligible: Option<(i64,)> = sqlx::query_as(concat!(
+            "SELECT u.id FROM users u WHERE u.id = $1 AND ",
+            eligible_voter!()
+        ))
+        .bind(voter.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| db_err("contribution.vote_on_proposal", e))?;
         if eligible.is_none() {
             return Err(ContributionError::NotVerified);
         }
@@ -434,39 +442,63 @@ impl ParkingContributionRepository for SqlxParkingContributionRepository {
             approvals: i64,
             rejections: i64,
         }
-        let totals = sqlx::query_as::<_, Totals>(r#"
-            SELECT COUNT(*) FILTER (WHERE v.vote = 'APPROVE')::bigint AS approvals,
-                   COUNT(*) FILTER (WHERE v.vote = 'REJECT')::bigint AS rejections
-            FROM parking_proposal_vote v JOIN users u ON u.id = v.voter_id
-            WHERE v.proposal_id = $1 AND u.account_state = 'ACTIVE' AND u.email_verified_at IS NOT NULL
-        "#).bind(proposal_id).fetch_one(&mut *tx).await
+        let totals = sqlx::query_as::<_, Totals>(concat!(
+            "SELECT COUNT(*) FILTER (WHERE v.vote = 'APPROVE' AND u.id IS NOT NULL)::bigint AS approvals,
+                    COUNT(*) FILTER (WHERE v.vote = 'REJECT' AND u.id IS NOT NULL)::bigint AS rejections
+             FROM parking_proposal p",
+            eligible_votes_join!(),
+            "WHERE p.id = $1"
+        ))
+        .bind(proposal_id).fetch_one(&mut *tx).await
             .map_err(|e| db_err("contribution.vote_on_proposal", e))?;
         let mut published = false;
-        if totals.approvals >= 6 {
+        if bikesnest_domain::should_publish(totals.approvals) && locked.escalated_at.is_none() {
             let kind = bikesnest_domain::ProposalKind::from_code(&locked.kind)?;
             let change = bikesnest_domain::ProposedChange::from_json(kind, &locked.proposed);
-            if let Ok(applied) = bikesnest_application::ProposalApplication::merge(
+            match bikesnest_application::ProposalApplication::merge(
                 kind,
                 &change,
                 &Default::default(),
             ) {
-                crate::moderation::actions::approve_in_transaction(
-                    &mut tx,
-                    proposal_id,
-                    voter,
-                    applied,
-                )
-                .await
-                .map_err(|e| match e {
-                    bikesnest_application::ModerationError::StaleProposal => {
-                        ContributionError::VersionConflict
-                    }
-                    bikesnest_application::ModerationError::InvalidState => {
-                        ContributionError::Conflict
-                    }
-                    _ => ContributionError::Internal,
-                })?;
-                published = true;
+                Ok(applied) => {
+                    crate::moderation::actions::approve_in_transaction(
+                        &mut tx,
+                        proposal_id,
+                        voter,
+                        applied,
+                    )
+                    .await
+                    .map_err(|e| match e {
+                        bikesnest_application::ModerationError::StaleProposal => {
+                            ContributionError::VersionConflict
+                        }
+                        bikesnest_application::ModerationError::InvalidState => {
+                            ContributionError::Conflict
+                        }
+                        _ => ContributionError::Internal,
+                    })?;
+                    published = true;
+                }
+                Err(error) => {
+                    // The community approved a change that cannot be applied
+                    // as stored. Retrying on every later vote would fail the
+                    // same way, so hand it to a moderator, who can approve it
+                    // with corrected values or reject it.
+                    tracing::error!(
+                        proposal_id,
+                        location_id = location.0,
+                        kind = %locked.kind,
+                        error = ?error,
+                        "community-approved proposal could not be merged; escalating to moderator review"
+                    );
+                    sqlx::query(
+                        "UPDATE parking_proposal SET escalated_at = now() WHERE id = $1 AND escalated_at IS NULL",
+                    )
+                    .bind(proposal_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| db_err("contribution.escalate_proposal", e))?;
+                }
             }
         }
         tx.commit()
@@ -501,19 +533,18 @@ impl ParkingContributionRepository for SqlxParkingContributionRepository {
             .acquire()
             .await
             .map_err(|e| db_err("contribution.listing_proposals", e))?;
-        let rows = sqlx::query_as::<_, Row>(r#"
-            SELECT p.id, p.kind, p.proposed, p.status, p.created_at, p.base_version, p.proposer_id,
-                   COUNT(*) FILTER (WHERE v.vote = 'APPROVE' AND u.id IS NOT NULL)::bigint AS approvals,
-                   COUNT(*) FILTER (WHERE v.vote = 'REJECT' AND u.id IS NOT NULL)::bigint AS rejections
-            FROM parking_proposal p
-            LEFT JOIN parking_proposal_vote v ON v.proposal_id = p.id
-            LEFT JOIN users u ON u.id = v.voter_id
-                 AND u.account_state = 'ACTIVE' AND u.email_verified_at IS NOT NULL
-            WHERE p.location_id = $1
-            GROUP BY p.id
-            ORDER BY (p.status = 'PENDING') DESC, p.created_at DESC, p.id DESC
-            LIMIT $2
-        "#).bind(location_id).bind(limit.clamp(1, 100)).fetch_all(&mut *conn).await
+        let rows = sqlx::query_as::<_, Row>(concat!(
+            "SELECT p.id, p.kind, p.proposed, p.status, p.created_at, p.base_version, p.proposer_id,
+                    COUNT(*) FILTER (WHERE v.vote = 'APPROVE' AND u.id IS NOT NULL)::bigint AS approvals,
+                    COUNT(*) FILTER (WHERE v.vote = 'REJECT' AND u.id IS NOT NULL)::bigint AS rejections
+             FROM parking_proposal p",
+            eligible_votes_join!(),
+            "WHERE p.location_id = $1
+             GROUP BY p.id
+             ORDER BY (p.status = 'PENDING') DESC, p.created_at DESC, p.id DESC
+             LIMIT $2"
+        ))
+        .bind(location_id).bind(limit.clamp(1, 100)).fetch_all(&mut *conn).await
             .map_err(|e| db_err("contribution.listing_proposals", e))?;
         rows.into_iter()
             .map(|row| {
@@ -672,16 +703,27 @@ impl ParkingContributionRepository for SqlxParkingContributionRepository {
             rejections: i64,
             created_at: chrono::DateTime<chrono::Utc>,
         }
-        let rows = sqlx::query_as::<_, Row>(r#"
-            SELECT p.id,p.base_version,p.proposer_id,p.kind,p.proposed,p.status,p.created_at,
-              COUNT(*) FILTER (WHERE v.vote='APPROVE' AND u.id IS NOT NULL)::bigint approvals,
-              COUNT(*) FILTER (WHERE v.vote='REJECT' AND u.id IS NOT NULL)::bigint rejections
-            FROM parking_proposal p LEFT JOIN parking_proposal_vote v ON v.proposal_id=p.id
-            LEFT JOIN users u ON u.id=v.voter_id AND u.account_state='ACTIVE' AND u.email_verified_at IS NOT NULL
-            WHERE p.location_id=$1 AND p.status='PENDING' AND ($2::bigint IS NULL OR p.id<$2)
-            GROUP BY p.id ORDER BY p.id DESC LIMIT $3
-        "#).bind(location_id).bind(after_id).bind(limit + 1).fetch_all(&mut *self.db.acquire().await.map_err(|e| db_err("contribution.proposal_page.acquire", e))?).await
-            .map_err(|e| db_err("contribution.proposal_page", e))?;
+        let rows = sqlx::query_as::<_, Row>(concat!(
+            "SELECT p.id,p.base_version,p.proposer_id,p.kind,p.proposed,p.status,p.created_at,
+               COUNT(*) FILTER (WHERE v.vote='APPROVE' AND u.id IS NOT NULL)::bigint approvals,
+               COUNT(*) FILTER (WHERE v.vote='REJECT' AND u.id IS NOT NULL)::bigint rejections
+             FROM parking_proposal p",
+            eligible_votes_join!(),
+            "WHERE p.location_id=$1 AND p.status='PENDING' AND ($2::bigint IS NULL OR p.id<$2)
+             GROUP BY p.id ORDER BY p.id DESC LIMIT $3"
+        ))
+        .bind(location_id)
+        .bind(after_id)
+        .bind(limit + 1)
+        .fetch_all(
+            &mut *self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| db_err("contribution.proposal_page.acquire", e))?,
+        )
+        .await
+        .map_err(|e| db_err("contribution.proposal_page", e))?;
         let mut page = rows
             .into_iter()
             .map(|row| {
@@ -918,16 +960,15 @@ pub(crate) async fn write_hours(
         let mut all_day: Vec<bool> = Vec::with_capacity(rows.len());
         for (day, range) in rows {
             days.push(i16::from(*day));
-            opens.push(if range.all_day {
-                chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap()
+            // All-day rows are stored with the canonical bounds, whatever
+            // times the caller happened to carry.
+            let stored = if range.all_day {
+                TimeRange::all_day()
             } else {
-                range.opens_at
-            });
-            closes.push(if range.all_day {
-                chrono::NaiveTime::from_hms_opt(23, 59, 59).unwrap()
-            } else {
-                range.closes_at
-            });
+                *range
+            };
+            opens.push(stored.opens_at);
+            closes.push(stored.closes_at);
             all_day.push(range.all_day);
         }
         sqlx::query(

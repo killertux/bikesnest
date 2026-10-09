@@ -672,6 +672,42 @@ async fn writes_are_refused_for_a_location_that_is_not_active() {
     }
 }
 
+/// Proposing that an active spot "exists" would file a proposal that changes
+/// nothing when merged, so it is refused; proposing its removal is accepted.
+#[tokio::test]
+async fn an_existence_proposal_for_an_active_spot_must_propose_removal() {
+    let repo = FakeContributionRepo::new(vec![]);
+    repo.seed(42, 7, ModerationState::Active);
+    let svc = service(
+        Box::new(repo),
+        FakeReviewRepo::new(),
+        FakeVerificationRepo::new(),
+        FakeFavoriteRepo { favorited: false },
+    );
+    let user = verified_user(1);
+    let kind = bikesnest_domain::ProposalKind::ChangeExistence;
+
+    assert!(
+        matches!(
+            svc.propose_location_change(
+                &user,
+                42,
+                kind,
+                serde_json::json!({"existence": "exists"})
+            )
+            .await,
+            Err(ContributionError::InvalidField(_))
+        ),
+        "a no-op 'still exists' proposal is refused"
+    );
+    assert!(
+        svc.propose_location_change(&user, 42, kind, serde_json::json!({"existence": "removed"}))
+            .await
+            .is_ok(),
+        "a removal proposal is accepted"
+    );
+}
+
 /// A favorite is a private bookmark, not a contribution: it keeps working so a
 /// user can still un-favorite a spot that was taken down.
 #[tokio::test]

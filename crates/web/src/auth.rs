@@ -24,8 +24,8 @@ pub const CSRF_HEADER: &str = "x-csrf-token";
 /// because the middleware cannot parse a multipart body without consuming the
 /// stream the handler's `Multipart` extractor needs.
 pub const CSRF_QUERY: &str = "csrf";
-/// Name of the anonymous double-submit CSRF cookie ( — protects pre-session
-/// requests like login/register/reset, which have no session row yet).
+/// Name of the anonymous double-submit CSRF cookie. It protects pre-session
+/// requests (login, register, password reset), which have no session row yet.
 pub const ANON_CSRF_COOKIE: &str = "__Host-csrf";
 
 /// How much of a urlencoded body the CSRF middleware buffers to find the `csrf`
@@ -410,8 +410,12 @@ pub async fn auth_middleware(
     // as `GET` (axum answers `HEAD` with the `GET` route), so requiring one
     // there only broke `HEAD`.
     let is_safe = matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
+    // Browsers POST CSP violation reports without any token. That one exact
+    // route only logs (rate limited, size capped), so it is exempt.
+    let is_csp_report =
+        *req.method() == Method::POST && req.uri().path() == crate::security::CSP_REPORT_PATH;
 
-    if !is_safe {
+    if !is_safe && !is_csp_report {
         // Token sources, in order:
         //   1. `X-CSRF-Token` — every htmx request (web/static/js/auth.js reads
         //      `<meta name="csrf">` in `htmx:config:request`);

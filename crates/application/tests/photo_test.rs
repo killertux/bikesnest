@@ -164,19 +164,6 @@ impl PhotoRepository for FakePhotoRepo {
         self.inserted.lock().unwrap().push(id);
         Ok(id)
     }
-    async fn max_position(
-        &self,
-        target: bikesnest_application::PhotoTarget,
-    ) -> Result<i32, PhotoError> {
-        let photos = self.photos.lock().unwrap();
-        let max = photos
-            .values()
-            .filter(|p| p.kind == target.kind() && p.parent_id == target.parent_id())
-            .map(|p| p.position)
-            .max()
-            .unwrap_or(0);
-        Ok(max)
-    }
     async fn delete(&self, _kind: PhotoKind, id: i64) -> Result<(), PhotoError> {
         self.photos.lock().unwrap().remove(&id);
         self.deleted.lock().unwrap().push(id);
@@ -184,19 +171,29 @@ impl PhotoRepository for FakePhotoRepo {
     }
     async fn approve(
         &self,
-        _kind: PhotoKind,
+        kind: PhotoKind,
         id: i64,
         _moderator: UserId,
-        position: i32,
-    ) -> Result<(), PhotoError> {
+    ) -> Result<i32, PhotoError> {
         let mut photos = self.photos.lock().unwrap();
-        let p = photos.get_mut(&id).ok_or(PhotoError::NotFound)?;
-        if p.state != PhotoModerationState::PendingReview {
+        let (state, parent_id) = {
+            let p = photos.get(&id).ok_or(PhotoError::NotFound)?;
+            (p.state, p.parent_id)
+        };
+        if state != PhotoModerationState::PendingReview {
             return Err(PhotoError::NotPending);
         }
+        let position = photos
+            .values()
+            .filter(|p| p.kind == kind && p.parent_id == parent_id)
+            .map(|p| p.position)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let p = photos.get_mut(&id).expect("checked above");
         p.state = PhotoModerationState::Approved;
         p.position = position;
-        Ok(())
+        Ok(position)
     }
     async fn reject(
         &self,
@@ -641,12 +638,6 @@ async fn upload_compensates_both_objects_when_the_insert_fails() {
         ) -> Result<i64, PhotoError> {
             Err(PhotoError::Conflict)
         }
-        async fn max_position(
-            &self,
-            target: bikesnest_application::PhotoTarget,
-        ) -> Result<i32, PhotoError> {
-            self.0.max_position(target).await
-        }
         async fn delete(&self, kind: PhotoKind, id: i64) -> Result<(), PhotoError> {
             self.0.delete(kind, id).await
         }
@@ -655,9 +646,8 @@ async fn upload_compensates_both_objects_when_the_insert_fails() {
             kind: PhotoKind,
             id: i64,
             moderator: UserId,
-            position: i32,
-        ) -> Result<(), PhotoError> {
-            self.0.approve(kind, id, moderator, position).await
+        ) -> Result<i32, PhotoError> {
+            self.0.approve(kind, id, moderator).await
         }
         async fn reject(
             &self,

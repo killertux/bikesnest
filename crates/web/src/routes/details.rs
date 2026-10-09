@@ -1,7 +1,7 @@
 //! `/parking/{id}` — parking details, gallery, and community proposals.
 
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use bikesnest_domain::{ModerationState, Role};
 
@@ -69,10 +69,43 @@ pub(crate) struct DetailsNotice {
     voted: Option<String>,
 }
 
+/// The details page's error banner: a proposal vote that could not be
+/// recorded lands here (`?proposal_error=1`). It renders as an alert, apart
+/// from the success banner below.
+pub(crate) fn details_error_notice(tr: Translator, q: &DetailsNotice) -> Option<String> {
+    q.proposal_error
+        .is_some()
+        .then(|| tr.t("profile.proposal_error").to_string())
+}
+
+/// Where the breadcrumb's "Search" link goes: back to the search the rider
+/// came from (query, filters and all) when the referrer is this site's own
+/// `/search`, otherwise the bare search page. Only a path on this host is
+/// ever echoed back, so the link cannot point anywhere else.
+pub(crate) fn search_breadcrumb_href(headers: &HeaderMap) -> String {
+    const FALLBACK: &str = "/search";
+    let header = |name| headers.get(name).and_then(|v| v.to_str().ok());
+    let (Some(referer), Some(host)) = (header(header::REFERER), header(header::HOST)) else {
+        return FALLBACK.to_string();
+    };
+    let Ok(uri) = referer.parse::<axum::http::Uri>() else {
+        return FALLBACK.to_string();
+    };
+    let same_host = uri
+        .authority()
+        .is_some_and(|a| a.as_str().eq_ignore_ascii_case(host));
+    match uri.path_and_query() {
+        Some(pq) if same_host && pq.path() == "/search" && pq.as_str().len() <= 2048 => {
+            pq.as_str().to_string()
+        }
+        _ => FALLBACK.to_string(),
+    }
+}
+
 /// One notice for the details page banner, newest/strongest action first.
 pub(crate) fn details_notice(tr: Translator, q: &DetailsNotice) -> Option<String> {
     if q.proposal_error.is_some() {
-        return Some(tr.t("profile.proposal_error").into());
+        return None;
     }
     if q.created.is_some() {
         Some(tr.t("contribution.created_notice").to_string())
@@ -203,6 +236,8 @@ pub(crate) async fn parking_details(
             )
             .await
             .notice(notice);
+            page.error_notice = details_error_notice(tr, &q);
+            page.search_href = search_breadcrumb_href(&headers);
             page.tab = tab.into();
             page.gallery_available = gallery_available;
             page.gallery_total = gallery_total;
@@ -275,6 +310,45 @@ pub(crate) async fn parking_details(
             render(page, StatusCode::OK)
         }
         Ok(None) => not_found_page(&headers, &state.map, &auth, tr),
-        Err(_) => internal_error(&headers, &state.map, &auth, tr),
+        Err(e) => internal_error(&headers, &state.map, &auth, tr, &e),
+    }
+}
+
+#[cfg(test)]
+mod breadcrumb_tests {
+    use super::*;
+
+    fn headers(referer: &str, host: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::REFERER, referer.parse().unwrap());
+        h.insert(header::HOST, host.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn the_breadcrumb_returns_to_the_riders_own_search() {
+        assert_eq!(
+            search_breadcrumb_href(&headers(
+                "https://bikesnest.example/search?q=Rua+XV&type=rack",
+                "bikesnest.example"
+            )),
+            "/search?q=Rua+XV&type=rack"
+        );
+    }
+
+    #[test]
+    fn any_other_referrer_falls_back_to_the_bare_search_page() {
+        for (referer, host) in [
+            ("https://evil.example/search?q=x", "bikesnest.example"),
+            ("https://bikesnest.example/parking/1", "bikesnest.example"),
+            (
+                "https://bikesnest.example/searching?q=x",
+                "bikesnest.example",
+            ),
+            ("not a url", "bikesnest.example"),
+        ] {
+            assert_eq!(search_breadcrumb_href(&headers(referer, host)), "/search");
+        }
+        assert_eq!(search_breadcrumb_href(&HeaderMap::new()), "/search");
     }
 }

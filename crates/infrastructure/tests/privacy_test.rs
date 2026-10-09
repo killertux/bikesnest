@@ -48,6 +48,7 @@ fn empty_payload(user_id: i64) -> ExportPayload {
             account_state: "ACTIVE".to_string(),
             email_verified_at: None,
             created_at: Utc::now(),
+            last_active_at: None,
             roles: vec![],
         },
         vec![],
@@ -481,6 +482,38 @@ async fn export_payload_excludes_credential_hash(tx: &mut bikesnest_test_support
     // credential_hash is never selected into the payload.
     let json = serde_json::to_string(&payload).unwrap();
     assert!(!json.contains("supersecret-hash"));
+}
+
+/// The durable activity timestamp is personal data the retention rule acts on,
+/// so the export carries it.
+#[db_test]
+async fn export_payload_includes_durable_last_active_at(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
+    let user = UserBuilder::new()
+        .with_email("last-active-export@example.com")
+        .create(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    let stamp = DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    sqlx::query("UPDATE users SET last_active_at = $2 WHERE id = $1")
+        .bind(user.id.0)
+        .bind(stamp)
+        .execute(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+
+    let payload = SqlxExportRepository::new(db.clone())
+        .assemble_payload(user.id)
+        .await
+        .unwrap();
+    assert_eq!(payload.account.last_active_at, Some(stamp));
+    let json = serde_json::to_value(&payload).unwrap();
+    assert_eq!(
+        json["account"]["last_active_at"],
+        serde_json::json!("2026-03-04T05:06:07Z")
+    );
 }
 
 #[db_test]

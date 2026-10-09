@@ -6,23 +6,15 @@
 <span id="search-sort-state" hidden hx-swap-oob="true">{% call state::hidden(form, false, true, false, false, false) %}</span>
 <span id="search-filter-state" hidden hx-swap-oob="true">{% call state::hidden(form, false, false, true, false, false) %}</span>
 <span id="search-browse-state" hidden hx-swap-oob="true">{% call state::browse(form) %}</span>
-<h1 id="search-heading" hx-swap-oob="true" class="font-display text-[clamp(1.875rem,3vw,2.75rem)] leading-[1.15] font-bold tracking-[-0.04em] wrap-anywhere">
-  {% if results.browse %}
-    {{ tr.t("search.browse.heading") }}
-  {% else if let Some(label) = results.destination_label %}
-    {{ tr.t("search.heading.near") }} <span class="text-accent-strong">“{{ label }}”</span>
-  {% else %}
-    {{ tr.t("search.heading.generic") }}
-  {% endif %}
-</h1>
-<p id="result-count" hx-swap-oob="true" aria-live="polite" class="text-sm text-muted">
-  {% if results.error.is_some() %}{% else %}{{ results.total_label }}{% endif %}
-</p>
+{# The heading and the count are patched in place (`innerHTML`), never
+   replaced: `#result-count` is a live region, and a live region that is
+   swapped out whole is a new node screen readers never announce. #}
+<h1 id="search-heading" hx-swap-oob="innerHTML">{% include "components/search_heading.html" %}</h1>
+<p id="result-count" hx-swap-oob="innerHTML">{% if results.error.is_none() %}{{ results.total_label }}{% endif %}</p>
 {# `#search-data` itself lives outside `#results` (search.html renders the
-   primary copy as a sibling: `role="list"` must contain only
-   `role="listitem"` children) — this fragment only re-renders it here,
+   primary copy as a sibling) — this fragment only re-renders it here,
    out-of-band, so a re-search's `hx-target="#results" hx-swap="innerHTML"`
-   never leaves a second copy sitting inside the list. #}
+   never leaves a second copy inside the results. #}
 <script type="application/json" id="search-data" hx-swap-oob="true">{{ results.map_json|safe }}</script>
 {% endif %}
 
@@ -63,7 +55,7 @@
       <h2 class="font-display mt-4 text-xl font-semibold">{{ tr.t("search.empty.title") }}</h2>
       <p class="mx-auto mt-2 max-w-sm text-[15px] text-muted">{{ tr.t("search.empty.body") }}</p>
       <div class="mt-6 flex flex-wrap items-center justify-center gap-3">
-        <a data-search-clear href="{{ form.clear_filters_url() }}" hx-get="{{ form.clear_filters_url() }}" hx-target="#results" hx-swap="innerHTML" hx-sync="#results:replace" hx-push-url="true" hx-indicator="#results-indicator" class="rounded-xl border border-border bg-surface px-5 py-2.5 text-sm font-medium text-fg transition-colors hover:border-fg">{{ tr.t("search.filters.clear") }}</a>
+        <a data-search-clear href="{{ form.clear_filters_url() }}" hx-get="{{ form.clear_filters_url() }}" hx-target="#results" hx-swap="innerHTML" hx-sync="#results:replace" hx-replace-url="true" hx-indicator="#results-indicator" class="rounded-xl border border-border bg-surface px-5 py-2.5 text-sm font-medium text-fg transition-colors hover:border-fg">{{ tr.t("search.filters.clear") }}</a>
         {% if can_contribute %}
           <a href="/parking/new" class="rounded-xl bg-accent-strong px-5 py-2.5 text-sm font-medium text-white transition-colors hover:bg-accent-dark">{{ tr.t("nav.add_spot") }}</a>
         {% else if !is_authenticated %}
@@ -76,13 +68,14 @@
     {% if results.browse %}
       <p class="font-mono text-xs text-muted">{{ tr.t("search.browse.from_center") }}</p>
     {% endif %}
-    {# No wrapper here: `#results` (search.html) is `role="list"` and already
-       carries `space-y-4` itself, so each card — `role="listitem"` in
-       components/parking_card.html — is a direct child of the list, not
-       nested inside an extra div. #}
+    {# The list holds the cards alone (each `role="listitem"`, see
+       components/parking_card.html); the notes and the pager around it are
+       siblings inside `#results`, not list items. #}
+    <div id="results-list" role="list" aria-label="{{ tr.t("search.results_aria") }}" class="space-y-4">
     {% for item in results.items %}
       {% include "components/parking_card.html" %}
     {% endfor %}
+    </div>
 
     {% if let Some(hint) = results.refine_hint %}
       <p class="mt-6 rounded-xl border border-dashed border-border bg-surface px-4 py-3 text-sm text-muted">{{ hint }}</p>
@@ -97,6 +90,7 @@
           hx-swap="innerHTML"
           hx-sync="#results:replace"
           hx-push-url="true"
+          hx-indicator="#results-indicator"
           class="inline-flex items-center gap-1.5 rounded-lg border border-border bg-surface px-4 py-2 text-sm font-medium text-fg transition-colors hover:border-fg"
         >
           {{ tr.t("search.next") }}

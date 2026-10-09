@@ -10,13 +10,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bikesnest_application::{
     AuthService, CheckReadiness, CommunityParkingDetails, ContributionError, ContributionService,
-    FreshnessConfig, GetParkingDetails, ListingProposal, ModerationService, ObjectStorage,
-    ParkingPhotoReader, PendingProposalSummary, PhotoService, PrivacyService, RateLimiter,
-    ReaderError, SearchParking, SitemapReader, StoredPhoto,
+    FreshnessConfig, GetParkingDetails, JobHealthService, ListingProposal, ModerationService,
+    ObjectStorage, ParkingPhotoReader, PendingProposalSummary, PhotoService, PrivacyService,
+    RateLimiter, ReaderError, ResolveDestination, SearchParking, SitemapReader, StoredPhoto,
 };
 use bikesnest_domain::{ParkingLocation, RevisionSummary, UserId};
-use bikesnest_infrastructure::probe::SqlxDatabaseProbe;
-use bikesnest_infrastructure::{CachingGeocoder, Config, GeocodeLimits, MapConfig};
+use bikesnest_infrastructure::{Config, MapConfig};
 
 use crate::security::SecurityHeaders;
 
@@ -108,16 +107,14 @@ impl DetailReads for AppDetailReads {
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
-    pub readiness: Arc<CheckReadiness<SqlxDatabaseProbe>>,
+    pub readiness: Arc<CheckReadiness>,
     pub search: Arc<SearchParking>,
-    /// The very geocoder the search use case calls, so `/search` can ask
-    /// whether a destination is already resolved before spending any of the
-    /// caller's geocode budget on it.
-    pub geocoder: Arc<CachingGeocoder>,
-    /// Shared limiter store, for the per-IP geocode budget.
+    /// Destination resolution under the per-IP geocode budget. It reads the
+    /// same geocoder (and cache) the search use case calls, so `/search` can
+    /// tell whether a destination is already resolved before charging for it.
+    pub destinations: Arc<ResolveDestination>,
+    /// Shared limiter store (the CSP report endpoint's per-IP cap).
     pub rate_limiter: Arc<dyn RateLimiter>,
-    /// That budget's size and window.
-    pub geocode_limits: GeocodeLimits,
     pub details: Arc<GetParkingDetails>,
     pub detail_reads: Arc<dyn DetailReads>,
     /* Configured freshness thresholds, used for display categorization so the
@@ -133,6 +130,8 @@ pub struct AppState {
     pub photo: Arc<PhotoService>,
     pub moderation: Arc<ModerationService>,
     pub privacy: Arc<PrivacyService>,
+    /// Admin background-job health (recurring jobs, queue pressure).
+    pub jobs: Arc<JobHealthService>,
     pub policy: Arc<dyn bikesnest_application::PolicyReader>,
     pub terms: Arc<dyn bikesnest_application::TermsAcknowledgementStore>,
     /// Security/CSP header policy, built once from the configured origins.
@@ -143,7 +142,7 @@ pub struct AppState {
     pub base_url: String,
     /// Google sign-in feature flag (disabled until a real OAuth provider exists).
     pub google_oauth_enabled: bool,
-    /// Content-hash manifest for `/static/...` (WP14): logical path → hash,
+    /// Content-hash manifest for `/static/...`: logical path → hash,
     /// computed once at startup by `crate::assets::init`. Backs the
     /// `/static/h/{hash}/{*path}` handler; `PageLayout::asset()` resolves
     /// URLs from the same manifest.

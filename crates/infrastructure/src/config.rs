@@ -596,7 +596,7 @@ impl Config {
             rate_limiter: rate_limiter_config(&env),
             geocode: geocode_limits(&env),
             storage: s3_config(&env, dev),
-            security: security_config(&env),
+            security: security_config(&env)?,
             map: map_config(&env)?,
             fake_oauth: FakeOAuthConfig {
                 email: env
@@ -1015,15 +1015,64 @@ fn s3_config(env: &EnvSource<'_>, dev: bool) -> S3Config {
     }
 }
 
-/// `CSP_*` origin lists.
-fn security_config(env: &EnvSource<'_>) -> SecurityConfig {
-    SecurityConfig {
-        tile_hosts: env
-            .list("CSP_TILE_HOSTS")
+/// `CSP_*` origin lists. Every entry is templated verbatim into the
+/// `Content-Security-Policy` header, so each one must be a bare origin: a
+/// stray `;` would inject a directive and a control character would make the
+/// header unrepresentable. Both are refused here, at startup.
+fn security_config(env: &EnvSource<'_>) -> Result<SecurityConfig, ConfigError> {
+    let origins = |key: &'static str| -> Result<Option<Vec<String>>, ConfigError> {
+        let Some(hosts) = env.list(key) else {
+            return Ok(None);
+        };
+        for host in &hosts {
+            validate_csp_origin(host).map_err(|reason| ConfigError::invalid(key, reason))?;
+        }
+        Ok(Some(hosts))
+    };
+    Ok(SecurityConfig {
+        tile_hosts: origins("CSP_TILE_HOSTS")?
             .unwrap_or_else(|| vec![DEFAULT_TILE_HOST.to_string()]),
-        geocode_hosts: env.list("CSP_GEOCODE_HOSTS").unwrap_or_default(),
-        media_hosts: env.list("CSP_MEDIA_HOSTS").unwrap_or_default(),
+        geocode_hosts: origins("CSP_GEOCODE_HOSTS")?.unwrap_or_default(),
+        media_hosts: origins("CSP_MEDIA_HOSTS")?.unwrap_or_default(),
+    })
+}
+
+/// Accept only `http://` or `https://` followed by a host (DNS labels, with an
+/// optional leading `*.` wildcard) and an optional `:port` — nothing else: no
+/// path, query, userinfo, whitespace or CSP keyword.
+pub fn validate_csp_origin(source: &str) -> Result<(), String> {
+    let reject = || {
+        format!(
+            "{source:?} is not an origin; expected scheme://host[:port], e.g. https://tiles.example.com"
+        )
+    };
+    let rest = source
+        .strip_prefix("https://")
+        .or_else(|| source.strip_prefix("http://"))
+        .ok_or_else(reject)?;
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (rest, None),
+    };
+    if let Some(port) = port
+        && !matches!(port.parse::<u16>(), Ok(p) if p > 0 && !port.starts_with('0'))
+    {
+        return Err(reject());
     }
+    let labels = host.strip_prefix("*.").unwrap_or(host);
+    let label_ok = |label: &str| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    if labels.is_empty() || labels.len() > 253 || !labels.split('.').all(label_ok) {
+        return Err(reject());
+    }
+    Ok(())
 }
 
 /// Is the style URL a Mapbox style (which needs a client-side access token)?
@@ -1930,6 +1979,76 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // --- CSP origins --------------------------------------------------------
+
+    #[test]
+    fn csp_origins_accept_bare_origins_with_optional_wildcard_and_port() {
+        for ok in [
+            "https://tiles.openfreemap.org",
+            "http://localhost:9000",
+            "https://*.s3.eu-west-1.amazonaws.com",
+            "https://cdn.bikesnest.example:8443",
+            "http://127.0.0.1:9000",
+        ] {
+            assert_eq!(validate_csp_origin(ok), Ok(()), "{ok}");
+        }
+    }
+
+    #[test]
+    fn csp_origins_reject_anything_that_could_reshape_the_policy() {
+        for bad in [
+            "https://tiles.example.com; script-src *",
+            "https://tiles.example.com\nX-Injected: 1",
+            "https://tiles.example.com\u{7f}",
+            "https://tiles.example.com/styles",
+            "https://tiles.example.com?q=1",
+            "https://user@tiles.example.com",
+            "tiles.example.com",
+            "javascript://x",
+            "'unsafe-inline'",
+            "*",
+            "https://",
+            "https://*",
+            "https://tiles.example.com:",
+            "https://tiles.example.com:0",
+            "https://tiles.example.com:99999",
+            "https://tiles..example.com",
+            "https://-tiles.example.com",
+            "https://tiles example.com",
+        ] {
+            assert!(validate_csp_origin(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn an_invalid_csp_origin_fails_startup_naming_its_key() {
+        for key in ["CSP_TILE_HOSTS", "CSP_GEOCODE_HOSTS", "CSP_MEDIA_HOSTS"] {
+            let err = Config::from_lookup(&lookup(&[
+                DB,
+                (
+                    key,
+                    "https://ok.example.com, https://evil.example.com; script-src *",
+                ),
+            ]))
+            .expect_err("a `;` in a CSP origin is refused");
+            assert!(
+                matches!(err, ConfigError::Invalid { key: failed, .. } if failed == key),
+                "{err}"
+            );
+        }
+        let ok = config(&[
+            DB,
+            (
+                "CSP_MEDIA_HOSTS",
+                " https://cdn.example.com , http://localhost:9000 ",
+            ),
+        ]);
+        assert_eq!(
+            ok.security.media_hosts,
+            ["https://cdn.example.com", "http://localhost:9000"]
+        );
     }
 
     // --- map style ----------------------------------------------------------

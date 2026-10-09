@@ -395,6 +395,17 @@ async fn htmx_search_fragment_updates_result_count_out_of_band(tx: &mut TestTx) 
     let html = String::from_utf8_lossy(&body);
     assert!(html.contains(r#"id="result-count""#), "fragment: {html}");
     assert!(html.contains("hx-swap-oob"), "fragment: {html}");
+    // The live region and the heading are patched in place, never replaced:
+    // a swapped-out live region is a new node screen readers do not announce,
+    // and the heading keeps the page's own classes.
+    assert!(
+        html.contains(r#"<p id="result-count" hx-swap-oob="innerHTML">"#),
+        "fragment: {html}"
+    );
+    assert!(
+        html.contains(r#"<h1 id="search-heading" hx-swap-oob="innerHTML">"#),
+        "fragment: {html}"
+    );
 }
 
 #[db_test]
@@ -646,7 +657,10 @@ async fn browsing_a_box_lists_numbered_cards_and_no_next_page(tx: &mut TestTx) {
         "from-centre note"
     );
     // Numbered cards, and the same numbers in the map payload.
-    assert!(body.contains(r#"aria-label="Spot 1""#), "card number badge");
+    assert!(
+        body.contains(r#"<span class="sr-only">Spot 1</span>"#),
+        "card number badge"
+    );
     let json_block = search_data_block(&body);
     let parsed: serde_json::Value = serde_json::from_str(&json_block).expect("valid JSON block");
     let first = &parsed["items"][0];
@@ -1911,6 +1925,23 @@ async fn get_c(app: &axum::Router, uri: &str, cookie: Option<&str>) -> (StatusCo
     (status, body)
 }
 
+/// Follow a verification link the way a person does: open it (a GET that only
+/// renders the form), then submit the form with the account password.
+/// Returns the POST status (303 to `/login?verified=1` on success).
+async fn follow_verification(app: &axum::Router, token: &str, password: &str) -> StatusCode {
+    let (status, page) = get_c(app, &format!("/verify-email?token={token}"), None).await;
+    assert_eq!(status, StatusCode::OK, "the link opens a form");
+    assert!(page.contains(r#"action="/verify-email""#), "{page}");
+    let (status, _, _) = post_form(
+        app,
+        "/verify-email",
+        &[("token", token), ("password", password)],
+        None,
+    )
+    .await;
+    status
+}
+
 /// Which page to GET to obtain the anonymous double-submit CSRF cookie for a
 /// given POST route (the form with the hidden `csrf` lives there).
 fn anon_source_for(uri: &str) -> Option<&str> {
@@ -1918,7 +1949,7 @@ fn anon_source_for(uri: &str) -> Option<&str> {
         Some("/password-reset/new")
     } else if uri.starts_with("/password-reset") {
         Some("/password-reset")
-    } else if uri.starts_with("/verify-email/resend") {
+    } else if uri.starts_with("/verify-email/resend") || uri == "/verify-email" {
         Some("/verify-email")
     } else if uri.starts_with("/register") {
         Some("/register")
@@ -2092,8 +2123,11 @@ async fn register_verify_login_account_logout(tx: &mut bikesnest_test_support::T
     assert!(account_before.contains(EMAIL));
 
     // Verify via the email link, then log in again (verified).
-    let (s, _) = get_c(&app, &format!("/verify-email?token={token}"), None).await;
-    assert_eq!(s, StatusCode::SEE_OTHER, "verify redirects to login");
+    assert_eq!(
+        follow_verification(&app, &token, "password123").await,
+        StatusCode::SEE_OTHER,
+        "verify redirects to login"
+    );
     let (_, _, cookie2) = post_form(
         &app,
         "/login",
@@ -2117,6 +2151,332 @@ async fn register_verify_login_account_logout(tx: &mut bikesnest_test_support::T
     assert!(
         matches!(s, StatusCode::SEE_OTHER | StatusCode::FOUND),
         "logged-out user is redirected"
+    );
+}
+
+async fn account_state_of(db: &Db, addr: &str) -> String {
+    sqlx::query_scalar("SELECT account_state::text FROM users WHERE email = $1")
+        .bind(addr)
+        .fetch_one(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap()
+}
+
+/// The verification link is a GET that link scanners prefetch, so it only
+/// renders a form; activating a pending account takes the account password,
+/// so an attacker's re-registration cannot be activated by the owner's click.
+#[db_test]
+async fn verification_link_renders_a_password_form_and_only_post_activates(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
+    const EMAIL: &str = "activate-form@example.com";
+    post_form(
+        &app,
+        "/register",
+        &[("email", EMAIL), ("password", "password123")],
+        None,
+    )
+    .await;
+    let token = email.token_for("/verify-email").unwrap();
+
+    // Opening the link (twice, as a scanner then the person) spends nothing.
+    for _ in 0..2 {
+        let (s, page) = get_c(&app, &format!("/verify-email?token={token}"), None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(page.contains("Activate your account"), "{page}");
+        assert!(page.contains(r#"name="password""#));
+        assert!(page.contains(r#"autocomplete="current-password""#));
+        assert!(page.contains(r#"<label for="password""#), "labelled field");
+        assert!(page.contains(&format!(r#"name="token" value="{token}""#)));
+    }
+    assert_eq!(
+        account_state_of(&db, EMAIL).await,
+        "PENDING_EMAIL_VERIFICATION"
+    );
+
+    // The form is CSRF-protected like every other anonymous POST.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/verify-email")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from(format!("token={token}&password=password123")))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+
+    // A wrong password re-renders the form with an accessible error and
+    // leaves the account pending and the token usable.
+    let (s, body, _) = post_form(
+        &app,
+        "/verify-email",
+        &[("token", &token), ("password", "not-my-password")],
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        body.contains("That password does not match this account"),
+        "{body}"
+    );
+    assert!(body.contains(r#"role="alert""#));
+    assert!(body.contains(r#"aria-invalid="true""#));
+    assert!(body.contains(&format!(r#"name="token" value="{token}""#)));
+    assert_eq!(
+        account_state_of(&db, EMAIL).await,
+        "PENDING_EMAIL_VERIFICATION"
+    );
+
+    // The right password activates and lands on the login notice.
+    let (s, _, _) = post_form(
+        &app,
+        "/verify-email",
+        &[("token", &token), ("password", "password123")],
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::SEE_OTHER);
+    assert_eq!(account_state_of(&db, EMAIL).await, "ACTIVE");
+
+    // The token is spent: the link now shows the invalid state + resend form.
+    let (s, page) = get_c(&app, &format!("/verify-email?token={token}"), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(
+        page.contains("Verification link invalid or expired"),
+        "{page}"
+    );
+    assert!(page.contains(r#"action="/verify-email/resend""#));
+    assert!(!page.contains(r#"name="password""#));
+}
+
+#[db_test]
+async fn verification_form_is_translated_for_pt_br(tx: &mut bikesnest_test_support::TestTx) {
+    let (app, email) = auth_app(tx).await;
+    post_form(
+        &app,
+        "/register",
+        &[("email", "ativar@example.com"), ("password", "password123")],
+        None,
+    )
+    .await;
+    let token = email.token_for("/verify-email").unwrap();
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/verify-email?token={token}"))
+                .header("Accept-Language", "pt-BR")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("Ative sua conta"), "{body}");
+    assert!(body.contains("Verificar e ativar"));
+}
+
+/// An email change is confirmed with one POST and no password (the password
+/// was re-entered to request it); the GET alone changes nothing.
+#[db_test]
+async fn email_change_link_confirms_on_post_without_a_password(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
+    const OLD: &str = "change-old@example.com";
+    const NEW: &str = "change-new@example.com";
+    let cookie = verified_cookie(&app, &email, OLD).await;
+    let (_, page) = get_c(&app, "/account/email", Some(&cookie)).await;
+    let csrf = extract_csrf(&page);
+    let (s, _, _) = post_form(
+        &app,
+        "/account/email",
+        &[
+            ("csrf", &csrf),
+            ("current_password", "password123"),
+            ("new_email", NEW),
+        ],
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(s, StatusCode::SEE_OTHER);
+    let mail = email
+        .emails()
+        .into_iter()
+        .rev()
+        .find(|m| m.to == NEW)
+        .expect("confirmation sent to the new address");
+    let token = regex::Regex::new(r"verify-email\?token=([A-Za-z0-9_-]+)")
+        .unwrap()
+        .captures(&mail.text)
+        .unwrap()[1]
+        .to_string();
+
+    let (s, page) = get_c(&app, &format!("/verify-email?token={token}"), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(page.contains("Confirm your new email"), "{page}");
+    assert!(
+        !page.contains(r#"name="password""#),
+        "no password for a change"
+    );
+    let (current,): (String,) = sqlx::query_as("SELECT email FROM users WHERE email = $1")
+        .bind(OLD)
+        .fetch_one(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(current, OLD, "the GET did not apply the change");
+
+    let (s, _, _) = post_form(&app, "/verify-email", &[("token", &token)], None).await;
+    assert_eq!(s, StatusCode::SEE_OTHER);
+    assert_eq!(account_state_of(&db, NEW).await, "ACTIVE");
+}
+
+/// Password re-entry on the settings forms is throttled; the sixth attempt is
+/// a 429 with the translated "too many attempts" message.
+#[db_test]
+async fn settings_password_reentry_is_rate_limited(tx: &mut bikesnest_test_support::TestTx) {
+    let (app, email) = auth_app(tx).await;
+    let cookie = verified_cookie(&app, &email, "reauth-web@example.com").await;
+    let (_, page) = get_c(&app, "/account/password", Some(&cookie)).await;
+    let csrf = extract_csrf(&page);
+    for _ in 0..5 {
+        let (s, body, _) = post_form(
+            &app,
+            "/account/password",
+            &[
+                ("csrf", &csrf),
+                ("current_password", "wrong-guess"),
+                ("new_password", "new-password-1"),
+            ],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(body.contains("incorrect"), "{body}");
+    }
+    let (s, body, _) = post_form(
+        &app,
+        "/account/email",
+        &[
+            ("csrf", &csrf),
+            ("current_password", "password123"),
+            ("new_email", "elsewhere@example.com"),
+        ],
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+    assert!(body.contains("Too many attempts"), "{body}");
+    let (s, body, _) = post_form(
+        &app,
+        "/account/delete",
+        &[
+            ("csrf", &csrf),
+            ("email", "reauth-web@example.com"),
+            ("password", "password123"),
+        ],
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::TOO_MANY_REQUESTS,
+        "deletion shares the budget"
+    );
+    assert!(body.contains("Too many attempts"), "{body}");
+}
+
+#[db_test]
+async fn export_requests_are_rate_limited_with_a_translated_notice(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let (app, email) = auth_app(tx).await;
+    let cookie = verified_cookie(&app, &email, "export-limit@example.com").await;
+    let (_, page) = get_c(&app, "/account/privacy", Some(&cookie)).await;
+    let csrf = extract_csrf(&page);
+    let mut last = String::new();
+    for _ in 0..4 {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/account/privacy/export")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", &cookie)
+            .body(Body::from(format!("csrf={csrf}")))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        last = res.headers()["location"].to_str().unwrap().to_string();
+    }
+    assert_eq!(last, "/account/privacy?export_error=rate_limited");
+    let (s, body) = get_c(&app, &last, Some(&cookie)).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(body.contains("Too many attempts"), "{body}");
+    assert!(body.contains(r#"role="alert""#));
+}
+
+#[db_test]
+async fn admin_cannot_suspend_themselves_and_sees_why(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
+    const ADMIN: &str = "self-suspend-admin@example.com";
+    let admin_cookie = admin_cookie(&db, &app, &email, ADMIN).await;
+    let (_, page) = get_c(&app, "/admin/users", Some(&admin_cookie)).await;
+    let csrf = extract_csrf(&page);
+    let (uid,): (i64,) = sqlx::query_as("SELECT id FROM users WHERE email = $1")
+        .bind(ADMIN)
+        .fetch_one(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/admin/users/{uid}/suspend"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("cookie", &admin_cookie)
+        .body(Body::from(format!("csrf={csrf}")))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::SEE_OTHER);
+    let location = res.headers()["location"].to_str().unwrap().to_string();
+    assert_eq!(location, "/admin/users?error=self_suspension");
+    assert_eq!(account_state_of(&db, ADMIN).await, "ACTIVE");
+    let (_, body) = get_c(&app, &location, Some(&admin_cookie)).await;
+    assert!(
+        body.contains("You cannot suspend your own account"),
+        "{body}"
+    );
+    assert!(!body.contains("User suspended"));
+
+    // Suspending an account that is already suspended is reported too.
+    verified_cookie(&app, &email, "twice@example.com").await;
+    let (target,): (i64,) = sqlx::query_as("SELECT id FROM users WHERE email = $1")
+        .bind("twice@example.com")
+        .fetch_one(&mut *db.acquire().await.unwrap())
+        .await
+        .unwrap();
+    let mut locations = Vec::new();
+    for _ in 0..2 {
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/admin/users/{target}/suspend"))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", &admin_cookie)
+            .body(Body::from(format!("csrf={csrf}")))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        locations.push(res.headers()["location"].to_str().unwrap().to_string());
+    }
+    assert_eq!(
+        locations,
+        [
+            "/admin/users?suspended=1",
+            "/admin/users?error=state_unchanged"
+        ]
     );
 }
 
@@ -2197,7 +2557,7 @@ async fn privacy_public_pages_gating_and_export_flow(tx: &mut bikesnest_test_sup
     let token = email
         .token_for("/verify-email")
         .expect("verification email captured");
-    get_c(&app, &format!("/verify-email?token={token}"), None).await;
+    follow_verification(&app, &token, "password123").await;
     let (_, _, cookie) = post_form(
         &app,
         "/login",
@@ -2979,10 +3339,8 @@ async fn verified_cookie(
         None,
     )
     .await;
-    let token = email
-        .token_for("/verify-email")
-        .expect("verification email captured");
-    get_c(app, &format!("/verify-email?token={token}"), None).await;
+    let token = verification_token_to(email, addr);
+    follow_verification(app, &token, "password123").await;
     let (_, _, cookie) = post_form(
         app,
         "/login",
@@ -3488,6 +3846,193 @@ async fn proposing_a_move_creates_pending_proposal(tx: &mut bikesnest_test_suppo
     );
 }
 
+/// The "mark gone" form only ever proposes removal: no "still exists" choice,
+/// a required confirmation inside a fieldset, and a server that refuses a
+/// hand-crafted `existence=exists` with the edit form re-rendered (input kept,
+/// error as an alert) rather than a redirect to a success-styled banner.
+#[db_test]
+async fn existence_proposals_must_propose_removal_and_errors_rerender_the_form(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
+    const EMAIL: &str = "b5a-existence@example.com";
+    let cookie = verified_cookie(&app, &email, EMAIL).await;
+    let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
+    let csrf = extract_csrf(&form);
+    let id = add_location(&db, &app, &cookie, &csrf, "Existence Spot", &[]).await;
+
+    let (_, edit_html) = get_c(&app, &format!("/parking/{id}/edit"), Some(&cookie)).await;
+    assert!(
+        !edit_html.contains(r#"value="exists""#),
+        "no no-op 'still exists' choice"
+    );
+    assert!(edit_html.contains("<fieldset>") && edit_html.contains("<legend"));
+    assert!(
+        edit_html.contains(r#"name="existence" value="removed" required"#),
+        "the removal confirmation is required"
+    );
+    let ecsrf = extract_csrf(&edit_html);
+    let proposals = async || -> i64 {
+        sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM parking_proposal WHERE location_id = $1")
+            .bind(id)
+            .fetch_one(&mut *db.acquire().await.unwrap())
+            .await
+            .unwrap()
+            .0
+    };
+
+    for (existence, message) in [
+        ("exists", "This spot is already listed."),
+        ("info_changed", "This spot is already listed."),
+        ("", "Confirm that the spot no longer exists"),
+    ] {
+        let (s, body, _) = post_form(
+            &app,
+            &format!("/parking/{id}/proposal"),
+            &[
+                ("csrf", &ecsrf),
+                ("kind", "change_existence"),
+                ("existence", existence),
+                ("reason", "kept-reason-text"),
+            ],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{existence:?}");
+        assert!(body.contains(message), "{existence:?}: {body}");
+        assert!(
+            body.contains(r#"id="removal-error" role="alert""#),
+            "{existence:?}: the error is an alert"
+        );
+        assert!(
+            body.contains(r#"value="kept-reason-text""#),
+            "{existence:?}: the reason survives"
+        );
+        assert!(
+            body.contains("Existence Spot"),
+            "the edit form is pre-filled"
+        );
+    }
+    assert_eq!(proposals().await, 0, "no no-op proposal was filed");
+
+    let (s, _, _) = post_form(
+        &app,
+        &format!("/parking/{id}/proposal"),
+        &[
+            ("csrf", &ecsrf),
+            ("kind", "change_existence"),
+            ("existence", "removed"),
+            ("reason", "demolished"),
+        ],
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(s, StatusCode::SEE_OTHER, "a removal proposal is accepted");
+    assert_eq!(proposals().await, 1);
+}
+
+/// A move proposal with coordinates that do not parse comes back to the edit
+/// page with what the rider typed, and the error next to that form.
+#[db_test]
+async fn a_rejected_move_proposal_keeps_the_input(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
+    const EMAIL: &str = "b5a-move-error@example.com";
+    let cookie = verified_cookie(&app, &email, EMAIL).await;
+    let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
+    let csrf = extract_csrf(&form);
+    let id = add_location(&db, &app, &cookie, &csrf, "Move Error Spot", &[]).await;
+
+    let (s, body, _) = post_form(
+        &app,
+        &format!("/parking/{id}/proposal"),
+        &[
+            ("csrf", &csrf),
+            ("kind", "move_location"),
+            ("lat", "-25.5"),
+            ("lon", "west"),
+            ("timezone", "America/Sao_Paulo"),
+            ("reason", "across-the-street"),
+        ],
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(body.contains(r#"id="move-error" role="alert""#), "{body}");
+    assert!(body.contains("Enter a valid latitude and longitude"));
+    assert!(body.contains(r#"value="-25.5""#), "the latitude survives");
+    assert!(body.contains(r#"value="America/Sao_Paulo""#));
+    assert!(body.contains(r#"value="across-the-street""#));
+}
+
+/// A failed proposal vote lands on the details page with an error alert, not
+/// in the success banner.
+#[db_test]
+async fn the_details_proposal_error_is_an_alert(tx: &mut bikesnest_test_support::TestTx) {
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
+    const EMAIL: &str = "b5a-details-alert@example.com";
+    let cookie = verified_cookie(&app, &email, EMAIL).await;
+    let (_, form) = get_c(&app, "/parking/new", Some(&cookie)).await;
+    let csrf = extract_csrf(&form);
+    let id = add_location(&db, &app, &cookie, &csrf, "Alert Spot", &[]).await;
+
+    let (s, body) = get_c(
+        &app,
+        &format!("/parking/{id}?proposal_error=1"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let at = body
+        .find("This change could not be recorded.")
+        .expect("the error is shown");
+    let banner = &body[body[..at].rfind("<div").unwrap()..at];
+    assert!(banner.contains(r#"role="alert""#), "{banner}");
+    assert!(banner.contains("text-danger"), "{banner}");
+}
+
+/// The details breadcrumb returns to the search the rider came from.
+#[db_test]
+async fn the_details_breadcrumb_returns_to_the_referring_search(
+    tx: &mut bikesnest_test_support::TestTx,
+) {
+    let db = tx.db().await;
+    let id = ParkingBuilder::new()
+        .with_name("Breadcrumb Spot")
+        .create(&mut db.acquire().await.unwrap())
+        .await
+        .unwrap()
+        .id();
+    let app = scoped_test_app(db);
+    let page = async |referer: &str| -> String {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/parking/{id}"))
+                    .header("Accept-Language", "en")
+                    .header("host", "bikesnest.test")
+                    .header("referer", referer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    let body = page("http://bikesnest.test/search?q=Rua+XV&type=rack").await;
+    assert!(
+        body.contains(r#"<a href="/search?q=Rua+XV&#38;type=rack" class="hover:text-fg">"#),
+        "{body}"
+    );
+    let body = page("http://elsewhere.test/search?q=x").await;
+    assert!(body.contains(r#"<a href="/search" class="hover:text-fg">"#));
+}
+
 #[db_test]
 async fn review_create_updates_aggregate(tx: &mut bikesnest_test_support::TestTx) {
     let db = tx.db().await;
@@ -3855,10 +4400,8 @@ async fn moderator_cookie(
         None,
     )
     .await;
-    let token = email
-        .token_for("/verify-email")
-        .expect("moderator verification email");
-    get_c(app, &format!("/verify-email?token={token}"), None).await;
+    let token = verification_token_to(email, addr);
+    follow_verification(app, &token, "password123").await;
     let (uid,): (i64,) = sqlx::query_as("SELECT id FROM users WHERE email = $1")
         .bind(addr)
         .fetch_one(&mut *db.acquire().await.unwrap())
@@ -4229,10 +4772,8 @@ async fn admin_cookie(
         None,
     )
     .await;
-    let token = email
-        .token_for("/verify-email")
-        .expect("admin verification email");
-    get_c(app, &format!("/verify-email?token={token}"), None).await;
+    let token = verification_token_to(email, addr);
+    follow_verification(app, &token, "password123").await;
     let (uid,): (i64,) = sqlx::query_as("SELECT id FROM users WHERE email = $1")
         .bind(addr)
         .fetch_one(&mut *db.acquire().await.unwrap())
@@ -5051,22 +5592,46 @@ fn web_sources() -> Vec<(std::path::PathBuf, String)> {
 /// only infrastructure types it may mention are the parsed configuration
 /// values it renders (`MapConfig`, the featured origin, …).
 ///
-/// `wiring.rs` is where the `Sqlx…` constructors belong (`state.rs` names one
-/// probe type, in the signature of the readiness use case it holds).
+/// `wiring.rs` is where the `Sqlx…` constructors belong. `AppState` (in
+/// `state.rs`) is what every handler sees, so it must hold ports and use
+/// cases, never a concrete adapter: the only infrastructure names `state.rs`
+/// may mention are the parsed configuration values it carries.
 #[test]
 fn route_handlers_never_reach_for_infrastructure() {
-    const ALLOWED_INFRA_TYPES: &[&str] = &[
-        "Config",
-        "MapConfig",
-        "SecurityConfig",
-        "FEATURED_ORIGIN",
-        "GeocodeLimits",
-    ];
+    const ALLOWED_INFRA_TYPES: &[&str] =
+        &["Config", "MapConfig", "SecurityConfig", "FEATURED_ORIGIN"];
+    const STATE_ALLOWED_INFRA_TYPES: &[&str] = &["Config", "MapConfig"];
     const FORBIDDEN: &[&str] = &["Sqlx", "sqlx::", "S3ObjectStorage", "Db::", "db.pool()"];
 
     let infra = regex::Regex::new(r"bikesnest_infrastructure::\{?([A-Za-z_0-9]+)").unwrap();
+    // Every path `state.rs` reaches into the infrastructure crate through,
+    // including grouped and nested imports (`{probe::SqlxDatabaseProbe, …}`).
+    let infra_path =
+        regex::Regex::new(r"bikesnest_infrastructure::(\{[^;]*\}|[A-Za-z_0-9:]+)").unwrap();
+    let type_name = regex::Regex::new(r"\b[A-Z][A-Za-z0-9_]*").unwrap();
     let mut offenders = Vec::new();
     for (path, contents) in web_sources() {
+        if path.file_name().is_some_and(|name| name == "state.rs") {
+            for caps in infra_path.captures_iter(&contents) {
+                for name in type_name.find_iter(caps.get(1).unwrap().as_str()) {
+                    if !STATE_ALLOWED_INFRA_TYPES.contains(&name.as_str()) {
+                        offenders.push(format!(
+                            "{}: AppState module names bikesnest_infrastructure::{}",
+                            path.display(),
+                            name.as_str()
+                        ));
+                    }
+                }
+            }
+            for (n, line) in contents.lines().enumerate() {
+                for needle in FORBIDDEN.iter().chain(&["Caching", "Probe<"]) {
+                    if line.contains(needle) {
+                        offenders.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+                    }
+                }
+            }
+            continue;
+        }
         if !path.components().any(|c| c.as_os_str() == "routes") {
             continue;
         }
@@ -5097,17 +5662,15 @@ fn route_handlers_never_reach_for_infrastructure() {
 
 /// The router used to be one 5k-line module. Nothing in the web crate should
 /// grow back into that: a slice that outgrows this limit wants splitting.
-/// `view.rs` (the view-model builders) is the one file still over it.
+/// There are no exemptions.
 #[test]
 fn no_web_source_file_is_longer_than_1200_lines() {
     const LIMIT: usize = 1200;
-    const EXEMPT: &[&str] = &["view.rs"];
 
     let mut offenders = Vec::new();
     for (path, contents) in web_sources() {
-        let name = path.file_name().unwrap().to_string_lossy().to_string();
         let lines = contents.lines().count();
-        if lines > LIMIT && !EXEMPT.contains(&name.as_str()) {
+        if lines > LIMIT {
             offenders.push(format!("{}: {lines} lines", path.display()));
         }
     }
@@ -6902,6 +7465,25 @@ async fn proposal_queue_flags_stale_and_unreadable_proposals(
     let (stale, unreadable) = (ids[0], ids[1]);
     drop(conn);
 
+    // A proposal the community approved but that could not merge is flagged
+    // for moderators and leads the queue.
+    let (escalated,): (i64,) = sqlx::query_as(
+        "INSERT INTO parking_proposal (location_id, proposer_id, base_version, kind, proposed, status, escalated_at) VALUES ($1, $2, 7, 'change_existence', $3, 'PENDING', now()) RETURNING id")
+        .bind(loc).bind(proposer.id.0)
+        .bind(serde_json::json!({"existence": "removed"}))
+        .fetch_one(&mut *db.acquire().await.unwrap()).await.unwrap();
+    let (s, body) = get_c(&app, "/moderation/proposals", Some(&mod_cookie)).await;
+    assert_eq!(s, StatusCode::OK);
+    let badge = body
+        .find("Approved, needs a moderator")
+        .expect("the escalated proposal carries a badge");
+    let first_card = body.find("<article").expect("a queue card");
+    assert!(
+        body[first_card..badge].matches("<article").count() == 1,
+        "the escalated proposal is the first card"
+    );
+    assert!(body.contains(&format!("/moderation/proposals/{escalated}/approve")));
+
     let queue_url = format!("/moderation/proposals?after_id={}", stale - 1);
     let (s, body) = get_c(&app, &queue_url, Some(&mod_cookie)).await;
     assert_eq!(s, StatusCode::OK, "an unreadable payload does not 500");
@@ -8136,7 +8718,9 @@ async fn a_script_free_submission_records_hours_and_a_definitive_no(tx: &mut Tes
     let (status, body) = get_c(&app, &format!("/parking/{id}"), Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        body.contains(r#"aria-label="No">✗</span><span class="text-muted">CCTV"#),
+        body.contains(
+            r#"aria-hidden="true">✗</span><span class="sr-only">No</span><span class="text-muted">CCTV"#
+        ),
         "the details page marks CCTV as absent: {body}"
     );
     assert!(
@@ -8427,7 +9011,7 @@ async fn login_wrong_password_banner_is_an_alert(tx: &mut bikesnest_test_support
 /// `AuthError::EmailTaken` is defined but `AuthService::register` never
 /// returns it: a taken email is deliberately answered exactly like a fresh
 /// one (`Ok(())`, no mail sent) so the response cannot be used to enumerate
-/// registered addresses ( — see the comment in
+/// registered addresses (see the comment in
 /// `crates/application/src/auth.rs`'s `register`). `register_field_error`'s
 /// `EmailTaken => Some("email")` arm therefore has no live producer through
 /// this form; the same field association is exercised here through
@@ -8750,10 +9334,19 @@ async fn search_results_list_has_no_script_child_and_listitems_are_direct_childr
         "search-data must render before #results, not inside it"
     );
 
-    // The first element inside `#results` must be a listitem, not a wrapper
-    // div — nothing but whitespace stands between the list's own opening tag
-    // and its first child.
-    let after_results = &body[results_at..];
+    // `#results` holds notes and the pager as well as cards, so it is not the
+    // list; the cards sit in `#results-list`, and the first element inside it
+    // must be a listitem — nothing but whitespace stands between the list's
+    // own opening tag and its first child.
+    assert!(
+        !body[results_at..].starts_with(r#"<div id="results" role="list""#),
+        "the swap target is not itself the list"
+    );
+    let list_at = body
+        .find(r#"<div id="results-list" role="list""#)
+        .expect("the results list");
+    assert!(list_at > results_at, "the list lives inside #results");
+    let after_results = &body[list_at..];
     let open_end = after_results.find('>').unwrap() + 1;
     let after_open = &after_results[open_end..];
     let next_tag_at = after_open.find('<').expect("a child tag follows");
@@ -9114,4 +9707,105 @@ fn no_hardcoded_english_sentences_in_static_js() {
          i18n catalog, read from a server-rendered data attribute):\n{}",
         offenders.join("\n")
     );
+}
+
+/// The newest verification link mailed to `addr`. `token_for` returns the
+/// first captured link, which belongs to whichever account registered first.
+fn verification_token_to(
+    email: &bikesnest_infrastructure::FakeEmailProvider,
+    addr: &str,
+) -> String {
+    let mail = email
+        .emails()
+        .into_iter()
+        .rev()
+        .find(|m| m.to == addr && m.text.contains("/verify-email?token="))
+        .expect("verification email captured");
+    regex::Regex::new(r"verify-email\?token=([A-Za-z0-9_-]+)")
+        .unwrap()
+        .captures(&mail.text)
+        .unwrap()[1]
+        .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Admin background-job health
+// ---------------------------------------------------------------------------
+
+#[db_test]
+async fn job_health_page_is_admin_only_and_shows_recurring_jobs(tx: &mut TestTx) {
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
+    sqlx::query(
+        "INSERT INTO background_job (kind, payload, schedule, run_at, attempts, last_error, idempotency_key)
+         VALUES ('test.web.health.late', '{}', '{\"every_seconds\": 3600}',
+                 clock_timestamp() - interval '2 hours', 1, 'job failed: probe', 'test:web:health:late')",
+    )
+    .execute(&mut *db.acquire().await.unwrap())
+    .await
+    .unwrap();
+
+    let (s, _) = get_c(&app, "/admin/jobs", None).await;
+    assert!(
+        matches!(s, StatusCode::SEE_OTHER | StatusCode::FOUND),
+        "anonymous is sent to sign in: {s}"
+    );
+    let mod_cookie = moderator_cookie(&db, &app, &email, "jobs-mod@example.com").await;
+    let (s, _) = get_c(&app, "/admin/jobs", Some(&mod_cookie)).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "moderators cannot see job health");
+    let (s, _, _) = request_h(
+        &app,
+        "GET",
+        "/admin/jobs/status",
+        Some(&mod_cookie),
+        HX_FRAGMENT,
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "nor its fragment");
+
+    let admin = admin_cookie(&db, &app, &email, "jobs-admin@example.com").await;
+    let (s, body) = get_c(&app, "/admin/jobs", Some(&admin)).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(is_document(&body), "a whole page");
+    assert!(
+        body.contains(r#"data-job-kind="test.web.health.late" data-job-status="late""#),
+        "the overdue recurring job is flagged late: {body}"
+    );
+    assert!(body.contains("job failed: probe"), "last_error is shown");
+    assert!(body.contains("overdue"), "lateness is shown");
+    assert!(body.contains(r#"data-job-health="attention""#));
+    assert!(
+        body.contains(r#"hx-get="/admin/jobs/status""#),
+        "the region polls"
+    );
+}
+
+#[db_test]
+async fn job_health_fragment_endpoint_answers_only_fragment_requests(tx: &mut TestTx) {
+    let db = tx.db().await;
+    let (app, email) = auth_app(tx).await;
+    let admin = admin_cookie(&db, &app, &email, "jobs-frag-admin@example.com").await;
+
+    // A real fragment request gets the region, not a document.
+    let (s, head, body) =
+        request_h(&app, "GET", "/admin/jobs/status", Some(&admin), HX_FRAGMENT).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(!is_document(&body), "fragment, not a page: {body}");
+    assert!(body.contains(r#"id="job-health""#));
+    assert!(vary_of(&head).contains("hx-request"), "{head:?}");
+
+    // A plain GET, a boosted navigation and a history restore all get the page.
+    for headers in [
+        &[][..],
+        &[("HX-Request", "true"), ("HX-Boosted", "true")][..],
+        &[
+            ("HX-Request", "true"),
+            ("HX-History-Restore-Request", "true"),
+        ][..],
+    ] {
+        let (s, head, _) =
+            request_h(&app, "GET", "/admin/jobs/status", Some(&admin), headers).await;
+        assert_eq!(s, StatusCode::SEE_OTHER, "{headers:?}");
+        assert_eq!(location_of(&head), "/admin/jobs", "{headers:?}");
+    }
 }

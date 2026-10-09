@@ -75,6 +75,48 @@ pub trait Geocoder: Send + Sync {
     ) -> Result<Option<GeoHit>, GeocodeError> {
         Ok(None)
     }
+
+    /// The answer [`Self::geocode`] would return *without* calling a billable
+    /// provider, if the adapter already holds one (an in-process cache).
+    ///
+    /// Must not record anything or reach the network. Adapters without a cache
+    /// keep the default `None`, which means "resolving this costs a call".
+    fn peek(&self, _query: &str) -> Option<GeoHit> {
+        None
+    }
+}
+
+/// One geocoder shared by several holders (the search use case and the
+/// destination-resolution use case read the same cache).
+#[async_trait]
+impl<T: Geocoder + ?Sized> Geocoder for std::sync::Arc<T> {
+    async fn geocode(&self, query: &str) -> Result<Option<GeoHit>, GeocodeError> {
+        (**self).geocode(query).await
+    }
+
+    async fn suggest(
+        &self,
+        query: &str,
+        limit: usize,
+        session_token: Option<&str>,
+        language_code: &str,
+    ) -> Result<Vec<AddressSuggestion>, GeocodeError> {
+        (**self)
+            .suggest(query, limit, session_token, language_code)
+            .await
+    }
+
+    async fn resolve_suggestion(
+        &self,
+        reference: &str,
+        session_token: Option<&str>,
+    ) -> Result<Option<GeoHit>, GeocodeError> {
+        (**self).resolve_suggestion(reference, session_token).await
+    }
+
+    fn peek(&self, query: &str) -> Option<GeoHit> {
+        (**self).peek(query)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -389,17 +431,20 @@ pub const BROWSE_GRID_COLUMNS: f64 = 12.0;
 /// A validated map viewport plus the same filters a radius search takes.
 ///
 /// Constructed only through [`BoundsQuery::parse`], so no unbounded,
-/// inside-out or off-globe box can reach the reader.
+/// inside-out or off-globe box can reach the reader. The fields are private
+/// for the same reason; readers use the accessors.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundsQuery {
-    pub west: f64,
-    pub south: f64,
-    pub east: f64,
-    pub north: f64,
-    pub filters: Filters,
+    west: f64,
+    south: f64,
+    east: f64,
+    north: f64,
+    /// The box's midpoint, validated once by `parse`.
+    center: GeoPoint,
+    filters: Filters,
     /// Marker cap for this query — [`BROWSE_MARKER_CAP`] in production; tests
     /// lower it to exercise clustering without inserting hundreds of rows.
-    pub limit: usize,
+    limit: usize,
 }
 
 impl BoundsQuery {
@@ -431,24 +476,48 @@ impl BoundsQuery {
         if east - west > MAX_BROWSE_SPAN_DEG || north - south > MAX_BROWSE_SPAN_DEG {
             return None;
         }
+        let center = GeoPoint::new((south + north) / 2.0, (west + east) / 2.0).ok()?;
         Some(Self {
             west,
             south,
             east,
             north,
+            center,
             filters,
             limit: limit.clamp(1, BROWSE_MARKER_CAP),
         })
     }
 
+    pub fn west(&self) -> f64 {
+        self.west
+    }
+
+    pub fn south(&self) -> f64 {
+        self.south
+    }
+
+    pub fn east(&self) -> f64 {
+        self.east
+    }
+
+    pub fn north(&self) -> f64 {
+        self.north
+    }
+
+    /// The radius search's filters, applied to this box.
+    pub fn filters(&self) -> &Filters {
+        &self.filters
+    }
+
+    /// The marker cap, already clamped to `1..=BROWSE_MARKER_CAP`.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
     /// The box's centre — what browse-mode distances are measured from, since
     /// there is no destination to be near.
     pub fn center(&self) -> GeoPoint {
-        GeoPoint::new(
-            (self.south + self.north) / 2.0,
-            (self.west + self.east) / 2.0,
-        )
-        .expect("a validated bounds' midpoint is on the globe")
+        self.center
     }
 
     /// Side of the clustering grid cell, in degrees: the box's width over

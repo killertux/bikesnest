@@ -1,0 +1,10 @@
+{# The search heading's text, shared by the page (search.html) and the results
+   fragment, which swaps it into the page's `#search-heading` with
+   `hx-swap-oob="innerHTML"`: the element and its classes stay the page's. #}
+{% if results.browse %}
+  {{ tr.t("search.browse.heading") }}
+{% else if let Some(label) = results.destination_label %}
+  {{ tr.t("search.heading.near") }} <span class="text-accent-strong">“{{ label }}”</span>
+{% else %}
+  {{ tr.t("search.heading.generic") }}
+{% endif %}

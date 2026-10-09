@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use bikesnest_application::{AddressSuggestion, GeoHit, GeocodeError, Geocoder};
 use bikesnest_domain::GeoPoint;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Origin of the home page's featured strip: the Rua XV de Novembro landmark.
@@ -602,35 +602,23 @@ impl CachingGeocoder {
         }
     }
 
-    /// The cached resolution for `query`, if one is live — without calling the
-    /// provider and without recording anything.
-    ///
-    /// The web layer checks this before charging a search against the caller's
-    /// geocode budget: a query this cache can already answer costs the
-    /// provider nothing, so it must not cost the caller anything either.
-    pub fn peek(&self, query: &str) -> Option<GeoHit> {
-        if self.capacity == 0 {
-            return None;
-        }
-        let key = normalize(query);
-        let state = self.state.lock().expect("geocode cache mutex");
-        let (hit, at) = state.hits.get(&key)?;
-        (at.elapsed() < self.ttl).then(|| hit.clone())
-    }
-
     fn remember(&self, query: &str, hit: &GeoHit) {
         if self.capacity == 0 {
             return;
         }
         let key = normalize(query);
         let mut state = self.state.lock().expect("geocode cache mutex");
+        // A refreshed key is the newest entry again: move it to the back, or
+        // the bound would evict it as if it were still its first resolution.
         if state
             .hits
             .insert(key.clone(), (hit.clone(), Instant::now()))
-            .is_none()
+            .is_some()
+            && let Some(at) = state.order.iter().position(|queued| *queued == key)
         {
-            state.order.push_back(key);
+            state.order.remove(at);
         }
+        state.order.push_back(key);
         while state.order.len() > self.capacity {
             if let Some(oldest) = state.order.pop_front() {
                 state.hits.remove(&oldest);
@@ -641,6 +629,22 @@ impl CachingGeocoder {
 
 #[async_trait]
 impl Geocoder for CachingGeocoder {
+    /// The cached resolution for `query`, if one is live — without calling the
+    /// provider and without recording anything.
+    ///
+    /// The destination use case checks this before charging a caller's
+    /// geocode budget: a query this cache can already answer costs the
+    /// provider nothing, so it must not cost the caller anything either.
+    fn peek(&self, query: &str) -> Option<GeoHit> {
+        if self.capacity == 0 {
+            return None;
+        }
+        let key = normalize(query);
+        let state = self.state.lock().expect("geocode cache mutex");
+        let (hit, at) = state.hits.get(&key)?;
+        (at.elapsed() < self.ttl).then(|| hit.clone())
+    }
+
     async fn geocode(&self, query: &str) -> Result<Option<GeoHit>, GeocodeError> {
         if let Some(hit) = self.peek(query) {
             return Ok(Some(hit));
@@ -675,44 +679,6 @@ impl Geocoder for CachingGeocoder {
     }
 }
 
-/// One [`CachingGeocoder`] behind the [`Geocoder`] port, so the use case and
-/// the handler that inspects the cache hold the same instance (the same shape
-/// as `SharedRateLimiter`).
-pub struct SharedGeocoder(Arc<CachingGeocoder>);
-
-impl SharedGeocoder {
-    pub fn new(inner: Arc<CachingGeocoder>) -> Self {
-        Self(inner)
-    }
-}
-
-#[async_trait]
-impl Geocoder for SharedGeocoder {
-    async fn geocode(&self, query: &str) -> Result<Option<GeoHit>, GeocodeError> {
-        self.0.geocode(query).await
-    }
-
-    async fn suggest(
-        &self,
-        query: &str,
-        limit: usize,
-        session_token: Option<&str>,
-        language_code: &str,
-    ) -> Result<Vec<AddressSuggestion>, GeocodeError> {
-        self.0
-            .suggest(query, limit, session_token, language_code)
-            .await
-    }
-
-    async fn resolve_suggestion(
-        &self,
-        reference: &str,
-        session_token: Option<&str>,
-    ) -> Result<Option<GeoHit>, GeocodeError> {
-        self.0.resolve_suggestion(reference, session_token).await
-    }
-}
-
 /// Build the geocoder the parsed configuration selected. `Mapbox` carries its
 /// token, so there is no "asked for Mapbox, got the fake" path any more: a
 /// missing token is rejected while the configuration is parsed.
@@ -740,6 +706,7 @@ pub fn caching_geocoder_from_config(config: &GeocoderConfig) -> CachingGeocoder 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     // --- FakeGeocoder ------------------------------------------------------
 
@@ -1072,6 +1039,29 @@ mod tests {
         // consuming another slot.
         geo.geocode("second").await.unwrap();
         assert_eq!(geo.state.lock().unwrap().order.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_refreshed_entry_moves_to_the_back_of_the_eviction_order() {
+        let (inner, calls) = counting(true);
+        let geo = CachingGeocoder::with_limits(inner, Duration::from_millis(40), 2);
+
+        geo.geocode("first").await.unwrap();
+        geo.geocode("second").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        // Both expired; re-resolving "first" makes it the newest entry.
+        geo.geocode("first").await.unwrap();
+        geo.geocode("third").await.unwrap();
+        assert_eq!(calls.get(), 4);
+
+        let state = geo.state.lock().unwrap();
+        assert_eq!(
+            state.order.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["first", "third"],
+            "the stale \"second\" is evicted, not the just-refreshed \"first\""
+        );
+        assert!(state.hits.contains_key("first"));
+        assert!(!state.hits.contains_key("second"));
     }
 
     #[test]

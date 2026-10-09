@@ -49,8 +49,10 @@ map-page manifests, htmx, Alpine and consumer scripts. External map services are
 stubbed with delayed responses; no database, account or API key is needed.
 The suite covers mobile menus, metadata/focus across boost and history,
 geolocation outcomes and detached callbacks, every map consumer and provider
-configuration, same-page map recovery/state preservation, and retry after an
-asset or renderer failure. It also constructs the vendored MapLibre and Mapbox
+configuration, same-page map recovery/state preservation, retry after an
+asset or renderer failure (including a map asset that arrives after the
+timeout, and the reload that recovers a failed module), focus after fragment
+swaps, and the notice shown when a request gets no answer. It also constructs the vendored MapLibre and Mapbox
 SDKs with local empty styles. CI installs Chromium with its system dependencies
 and runs these tests in the Frontend assets job.
 

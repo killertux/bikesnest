@@ -12,13 +12,7 @@
   <div class="search-shell mx-auto max-w-[88rem] px-6 pb-5 pt-7 md:px-8">
     <p class="mb-2 text-xs font-semibold uppercase tracking-wide text-accent-strong">{{ tr.t("search.eyebrow") }}</p>
     <h1 id="search-heading" class="font-display text-[clamp(1.625rem,2.5vw,2.25rem)] leading-[1.15] font-bold tracking-[-0.04em] wrap-anywhere">
-      {% if results.browse %}
-        {{ tr.t("search.browse.heading") }}
-      {% else if let Some(label) = results.destination_label %}
-        {{ tr.t("search.heading.near") }} <span class="text-accent-strong">“{{ label }}”</span>
-      {% else %}
-        {{ tr.t("search.heading.generic") }}
-      {% endif %}
+      {% include "components/search_heading.html" %}
     </h1>
     <p class="mt-2 text-sm text-muted">{{ tr.t("search.subtitle") }}</p>
 
@@ -100,9 +94,7 @@
 <section class="border-b border-border bg-bg">
   <div class="search-shell mx-auto max-w-[88rem] px-6 py-4 md:px-8">
     <div class="flex flex-wrap items-center justify-between gap-3">
-      <p id="result-count" aria-live="polite" class="text-sm text-muted">
-        {% if results.error.is_some() %}{% else %}{{ results.total_label }}{% endif %}
-      </p>
+      <p id="result-count" aria-live="polite" aria-atomic="true" class="text-sm text-muted">{% if results.error.is_none() %}{{ results.total_label }}{% endif %}</p>
       <div class="search-tools flex flex-wrap items-center gap-2.5 max-md:w-full max-md:[&>a]:order-3 max-md:[&>a]:w-full max-md:[&>a]:justify-center max-md:[&>button]:flex-1 max-md:[&>button]:justify-center max-md:[&>form]:order-2 max-md:[&>form]:w-full max-md:[&>form>label]:w-full max-md:[&>form>label]:justify-between">
         {% if can_contribute %}
           <a href="/parking/new" class="inline-flex items-center gap-1.5 rounded-lg border border-border bg-surface px-3 py-2 text-xs font-medium text-fg transition-colors hover:border-accent">
@@ -118,7 +110,7 @@
           <svg aria-hidden="true" class="h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.1 5.5 9.9 3.8 4 6v15l5.9-2.2 4.2 1.7 5.9-2.3V3.7Z" /><path d="M9.9 3.8v15" /><path d="M14.1 5.5v15" /></svg>
           <span x-text="mapOpen ? '{{ tr.t("search.map.hide") }}' : '{{ tr.t("search.map.show") }}'">{{ tr.t("search.map.show") }}</span>
         </button>
-        <form id="search-sort-form" action="/search" method="get" hx-get="/search" hx-target="#results" hx-swap="innerHTML" hx-sync="#results:replace" hx-push-url="true" hx-indicator="#results-indicator" @submit="syncSearchState" class="flex items-center gap-2.5">
+        <form id="search-sort-form" action="/search" method="get" hx-get="/search" hx-target="#results" hx-swap="innerHTML" hx-sync="#results:replace" hx-replace-url="true" hx-indicator="#results-indicator" @submit="syncSearchState" class="flex items-center gap-2.5">
           <span id="search-sort-state" hidden>{% call state::hidden(form, false, true, false, false, false) %}</span>
           <label class="flex items-center gap-2 text-sm text-muted">
             {{ tr.t("search.sort.label") }}
@@ -143,17 +135,20 @@
     </div>
 
     <!-- Filter panel -->
+    {# Filters, sort and "clear" refine the search already on screen, so they
+       replace the history entry instead of pushing one per checkbox; a new
+       destination, a map-area search and the pager still push. #}
     <div id="search-filter-panel" x-show="filtersOpen" class="search-filter-panel mt-4 rounded-2xl border border-border bg-surface p-6 [&_label]:min-h-7 [&_fieldset]:min-w-0">
       <div class="flex items-center justify-between">
         <h2 class="font-display text-sm font-semibold uppercase tracking-wide text-muted">{{ tr.t("search.filters.results") }}</h2>
-        <a data-search-clear href="{{ clear_filters_url() }}" hx-get="{{ clear_filters_url() }}" hx-target="#results" hx-swap="innerHTML" hx-sync="#results:replace" hx-push-url="true" hx-indicator="#results-indicator" @click="clearSearchState" class="text-sm font-medium text-accent-strong hover:text-accent-dark">{{ tr.t("search.filters.clear") }}</a>
+        <a data-search-clear href="{{ clear_filters_url() }}" hx-get="{{ clear_filters_url() }}" hx-target="#results" hx-swap="innerHTML" hx-sync="#results:replace" hx-replace-url="true" hx-indicator="#results-indicator" @click="clearSearchState" class="text-sm font-medium text-accent-strong hover:text-accent-dark">{{ tr.t("search.filters.clear") }}</a>
       </div>
       <form
         action="/search" method="get"
         id="search-filter-form"
         hx-get="/search" hx-target="#results" hx-swap="innerHTML" hx-sync="#results:replace"
         hx-trigger="change"
-        hx-push-url="true" hx-indicator="#results-indicator"
+        hx-replace-url="true" hx-indicator="#results-indicator"
         @change="syncSearchState" @submit="syncSearchState"
         class="mt-5 grid gap-6 sm:grid-cols-2 xl:grid-cols-4"
       >
@@ -197,10 +192,9 @@
         <fieldset class="md:col-span-1">
           <legend class="mb-2.5 text-sm font-semibold text-fg">{{ tr.t("search.filters.radius") }}</legend>
           <select name="radius" class="h-10 w-full rounded-lg border border-border bg-bg px-2.5 text-sm font-medium text-fg focus:border-accent">
-            <option value="1000" {% if radius_none() %}selected{% endif %}>1 km · {{ tr.t("search.radius.default") }}</option>
             <option value="250" {% if radius_is(250) %}selected{% endif %}>250 m</option>
             <option value="500" {% if radius_is(500) %}selected{% endif %}>500 m</option>
-            <option value="1000" {% if radius_is(1000) %}selected{% endif %}>1 km</option>
+            <option value="1000" {% if radius_none() || radius_is(1000) %}selected{% endif %}>1 km · {{ tr.t("search.radius.default") }}</option>
             <option value="2000" {% if radius_is(2000) %}selected{% endif %}>2 km</option>
             <option value="5000" {% if radius_is(5000) %}selected{% endif %}>{{ tr.t("search.radius.5km") }}</option>
           </select>
@@ -274,8 +268,7 @@
       <div :class="resultsClass">
         <div class="relative">
           {# The map's data island: a sibling of `#results`, never a child of
-             it — `role="list"` must contain only `role="listitem"` articles
-             for accessible list structure. The AJAX fragment (partials/search_results.html,
+             it, so a results swap cannot leave a stale copy behind. The AJAX fragment (partials/search_results.html,
              rendered standalone with `oob: true`) re-renders this same id via
              `hx-swap-oob`, so search.js's `readData()` (a plain
              `document.getElementById("search-data")`) keeps finding it after
@@ -285,7 +278,7 @@
           <div id="results-indicator" class="htmx-indicator pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-[oklch(98%_0.004_240_/_0.7)]" aria-hidden="true">
             <span class="inline-flex items-center gap-2.5 rounded-xl border border-border bg-surface px-4 py-2.5 text-sm font-medium text-fg shadow-pop">{{ tr.t("search.updating") }}</span>
           </div>
-          <div id="results" role="list" aria-label="{{ tr.t("search.results_aria") }}" class="space-y-4">
+          <div id="results" class="space-y-4">
             {% include "partials/search_results.html" %}
           </div>
         </div>

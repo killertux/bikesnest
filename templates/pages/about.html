@@ -19,7 +19,7 @@
         srcset="{{ layout.asset("img/square-bike-rows-640.jpg") }} 640w, {{ layout.asset("img/square-bike-rows-795.jpg") }} 795w"
         sizes="(min-width: 1024px) 50vw, 100vw"
         loading="lazy"
-        alt="Row of bicycles parked under trees in a sunny public square" class="aspect-[4/3] w-full object-cover"
+        alt="" class="aspect-[4/3] w-full object-cover"
       />
     </div>
   </div>
@@ -62,23 +62,23 @@
         </thead>
         <tbody>
           <tr class="border-t border-border">
-            <td class="px-4 py-3"><span class="inline-flex rounded-full bg-fresh/10 px-2.5 py-0.5 text-xs font-medium text-fresh">{{ tr.t("freshness.fresh") }}</span></td>
+            <td class="px-4 py-3"><span class="inline-flex rounded-full bg-fresh/10 px-2.5 py-0.5 text-xs font-medium text-fresh-strong">{{ tr.t("freshness.fresh") }}</span></td>
             <td class="px-4 py-3 text-muted">{{ tr.t("about.fresh.fresh") }}</td>
           </tr>
           <tr class="border-t border-border">
-            <td class="px-4 py-3"><span class="inline-flex rounded-full bg-fresh/10 px-2.5 py-0.5 text-xs font-medium text-fresh">{{ tr.t("freshness.recently_verified") }}</span></td>
+            <td class="px-4 py-3"><span class="inline-flex rounded-full bg-fresh/10 px-2.5 py-0.5 text-xs font-medium text-fresh-strong">{{ tr.t("freshness.recently_verified") }}</span></td>
             <td class="px-4 py-3 text-muted">{{ tr.t("about.fresh.recently_verified") }}</td>
           </tr>
           <tr class="border-t border-border">
-            <td class="px-4 py-3"><span class="inline-flex rounded-full bg-aging/10 px-2.5 py-0.5 text-xs font-medium text-aging">{{ tr.t("freshness.aging") }}</span></td>
+            <td class="px-4 py-3"><span class="inline-flex rounded-full bg-aging/10 px-2.5 py-0.5 text-xs font-medium text-aging-strong">{{ tr.t("freshness.aging") }}</span></td>
             <td class="px-4 py-3 text-muted">{{ tr.t("about.fresh.aging") }}</td>
           </tr>
           <tr class="border-t border-border">
-            <td class="px-4 py-3"><span class="inline-flex rounded-full bg-stale/10 px-2.5 py-0.5 text-xs font-medium text-stale">{{ tr.t("freshness.stale") }}</span></td>
+            <td class="px-4 py-3"><span class="inline-flex rounded-full bg-stale/10 px-2.5 py-0.5 text-xs font-medium text-stale-strong">{{ tr.t("freshness.stale") }}</span></td>
             <td class="px-4 py-3 text-muted">{{ tr.t("about.fresh.stale") }}</td>
           </tr>
           <tr class="border-t border-border">
-            <td class="px-4 py-3"><span class="inline-flex rounded-full bg-stale/10 px-2.5 py-0.5 text-xs font-medium text-stale">{{ tr.t("freshness.very_stale") }}</span></td>
+            <td class="px-4 py-3"><span class="inline-flex rounded-full bg-stale/10 px-2.5 py-0.5 text-xs font-medium text-stale-strong">{{ tr.t("freshness.very_stale") }}</span></td>
             <td class="px-4 py-3 text-muted">{{ tr.t("about.fresh.very_stale") }}</td>
           </tr>
         </tbody>

@@ -375,6 +375,7 @@ fn proposal(id: i64, kind: ProposalKind, change: ProposedChange) -> Proposal {
         current_snapshot: serde_json::json!({}),
         status: ProposalStatus::Pending,
         created_at: chrono::Utc::now(),
+        escalated_at: None,
     }
 }
 

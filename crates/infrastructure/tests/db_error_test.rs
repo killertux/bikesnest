@@ -5,9 +5,8 @@
 //! are provoked against the real server here. The pure branches (`PoolTimedOut`,
 //! `RowNotFound`, the code table) are unit-tested inside `db_error.rs`.
 
-use bikesnest_application::{ContributionError, ReviewRepository};
-use bikesnest_domain::{ReviewBody, StarRating};
-use bikesnest_infrastructure::{DbFailure, SqlxReviewRepository, classify};
+use bikesnest_application::{ContributionError, FavoriteRepository};
+use bikesnest_infrastructure::{DbFailure, SqlxFavoriteRepository, classify};
 use bikesnest_test_support::{ParkingBuilder, UserBuilder, db_test};
 
 /// Runs `sql` inside the test transaction and returns the failure it produced.
@@ -96,8 +95,9 @@ async fn statement_timeout_is_unavailable(tx: &mut bikesnest_test_support::TestT
 }
 
 /// End-to-end through a repository: the mapper turns an FK rejection into the
-/// feature's own error instead of an opaque `Internal`.
-///
+/// feature's own error instead of an opaque `Internal`. (A review of a missing
+/// location no longer reaches the FK: the review repository locks the location
+/// first and reports `NotFound`. A favorite still relies on the FK alone.)
 #[db_test]
 async fn repository_maps_a_rejected_write_off_internal(tx: &mut bikesnest_test_support::TestTx) {
     let db = tx.db().await;
@@ -109,18 +109,11 @@ async fn repository_maps_a_rejected_write_off_internal(tx: &mut bikesnest_test_s
         .expect("fixture author");
     drop(conn);
 
-    let repo = SqlxReviewRepository::new(db);
-    let body = ReviewBody::new("Plenty of racks, always free.").expect("valid body");
-
+    let repo = SqlxFavoriteRepository::new(db);
     let err = repo
-        .upsert_review(
-            -1,
-            author.id,
-            StarRating::new(4).expect("valid rating"),
-            &body,
-        )
+        .toggle(author.id, -1)
         .await
-        .expect_err("the review FKs cannot be satisfied");
+        .expect_err("the favorite FK cannot be satisfied");
 
     assert!(
         matches!(err, ContributionError::InvalidField(_)),

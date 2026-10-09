@@ -9,7 +9,9 @@ use bikesnest_domain::DomainError;
 pub mod audit;
 pub mod auth;
 pub mod community;
+pub mod destination;
 pub mod email;
+pub mod job_health;
 pub mod jobs;
 pub mod moderation;
 pub mod photo;
@@ -28,6 +30,7 @@ pub use auth::{
     AuthenticatedUser, Clock, EmailConfirmationOutcome, EmailVerificationOutcome, IdentityRecord,
     LoginOutcome, NewAccount, OAuthProvider, PasswordHasher, ResolvedSession, Session,
     SessionStore, TermsAcceptance, TokenGenerator, TokenStore, UserActivity, UserSearch,
+    VerificationPurpose,
 };
 pub use community::{
     AddParkingLocationOutcome, AttributeSummary, CommunityParkingDetails, ContributionDeps,
@@ -37,7 +40,12 @@ pub use community::{
     PendingProposalSummary, ProposalVote, ProposalVoteTotals, Reason, Review, ReviewRepository,
     VerificationRepository, recommendation_reasons,
 };
+pub use destination::{DestinationError, GeocodeBudget, ResolveDestination};
 pub use email::{EmailError, EmailKind, EmailMessage, EmailProvider, EmailQueue};
+pub use job_health::{
+    JOB_LATE_AFTER_SECS, JobHealth, JobHealthError, JobHealthReader, JobHealthReport,
+    JobHealthService, JobQueueSummary, RecurringJobStatus,
+};
 pub use jobs::{JOB_EMAIL_SEND, JOB_JOBS_GC, JOB_RETENTION, JobError, JobHandler, JobPayload};
 pub use moderation::{
     ModerationDeps, ModerationError, ModerationRepository, ModerationService, NewReport, Proposal,
@@ -83,7 +91,7 @@ pub trait DatabaseProbe: Send + Sync {
 #[derive(Debug, thiserror::Error)]
 pub enum ProbeError {
     /// The dependency is unreachable / timed out (readiness must report
-    /// "dependency down", distinct from an application bug — ).
+    /// "dependency down", distinct from an application bug).
     #[error("dependency unavailable")]
     Unavailable,
     /// An unexpected error on our side (maps to 5xx app error).
@@ -106,8 +114,17 @@ pub enum Readiness {
     AppError,
 }
 
+/// A boxed probe is a probe, so the web layer can hold the readiness use case
+/// without naming the concrete adapter behind it.
+#[async_trait]
+impl<T: DatabaseProbe + ?Sized> DatabaseProbe for Box<T> {
+    async fn ping(&self) -> Result<(), ProbeError> {
+        (**self).ping().await
+    }
+}
+
 /// Use case: can the application serve requests and access its dependencies?
-pub struct CheckReadiness<P> {
+pub struct CheckReadiness<P = Box<dyn DatabaseProbe>> {
     probe: P,
 }
 

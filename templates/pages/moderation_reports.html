@@ -6,7 +6,7 @@
   {% if let Some(notice) = notice %}
     {# The no-JS landing banner: a moderation action redirects a whole-document
        caller back here with `?done=…` instead of answering with a toast. #}
-    <div class="mt-4 rounded-lg border border-fresh/30 bg-fresh/10 px-4 py-3 text-sm text-fresh" role="status">{{ notice }}</div>
+    <div class="mt-4 rounded-lg border border-fresh/30 bg-fresh/10 px-4 py-3 text-sm text-fresh-strong" role="status">{{ notice }}</div>
   {% endif %}
 
   <nav class="mt-4 flex flex-wrap items-center gap-2 text-sm" aria-label="{{ tr.t("a11y.report_filter") }}">
